@@ -2,146 +2,226 @@
 	path = tools/rocket-chip
 	url = https://github.com/SCORE-CIRCUITS/rocket-chip.git
 	branch = score-v1.0
+
 [submodule "tools/openpiton"]
 	path = tools/openpiton
 	url = https://github.com/SCORE-CIRCUITS/openpiton.git
 	branch = score-v1.0
+
 [submodule "tools/gemmini"]
 	path = tools/gemmini
 	url = https://github.com/SCORE-CIRCUITS/gemmini.git
 	branch = score-v1.0
+
 [submodule "tools/SoC_Automation"]
 	path = tools/SoC_Automation
-	url = git@github.com:habibagamal/SoC_Automation.git
+	url = https://github.com/SCORE-CIRCUITS/SoC_Automation.git
+	branch = score-v1.0
+
 [submodule "tools/riscv_vhdl"]
 	path = tools/riscv_vhdl
-	url = git@github.com:sergeykhbr/riscv_vhdl.git
+	url = https://github.com/SCORE-CIRCUITS/riscv_vhdl.git
+	branch = score-v1.0
+
 [submodule "tools/hero"]
 	path = tools/hero
 	url = https://github.com/SCORE-CIRCUITS/hero.git
 	branch = score-v1.0
+
 [submodule "tools/iob-soc"]
 	path = tools/iob-soc
-	url = git@github.com:IObundle/iob-soc.git
+	url = https://github.com/SCORE-CIRCUITS/iob-soc.git
+	branch = score-v1.0
+
 [submodule "tools/neorv32"]
 	path = tools/neorv32
 	url = https://github.com/SCORE-CIRCUITS/neorv32.git
 	branch = score-v1.0
+
 [submodule "tools/mflowgen"]
 	path = tools/mflowgen
-	url = git@github.com:mflowgen/mflowgen.git
+	url = https://github.com/SCORE-CIRCUITS/mflowgen.git
+	branch = score-v1.0
+
 [submodule "tools/chipyard"]
 	path = tools/chipyard
-	url = git@github.com:ucb-bar/chipyard.git
+	url = https://github.com/SCORE-CIRCUITS/chipyard.git
+	branch = score-v1.0
+
 [submodule "tools/verilator"]
 	path = tools/verilator
-	url = https://github.com/verilator/verilator.git
+	url = https://github.com/SCORE-CIRCUITS/verilator.git
+	branch = score-v1.0
+
 [submodule "tools/amaranth"]
 	path = tools/amaranth
-	url = https://github.com/amaranth-lang/amaranth
+	url = https://github.com/SCORE-CIRCUITS/amaranth.git
+	branch = score-v1.0
+
 [submodule "tools/xls"]
 	path = tools/xls
-	url = https://github.com/google/xls.git
+	url = https://github.com/SCORE-CIRCUITS/xls.git
+	branch = score-v1.0
+
 [submodule "tools/aha"]
 	path = tools/aha
-	url = https://github.com/StanfordAHA/aha.git
+	url = https://github.com/SCORE-CIRCUITS/aha.git
+	branch = score-v1.0
+
 [submodule "tools/bambu"]
 	path = tools/bambu
-	url = https://github.com/ferrandi/PandA-bambu.git
+	url = https://github.com/SCORE-CIRCUITS/PandA-bambu.git
+	branch = score-v1.0
+
 [submodule "tools/pipelinec"]
 	path = tools/pipelinec
-	url = https://github.com/JulianKemmerer/PipelineC.git
+	url = https://github.com/SCORE-CIRCUITS/PipelineC.git
+	branch = score-v1.0
+
 [submodule "tools/chisel"]
 	path = tools/chisel
-	url = https://github.com/chipsalliance/chisel.git
+	url = https://github.com/SCORE-CIRCUITS/chisel.git
+	branch = score-v1.0
+
 [submodule "tools/spinalhdl"]
 	path = tools/spinalhdl
-	url = https://github.com/SpinalHDL/SpinalHDL.git
+	url = https://github.com/SCORE-CIRCUITS/SpinalHDL.git
+	branch = score-v1.0
+
 [submodule "tools/myhdl"]
 	path = tools/myhdl
-	url = https://github.com/myhdl/myhdl.git
+	url = https://github.com/SCORE-CIRCUITS/myhdl.git
+	branch = score-v1.0
+
 [submodule "tools/pymtl3"]
 	path = tools/pymtl3
-	url = https://github.com/pymtl/pymtl3.git
+	url = https://github.com/SCORE-CIRCUITS/pymtl3.git
+	branch = score-v1.0
+
 [submodule "tools/peakrdl"]
 	path = tools/peakrdl
-	url = https://github.com/SystemRDL/PeakRDL.git
+	url = https://github.com/SCORE-CIRCUITS/PeakRDL.git
+	branch = score-v1.0
+
 [submodule "tools/rggen"]
 	path = tools/rggen
-	url = https://github.com/rggen/rggen.git
+	url = https://github.com/SCORE-CIRCUITS/rggen.git
+	branch = score-v1.0
+
 [submodule "tools/rv-tracer"]
 	path = tools/rv-tracer
-	url = https://github.com/pulp-platform/rv_tracer.git
+	url = https://github.com/SCORE-CIRCUITS/rv_tracer.git
+	branch = score-v1.0
+
 [submodule "tools/ara"]
 	path = tools/ara
 	url = https://github.com/SCORE-CIRCUITS/ara.git
 	branch = score-v1.0
+
 [submodule "tools/mempool"]
 	path = tools/mempool
-	url = https://github.com/pulp-platform/mempool.git
+	url = https://github.com/SCORE-CIRCUITS/mempool.git
+	branch = score-v1.0
+
 [submodule "tools/spatz"]
 	path = tools/spatz
 	url = https://github.com/SCORE-CIRCUITS/spatz.git
 	branch = score-v1.0
+
 [submodule "tools/snitch-cluster"]
 	path = tools/snitch-cluster
-	url = https://github.com/pulp-platform/snitch_cluster.git
+	url = https://github.com/SCORE-CIRCUITS/snitch_cluster.git
+	branch = score-v1.0
+
 [submodule "tools/pulpissimo"]
 	path = tools/pulpissimo
-	url = https://github.com/pulp-platform/pulpissimo.git
+	url = https://github.com/SCORE-CIRCUITS/pulpissimo.git
+	branch = score-v1.0
+
 [submodule "tools/occamy"]
 	path = tools/occamy
-	url = https://github.com/pulp-platform/occamy.git
+	url = https://github.com/SCORE-CIRCUITS/occamy.git
+	branch = score-v1.0
+
 [submodule "tools/cheshire"]
 	path = tools/cheshire
-	url = https://github.com/pulp-platform/cheshire.git
+	url = https://github.com/SCORE-CIRCUITS/cheshire.git
+	branch = score-v1.0
+
 [submodule "tools/cva6"]
 	path = tools/cva6
 	url = https://github.com/SCORE-CIRCUITS/cva6.git
 	branch = score-v1.0
+
 [submodule "tools/carfield"]
 	path = tools/carfield
-	url = https://github.com/pulp-platform/carfield.git
+	url = https://github.com/SCORE-CIRCUITS/carfield.git
+	branch = score-v1.0
+
 [submodule "tools/croc"]
 	path = tools/croc
-	url = https://github.com/pulp-platform/croc.git
+	url = https://github.com/SCORE-CIRCUITS/croc.git
+	branch = score-v1.0
+
 [submodule "tools/pulp-cluster"]
 	path = tools/pulp-cluster
-	url = https://github.com/pulp-platform/pulp_cluster.git
+	url = https://github.com/SCORE-CIRCUITS/pulp_cluster.git
+	branch = score-v1.0
+
 [submodule "tools/pulp-soc"]
 	path = tools/pulp-soc
-	url = https://github.com/pulp-platform/pulp_soc.git
+	url = https://github.com/SCORE-CIRCUITS/pulp_soc.git
+	branch = score-v1.0
+
 [submodule "tools/chimera"]
 	path = tools/chimera
-	url = https://github.com/pulp-platform/chimera.git
+	url = https://github.com/SCORE-CIRCUITS/chimera.git
+	branch = score-v1.0
+
 [submodule "tools/picobello"]
 	path = tools/picobello
-	url = https://github.com/pulp-platform/picobello.git
+	url = https://github.com/SCORE-CIRCUITS/picobello.git
+	branch = score-v1.0
+
 [submodule "tools/safety-island"]
 	path = tools/safety-island
-	url = https://github.com/pulp-platform/safety_island.git
+	url = https://github.com/SCORE-CIRCUITS/safety_island.git
+	branch = score-v1.0
+
 [submodule "tools/cheshire-ihp130-o"]
 	path = tools/cheshire-ihp130-o
-	url = https://github.com/pulp-platform/cheshire-ihp130-o.git
+	url = https://github.com/SCORE-CIRCUITS/cheshire-ihp130-o.git
+	branch = score-v1.0
+
 [submodule "tools/magia"]
 	path = tools/magia
-	url = https://github.com/pulp-platform/MAGIA.git
+	url = https://github.com/SCORE-CIRCUITS/MAGIA.git
+	branch = score-v1.0
+
 [submodule "tools/auteur"]
 	path = tools/auteur
-	url = https://github.com/pulp-platform/auteur.git
+	url = https://github.com/SCORE-CIRCUITS/auteur.git
+	branch = score-v1.0
+
 [submodule "tools/astral"]
 	path = tools/astral
-	url = https://github.com/pulp-platform/astral.git
+	url = https://github.com/SCORE-CIRCUITS/astral.git
+	branch = score-v1.0
+
 [submodule "tools/araxl"]
 	path = tools/araxl
-	url = git@github.com:pulp-platform/AraXL.git
+	url = https://github.com/SCORE-CIRCUITS/AraXL.git
+	branch = score-v1.0
+
 [submodule "tools/rv12"]
 	path = tools/rv12
-	url = https://github.com/RoaLogic/RV12.git
+	url = https://github.com/SCORE-CIRCUITS/RV12.git
+	branch = score-v1.0
 
 [submodule "tools/picorv32"]
 	path = tools/picorv32
-	url = https://github.com/YosysHQ/picorv32.git
+	url = https://github.com/SCORE-CIRCUITS/picorv32.git
+	branch = score-v1.0
 
 [submodule "tools/darkriscv"]
 	path = tools/darkriscv
@@ -155,7 +235,8 @@
 
 [submodule "tools/hazard3"]
 	path = tools/hazard3
-	url = https://github.com/Wren6991/Hazard3.git
+	url = https://github.com/SCORE-CIRCUITS/Hazard3.git
+	branch = score-v1.0
 
 [submodule "tools/scr1"]
 	path = tools/scr1
@@ -164,15 +245,18 @@
 
 [submodule "tools/vexriscv"]
 	path = tools/vexriscv
-	url = https://github.com/SpinalHDL/VexRiscv.git
+	url = https://github.com/SCORE-CIRCUITS/VexRiscv.git
+	branch = score-v1.0
 
 [submodule "tools/opentitan"]
 	path = tools/opentitan
-	url = https://github.com/lowRISC/opentitan.git
+	url = https://github.com/SCORE-CIRCUITS/opentitan.git
+	branch = score-v1.0
 
 [submodule "tools/black-parrot"]
 	path = tools/black-parrot
-	url = https://github.com/black-parrot/black-parrot.git
+	url = https://github.com/SCORE-CIRCUITS/black-parrot.git
+	branch = score-v1.0
 
 [submodule "tools/veer-el2"]
 	path = tools/veer-el2
@@ -183,6 +267,23 @@
 	path = tools/ibex
 	url = https://github.com/SCORE-CIRCUITS/ibex.git
 	branch = score-v1.0
+
 [submodule "publications"]
 	path = publications
-	url = git@github.com:SJTU-YONGFU-RESEARCH-GRP/score_publications.git
+	url = git@github.com:SCORE-CIRCUITS/score_publications.git
+
+[submodule "tools/dramsim2"]
+	path = tools/dramsim2
+	url = https://github.com/SCORE-CIRCUITS/DRAMSim2.git
+	branch = score-v1.0
+
+[submodule "tools/noculator"]
+	path = tools/noculator
+	url = https://github.com/SCORE-CIRCUITS/NOCulator.git
+	branch = score-v1.0
+
+[submodule "tools/riscv-compliance"]
+	path = tools/riscv-compliance
+	url = https://github.com/SCORE-CIRCUITS/riscv-arch-test.git
+	branch = score-v1.0
+

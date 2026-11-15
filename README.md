@@ -61,9 +61,9 @@ Not every architecture has benchmark runners implemented yet — those are marke
 
 The living open-architecture platform (catalog, project pages, registry updates) is a static site under [`site/`](site/), deployed to GitHub Pages:
 
-**https://SJTU-YONGFU-RESEARCH-GRP.github.io/score/**
+**https://SCORE-CIRCUITS.github.io/score/**
 
-Survey manuscript and evidence corpus live in the private [`score_publications`](https://github.com/SJTU-YONGFU-RESEARCH-GRP/score_publications) repo, linked as the [`publications/`](publications/) git submodule — see [`publications/README.md`](publications/README.md). The site builds from `publications/papers/projects.csv`, `publications/papers/architecture_index.csv`, digests, source notes, and `publications/papers/CHANGELOG.md`. Local build and Pages setup notes are in [`site/README.md`](site/README.md).
+Survey manuscript and evidence corpus live in the private [`score_publications`](https://github.com/SCORE-CIRCUITS/score_publications) repo, linked as the [`publications/`](publications/) git submodule — see [`publications/README.md`](publications/README.md). The site builds from `publications/papers/projects.csv`, `publications/papers/architecture_index.csv`, digests, source notes, and `publications/papers/CHANGELOG.md`. Local build and Pages setup notes are in [`site/README.md`](site/README.md).
 
 ## Architectures supported via `scripts/`
 

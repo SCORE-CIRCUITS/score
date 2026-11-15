@@ -2,12 +2,12 @@
 
 Static Astro site for the open-architecture registry. Deploys to GitHub Pages at:
 
-**https://SJTU-YONGFU-RESEARCH-GRP.github.io/score/**
+**https://SCORE-CIRCUITS.github.io/score/**
 
 ## Requirements
 
 - Node.js **22+**
-- Registry sources in `../publications/papers/` (`projects.csv`, `architecture_index.csv`, digests, source notes, `CHANGELOG.md`) — from the private [`score_publications`](https://github.com/SJTU-YONGFU-RESEARCH-GRP/score_publications) submodule (`git submodule update --init publications`).
+- Registry sources in `../publications/papers/` (`projects.csv`, `architecture_index.csv`, digests, source notes, `CHANGELOG.md`) — from the private [`score_publications`](https://github.com/SCORE-CIRCUITS/score_publications) submodule (`git submodule update --init publications`).
 
 ## Local development
 
@@ -26,7 +26,7 @@ npm run preview
 
 1. Repo **Settings → Pages → Build and deployment → Source**: **GitHub Actions**
 2. Merge/push to `main` (or run **Actions → Deploy GitHub Pages → Run workflow**)
-3. Site URL: `https://SJTU-YONGFU-RESEARCH-GRP.github.io/score/`
+3. Site URL: `https://SCORE-CIRCUITS.github.io/score/`
 
 The workflow is [`.github/workflows/pages.yml`](../.github/workflows/pages.yml). It rebuilds when `site/**` or `publications/**` changes.
 
