@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-15T17:24:37+00:00",
-  "count": 37,
+  "generated_utc": "2026-11-15T19:06:21+00:00",
+  "count": 39,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -585,6 +585,41 @@
     {
       "schema": "score.benchmark_results.v1",
       "evidence_class": "score_measured",
+      "core": "vexriscv",
+      "upstream_commit": "f9cb9558",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "iob_soc_v0.8_default",
+      "metrics": {
+        "execution_cycles": 409863,
+        "elapsed_us": 4098.63,
+        "frequency_mhz": 100.0,
+        "pi_calculation": "3.141500",
+        "firmware_size_bytes": 24086,
+        "loopback_file_bytes": 348,
+        "baud_rate": 3000000,
+        "memory_system": "AXI4-Full Crossbar + DDR",
+        "status": "PASS",
+        "uart_output_verified": true,
+        "loopback_verified": true,
+        "pass": true
+      },
+      "generated_utc": "2026-11-15T18:42:00+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.11"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0",
+        "riscv_gcc": "13.2.0"
+      },
+      "_path": "datasets/iob-soc/f9cb9558/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
       "core": "mempool",
       "upstream_commit": "88a20ceb",
       "profile": "soc_verilator",
@@ -951,6 +986,42 @@
         "gcc": "10.2.0"
       },
       "_path": "datasets/mempool/88a20ceb/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ariane",
+      "upstream_commit": "4e8ab3db",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "openpiton_ariane_1tile",
+      "metrics": {
+        "execution_cycles": 356310,
+        "simulation_time_ps": 178155250,
+        "tiles_x": 1,
+        "tiles_y": 1,
+        "architecture": "rv64imac",
+        "interconnect": "Princeton P-Mesh 2D NoC (3 physical networks)",
+        "l15_cache_present": true,
+        "l2_cache_present": true,
+        "fake_uart_lines": 32,
+        "status": "PASS",
+        "uart_output_verified": true,
+        "workload_complete": true,
+        "pass": true
+      },
+      "generated_utc": "2026-11-15T19:05:54+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.11"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0",
+        "riscv_gcc": "13.2.0"
+      },
+      "_path": "datasets/openpiton/4e8ab3db/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",

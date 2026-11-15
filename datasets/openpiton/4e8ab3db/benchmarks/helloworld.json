@@ -1,0 +1,35 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ariane",
+  "upstream_commit": "4e8ab3db",
+  "profile": "soc_verilator",
+  "workload": "helloworld",
+  "config": "openpiton_ariane_1tile",
+  "metrics": {
+    "execution_cycles": 356310,
+    "simulation_time_ps": 178155250,
+    "tiles_x": 1,
+    "tiles_y": 1,
+    "architecture": "rv64imac",
+    "interconnect": "Princeton P-Mesh 2D NoC (3 physical networks)",
+    "l15_cache_present": true,
+    "l2_cache_present": true,
+    "fake_uart_lines": 32,
+    "status": "PASS",
+    "uart_output_verified": true,
+    "workload_complete": true,
+    "pass": true
+  },
+  "generated_utc": "2026-11-15T19:05:54+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.11.11"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "11.5.0",
+    "riscv_gcc": "13.2.0"
+  }
+}

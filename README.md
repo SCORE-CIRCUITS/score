@@ -128,10 +128,10 @@ Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kerne
 | **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` | — |
 | **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` | — |
 | **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` | — |
-| **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc.sh` | — |
+| **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc_benchmarks.sh` | helloworld (VexRiscv RV32, AXI4 full crossbar, DDR, UART console loopback, Pi calculation) ✅ |
 | **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` | — |
 | **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` | — |
-| **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton.sh` | — |
+| **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton_benchmarks.sh` | helloworld (Ariane RV64, P-Mesh 2D NoC, L1.5/L2 cache, UART) ✅ |
 | **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` | — |
 | **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | — |
 | **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
