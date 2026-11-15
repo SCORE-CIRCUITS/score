@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "category": "64-bit Application Cores",
+  "cores": [
+    {
+      "score_tool": "rocket-chip",
+      "profile": "app_verilator",
+      "architecture": "rv64gc",
+      "config": "DefaultConfig",
+      "description": "RISC-V Rocket Chip 64-bit in-order application core with FPU, MMU, caches, and TileLink crossbar",
+      "workloads": {
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh dhrystone"
+        },
+        "mm": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh mm"
+        },
+        "qsort": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh qsort"
+        },
+        "rsort": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh rsort"
+        },
+        "spmv": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh spmv"
+        },
+        "multiply": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh multiply"
+        },
+        "median": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh median"
+        },
+        "towers": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh towers"
+        },
+        "vvadd": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh vvadd"
+        }
+      }
+    },
+    {
+      "score_tool": "cva6",
+      "profile": "app_verilator",
+      "architecture": "rv64gc",
+      "config": "cv64a6_imafdc_sv39",
+      "description": "OpenHW Group CVA6 (Ariane) 64-bit 6-stage application core with MMU, FPU, and AXI interconnect",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh coremark"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh dhrystone"
+        },
+        "mm": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh mm"
+        },
+        "qsort": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh qsort"
+        },
+        "rsort": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh rsort"
+        },
+        "spmv": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh spmv"
+        },
+        "multiply": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh multiply"
+        },
+        "median": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh median"
+        },
+        "towers": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh towers"
+        },
+        "vvadd": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh vvadd"
+        }
+      }
+    }
+  ]
+}

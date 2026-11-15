@@ -1,0 +1,28 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "rocket-chip",
+  "upstream_commit": "885dd596",
+  "profile": "app_verilator",
+  "workload": "vvadd",
+  "config": "DefaultConfig",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gc",
+    "configuration": "DefaultConfig",
+    "benchmark_cycles": 2469,
+    "instructions_retired": 2416,
+    "ipc": 0.9785
+  },
+  "generated_utc": "2026-11-15T04:51:12+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "firtool": "1.62.0"
+  }
+}
