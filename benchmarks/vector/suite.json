@@ -103,6 +103,162 @@
           "notes": "Upstream RTL bug in vstu.sv line 326: reduction AND (&stu_operand_valid) deadlocks when vl < NrLanes (vl=2 with 4 lanes) because inactive lanes never assert valid."
         }
       }
+    },
+    {
+      "score_tool": "spatz",
+      "profile": "vector_verilator",
+      "architecture": "rv32imafd_v",
+      "config": "spatz_cluster_2core",
+      "description": "PULP Spatz clustered vector accelerator (Snitch + Spatz vector unit, 2 cores, 4 FPUs/core, ELEN=64)",
+      "workloads": {
+        "fmatmul": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fmatmul",
+          "result_file": "datasets/spatz/68503856/benchmarks/fmatmul.json",
+          "metrics": {
+            "kernel_cycles": 33518,
+            "performance_ops_per_cycle": 15.641,
+            "vector_utilization_pct": 97.7,
+            "datatype": "fp64"
+          }
+        },
+        "fmatmul_sp": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fmatmul_sp",
+          "result_file": "datasets/spatz/68503856/benchmarks/fmatmul_sp.json",
+          "metrics": {
+            "kernel_cycles": 16844,
+            "performance_ops_per_cycle": 31.126,
+            "vector_utilization_pct": 97.2,
+            "datatype": "fp32"
+          }
+        },
+        "fmatmul_sp_64_128_64": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fmatmul_sp_64_128_64",
+          "result_file": "datasets/spatz/68503856/benchmarks/fmatmul_sp_64_128_64.json",
+          "metrics": {
+            "kernel_cycles": 33650,
+            "performance_ops_per_cycle": 31.161,
+            "vector_utilization_pct": 97.3,
+            "datatype": "fp32"
+          }
+        },
+        "fconv2d": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fconv2d",
+          "result_file": "datasets/spatz/68503856/benchmarks/fconv2d.json",
+          "metrics": {
+            "kernel_cycles": 7085,
+            "performance_ops_per_cycle": 14.164,
+            "vector_utilization_pct": 88.5,
+            "datatype": "fp64"
+          }
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fdotproduct",
+          "result_file": "datasets/spatz/68503856/benchmarks/fdotproduct.json",
+          "metrics": {
+            "kernel_cycles": 1300,
+            "performance_ops_per_cycle": 6.301,
+            "vector_utilization_pct": 39.3,
+            "datatype": "fp64"
+          }
+        },
+        "fdotproduct_128": {
+          "status": "verified",
+          "runner": "python3 scripts/benchmarks/run_spatz_benchmarks.py --test fdotproduct_128",
+          "result_file": "datasets/spatz/68503856/benchmarks/fdotproduct_128.json",
+          "metrics": {
+            "kernel_cycles": 236,
+            "performance_ops_per_cycle": 1.084,
+            "vector_utilization_pct": 6.7,
+            "datatype": "fp64"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "gemmini",
+      "profile": "coprocessor_verilator",
+      "architecture": "rv64gc_gemmini_rocc",
+      "config": "GemminiRocketConfig_16x16",
+      "description": "UC Berkeley Gemmini systolic array accelerator (16x16 WS INT8/INT32, 256 MACs/cyc peak) tightly coupled to Rocket Core via RoCC",
+      "workloads": {
+        "tiled_matmul_ws_128_256_256": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/tiled_matmul_ws_perf-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/tiled_matmul_ws_perf-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/tiled_matmul_ws_128_256_256.json",
+          "metrics": {
+            "kernel_cycles": 37217,
+            "total_macs": 8388608,
+            "total_ops": 16777216,
+            "macs_per_cycle": 225.40,
+            "performance_ops_per_cycle": 450.80,
+            "systolic_utilization_pct": 88.0,
+            "datatype": "int8_in_int32_acc"
+          }
+        },
+        "matmul_ws_128_128_128": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/matmul_ws_128-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/matmul_ws_128-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/matmul_ws_128_128_128.json",
+          "metrics": {
+            "kernel_cycles": 11830,
+            "total_macs": 2097152,
+            "total_ops": 4194304,
+            "macs_per_cycle": 177.27,
+            "performance_ops_per_cycle": 354.55,
+            "systolic_utilization_pct": 69.2,
+            "datatype": "int8_in_int32_acc"
+          }
+        },
+        "matmul_ws_64_64_64": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/matmul_ws_64-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/matmul_ws_64-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/matmul_ws_64_64_64.json",
+          "metrics": {
+            "kernel_cycles": 2898,
+            "total_macs": 262144,
+            "total_ops": 524288,
+            "macs_per_cycle": 90.45,
+            "performance_ops_per_cycle": 180.90,
+            "systolic_utilization_pct": 35.3,
+            "datatype": "int8_in_int32_acc"
+          }
+        },
+        "conv_2d": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/conv_fast-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/conv_fast-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/conv_2d.json",
+          "metrics": {
+            "kernel_cycles": 2653,
+            "dimensions": "batch2_in9x9x5_out5x5x7_k3x3_s2_p1",
+            "datatype": "int8_in_int32_acc"
+          }
+        },
+        "resadd": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/resadd-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/resadd-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/resadd.json",
+          "metrics": {
+            "kernel_cycles": 838,
+            "dimensions": "35x27_relu",
+            "datatype": "int8_in_int32_acc"
+          }
+        },
+        "mvin_mvout": {
+          "status": "verified",
+          "runner": "datasets/gemmini/workshop/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig +permissive +loadmem=tools/gemmini/software/gemmini-rocc-tests/bareMetalC/mvin_mvout-baremetal +max-cycles=500000 +permissive-off tools/gemmini/software/gemmini-rocc-tests/bareMetalC/mvin_mvout-baremetal",
+          "result_file": "datasets/gemmini/8c3f9923/benchmarks/mvin_mvout.json",
+          "metrics": {
+            "kernel_cycles": 63786,
+            "dimensions": "8tiles_16x16_dma",
+            "datatype": "int8"
+          }
+        }
+      }
     }
   ]
 }

@@ -1,0 +1,37 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "spatz",
+  "upstream_commit": "68503856",
+  "profile": "vector_verilator",
+  "workload": "fmatmul_sp",
+  "config": "spatz_cluster_2core",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imafd_v",
+    "configuration": "spatz_cluster_2core",
+    "cores": 2,
+    "fpus_per_core": 4,
+    "elen": 64,
+    "wall_time_s": 60.594,
+    "exit_code": 0,
+    "benchmark_cycles": 16844,
+    "kernel_cycles": 16844,
+    "performance_ops_per_cycle": 31.126,
+    "vector_utilization_pct": 97.2,
+    "dimensions": "64x64x64",
+    "datatype": "fp32",
+    "stdout_summary": "execution=16844 cyc, perf=31126 OP/1000cyc (97.2%)"
+  },
+  "generated_utc": "2026-11-15T11:54:37+00:00",
+  "host": {
+    "hostname": "score-bench",
+    "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.21"
+  },
+  "tool_versions": {
+    "verilator": "5.048",
+    "gcc": "13.2.0"
+  }
+}
