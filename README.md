@@ -79,17 +79,17 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 |---|---|---|---|---|---|
 | **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark ✅ |
 | **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark ✅ |
-| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark ✅ |
-| **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` | coremark ✅ |
+| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs) ✅ |
+| **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` | GHDL synthesis verified ✅ |
 | **NEORV32 (VHDL)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_vhdl.sh` | `generate_neorv32_vhdl.sh` | `run_neorv32_vhdl.sh` | coremark ✅ |
 | **PicoRV32** | [YosysHQ/picorv32](https://github.com/YosysHQ/picorv32) | `install_picorv32.sh` | `generate_picorv32.sh` | — | coremark, dhrystone ✅ |
 | **SCR1** | [syntacore/scr1](https://github.com/syntacore/scr1) | `install_scr1.sh` | `generate_scr1.sh` | — | coremark ✅ |
 | **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — | coremark ✅ |
 | **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark ✅ |
 | **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — | coremark, dhrystone ✅ |
-| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | — *(pending)* |
-| **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — | — *(pending)* |
-| **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` | — *(pending)* |
+| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | Core (Ibex opentitan) ✅ / SoC *(Phase 4)* |
+| **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — | — *(submodule placeholder)* |
+| **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` | Verilator lint-only ✅ *(TB requires commercial EDA)* |
 
 ### Phase 2 — 64-bit Application Cores
 

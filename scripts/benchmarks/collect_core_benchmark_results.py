@@ -13,6 +13,19 @@ OUT = ROOT / "benchmarks" / "core" / "aggregated_results.json"
 FIGURE_DATA = ROOT / "publications" / "writings" / "csur" / "figures" / "core_benchmark_data.json"
 
 
+MCU_CORES = {
+    "hazard3",
+    "ibex",
+    "scr1",
+    "veer_el2",
+    "vexriscv",
+    "picorv32",
+    "darkriscv",
+    "serv",
+    "neorv32",
+}
+
+
 def collect() -> list[dict]:
     rows: list[dict] = []
     if not DATASETS.is_dir():
@@ -24,8 +37,11 @@ def collect() -> list[dict]:
             continue
         if doc.get("schema") != "score.benchmark_results.v1":
             continue
-        doc["_path"] = str(path.relative_to(ROOT))
-        rows.append(doc)
+        core = doc.get("core", "")
+        profile = doc.get("profile", "")
+        if core in MCU_CORES or "mcu" in profile:
+            doc["_path"] = str(path.relative_to(ROOT))
+            rows.append(doc)
     return rows
 
 

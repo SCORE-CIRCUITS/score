@@ -1,7 +1,7 @@
 design_name: neorv32_verilog_minimal
 design_category: neorv32_verilog
 description: "Minimal"
-generation_date: Sun Nov 15 08:45:39 AM +08 2026
+generation_date: Sun Nov 15 11:12:18 PM +08 2026
 source_repository: neorv32-verilog
 vhdl_files: 2
 verilog_files: 2

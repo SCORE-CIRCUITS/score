@@ -1,0 +1,5 @@
+Ibex CoreMark benchmark summary (SCORE)
+Commit: c577ddec
+Profile: mcu_verilator
+Configs: maxperf-pmp-bmfull-icache experimental-branch-predictor
+Results: /home/yongfu/proj/score/datasets/ibex/c577ddec/benchmarks

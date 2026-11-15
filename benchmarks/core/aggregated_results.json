@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T04:13:02+00:00",
-  "count": 12,
+  "generated_utc": "2026-11-15T15:37:10+00:00",
+  "count": 19,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -88,6 +88,195 @@
         "verilator": "5.022"
       },
       "_path": "datasets/ibex/7b5df75a/benchmarks/coremark_small.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "experimental-branch-predictor",
+      "metrics": {
+        "coremark_per_mhz": 3.2256,
+        "iterations": 10,
+        "total_cycles": 3100173,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "experimental-branch-predictor"
+      },
+      "generated_utc": "2026-11-15T15:33:11Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_experimental-branch-predictor.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "maxperf-pmp-bmbalanced",
+      "metrics": {
+        "coremark_per_mhz": 3.1286,
+        "iterations": 10,
+        "total_cycles": 3196368,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "maxperf-pmp-bmbalanced"
+      },
+      "generated_utc": "2026-11-15T15:17:18Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_maxperf-pmp-bmbalanced.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "maxperf-pmp-bmfull-icache",
+      "metrics": {
+        "coremark_per_mhz": 3.118,
+        "iterations": 10,
+        "total_cycles": 3207152,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "maxperf-pmp-bmfull-icache"
+      },
+      "generated_utc": "2026-11-15T15:30:47Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_maxperf-pmp-bmfull-icache.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "maxperf-pmp-bmfull",
+      "metrics": {
+        "coremark_per_mhz": 3.1286,
+        "iterations": 10,
+        "total_cycles": 3196368,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "maxperf-pmp-bmfull"
+      },
+      "generated_utc": "2026-11-15T15:27:01Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_maxperf-pmp-bmfull.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "maxperf-pmp",
+      "metrics": {
+        "coremark_per_mhz": 3.1286,
+        "iterations": 10,
+        "total_cycles": 3196368,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "maxperf-pmp"
+      },
+      "generated_utc": "2026-11-15T15:14:09Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_maxperf-pmp.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "maxperf",
+      "metrics": {
+        "coremark_per_mhz": 3.1286,
+        "iterations": 10,
+        "total_cycles": 3196368,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "maxperf"
+      },
+      "generated_utc": "2026-11-15T15:01:40Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_maxperf.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "c577ddec",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "opentitan",
+      "metrics": {
+        "coremark_per_mhz": 3.118,
+        "iterations": 10,
+        "total_cycles": 3207152,
+        "validated": true,
+        "rv_isa": "rv32im",
+        "ibex_config": "opentitan"
+      },
+      "generated_utc": "2026-11-15T15:10:49Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/c577ddec/benchmarks/coremark_opentitan.json"
     },
     {
       "schema": "score.benchmark_results.v1",

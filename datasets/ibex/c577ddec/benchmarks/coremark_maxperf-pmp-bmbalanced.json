@@ -1,0 +1,26 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ibex",
+  "upstream_commit": "c577ddec",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "maxperf-pmp-bmbalanced",
+  "metrics": {
+    "coremark_per_mhz": 3.1286,
+    "iterations": 10,
+    "total_cycles": 3196368,
+    "validated": true,
+    "rv_isa": "rv32im",
+    "ibex_config": "maxperf-pmp-bmbalanced"
+  },
+  "generated_utc": "2026-11-15T15:17:18Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022"
+  }
+}

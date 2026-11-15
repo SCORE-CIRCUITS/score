@@ -28,7 +28,7 @@ EOF
 if [[ ! -x "$EMULATOR" ]]; then
     log_info "Rocket Chip emulator not found at $EMULATOR, building via Mill..."
     cd "$ROCKET_DIR"
-    ./mill -i "emulator[freechips.rocketchip.system.TestHarness,freechips.rocketchip.system.DefaultConfig].elf"
+    "${MILL:-mill}" -i "emulator[freechips.rocketchip.system.TestHarness,freechips.rocketchip.system.DefaultConfig].elf"
 fi
 
 [[ -x "$EMULATOR" ]] || { log_error "Failed to build or find Rocket Chip emulator: $EMULATOR"; exit 1; }

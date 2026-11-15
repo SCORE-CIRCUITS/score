@@ -1,7 +1,7 @@
 design_name: neorv32_verilog_standard
 design_category: neorv32_verilog
 description: "Standard"
-generation_date: Sun Nov 15 08:45:46 AM +08 2026
+generation_date: Sun Nov 15 11:12:25 PM +08 2026
 source_repository: neorv32-verilog
 vhdl_files: 2
 verilog_files: 2

@@ -62,8 +62,6 @@ fi
 # Map config -> RV_ISA per upstream benchmarks README
 ibex_rv_isa_for_config() {
     case "$1" in
-        small|maxperf) echo rv32im ;;
-        maxperf-pmp-bmfull|maxperf-pmp-bmfull-icache) echo rv32imcb ;;
         micro) echo rv32imc ;;
         *) echo rv32im ;;
     esac
