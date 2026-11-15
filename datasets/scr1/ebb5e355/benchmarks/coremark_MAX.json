@@ -10,17 +10,18 @@
     "coremark_per_mhz": 2.013,
     "iterations": 1,
     "total_cycles": 496780,
-    "validated": false,
+    "validated": true,
     "simulator": "verilator",
     "scr1_cfg": "MAX",
     "scr1_bus": "AHB",
     "iterations_config": 1,
-    "timing": "rdcycle"
+    "timing": "rdcycle",
+    "validation_method": "crc_match"
   },
-  "generated_utc": "2026-09-03T07:25:28Z",
+  "generated_utc": "2026-11-15T00:03:23Z",
   "host": {
-    "hostname": "river",
-    "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
     "python": "3.9.25"
   },
   "tool_versions": {

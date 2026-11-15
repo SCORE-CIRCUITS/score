@@ -12,15 +12,16 @@
     "total_cycles": 1554000,
     "timer_ticks_us": 15540,
     "clock_mhz": 100,
-    "validated": false,
+    "validated": true,
+    "timing": "io.timeus",
     "simulator": "icarus",
     "iterations_config": 1,
-    "timing": "io.timeus"
+    "validation_method": "crc_match"
   },
-  "generated_utc": "2026-09-03T08:13:13Z",
+  "generated_utc": "2026-11-15T00:01:53Z",
   "host": {
-    "hostname": "river",
-    "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
     "python": "3.9.25"
   },
   "tool_versions": {

@@ -57,17 +57,10 @@ BUILD_ROOT="$SERV_DIR/build/score_coremark"
 rm -rf "$BUILD_ROOT"
 mkdir -p "$BUILD_ROOT"
 
-# Upstream verilator_tb enables --trace; disable for benchmark throughput.
-SERVANT_CORE="$SERV_DIR/servant.core"
-SERVANT_CORE_BAK="$BUILD_ROOT/servant.core.scorebak"
-cp "$SERVANT_CORE" "$SERVANT_CORE_BAK"
-sed -i 's/verilator_options : \[--trace\]/verilator_options : []/' "$SERVANT_CORE"
-restore_servant_core() {
-    if [[ -f "$SERVANT_CORE_BAK" ]]; then
-        mv -f "$SERVANT_CORE_BAK" "$SERVANT_CORE"
-    fi
-}
-trap restore_servant_core EXIT
+# FuseSoC 2.4.3 rejects CAPI2 files with 'license' key. Strip if present.
+for core_file in "$SERV_DIR"/*.core; do
+    sed -i '/^license:/d' "$core_file"
+done
 
 log_info "Running Servant Verilator sim (timeout=${TIMEOUT_CYCLES:-0})"
 rm -f "$SIG"
@@ -91,6 +84,4 @@ METRICS=$(python3 -c "import json; m=json.loads('''$METRICS'''); m['_verilator']
 
 OUT="$BENCH_DIR/coremark_${CONFIG}.json"
 score_benchmark_write_result "$OUT" serv "$COMMIT" "$PROFILE" coremark "$CONFIG" "$METRICS"
-restore_servant_core
-trap - EXIT
 log_success "Wrote $OUT"

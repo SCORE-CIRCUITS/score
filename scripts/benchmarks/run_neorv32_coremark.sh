@@ -17,9 +17,8 @@ CROSS_PREFIX="$(score_benchmark_riscv_prefix)" || {
     exit 1
 }
 ITERATIONS="${SCORE_COREMARK_ITERATIONS:-1}"
-# GHDL wall time scales with simulated time; 20ms @ 100MHz is enough for list-only ITERATIONS=1.
-# GHDL wall time scales with simulated time; 50ms @ 100MHz for list-only ITERATIONS=1.
-SIM_STOP="${SCORE_NEORV32_SIM_STOP:-50ms}"
+# GHDL wall time scales with simulated time; ~14ms @ 100MHz is enough for list/matrix/state ITERATIONS=1.
+SIM_STOP="${SCORE_NEORV32_SIM_STOP:-14ms}"
 UART_LOG_NAME="tb.uart0_rx.log"
 
 usage() {
@@ -69,7 +68,13 @@ rm -f ghdl.log tb.uart0_rx.log tb.uart1_rx.log build/tb.uart0_rx.log build/tb.ua
 if [[ "${SCORE_GHDL_REBUILD:-0}" == 1 ]]; then
     rm -rf build
 fi
-GHDL="${GHDL:-$PROJECT_ROOT/tools/ghdl-install/bin/ghdl}"
+if [[ -z "${GHDL:-}" ]]; then
+    if [[ -x "$PROJECT_ROOT/tools/ghdl-install/bin/ghdl" ]]; then
+        GHDL="$PROJECT_ROOT/tools/ghdl-install/bin/ghdl"
+    else
+        GHDL="$(command -v ghdl)"
+    fi
+fi
 export GHDL
 export SCORE_GHDL_INCREMENTAL=1
 LOCK_DIR="$NEORV32_DIR/sim/.ghdl_build.lock.d"
@@ -87,7 +92,7 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 cleanup_ghdl_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
 trap cleanup_ghdl_lock EXIT
-bash ghdl.sh --stop-time="$SIM_STOP" 2>&1 | tee "$LOG"
+bash ghdl.sh -gTRACE_LOG_EN=false --stop-time="$SIM_STOP" 2>&1 | tee "$LOG"
 cleanup_ghdl_lock
 trap - EXIT
 
@@ -95,7 +100,7 @@ UART_LOG="$NEORV32_DIR/sim/$UART_LOG_NAME"
 if [[ ! -s "$UART_LOG" && -s "$NEORV32_DIR/sim/build/$UART_LOG_NAME" ]]; then
     UART_LOG="$NEORV32_DIR/sim/build/$UART_LOG_NAME"
 fi
-if [[ -s "$UART_LOG" ]]; then
+if [[ -s "$UART_LOG" ]] && grep -q "Iterations" "$UART_LOG" 2>/dev/null; then
     cp "$UART_LOG" "$BENCH_DIR/coremark_${CONFIG}.uart.log"
     PARSE_LOG="$UART_LOG"
 else

@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T00:03:36+00:00",
-  "count": 11,
+  "generated_utc": "2026-11-15T04:13:02+00:00",
+  "count": 12,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -17,10 +17,11 @@
         "total_cycles": 1554000,
         "timer_ticks_us": 15540,
         "clock_mhz": 100,
-        "validated": false,
+        "validated": true,
         "timing": "io.timeus",
         "simulator": "icarus",
-        "iterations_config": 1
+        "iterations_config": 1,
+        "validation_method": "crc_match"
       },
       "generated_utc": "2026-11-15T00:01:53Z",
       "host": {
@@ -124,23 +125,53 @@
       "workload": "coremark",
       "config": "default",
       "metrics": {
-        "coremark_per_mhz": 9.9417,
+        "coremark_per_mhz": 0.8941,
         "iterations": 1,
-        "total_cycles": 100586,
-        "validated": false,
+        "total_cycles": 1118417,
+        "validated": true,
         "simulator": "ghdl",
-        "iterations_config": 1
+        "iterations_config": 1,
+        "validation_method": "crc_match"
       },
-      "generated_utc": "2026-09-02T23:05:01Z",
+      "generated_utc": "2026-11-15T04:01:34Z",
       "host": {
-        "hostname": "river",
-        "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
         "python": "3.9.25"
       },
       "tool_versions": {
         "verilator": "5.022"
       },
       "_path": "datasets/neorv32/af7d3e6a/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "picorv32",
+      "upstream_commit": "a473fc8f",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 0.897,
+        "iterations": 1,
+        "total_cycles": 1114803,
+        "validated": true,
+        "tb_cycles": 1189637,
+        "simulator": "icarus",
+        "iterations_config": 1,
+        "timing": "rdcycle"
+      },
+      "generated_utc": "2026-11-15T02:50:08Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/picorv32/a473fc8f/benchmarks/coremark_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -179,12 +210,13 @@
         "coremark_per_mhz": 2.013,
         "iterations": 1,
         "total_cycles": 496780,
-        "validated": false,
+        "validated": true,
         "simulator": "verilator",
         "scr1_cfg": "MAX",
         "scr1_bus": "AHB",
         "iterations_config": 1,
-        "timing": "rdcycle"
+        "timing": "rdcycle",
+        "validation_method": "crc_match"
       },
       "generated_utc": "2026-11-15T00:03:23Z",
       "host": {

@@ -1,0 +1,104 @@
+{
+  "version": "1.0",
+  "cores": [
+    {
+      "score_tool": "hazard3",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_hazard3_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "ibex",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_ibex_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "scr1",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_scr1_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "veer_el2",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_el2_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "vexriscv",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_vexriscv_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_vexriscv_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "picorv32",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_picorv32_dhrystone.sh"
+        },
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_picorv32_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "darkriscv",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_darkriscv_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "serv",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_serv_coremark.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "neorv32",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_neorv32_coremark.sh"
+        }
+      }
+    }
+  ]
+}
+

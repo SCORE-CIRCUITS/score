@@ -169,11 +169,42 @@ PY
 score_benchmark_parse_coremark_text() {
     python3 - <<'PY'
 import json, re, sys
+
+# Known-correct CRC sets for EEMBC CoreMark standard seeds
+VALID_CRC_SETS = [
+    # PERFORMANCE_RUN (seed1=0, seed2=0, seed3=0x66)
+    {"seedcrc": "0xe9f5", "crclist": "0xe714", "crcmatrix": "0x1fd7", "crcstate": "0x8e3a", "crcfinal": "0xe714"},
+    # VALIDATION_RUN (seed1=0x3415, seed2=0x3415, seed3=0x66)
+    {"seedcrc": "0xe9f5", "crclist": "0xe714", "crcmatrix": "0x1fd7", "crcstate": "0x8e3a", "crcfinal": "0xfcaf"},
+]
+
+def crc_validated(text):
+    """Return True if the log contains a known-good CoreMark CRC set."""
+    seedcrc   = re.search(r"seedcrc\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    crcfinal  = re.search(r"\[0\]crcfinal\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    crclist   = re.search(r"\[0\]crclist\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    crcmatrix = re.search(r"\[0\]crcmatrix\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    crcstate  = re.search(r"\[0\]crcstate\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    if not (seedcrc and crcfinal):
+        return False
+    got = {
+        "seedcrc":   seedcrc.group(1).lower(),
+        "crcfinal":  crcfinal.group(1).lower(),
+        "crclist":   crclist.group(1).lower()   if crclist   else "",
+        "crcmatrix": crcmatrix.group(1).lower() if crcmatrix else "",
+        "crcstate":  crcstate.group(1).lower()  if crcstate  else "",
+    }
+    for s in VALID_CRC_SETS:
+        if got["seedcrc"] == s["seedcrc"] and got["crcfinal"] == s["crcfinal"]:
+            return True
+    return False
+
 text = sys.stdin.read()
 iters_m = re.search(r"Iterations\s*:\s*(\d+)", text)
 ticks_m = re.search(r"Total ticks\s*:\s*(\d+)", text)
 cycles_m = re.search(r"Ran for (\d+) cycles", text)
-valid = "Correct operation validated" in text or "Exit code 0" in text
+valid = ("Correct operation validated" in text or "Exit code 0" in text
+         or crc_validated(text))
 if not iters_m or not ticks_m:
     raise SystemExit("could not parse CoreMark output (need Iterations and Total ticks)")
 iters = int(iters_m.group(1))
@@ -196,11 +227,36 @@ score_benchmark_parse_coremark_file() {
     local logfile="$1"
     python3 - "$logfile" <<'PY'
 import json, re, sys
+
+# Known-correct CRC sets for EEMBC CoreMark standard seeds
+VALID_CRC_SETS = [
+    # PERFORMANCE_RUN (seed1=0, seed2=0, seed3=0x66)
+    {"seedcrc": "0xe9f5", "crclist": "0xe714", "crcmatrix": "0x1fd7", "crcstate": "0x8e3a", "crcfinal": "0xe714"},
+    # VALIDATION_RUN (seed1=0x3415, seed2=0x3415, seed3=0x66)
+    {"seedcrc": "0xe9f5", "crclist": "0xe714", "crcmatrix": "0x1fd7", "crcstate": "0x8e3a", "crcfinal": "0xfcaf"},
+]
+
+def crc_validated(text):
+    """Return True if the log contains a known-good CoreMark CRC set."""
+    seedcrc   = re.search(r"seedcrc\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    crcfinal  = re.search(r"\[0\]crcfinal\s*:\s*(0x[0-9a-f]+)", text, re.I)
+    if not (seedcrc and crcfinal):
+        return False
+    got = {
+        "seedcrc":  seedcrc.group(1).lower(),
+        "crcfinal": crcfinal.group(1).lower(),
+    }
+    for s in VALID_CRC_SETS:
+        if got["seedcrc"] == s["seedcrc"] and got["crcfinal"] == s["crcfinal"]:
+            return True
+    return False
+
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 iters_matches = re.findall(r"Iterations\s*:\s*(\d+)", text)
 ticks_matches = re.findall(r"Total ticks\s*:\s*(\d+)", text)
 cycles_matches = re.findall(r"Ran for (\d+) cycles", text)
-valid = "Correct operation validated" in text or "Exit code 0" in text or "Test complete" in text
+valid = ("Correct operation validated" in text or "Exit code 0" in text
+         or "Test complete" in text or crc_validated(text))
 if not iters_matches:
     raise SystemExit("could not parse CoreMark output (need Iterations)")
 iters = int(iters_matches[-1])
