@@ -1,0 +1,380 @@
+{
+  "schema": "score.benchmark_aggregated.v1",
+  "generated_utc": "2026-11-15T10:40:23+00:00",
+  "count": 8,
+  "results": [
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "fconv2d",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 118.981,
+        "exit_code": 0,
+        "benchmark_cycles": 156914,
+        "kernel_cycles": 156914,
+        "simulation_cycles": 523687,
+        "performance_ops_per_cycle": 7.834304,
+        "vector_utilization_pct": 97.928802,
+        "sim_speed_hz": 4401.43,
+        "filter_size": "7x7",
+        "matrix_size": "112x112",
+        "datatype": "fp64"
+      },
+      "generated_utc": "2026-11-15T18:17:18+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/fconv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "fconv3d",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 207.153,
+        "exit_code": 0,
+        "benchmark_cycles": 480317,
+        "kernel_cycles": 480317,
+        "simulation_cycles": 864087,
+        "performance_ops_per_cycle": 7.678129,
+        "vector_utilization_pct": 95.976616,
+        "sim_speed_hz": 4171.25,
+        "input_matrix_size": "118x118",
+        "output_matrix_size": "112x112",
+        "filter_size": "7x7",
+        "channels": 3,
+        "datatype": "fp64"
+      },
+      "generated_utc": "2026-11-15T18:18:49+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/fconv3d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "fdotproduct",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 12.899,
+        "exit_code": 0,
+        "benchmark_cycles": 189,
+        "kernel_cycles": 189,
+        "simulation_cycles": 61150,
+        "vector_cycles_fp64": 189,
+        "scalar_cycles_fp64": 721,
+        "speedup_fp64": 3.815,
+        "vector_cycles_fp32": 153,
+        "scalar_cycles_fp32": 720,
+        "speedup_fp32": 4.706,
+        "vector_cycles_fp16": 137,
+        "scalar_cycles_fp16": 16168,
+        "speedup_fp16": 118.015,
+        "vector_length": 64
+      },
+      "generated_utc": "2026-11-15T18:00:00+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/fdotproduct.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "fft",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 13.849,
+        "exit_code": 0,
+        "benchmark_cycles": 6790,
+        "kernel_cycles": 6790,
+        "simulation_cycles": 64958,
+        "dif_fft_cycles": 6790,
+        "dit_fft_cycles": 8239,
+        "fft_points": 64,
+        "datatype": "fp64"
+      },
+      "generated_utc": "2026-11-15T18:00:00+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/fft.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "fmatmul",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 269.975,
+        "exit_code": 0,
+        "benchmark_cycles": 532717,
+        "kernel_cycles": 532717,
+        "simulation_cycles": 1156309,
+        "performance_ops_per_cycle": 7.8734,
+        "vector_utilization_pct": 98.42,
+        "peak_gflops_per_ghz": 7.8734,
+        "matrix_dimension": "128x128",
+        "datatype": "fp64",
+        "sweep_results": {
+          "4x4": {
+            "cycles": 452,
+            "flops_per_cycle": 0.283,
+            "utilization_pct": 3.54
+          },
+          "8x8": {
+            "cycles": 890,
+            "flops_per_cycle": 1.151,
+            "utilization_pct": 14.38
+          },
+          "16x16": {
+            "cycles": 2886,
+            "flops_per_cycle": 2.839,
+            "utilization_pct": 35.48
+          },
+          "32x32": {
+            "cycles": 11762,
+            "flops_per_cycle": 5.572,
+            "utilization_pct": 69.65
+          },
+          "64x64": {
+            "cycles": 70423,
+            "flops_per_cycle": 7.445,
+            "utilization_pct": 93.06
+          },
+          "128x128": {
+            "cycles": 532717,
+            "flops_per_cycle": 7.8734,
+            "utilization_pct": 98.42
+          }
+        }
+      },
+      "generated_utc": "2026-11-15T18:00:00+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/fmatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "imatmul",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 224.502,
+        "exit_code": 0,
+        "benchmark_cycles": 535801,
+        "kernel_cycles": 535801,
+        "simulation_cycles": 940656,
+        "performance_ops_per_cycle": 7.8281,
+        "vector_utilization_pct": 97.85125,
+        "peak_gops_per_ghz": 7.8281,
+        "matrix_dimension": "128x128",
+        "datatype": "int64",
+        "sweep_results": {
+          "4x4": {
+            "cycles": 496,
+            "ops_per_cycle": 0.258065,
+            "utilization_pct": 3.225806
+          },
+          "8x8": {
+            "cycles": 1025,
+            "ops_per_cycle": 0.999024,
+            "utilization_pct": 12.487804
+          },
+          "16x16": {
+            "cycles": 2619,
+            "ops_per_cycle": 3.127911,
+            "utilization_pct": 39.098892
+          },
+          "32x32": {
+            "cycles": 11793,
+            "ops_per_cycle": 5.557195,
+            "utilization_pct": 69.464935
+          },
+          "64x64": {
+            "cycles": 70225,
+            "ops_per_cycle": 7.465831,
+            "utilization_pct": 93.322891
+          },
+          "128x128": {
+            "cycles": 535801,
+            "ops_per_cycle": 7.8281,
+            "utilization_pct": 97.85125
+          }
+        }
+      },
+      "generated_utc": "2026-11-15T18:19:10+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/imatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "roi_align",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 1.377,
+        "exit_code": 0,
+        "benchmark_cycles": 389,
+        "kernel_cycles": 389,
+        "simulation_cycles": 1949,
+        "sim_speed_hz": 4700.8,
+        "datatype": "fp32"
+      },
+      "generated_utc": "2026-11-15T18:00:00+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/roi_align.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ara",
+      "upstream_commit": "826f57c9",
+      "profile": "vector_verilator",
+      "workload": "softmax",
+      "config": "default_4lanes",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "default_4lanes",
+        "nr_lanes": 4,
+        "vlen": 4096,
+        "wall_time_s": 41.189,
+        "exit_code": 0,
+        "benchmark_cycles": 5538,
+        "kernel_cycles": 5538,
+        "simulation_cycles": 195232,
+        "scalar_cycles": 156311,
+        "vector_cycles": 5538,
+        "speedup": 28.225,
+        "vector_length": 1024,
+        "datatype": "fp64"
+      },
+      "generated_utc": "2026-11-15T18:00:00+00:00",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.048",
+        "gcc": "13.2.0"
+      },
+      "_path": "datasets/ara/826f57c9/benchmarks/softmax.json"
+    }
+  ]
+}

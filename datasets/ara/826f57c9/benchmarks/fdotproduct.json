@@ -1,0 +1,42 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ara",
+  "upstream_commit": "826f57c9",
+  "profile": "vector_verilator",
+  "workload": "fdotproduct",
+  "config": "default_4lanes",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gcv",
+    "configuration": "default_4lanes",
+    "nr_lanes": 4,
+    "vlen": 4096,
+    "wall_time_s": 12.899,
+    "exit_code": 0,
+    "benchmark_cycles": 189,
+    "kernel_cycles": 189,
+    "simulation_cycles": 61150,
+    "vector_cycles_fp64": 189,
+    "scalar_cycles_fp64": 721,
+    "speedup_fp64": 3.815,
+    "vector_cycles_fp32": 153,
+    "scalar_cycles_fp32": 720,
+    "speedup_fp32": 4.706,
+    "vector_cycles_fp16": 137,
+    "scalar_cycles_fp16": 16168,
+    "speedup_fp16": 118.015,
+    "vector_length": 64
+  },
+  "generated_utc": "2026-11-15T18:00:00+00:00",
+  "host": {
+    "hostname": "score-bench",
+    "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.21"
+  },
+  "tool_versions": {
+    "verilator": "5.048",
+    "gcc": "13.2.0"
+  }
+}

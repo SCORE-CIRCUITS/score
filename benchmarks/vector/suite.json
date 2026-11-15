@@ -1,0 +1,108 @@
+{
+  "version": "1.0",
+  "category": "Vector & Coprocessor Engines",
+  "cores": [
+    {
+      "score_tool": "ara",
+      "profile": "vector_verilator",
+      "architecture": "rv64gcv",
+      "config": "default_4lanes",
+      "description": "PULP Ara 64-bit scalable vector coprocessor (RVV 1.0) paired with CVA6 application core (VLEN=4096, 4 lanes)",
+      "workloads": {
+        "fmatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh fmatmul",
+          "result_file": "datasets/ara/826f57c9/benchmarks/fmatmul.json",
+          "metrics": {
+            "kernel_cycles": 532717,
+            "performance_ops_per_cycle": 7.8734,
+            "vector_utilization_pct": 98.42,
+            "datatype": "fp64"
+          }
+        },
+        "imatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh imatmul",
+          "result_file": "datasets/ara/826f57c9/benchmarks/imatmul.json",
+          "metrics": {
+            "kernel_cycles": 535801,
+            "performance_ops_per_cycle": 7.8281,
+            "vector_utilization_pct": 97.85,
+            "datatype": "int64"
+          }
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh fdotproduct",
+          "result_file": "datasets/ara/826f57c9/benchmarks/fdotproduct.json",
+          "metrics": {
+            "vector_cycles": 189,
+            "speedup_vs_scalar": 3.81,
+            "datatype": "fp64"
+          }
+        },
+        "fconv2d": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh fconv2d",
+          "result_file": "datasets/ara/826f57c9/benchmarks/fconv2d.json",
+          "metrics": {
+            "kernel_cycles": 156914,
+            "performance_ops_per_cycle": 7.8343,
+            "vector_utilization_pct": 97.93,
+            "datatype": "fp64"
+          }
+        },
+        "fconv3d": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh fconv3d",
+          "result_file": "datasets/ara/826f57c9/benchmarks/fconv3d.json",
+          "metrics": {
+            "kernel_cycles": 480317,
+            "performance_ops_per_cycle": 7.6781,
+            "vector_utilization_pct": 95.98,
+            "datatype": "fp64"
+          }
+        },
+        "fft": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh fft",
+          "result_file": "datasets/ara/826f57c9/benchmarks/fft.json",
+          "metrics": {
+            "dif_cycles": 6790,
+            "dit_cycles": 8239,
+            "datatype": "fp64"
+          }
+        },
+        "softmax": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh softmax",
+          "result_file": "datasets/ara/826f57c9/benchmarks/softmax.json",
+          "metrics": {
+            "vector_cycles": 5538,
+            "speedup_vs_scalar": 28.22,
+            "datatype": "fp64"
+          }
+        },
+        "roi_align": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh roi_align",
+          "result_file": "datasets/ara/826f57c9/benchmarks/roi_align.json",
+          "metrics": {
+            "kernel_cycles": 389,
+            "datatype": "fp32"
+          }
+        },
+        "spmv": {
+          "status": "blocked_rtl_bug",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh spmv",
+          "notes": "Upstream RTL bug in vmfpu.sv/sldu.sv: inter-lane reduction deadlock in INTER_LANES_REDUCTION_TX waiting for sldu_operand_valid while SLDU is in SLIDE_RUN."
+        },
+        "dwt": {
+          "status": "blocked_rtl_bug",
+          "runner": "scripts/benchmarks/run_ara_benchmarks.sh dwt",
+          "notes": "Upstream RTL bug in vstu.sv line 326: reduction AND (&stu_operand_valid) deadlocks when vl < NrLanes (vl=2 with 4 lanes) because inactive lanes never assert valid."
+        }
+      }
+    }
+  ]
+}

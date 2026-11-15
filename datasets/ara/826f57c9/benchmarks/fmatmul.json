@@ -1,0 +1,45 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ara",
+  "upstream_commit": "826f57c9",
+  "profile": "vector_verilator",
+  "workload": "fmatmul",
+  "config": "default_4lanes",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gcv",
+    "configuration": "default_4lanes",
+    "nr_lanes": 4,
+    "vlen": 4096,
+    "wall_time_s": 269.975,
+    "exit_code": 0,
+    "benchmark_cycles": 532717,
+    "kernel_cycles": 532717,
+    "simulation_cycles": 1156309,
+    "performance_ops_per_cycle": 7.8734,
+    "vector_utilization_pct": 98.42,
+    "peak_gflops_per_ghz": 7.8734,
+    "matrix_dimension": "128x128",
+    "datatype": "fp64",
+    "sweep_results": {
+      "4x4": {"cycles": 452, "flops_per_cycle": 0.283, "utilization_pct": 3.54},
+      "8x8": {"cycles": 890, "flops_per_cycle": 1.151, "utilization_pct": 14.38},
+      "16x16": {"cycles": 2886, "flops_per_cycle": 2.839, "utilization_pct": 35.48},
+      "32x32": {"cycles": 11762, "flops_per_cycle": 5.572, "utilization_pct": 69.65},
+      "64x64": {"cycles": 70423, "flops_per_cycle": 7.445, "utilization_pct": 93.06},
+      "128x128": {"cycles": 532717, "flops_per_cycle": 7.8734, "utilization_pct": 98.42}
+    }
+  },
+  "generated_utc": "2026-11-15T18:00:00+00:00",
+  "host": {
+    "hostname": "score-bench",
+    "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.21"
+  },
+  "tool_versions": {
+    "verilator": "5.048",
+    "gcc": "13.2.0"
+  }
+}
