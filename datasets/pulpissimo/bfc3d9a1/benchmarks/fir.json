@@ -1,0 +1,34 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "pulpissimo",
+  "upstream_commit": "bfc3d9a1",
+  "profile": "soc_verilator",
+  "workload": "fir",
+  "config": "cv32e40p_fll",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imc",
+    "configuration": "cv32e40p_fll",
+    "core_type": "cv32e40p",
+    "wall_time_s": 18.21,
+    "exit_code": 0,
+    "execution_cycles": 24790,
+    "total_simulation_cycles": 58669,
+    "mcycle": 58669,
+    "minstr": 32115,
+    "ipc": 0.5474,
+    "errors": 0
+  },
+  "generated_utc": "2026-11-15T17:18:17+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "10.2.0"
+  }
+}

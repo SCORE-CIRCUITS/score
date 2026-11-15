@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T15:37:10+00:00",
-  "count": 19,
+  "generated_utc": "2026-11-15T17:24:50+00:00",
+  "count": 23,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -61,6 +61,35 @@
         "verilator": "5.022"
       },
       "_path": "datasets/hazard3/8af99293/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "hazard3",
+      "upstream_commit": "8af99293",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 1.2032,
+        "dhrystones_per_sec": 2114.0,
+        "validated": true,
+        "simulator": "cxxrtl",
+        "hazard3_config": "default",
+        "total_cycles": 349027,
+        "usec_per_run": 473.0,
+        "runs": 500
+      },
+      "generated_utc": "2026-11-15T16:31:55Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/hazard3/8af99293/benchmarks/dhrystone_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -308,6 +337,36 @@
     {
       "schema": "score.benchmark_results.v1",
       "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "f33ead1e",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "small",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 0.723,
+        "dhrystones_per_sec_per_mhz": 1271.0,
+        "validated": true,
+        "simulator": "verilator",
+        "ibex_config": "small",
+        "total_cycles": 131735,
+        "benchmark_cycles": 78632,
+        "instructions_retired": 73736,
+        "cpi": 1.686
+      },
+      "generated_utc": "2026-11-15T16:36:53Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/f33ead1e/benchmarks/dhrystone_small.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
       "core": "neorv32",
       "upstream_commit": "af7d3e6a",
       "profile": "mcu_verilator",
@@ -391,6 +450,33 @@
       "schema": "score.benchmark_results.v1",
       "evidence_class": "score_measured",
       "core": "scr1",
+      "upstream_commit": "b5c6c371",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "MAX",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 1.5418,
+        "dhrystones_per_sec": 2709.0,
+        "validated": true,
+        "simulator": "verilator",
+        "scr1_cfg": "MAX",
+        "scr1_bus": "AHB"
+      },
+      "generated_utc": "2026-11-15T16:30:36Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/scr1/b5c6c371/benchmarks/dhrystone_MAX.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "scr1",
       "upstream_commit": "ebb5e355",
       "profile": "mcu_verilator",
       "workload": "coremark",
@@ -445,6 +531,37 @@
         "verilator": "5.022"
       },
       "_path": "datasets/serv/41e8aeed/benchmarks/coremark_servant.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "veer_el2",
+      "upstream_commit": "4c38eb80",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 1.6783,
+        "dhrystones_per_sec_per_mhz": 2948.84,
+        "validated": true,
+        "simulator": "verilator",
+        "firmware_source": "canned_hex",
+        "total_cycles": 355049,
+        "instructions_retired": 343115,
+        "benchmark_cycles": 339169,
+        "runs": 1000,
+        "veer_test": "dhry"
+      },
+      "generated_utc": "2026-11-15T16:31:33Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/veer_el2/4c38eb80/benchmarks/dhrystone_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",

@@ -1,0 +1,36 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "mempool",
+  "upstream_commit": "88a20ceb",
+  "profile": "soc_verilator",
+  "workload": "dotp_i32",
+  "config": "minpool_16cores",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32ima",
+    "configuration": "minpool_16cores",
+    "num_cores": 16,
+    "num_groups": 4,
+    "num_cores_per_group": 4,
+    "num_banks": 64,
+    "banking_factor": 4,
+    "wall_time_s": 8.753,
+    "exit_code": 0,
+    "execution_cycles": 8253,
+    "total_simulation_cycles": 16506,
+    "simulation_speed_cps": 950.15,
+    "kernel_cycles": 600
+  },
+  "generated_utc": "2026-11-15T16:56:39+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "10.2.0"
+  }
+}

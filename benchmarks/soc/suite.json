@@ -1,0 +1,179 @@
+{
+  "version": "1.0",
+  "category": "Full SoC Platforms & Multi-Core Clusters",
+  "platforms": [
+    {
+      "score_tool": "cheshire",
+      "profile": "soc_verilator",
+      "architecture": "rv64gc",
+      "config": "cva6_cfg0",
+      "description": "OpenHW/PULP Cheshire 64-bit Linux-capable SoC featuring CVA6, AXI4 crossbar, LLC cache, CLIC, DMA, and peripherals",
+      "workloads": {
+        "helloworld": {
+          "status": "verified",
+          "execution_cycles": 449861,
+          "runner": "scripts/benchmarks/run_cheshire_benchmarks.sh helloworld"
+        },
+        "dma_1d": {
+          "status": "verified",
+          "execution_cycles": 102612,
+          "runner": "scripts/benchmarks/run_cheshire_benchmarks.sh dma_1d"
+        },
+        "dma_2d": {
+          "status": "verified",
+          "execution_cycles": 103439,
+          "runner": "scripts/benchmarks/run_cheshire_benchmarks.sh dma_2d"
+        },
+        "spm_uncached": {
+          "status": "verified",
+          "execution_cycles": 102193,
+          "runner": "scripts/benchmarks/run_cheshire_benchmarks.sh spm_uncached"
+        }
+      }
+    },
+    {
+      "score_tool": "croc",
+      "profile": "soc_verilator",
+      "architecture": "rv32i_zicsr",
+      "config": "cve2_idma",
+      "description": "PULP Croc microcontroller SoC targeting IHP SG13G2 open PDK with CVE2 core, OBI bus, iDMA, timer, and peripherals",
+      "workloads": {
+        "helloworld": {
+          "status": "verified",
+          "execution_cycles": 40985,
+          "total_simulation_cycles": 69852,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh helloworld"
+        },
+        "test_compute": {
+          "status": "verified",
+          "execution_cycles": 692,
+          "total_simulation_cycles": 32273,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_compute"
+        },
+        "test_idma": {
+          "status": "verified",
+          "execution_cycles": 692,
+          "total_simulation_cycles": 34205,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_idma"
+        },
+        "test_soc_ctrl": {
+          "status": "verified",
+          "execution_cycles": 692,
+          "total_simulation_cycles": 30755,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_soc_ctrl"
+        },
+        "test_obi_timer": {
+          "status": "verified",
+          "execution_cycles": 1358,
+          "total_simulation_cycles": 32249,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_obi_timer"
+        },
+        "test_clint": {
+          "status": "verified",
+          "execution_cycles": 2024,
+          "total_simulation_cycles": 32961,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_clint"
+        },
+        "test_gpio": {
+          "status": "verified",
+          "execution_cycles": 692,
+          "total_simulation_cycles": 32227,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_gpio"
+        },
+        "test_uart": {
+          "status": "verified",
+          "execution_cycles": 5687,
+          "total_simulation_cycles": 35980,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_uart"
+        },
+        "test_interrupts": {
+          "status": "verified",
+          "execution_cycles": 1358,
+          "total_simulation_cycles": 32663,
+          "runner": "scripts/benchmarks/run_croc_benchmarks.sh test_interrupts"
+        }
+      }
+    },
+    {
+      "score_tool": "mempool",
+      "profile": "soc_verilator",
+      "architecture": "rv32ima",
+      "config": "minpool_16cores",
+      "description": "PULP MemPool many-core shared-L1 scratchpad cluster with hierarchical logarithmic interconnect and low-latency synchronization (16 Snitch cores verified)",
+      "workloads": {
+        "conv2d_i32": {
+          "status": "verified",
+          "execution_cycles": 5922,
+          "runner": "scripts/benchmarks/run_mempool_benchmarks.sh conv2d_i32"
+        },
+        "dotp_i32": {
+          "status": "verified",
+          "execution_cycles": 8253,
+          "kernel_cycles": 600,
+          "runner": "scripts/benchmarks/run_mempool_benchmarks.sh dotp_i32"
+        },
+        "dct_i32": {
+          "status": "verified",
+          "execution_cycles": 9056,
+          "runner": "scripts/benchmarks/run_mempool_benchmarks.sh dct_i32"
+        },
+        "axpy_i32": {
+          "status": "verified",
+          "execution_cycles": 22285,
+          "checks_passed": 32,
+          "runner": "scripts/benchmarks/run_mempool_benchmarks.sh axpy_i32"
+        },
+        "hello_world": {
+          "status": "verified",
+          "execution_cycles": 25718,
+          "cores_reporting": 16,
+          "runner": "scripts/benchmarks/run_mempool_benchmarks.sh hello_world"
+        }
+      }
+    },
+    {
+      "score_tool": "pulpissimo",
+      "profile": "soc_verilator",
+      "architecture": "rv32imc",
+      "config": "cv32e40p_fll",
+      "description": "PULPissimo single-core RISC-V SoC with CV32E40P core, autonomous peripheral subsystem (uDMA), FLL clock generation, and logarithmic interconnect",
+      "workloads": {
+        "conv2d": {
+          "status": "verified",
+          "execution_cycles": 5248,
+          "mcycle": 38152,
+          "minstr": 17194,
+          "runner": "scripts/benchmarks/run_pulpissimo_benchmarks.sh conv2d"
+        },
+        "fibonacci": {
+          "status": "verified",
+          "execution_cycles": 338444,
+          "mcycle": 361410,
+          "minstr": 295680,
+          "runner": "scripts/benchmarks/run_pulpissimo_benchmarks.sh fibonacci"
+        },
+        "fir": {
+          "status": "verified",
+          "execution_cycles": 24790,
+          "mcycle": 58669,
+          "minstr": 32115,
+          "runner": "scripts/benchmarks/run_pulpissimo_benchmarks.sh fir"
+        },
+        "keccak": {
+          "status": "verified",
+          "execution_cycles": 178531,
+          "mcycle": 212343,
+          "minstr": 178680,
+          "runner": "scripts/benchmarks/run_pulpissimo_benchmarks.sh keccak"
+        },
+        "bubblesort": {
+          "status": "verified",
+          "execution_cycles": 69600,
+          "mcycle": 163312,
+          "minstr": 106769,
+          "runner": "scripts/benchmarks/run_pulpissimo_benchmarks.sh bubblesort"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cheshire",
+  "upstream_commit": "a31da013",
+  "profile": "soc_verilator",
+  "workload": "dma_1d",
+  "config": "cva6_cfg0",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gc_zifencei",
+    "configuration": "cva6_cfg0",
+    "clock_frequency_hz": 200000000,
+    "wall_time_s": 9.0713,
+    "exit_code": 0,
+    "simulation_cycles": 102612,
+    "total_simulation_cycles": 102612,
+    "simulation_speed_khz": 11.38,
+    "dma_transfers": 1,
+    "dma_bytes_transferred": 18,
+    "dma_type": "1D linear SPM copy",
+    "dma_supported": true
+  },
+  "generated_utc": "2026-11-15T16:41:22+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.11.13"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "11.5.0"
+  }
+}

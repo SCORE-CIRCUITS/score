@@ -8,6 +8,10 @@
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_hazard3_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_hazard3_dhrystone.sh"
         }
       }
     },
@@ -18,6 +22,10 @@
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_ibex_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_ibex_dhrystone.sh"
         }
       }
     },
@@ -28,6 +36,10 @@
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_scr1_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_scr1_dhrystone.sh"
         }
       }
     },
@@ -38,6 +50,10 @@
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_veer_el2_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_el2_dhrystone.sh"
         }
       }
     },

@@ -1,0 +1,29 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cva6",
+  "upstream_commit": "4c02b24f",
+  "profile": "app_verilator",
+  "workload": "memcpy",
+  "config": "cv64a6_imafdc_sv39",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gc",
+    "configuration": "cv64a6_imafdc_sv39",
+    "total_simulation_cycles": 46990,
+    "benchmark_cycles": 15067,
+    "instructions_retired": 10037,
+    "ipc": 0.6662
+  },
+  "generated_utc": "2026-11-15T17:08:45+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.048",
+    "gcc": "13.2.0"
+  }
+}

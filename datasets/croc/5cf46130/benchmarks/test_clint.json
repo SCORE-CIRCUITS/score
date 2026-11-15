@@ -1,0 +1,30 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "croc",
+  "upstream_commit": "5cf46130",
+  "profile": "soc_verilator",
+  "workload": "test_clint",
+  "config": "cve2_idma",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32i_zicsr",
+    "configuration": "cve2_idma",
+    "clock_frequency_hz": 20000000,
+    "wall_time_s": 2.3006,
+    "exit_code": 0,
+    "total_simulation_cycles": 32961,
+    "execution_cycles": 2024
+  },
+  "generated_utc": "2026-11-15T16:21:40+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "10.2.0"
+  }
+}

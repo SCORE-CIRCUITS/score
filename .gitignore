@@ -63,6 +63,7 @@ verification_results_*.txt
 setup_gemmini_env.sh
 setup_hero_env.sh
 tools/riscv_toolchain_wrapper/
+tools/verilator_wrapper/
 tools/neorv32-verilog/
 tools/iob_soc_V*/
 tools/py2hwsw/

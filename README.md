@@ -78,14 +78,14 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
 |---|---|---|---|---|---|
 | **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark ✅ |
-| **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark ✅ |
-| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs) ✅ |
+| **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark, dhrystone ✅ |
+| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs), dhrystone ✅ |
 | **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` | GHDL synthesis verified ✅ |
 | **NEORV32 (VHDL)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_vhdl.sh` | `generate_neorv32_vhdl.sh` | `run_neorv32_vhdl.sh` | coremark ✅ |
 | **PicoRV32** | [YosysHQ/picorv32](https://github.com/YosysHQ/picorv32) | `install_picorv32.sh` | `generate_picorv32.sh` | — | coremark, dhrystone ✅ |
-| **SCR1** | [syntacore/scr1](https://github.com/syntacore/scr1) | `install_scr1.sh` | `generate_scr1.sh` | — | coremark ✅ |
+| **SCR1** | [syntacore/scr1](https://github.com/syntacore/scr1) | `install_scr1.sh` | `generate_scr1.sh` | — | coremark, dhrystone ✅ |
 | **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — | coremark ✅ |
-| **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark ✅ |
+| **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark, dhrystone ✅ |
 | **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — | coremark, dhrystone ✅ |
 | **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | Core (Ibex opentitan) ✅ / SoC *(Phase 4)* |
 | **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — | — *(submodule placeholder)* |
@@ -93,12 +93,12 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 
 ### Phase 2 — 64-bit Application Cores
 
-Workloads: **CoreMark**, **Dhrystone**, **riscv-tests** (median, mm, multiply, qsort, rsort, spmv, towers, vvadd) · Profile: `app_verilator` · Suite: [`benchmarks/app/suite.json`](benchmarks/app/suite.json)
+Workloads: **CoreMark**, **Dhrystone**, **memcpy**, **pmp**, **riscv-tests** (median, mm, multiply, qsort, rsort, spmv, towers, vvadd) · Profile: `app_verilator` · Suite: [`benchmarks/app/suite.json`](benchmarks/app/suite.json)
 
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
 |---|---|---|---|---|---|
-| **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone + 8 riscv-tests ✅ |
-| **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | dhrystone + 8 riscv-tests ✅ |
+| **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
+| **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
 
 ### Phase 3 — Vector & Coprocessor Engines
 
@@ -110,30 +110,30 @@ Workloads: **fmatmul**, **fconv2d**, **fconv3d**, **fdotproduct**, **fft**, **im
 | **Gemmini** | [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini) | `install_gemmini.sh` | `generate_gemmini.sh` | `run_gemmini.sh` | 6 systolic workloads ✅ |
 | **Spatz** | [pulp-platform/spatz](https://github.com/pulp-platform/spatz) | `install_spatz.sh` | `generate_spatz.sh` | `run_spatz.sh` | 6 vector kernels ✅ |
 
-### Phase 4 — Full SoC Platforms
+### Phase 4 — Full SoC Platforms & Multi-Core Clusters
 
-Workloads: TBD (RISC-V compliance, multi-core scaling, OS boot, memory bandwidth) · Profile: `soc_verilator` · Suite: `benchmarks/soc/suite.json` *(planned)*
+Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kernels** (conv2d, dotp, dct, axpy, fibonacci, fir, keccak, bubblesort), **Peripheral Subsystems** (CLINT, OBI timer, GPIO, UART, interrupt controller) · Profile: `soc_verilator` · Suite: [`benchmarks/soc/suite.json`](benchmarks/soc/suite.json) · Aggregated: [`benchmarks/soc/aggregated_results.json`](benchmarks/soc/aggregated_results.json)
 
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
 |---|---|---|---|---|---|
+| **Cheshire** | [pulp-platform/cheshire](https://github.com/pulp-platform/cheshire) | `install_cheshire.sh` | `generate_cheshire.sh` | `run_cheshire.sh` | helloworld, dma_1d, dma_2d, spm_uncached (4 workloads, verified on Verilator) ✅ |
+| **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` | 9 workloads (compute, idma, soc_ctrl, obi_timer, clint, gpio, uart, interrupts, helloworld) ✅ |
+| **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` | 5 parallel workloads on 16 Snitch cores (conv2d_i32, dotp_i32, dct_i32, axpy_i32, hello_world) ✅ |
+| **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` | 5 workloads on CV32E40P (conv2d, fibonacci, fir, keccak, bubblesort) ✅ |
 | **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl.sh` | — |
 | **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` | — |
 | **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` | — |
 | **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — | — |
 | **Carfield** | [pulp-platform/carfield](https://github.com/pulp-platform/carfield) | `install_carfield.sh` | `generate_carfield.sh` | `run_carfield.sh` | — |
-| **Cheshire** | [pulp-platform/cheshire](https://github.com/pulp-platform/cheshire) | `install_cheshire.sh` | `generate_cheshire.sh` | `run_cheshire.sh` | — |
 | **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` | — |
 | **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` | — |
-| **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` | — |
 | **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` | — |
 | **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc.sh` | — |
 | **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` | — |
-| **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` | — |
 | **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` | — |
 | **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton.sh` | — |
 | **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` | — |
 | **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | — |
-| **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` | — |
 | **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
 | **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | — |
 | **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster.sh` | — |

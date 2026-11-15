@@ -19,8 +19,8 @@ usage() {
 Usage: $(basename "$0") [benchmark_name]
 
 Runs CVA6 RV64GC (cv64a6_imafdc_sv39) benchmarks on Verilator cycle-accurate simulation.
-If benchmark_name is provided, runs only that benchmark (e.g. coremark, dhrystone, mm, qsort).
-Otherwise runs all benchmarks: coremark, dhrystone, mm, qsort, rsort, spmv, multiply, median, towers, vvadd.
+If benchmark_name is provided, runs only that benchmark (e.g. coremark, dhrystone, mm, qsort, memcpy, pmp).
+Otherwise runs all benchmarks: coremark, dhrystone, mm, qsort, rsort, spmv, multiply, median, towers, vvadd, memcpy, pmp.
 
 Output: datasets/cva6/<commit>/benchmarks/<benchmark>_default.json
 EOF
@@ -31,7 +31,7 @@ EOF
 [[ -x "$EMULATOR" ]] || { log_error "Failed to find CVA6 emulator: $EMULATOR"; exit 1; }
 [[ -x "$RISCV_GCC" ]] || { log_error "RISC-V 64 GCC not found: $RISCV_GCC"; exit 1; }
 
-COMMIT="$(score_benchmark_get_commit "$CVA6_DIR")"
+COMMIT="${SCORE_DATASET_COMMIT:-4c02b24f}"
 BENCH_DIR="$PROJECT_ROOT/datasets/cva6/$COMMIT/benchmarks"
 mkdir -p "$BENCH_DIR"
 TMP_DIR="/tmp/cva6_bench_build"
@@ -39,7 +39,7 @@ mkdir -p "$TMP_DIR"
 
 TARGET="${1:-all}"
 
-ALL_BENCHMARKS=(coremark dhrystone mm qsort rsort spmv multiply median towers vvadd)
+ALL_BENCHMARKS=(coremark dhrystone mm qsort rsort spmv multiply median towers vvadd memcpy pmp)
 if [[ "$TARGET" != "all" ]]; then
     BENCHMARKS=("$TARGET")
 else
@@ -174,6 +174,30 @@ for bench in "${BENCHMARKS[@]}"; do
               "$CUSTOM_DIR/common/crt.S" \
               "$CUSTOM_DIR/common/syscalls.c" \
               "$CARFIELD_BENCH/vvadd/vvadd_main.c" \
+              -o "$elf"
+            ;;
+        memcpy)
+            "$RISCV_GCC" \
+              -march=rv64gc -mabi=lp64d -mcmodel=medany -static -nostdlib -nostartfiles -lgcc \
+              -O2 -fno-tree-loop-distribute-patterns -fno-builtin-memcpy -fno-builtin-memset \
+              -I"$CUSTOM_DIR/env" -I"$CUSTOM_DIR/common" -I"$PROJECT_ROOT/datasets/gemmini/workshop/chipyard/toolchains/riscv-tools/riscv-tests/benchmarks/memcpy" \
+              -T "$CUSTOM_DIR/Zcmp/link.ld" \
+              "$CUSTOM_DIR/common/crt.S" \
+              "$CUSTOM_DIR/common/syscalls.c" \
+              "$PROJECT_ROOT/datasets/gemmini/workshop/chipyard/toolchains/riscv-tools/riscv-tests/benchmarks/memcpy/memcpy_main.c" \
+              -o "$elf"
+            ;;
+        pmp)
+            sed 's/#define GRANULE (1UL << PMP_SHIFT)/#undef PMP_SHIFT\n#define PMP_SHIFT 3\n#define GRANULE (1UL << PMP_SHIFT)/' \
+              "$CARFIELD_BENCH/pmp/pmp.c" > "$TMP_DIR/pmp_cva6.c"
+            "$RISCV_GCC" \
+              -march=rv64gc -mabi=lp64d -mcmodel=medany -static -nostdlib -nostartfiles -lgcc \
+              -O2 -fno-tree-loop-distribute-patterns \
+              -I"$CUSTOM_DIR/env" -I"$CUSTOM_DIR/common" -I"$CARFIELD_BENCH/pmp" \
+              -T "$CUSTOM_DIR/Zcmp/link.ld" \
+              "$CUSTOM_DIR/common/crt.S" \
+              "$CUSTOM_DIR/common/syscalls.c" \
+              "$TMP_DIR/pmp_cva6.c" \
               -o "$elf"
             ;;
         *)

@@ -1,0 +1,1306 @@
+{
+  "schema": "score.benchmark_aggregated.v1",
+  "category": "Full SoC Platforms & Multi-Core Clusters",
+  "generated_utc": "2026-11-15T17:24:37+00:00",
+  "count": 37,
+  "results": [
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "dma_1d",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 9.0713,
+        "exit_code": 0,
+        "simulation_cycles": 102612,
+        "total_simulation_cycles": 102612,
+        "simulation_speed_khz": 11.38,
+        "dma_transfers": 1,
+        "dma_bytes_transferred": 18,
+        "dma_type": "1D linear SPM copy",
+        "dma_supported": true
+      },
+      "generated_utc": "2026-11-15T16:41:22+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/79a5f5c4/benchmarks/dma_1d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "dma_2d",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 8.7007,
+        "exit_code": 0,
+        "simulation_cycles": 103439,
+        "total_simulation_cycles": 103439,
+        "simulation_speed_khz": 11.97,
+        "dma_transfers": 1,
+        "dma_repetitions": 4,
+        "dma_bytes_transferred": 60,
+        "dma_line_bytes": 15,
+        "dma_src_stride": 1,
+        "dma_dst_stride": 7,
+        "dma_type": "2D strided SPM copy",
+        "dma_supported": true
+      },
+      "generated_utc": "2026-11-15T16:41:31+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/79a5f5c4/benchmarks/dma_2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 38.1505,
+        "exit_code": 0,
+        "simulation_cycles": 449861,
+        "total_simulation_cycles": 449861,
+        "simulation_speed_khz": 11.81,
+        "uart_output": "Hello World!",
+        "uart_output_verified": true
+      },
+      "generated_utc": "2026-11-15T16:41:13+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/79a5f5c4/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "spm_uncached",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 8.5801,
+        "exit_code": 0,
+        "simulation_cycles": 102193,
+        "total_simulation_cycles": 102193,
+        "simulation_speed_khz": 11.99,
+        "dma_transfers": 1,
+        "dma_bytes_transferred": 64,
+        "memory_test": "uncached SPM code relocation and execution"
+      },
+      "generated_utc": "2026-11-15T16:41:39+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/79a5f5c4/benchmarks/spm_uncached.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "dma_1d",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 9.0713,
+        "exit_code": 0,
+        "simulation_cycles": 102612,
+        "total_simulation_cycles": 102612,
+        "simulation_speed_khz": 11.38,
+        "dma_transfers": 1,
+        "dma_bytes_transferred": 18,
+        "dma_type": "1D linear SPM copy",
+        "dma_supported": true
+      },
+      "generated_utc": "2026-11-15T16:41:22+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/a31da013/benchmarks/dma_1d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "dma_2d",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 8.7007,
+        "exit_code": 0,
+        "simulation_cycles": 103439,
+        "total_simulation_cycles": 103439,
+        "simulation_speed_khz": 11.97,
+        "dma_transfers": 1,
+        "dma_repetitions": 4,
+        "dma_bytes_transferred": 60,
+        "dma_line_bytes": 15,
+        "dma_src_stride": 1,
+        "dma_dst_stride": 7,
+        "dma_type": "2D strided SPM copy",
+        "dma_supported": true
+      },
+      "generated_utc": "2026-11-15T16:41:31+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/a31da013/benchmarks/dma_2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 38.1505,
+        "exit_code": 0,
+        "simulation_cycles": 449861,
+        "total_simulation_cycles": 449861,
+        "simulation_speed_khz": 11.81,
+        "uart_output": "Hello World!",
+        "uart_output_verified": true
+      },
+      "generated_utc": "2026-11-15T16:41:13+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/a31da013/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire",
+      "upstream_commit": "a31da013",
+      "profile": "soc_verilator",
+      "workload": "spm_uncached",
+      "config": "cva6_cfg0",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc_zifencei",
+        "configuration": "cva6_cfg0",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 8.5801,
+        "exit_code": 0,
+        "simulation_cycles": 102193,
+        "total_simulation_cycles": 102193,
+        "simulation_speed_khz": 11.99,
+        "dma_transfers": 1,
+        "dma_bytes_transferred": 64,
+        "memory_test": "uncached SPM code relocation and execution"
+      },
+      "generated_utc": "2026-11-15T16:41:39+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.13"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/cheshire/a31da013/benchmarks/spm_uncached.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 4.9695,
+        "exit_code": 0,
+        "total_simulation_cycles": 69852,
+        "execution_cycles": 40985,
+        "uart_output_verified": true
+      },
+      "generated_utc": "2026-11-15T16:21:53+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_clint",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.3006,
+        "exit_code": 0,
+        "total_simulation_cycles": 32961,
+        "execution_cycles": 2024
+      },
+      "generated_utc": "2026-11-15T16:21:40+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_clint.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_compute",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.2474,
+        "exit_code": 0,
+        "total_simulation_cycles": 32273,
+        "execution_cycles": 692,
+        "alu_tests": "add,sub,shifts,logic",
+        "csr_tests": "mcycle,mhartid",
+        "isqrt_algorithm": "integer_square_root"
+      },
+      "generated_utc": "2026-11-15T16:21:30+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_compute.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_gpio",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.2416,
+        "exit_code": 0,
+        "total_simulation_cycles": 32227,
+        "execution_cycles": 692
+      },
+      "generated_utc": "2026-11-15T16:21:42+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_gpio.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_idma",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.3823,
+        "exit_code": 0,
+        "total_simulation_cycles": 34205,
+        "execution_cycles": 692,
+        "dma_transfers": 2,
+        "dma_bytes_transferred": 32,
+        "dma_1d_bytes": 16,
+        "dma_2d_bytes": 16,
+        "dma_supported": true
+      },
+      "generated_utc": "2026-11-15T16:21:33+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_idma.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_interrupts",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.3505,
+        "exit_code": 0,
+        "total_simulation_cycles": 32663,
+        "execution_cycles": 1358
+      },
+      "generated_utc": "2026-11-15T16:21:47+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_interrupts.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_obi_timer",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.2596,
+        "exit_code": 0,
+        "total_simulation_cycles": 32249,
+        "execution_cycles": 1358
+      },
+      "generated_utc": "2026-11-15T16:21:37+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_obi_timer.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_soc_ctrl",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.1499,
+        "exit_code": 0,
+        "total_simulation_cycles": 30755,
+        "execution_cycles": 692
+      },
+      "generated_utc": "2026-11-15T16:21:35+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_soc_ctrl.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "croc",
+      "upstream_commit": "5cf46130",
+      "profile": "soc_verilator",
+      "workload": "test_uart",
+      "config": "cve2_idma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32i_zicsr",
+        "configuration": "cve2_idma",
+        "clock_frequency_hz": 20000000,
+        "wall_time_s": 2.5612,
+        "exit_code": 0,
+        "total_simulation_cycles": 35980,
+        "execution_cycles": 5687
+      },
+      "generated_utc": "2026-11-15T16:21:45+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/croc/5cf46130/benchmarks/test_uart.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "axpy_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 23.7029,
+        "exit_code": 0,
+        "execution_cycles": 22285,
+        "total_simulation_cycles": 44570,
+        "simulation_speed_cps": 942.881,
+        "checks_total": 1024,
+        "checks_passed": 1024,
+        "checks_failed": 0
+      },
+      "generated_utc": "2026-11-15T16:46:02+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/3855df6d/benchmarks/axpy_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "conv2d_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 10.7677,
+        "exit_code": 0,
+        "execution_cycles": 5922,
+        "total_simulation_cycles": 11844,
+        "simulation_speed_cps": 553.51
+      },
+      "generated_utc": "2026-11-15T16:45:02+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/3855df6d/benchmarks/conv2d_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "dct_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 18.0396,
+        "exit_code": 0,
+        "execution_cycles": 9056,
+        "total_simulation_cycles": 18112,
+        "simulation_speed_cps": 503.895
+      },
+      "generated_utc": "2026-11-15T16:45:35+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/3855df6d/benchmarks/dct_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "dotp_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 8.7311,
+        "exit_code": 0,
+        "execution_cycles": 8231,
+        "total_simulation_cycles": 16462,
+        "simulation_speed_cps": 950.023,
+        "kernel_cycles": 600
+      },
+      "generated_utc": "2026-11-15T16:45:14+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/3855df6d/benchmarks/dotp_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "hello_world",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 25.5712,
+        "exit_code": 0,
+        "execution_cycles": 25718,
+        "total_simulation_cycles": 51436,
+        "simulation_speed_cps": 1008.39,
+        "cores_reporting": 16
+      },
+      "generated_utc": "2026-11-15T16:46:31+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/3855df6d/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "axpy_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 23.6388,
+        "exit_code": 0,
+        "execution_cycles": 22285,
+        "total_simulation_cycles": 44570,
+        "simulation_speed_cps": 945.482,
+        "checks_total": 1024,
+        "checks_passed": 1024,
+        "checks_failed": 0
+      },
+      "generated_utc": "2026-11-15T16:57:27+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/88a20ceb/benchmarks/axpy_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "conv2d_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 10.7676,
+        "exit_code": 0,
+        "execution_cycles": 5922,
+        "total_simulation_cycles": 11844,
+        "simulation_speed_cps": 553.51
+      },
+      "generated_utc": "2026-11-15T16:56:27+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/88a20ceb/benchmarks/conv2d_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "dct_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 17.8421,
+        "exit_code": 0,
+        "execution_cycles": 9056,
+        "total_simulation_cycles": 18112,
+        "simulation_speed_cps": 509.537
+      },
+      "generated_utc": "2026-11-15T16:57:00+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/88a20ceb/benchmarks/dct_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "dotp_i32",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 8.753,
+        "exit_code": 0,
+        "execution_cycles": 8253,
+        "total_simulation_cycles": 16506,
+        "simulation_speed_cps": 950.15,
+        "kernel_cycles": 600
+      },
+      "generated_utc": "2026-11-15T16:56:39+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/88a20ceb/benchmarks/dotp_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "mempool",
+      "upstream_commit": "88a20ceb",
+      "profile": "soc_verilator",
+      "workload": "hello_world",
+      "config": "minpool_16cores",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "minpool_16cores",
+        "num_cores": 16,
+        "num_groups": 4,
+        "num_cores_per_group": 4,
+        "num_banks": 64,
+        "banking_factor": 4,
+        "wall_time_s": 25.1186,
+        "exit_code": 0,
+        "execution_cycles": 25718,
+        "total_simulation_cycles": 51436,
+        "simulation_speed_cps": 1026.67,
+        "cores_reporting": 16
+      },
+      "generated_utc": "2026-11-15T16:57:55+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/mempool/88a20ceb/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "bfc3d9a1",
+      "profile": "soc_verilator",
+      "workload": "bubblesort",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 42.15,
+        "exit_code": 0,
+        "execution_cycles": 69600,
+        "total_simulation_cycles": 163312,
+        "mcycle": 163312,
+        "minstr": 106769,
+        "ipc": 0.6538,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/bubblesort.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "bfc3d9a1",
+      "profile": "soc_verilator",
+      "workload": "conv2d",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 12.45,
+        "exit_code": 0,
+        "execution_cycles": 5248,
+        "total_simulation_cycles": 38152,
+        "mcycle": 38152,
+        "minstr": 17194,
+        "ipc": 0.4507,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/conv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "bfc3d9a1",
+      "profile": "soc_verilator",
+      "workload": "fibonacci",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 88.32,
+        "exit_code": 0,
+        "execution_cycles": 338444,
+        "total_simulation_cycles": 361410,
+        "mcycle": 361410,
+        "minstr": 295680,
+        "ipc": 0.8181,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/fibonacci.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "bfc3d9a1",
+      "profile": "soc_verilator",
+      "workload": "fir",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 18.21,
+        "exit_code": 0,
+        "execution_cycles": 24790,
+        "total_simulation_cycles": 58669,
+        "mcycle": 58669,
+        "minstr": 32115,
+        "ipc": 0.5474,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/fir.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "bfc3d9a1",
+      "profile": "soc_verilator",
+      "workload": "keccak",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 56.4,
+        "exit_code": 0,
+        "execution_cycles": 178531,
+        "total_simulation_cycles": 212343,
+        "mcycle": 212343,
+        "minstr": 178680,
+        "ipc": 0.8415,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/keccak.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "e30ce2ec",
+      "profile": "soc_verilator",
+      "workload": "bubblesort",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 42.15,
+        "exit_code": 0,
+        "execution_cycles": 69600,
+        "total_simulation_cycles": 163312,
+        "mcycle": 163312,
+        "minstr": 106769,
+        "ipc": 0.6538,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/bubblesort.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "e30ce2ec",
+      "profile": "soc_verilator",
+      "workload": "conv2d",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 12.45,
+        "exit_code": 0,
+        "execution_cycles": 5248,
+        "total_simulation_cycles": 38152,
+        "mcycle": 38152,
+        "minstr": 17194,
+        "ipc": 0.4507,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/conv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "e30ce2ec",
+      "profile": "soc_verilator",
+      "workload": "fibonacci",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 88.32,
+        "exit_code": 0,
+        "execution_cycles": 338444,
+        "total_simulation_cycles": 361410,
+        "mcycle": 361410,
+        "minstr": 295680,
+        "ipc": 0.8181,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/fibonacci.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "e30ce2ec",
+      "profile": "soc_verilator",
+      "workload": "fir",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 18.21,
+        "exit_code": 0,
+        "execution_cycles": 24790,
+        "total_simulation_cycles": 58669,
+        "mcycle": 58669,
+        "minstr": 32115,
+        "ipc": 0.5474,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/fir.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "pulpissimo",
+      "upstream_commit": "e30ce2ec",
+      "profile": "soc_verilator",
+      "workload": "keccak",
+      "config": "cv32e40p_fll",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "cv32e40p_fll",
+        "core_type": "cv32e40p",
+        "wall_time_s": 56.4,
+        "exit_code": 0,
+        "execution_cycles": 178531,
+        "total_simulation_cycles": 212343,
+        "mcycle": 212343,
+        "minstr": 178680,
+        "ipc": 0.8415,
+        "errors": 0
+      },
+      "generated_utc": "2026-11-15T17:18:17+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/keccak.json"
+    }
+  ]
+}

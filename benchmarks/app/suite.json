@@ -9,6 +9,10 @@
       "config": "DefaultConfig",
       "description": "RISC-V Rocket Chip 64-bit in-order application core with FPU, MMU, caches, and TileLink crossbar",
       "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh coremark"
+        },
         "dhrystone": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh dhrystone"
@@ -44,6 +48,14 @@
         "vvadd": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh vvadd"
+        },
+        "memcpy": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh memcpy"
+        },
+        "pmp": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rocket_chip_benchmarks.sh pmp"
         }
       }
     },
@@ -93,6 +105,14 @@
         "vvadd": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_cva6_benchmarks.sh vvadd"
+        },
+        "memcpy": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh memcpy"
+        },
+        "pmp": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva6_benchmarks.sh pmp"
         }
       }
     }

@@ -1,0 +1,30 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "veer_el2",
+  "upstream_commit": "4c38eb80",
+  "profile": "mcu_verilator",
+  "workload": "dhrystone",
+  "config": "default",
+  "metrics": {
+    "dhrystone_dmips_per_mhz": 1.6783,
+    "dhrystones_per_sec_per_mhz": 2948.84,
+    "validated": true,
+    "simulator": "verilator",
+    "firmware_source": "canned_hex",
+    "total_cycles": 355049,
+    "instructions_retired": 343115,
+    "benchmark_cycles": 339169,
+    "runs": 1000,
+    "veer_test": "dhry"
+  },
+  "generated_utc": "2026-11-15T16:31:33Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022"
+  }
+}
