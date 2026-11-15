@@ -77,9 +77,9 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
 |---|---|---|---|---|---|
-| **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark ✅ |
+| **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark, dhrystone ✅ |
 | **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark, dhrystone ✅ |
-| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs), dhrystone ✅ |
+| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs), dhrystone (small, opentitan) ✅ |
 | **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` | GHDL synthesis verified ✅ |
 | **NEORV32 (VHDL)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_vhdl.sh` | `generate_neorv32_vhdl.sh` | `run_neorv32_vhdl.sh` | coremark ✅ |
 | **PicoRV32** | [YosysHQ/picorv32](https://github.com/YosysHQ/picorv32) | `install_picorv32.sh` | `generate_picorv32.sh` | — | coremark, dhrystone ✅ |
@@ -120,25 +120,25 @@ Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kerne
 | **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` | 9 workloads (compute, idma, soc_ctrl, obi_timer, clint, gpio, uart, interrupts, helloworld) ✅ |
 | **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` | 5 parallel workloads on 16 Snitch cores (conv2d_i32, dotp_i32, dct_i32, axpy_i32, hello_world) ✅ |
 | **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` | 5 workloads on CV32E40P (conv2d, fibonacci, fir, keccak, bubblesort) ✅ |
-| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl_benchmarks.sh` | hello_world, fmatmul (CVA6 + dual Ara cluster, 8 lanes, VLEN=4096, verified on Verilator) ✅ |
-| **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` | — |
-| **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` | — |
-| **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — | — |
-| **Carfield** | [pulp-platform/carfield](https://github.com/pulp-platform/carfield) | `install_carfield.sh` | `generate_carfield.sh` | `run_carfield.sh` | — |
-| **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` | — |
-| **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` | — |
-| **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` | — |
+| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl_benchmarks.sh` | hello_world, fmatmul, imatmul, fdotproduct (4 vector workloads, CVA6 + dual Ara cluster, 8 lanes, VLEN=4096, verified on Verilator) ✅ |
+| **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` | ⚠️ Commercial EDA required (Carfield derivative; Siemens QuestaSim 2023+ / VCS) |
+| **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` | 🚧 Upstream early development (scaffold repository) |
+| **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — | 🚧 Submodule unpopulated (clone via upstream repo) |
+| **Carfield** | [pulp-platform/carfield](https://github.com/pulp-platform/carfield) | `install_carfield.sh` | `generate_carfield.sh` | `run_carfield.sh` | ⚠️ Commercial EDA required (Cheshire + CV32E40P safety island; QuestaSim 2023+ / VCS) |
+| **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` | 🏭 ASIC Tapeout (Basilisk 130nm BiCMOS tapeout flow via OpenROAD / Modelsim) |
+| **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` | ⚠️ Commercial EDA required (Snitch cluster derivative; QuestaSim 2023+ / VCS) |
+| **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` | 🛠️ Heterogeneous FPGA platform framework (Vivado / Petalinux / Linux buildroot) |
 | **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc_benchmarks.sh` | helloworld (VexRiscv RV32, AXI4 full crossbar, DDR, UART console loopback, Pi calculation) ✅ |
-| **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` | — |
-| **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` | — |
+| **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` | ⚠️ Commercial EDA required (QuestaSim vsim flow with UVM / RedMulE accelerator) |
+| **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` | ⚠️ Commercial EDA required (Dual-chiplet HBM2e platform; QuestaSim 2023+ / VCS) |
 | **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton_benchmarks.sh` | helloworld (Ariane RV64, P-Mesh 2D NoC, L1.5/L2 cache, UART) ✅ |
-| **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` | — |
-| **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | — |
-| **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
-| **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | — |
+| **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` | ⚠️ Commercial EDA required (Mixed-signal neuromorphic SoC; QuestaSim 2023+ / VCS) |
+| **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | ⚠️ Commercial EDA required (8x CV32E40P logarithmic cluster; QuestaSim 2023+ / VCS) |
+| **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | 📦 Subsystem IP (SoC microcontroller subsystem; verified under PULPissimo) |
+| **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | ⚠️ Commercial EDA required (Dual-core lockstep CV32E40P; QuestaSim 2023+ / VCS) |
 | **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster_benchmarks.sh` | simple, barrier, matmul_i32 (9 cores: 8 compute + 1 DMA, 108.3k sim cyc, verified on Verilator) ✅ |
-| **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` | — |
-| **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — | — |
+| **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` | 🛠️ Tooling (Hardware execution trace decoder utility) |
+| **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — | 🛠️ Tooling (PyMTL/SoC generation EDA automation scripts) |
 
 
 **Ibex:** the upstream core is not listed as a git submodule in `.gitmodules`; clone or link it under `tools/ibex` as expected by `install_ibex.sh` / `generate_ibex.sh`.

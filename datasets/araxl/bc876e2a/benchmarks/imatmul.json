@@ -1,0 +1,40 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "araxl",
+  "upstream_commit": "bc876e2a",
+  "profile": "soc_vector_verilator",
+  "workload": "imatmul",
+  "config": "cva6_2clusters_8lanes_vlen4096",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gcv",
+    "configuration": "cva6_2clusters_8lanes_vlen4096",
+    "clock_frequency_hz": 500000000,
+    "num_clusters": 2,
+    "nr_lanes_per_cluster": 4,
+    "total_lanes": 8,
+    "vlen": 4096,
+    "wall_time_s": 42.084,
+    "exit_code": 0,
+    "execution_cycles": 40250,
+    "total_simulation_cycles": 40250,
+    "simulation_speed_khz": 0.95642,
+    "kernel_execution_cycles": 529,
+    "performance_ops_per_cycle": 0.241966,
+    "vector_utilization_pct": 3.024575,
+    "description": "Integer matrix multiplication (int64) across 2 vector clusters (8 lanes)",
+    "stdout_verified": true
+  },
+  "generated_utc": "2026-11-15T23:03:44+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "11.5.0"
+  }
+}

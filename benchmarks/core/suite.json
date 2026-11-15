@@ -92,6 +92,10 @@
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_darkriscv_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_darkriscv_dhrystone.sh"
         }
       }
     },

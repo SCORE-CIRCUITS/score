@@ -74,3 +74,6 @@ datasets/croc/*/source_snapshot/artistic/artistic/
 datasets/croc/*/source_snapshot/ihp13/pdk/
 datasets/mempool/*/source_snapshot/toolchain/llvm-project/
 datasets/gemmini/workshop/chipyard/
+
+# Standalone website repository (score-circuits.github.io)
+website/

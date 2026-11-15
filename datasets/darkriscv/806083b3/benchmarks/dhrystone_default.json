@@ -1,0 +1,31 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "darkriscv",
+  "upstream_commit": "806083b3",
+  "profile": "mcu_verilator",
+  "workload": "dhrystone",
+  "config": "default",
+  "metrics": {
+    "dhrystones_per_sec": 59988,
+    "dmips": 34,
+    "dmips_per_mhz": 0.3414,
+    "number_of_runs": 100,
+    "total_cycles": 271757,
+    "instructions": 165453,
+    "cpi": 1.64,
+    "clock_mhz": 100,
+    "validated": true,
+    "timing": "io.timeus",
+    "simulator": "icarus"
+  },
+  "generated_utc": "2026-11-15T23:09:55Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022"
+  }
+}

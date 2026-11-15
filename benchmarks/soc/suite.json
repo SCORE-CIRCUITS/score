@@ -245,6 +245,19 @@
           "execution_cycles": 24897,
           "kernel_cycles": 3319,
           "runner": "scripts/benchmarks/run_araxl_benchmarks.sh fmatmul"
+        },
+        "imatmul": {
+          "status": "verified",
+          "execution_cycles": 40250,
+          "kernel_cycles": 3206,
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh imatmul"
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "execution_cycles": 10164,
+          "vector_runtime_cycles": 252,
+          "scalar_runtime_cycles": 886,
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh fdotproduct"
         }
       }
     }
@@ -279,6 +292,34 @@
       "commit": "d5d0d83",
       "architecture": "rv64gc_dual_chiplet",
       "description": "Occamy dual-chiplet many-core computing platform featuring HBM2e memory subsystem, CVA6 host, and Snitch clusters",
+      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
+      "status": "commercial_eda_required"
+    },
+    {
+      "score_tool": "astral",
+      "architecture": "rv64gc_carfield_derivative",
+      "description": "Astral Carfield derivative automotive SoC platform",
+      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
+      "status": "commercial_eda_required"
+    },
+    {
+      "score_tool": "chimera",
+      "architecture": "rv32imafd_snitch_derivative",
+      "description": "Chimera multi-core compute platform derived from Snitch cluster",
+      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
+      "status": "commercial_eda_required"
+    },
+    {
+      "score_tool": "magia",
+      "architecture": "rv32imc_redmule",
+      "description": "MAGIA heterogeneous SoC with RedMulE accelerator and UVM testbench environment",
+      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
+      "status": "commercial_eda_required"
+    },
+    {
+      "score_tool": "safety_island",
+      "architecture": "rv32imc_lockstep",
+      "description": "Safety Island dual-core lockstep CV32E40P safety platform with CLIC and ECC",
       "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
       "status": "commercial_eda_required"
     }

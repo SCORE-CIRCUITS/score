@@ -23,6 +23,8 @@ fi
 ALL_WORKLOADS=(
     "hello_world"
     "fmatmul"
+    "imatmul"
+    "fdotproduct"
 )
 
 WORKLOAD="${1:-all}"
@@ -107,7 +109,7 @@ success = ($ret == 0) and ("FAILED" not in content) and (exec_cycles > 0)
 if "$bmark" == "hello_world":
     if "Ariane says Hello!" in content or "Hello World" in content:
         success = True
-elif "$bmark" == "fmatmul":
+elif "$bmark" in ("fmatmul", "imatmul", "fdotproduct"):
     if "SUCCESS" in content or "Passed" in content or "sed." in content:
         success = True
 
@@ -142,6 +144,18 @@ if "$bmark" == "hello_world":
 elif "$bmark" == "fmatmul":
     metrics["description"] = "Double precision floating-point matrix multiplication across 2 vector clusters (8 lanes)"
     metrics["stdout_verified"] = ("SUCCESS" in content) or ("Passed" in content) or ("sed." in content)
+elif "$bmark" == "imatmul":
+    metrics["description"] = "Integer matrix multiplication (int64) across 2 vector clusters (8 lanes)"
+    metrics["stdout_verified"] = ("SUCCESS" in content) or ("Passed" in content) or ("sed." in content)
+elif "$bmark" == "fdotproduct":
+    metrics["description"] = "Double precision vector dot product across 2 vector clusters (8 lanes)"
+    metrics["stdout_verified"] = ("SUCCESS" in content)
+    vec_rt = re.search(r"Vector runtime:\s*(\d+)", content)
+    scalar_rt = re.search(r"Scalar runtime:\s*(\d+)", content)
+    if vec_rt:
+        metrics["vector_runtime_cycles"] = int(vec_rt.group(1))
+    if scalar_rt:
+        metrics["scalar_runtime_cycles"] = int(scalar_rt.group(1))
 
 payload = {
     "schema": "score.benchmark_results.v1",

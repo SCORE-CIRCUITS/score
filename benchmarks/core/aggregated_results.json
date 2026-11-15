@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T17:24:50+00:00",
-  "count": 23,
+  "generated_utc": "2026-11-15T23:12:54+00:00",
+  "count": 26,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -33,6 +33,38 @@
         "verilator": "5.022"
       },
       "_path": "datasets/darkriscv/4aa43799/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "darkriscv",
+      "upstream_commit": "806083b3",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dhrystones_per_sec": 59988,
+        "dmips": 34,
+        "dmips_per_mhz": 0.3414,
+        "number_of_runs": 100,
+        "total_cycles": 271757,
+        "instructions": 165453,
+        "cpi": 1.64,
+        "clock_mhz": 100,
+        "validated": true,
+        "timing": "io.timeus",
+        "simulator": "icarus"
+      },
+      "generated_utc": "2026-11-15T23:09:55Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/darkriscv/806083b3/benchmarks/dhrystone_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -341,6 +373,36 @@
       "upstream_commit": "f33ead1e",
       "profile": "mcu_verilator",
       "workload": "dhrystone",
+      "config": "opentitan",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 1.026,
+        "dhrystones_per_sec_per_mhz": 1804.0,
+        "validated": true,
+        "simulator": "verilator",
+        "ibex_config": "opentitan",
+        "total_cycles": 96378,
+        "benchmark_cycles": 55428,
+        "instructions_retired": 73736,
+        "cpi": 1.188
+      },
+      "generated_utc": "2026-11-15T23:12:29Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/ibex/f33ead1e/benchmarks/dhrystone_opentitan.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ibex",
+      "upstream_commit": "f33ead1e",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
       "config": "small",
       "metrics": {
         "dhrystone_dmips_per_mhz": 0.723,
@@ -363,6 +425,41 @@
         "verilator": "5.022"
       },
       "_path": "datasets/ibex/f33ead1e/benchmarks/dhrystone_small.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vexriscv",
+      "upstream_commit": "f9cb9558",
+      "profile": "soc_verilator",
+      "workload": "helloworld",
+      "config": "iob_soc_v0.8_default",
+      "metrics": {
+        "execution_cycles": 409863,
+        "elapsed_us": 4098.63,
+        "frequency_mhz": 100.0,
+        "pi_calculation": "3.141500",
+        "firmware_size_bytes": 24086,
+        "loopback_file_bytes": 348,
+        "baud_rate": 3000000,
+        "memory_system": "AXI4-Full Crossbar + DDR",
+        "status": "PASS",
+        "uart_output_verified": true,
+        "loopback_verified": true,
+        "pass": true
+      },
+      "generated_utc": "2026-11-15T18:42:00+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.11.11"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0",
+        "riscv_gcc": "13.2.0"
+      },
+      "_path": "datasets/iob-soc/f9cb9558/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",
