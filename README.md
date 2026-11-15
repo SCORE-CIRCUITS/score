@@ -69,56 +69,89 @@ Survey manuscript and evidence corpus live in the private [`score_publications`]
 
 Each row lists the **upstream GitHub repository** and the **script basename** (full path: `scripts/<name>.sh`). Dataset output generally lives under `datasets/<folder>/` with a short Git commit directory; exact layout is defined per `generate_*.sh`.
 
+Architectures are grouped by **benchmark phase** — each phase validates and benchmarks a different class of circuits using real RTL simulation (zero fake data or hardcoding), producing `score.benchmark_results.v1` JSON files under `datasets/<arch>/<commit>/benchmarks/`.
+
+### Phase 1 — MCU / Scalar Cores
+
+Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`benchmarks/core/suite.json`](benchmarks/core/suite.json)
+
+| Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
+|---|---|---|---|---|---|
+| **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark ✅ |
+| **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark ✅ |
+| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark ✅ |
+| **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` | coremark ✅ |
+| **NEORV32 (VHDL)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_vhdl.sh` | `generate_neorv32_vhdl.sh` | `run_neorv32_vhdl.sh` | coremark ✅ |
+| **PicoRV32** | [YosysHQ/picorv32](https://github.com/YosysHQ/picorv32) | `install_picorv32.sh` | `generate_picorv32.sh` | — | coremark, dhrystone ✅ |
+| **SCR1** | [syntacore/scr1](https://github.com/syntacore/scr1) | `install_scr1.sh` | `generate_scr1.sh` | — | coremark ✅ |
+| **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — | coremark ✅ |
+| **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark ✅ |
+| **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — | coremark, dhrystone ✅ |
+
+### Phase 2 — 64-bit Application Cores
+
+Workloads: **CoreMark**, **Dhrystone**, **riscv-tests** (median, mm, multiply, qsort, rsort, spmv, towers, vvadd) · Profile: `app_verilator` · Suite: [`benchmarks/app/suite.json`](benchmarks/app/suite.json)
+
+| Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
+|---|---|---|---|---|---|
+| **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone + 8 riscv-tests ✅ |
+| **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | dhrystone + 8 riscv-tests ✅ |
+
+### Phase 3 — Vector & Coprocessor Engines
+
+Workloads: **fmatmul**, **fconv2d**, **fconv3d**, **fdotproduct**, **fft**, **imatmul**, **roi_align**, **softmax** (Ara/Spatz); **matmul_ws**, **conv_2d**, **mvin_mvout**, **resadd**, **tiled_matmul** (Gemmini) · Profile: `vector_verilator` · Suite: [`benchmarks/vector/suite.json`](benchmarks/vector/suite.json)
+
+| Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
+|---|---|---|---|---|---|
+| **Ara** | [pulp-platform/ara](https://github.com/pulp-platform/ara) | `install_ara.sh` | `generate_ara.sh` | `run_ara.sh` | 8 vector kernels ✅ |
+| **Gemmini** | [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini) | `install_gemmini.sh` | `generate_gemmini.sh` | `run_gemmini.sh` | 6 systolic workloads ✅ |
+| **Spatz** | [pulp-platform/spatz](https://github.com/pulp-platform/spatz) | `install_spatz.sh` | `generate_spatz.sh` | `run_spatz.sh` | 6 vector kernels ✅ |
+
+### Phase 4 — Full SoC Platforms
+
+Workloads: TBD (RISC-V compliance, multi-core scaling, OS boot, memory bandwidth) · Profile: `soc_verilator` · Suite: `benchmarks/soc/suite.json` *(planned)*
+
+| Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
+|---|---|---|---|---|---|
+| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl.sh` | — |
+| **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` | — |
+| **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` | — |
+| **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — | — |
+| **Carfield** | [pulp-platform/carfield](https://github.com/pulp-platform/carfield) | `install_carfield.sh` | `generate_carfield.sh` | `run_carfield.sh` | — |
+| **Cheshire** | [pulp-platform/cheshire](https://github.com/pulp-platform/cheshire) | `install_cheshire.sh` | `generate_cheshire.sh` | `run_cheshire.sh` | — |
+| **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` | — |
+| **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` | — |
+| **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` | — |
+| **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` | — |
+| **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc.sh` | — |
+| **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` | — |
+| **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` | — |
+| **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` | — |
+| **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton.sh` | — |
+| **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` | — |
+| **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | — |
+| **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` | — |
+| **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
+| **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | — |
+| **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster.sh` | — |
+
+### Other Architectures (RTL generation only)
+
+No benchmark phase assigned; dataset generation only.
+
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` |
-|--------------|----------|-------------|--------------|---------|
-| **Ara** | [pulp-platform/ara](https://github.com/pulp-platform/ara) | `install_ara.sh` | `generate_ara.sh` | `run_ara.sh` |
-| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl.sh` |
-| **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` |
-| **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` |
-| **Carfield** | [pulp-platform/carfield](https://github.com/pulp-platform/carfield) | `install_carfield.sh` | `generate_carfield.sh` | `run_carfield.sh` |
-| **Cheshire** | [pulp-platform/cheshire](https://github.com/pulp-platform/cheshire) | `install_cheshire.sh` | `generate_cheshire.sh` | `run_cheshire.sh` |
-| **Cheshire (IHP130-O)** | [pulp-platform/cheshire-ihp130-o](https://github.com/pulp-platform/cheshire-ihp130-o) | `install_cheshire_ihp130_o.sh` | `generate_cheshire_ihp130_o.sh` | `run_cheshire_ihp130_o.sh` |
-| **Chimera** | [pulp-platform/chimera](https://github.com/pulp-platform/chimera) | `install_chimera.sh` | `generate_chimera.sh` | `run_chimera.sh` |
-| **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` |
-| **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` |
-| **Gemmini** | [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini) | `install_gemmini.sh` | `generate_gemmini.sh` | `run_gemmini.sh` |
-| **HERO** | [pulp-platform/hero](https://github.com/pulp-platform/hero) | `install_hero.sh` | `generate_hero.sh` | `run_hero.sh` |
-| **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` |
-| **IOb-SoC** | [IObundle/iob-soc](https://github.com/IObundle/iob-soc) | `install_iob_soc.sh` | `generate_iob_soc.sh` | `run_iob_soc.sh` |
-| **MAGIA** | [pulp-platform/MAGIA](https://github.com/pulp-platform/MAGIA) | `install_magia.sh` | `generate_magia.sh` | `run_magia.sh` |
-| **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` |
-| **NEORV32 (Verilog)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_verilog.sh` | `generate_neorv32_verilog.sh` | `run_neorv32_verilog.sh` |
-| **NEORV32 (VHDL)** | [stnolting/neorv32](https://github.com/stnolting/neorv32) | `install_neorv32_vhdl.sh` | `generate_neorv32_vhdl.sh` | `run_neorv32_vhdl.sh` |
-| **Occamy** | [pulp-platform/occamy](https://github.com/pulp-platform/occamy) | `install_occamy.sh` | `generate_occamy.sh` | `run_occamy.sh` |
-| **OpenPiton** | [PrincetonUniversity/openpiton](https://github.com/PrincetonUniversity/openpiton) | `install_openpiton.sh` | `generate_openpiton.sh` | `run_openpiton.sh` |
-| **Picobello** | [pulp-platform/picobello](https://github.com/pulp-platform/picobello) | `install_picobello.sh` | `generate_picobello.sh` | `run_picobello.sh` |
-| **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` |
-| **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` |
-| **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` |
-| **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` |
+|---|---|---|---|---|
+| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — |
 | **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — |
 | **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` |
 | **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` |
-| **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` |
-| **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster.sh` |
 | **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — |
-| **Spatz** | [pulp-platform/spatz](https://github.com/pulp-platform/spatz) | `install_spatz.sh` | `generate_spatz.sh` | `run_spatz.sh` |
-| **PicoRV32** | [YosysHQ/picorv32](https://github.com/YosysHQ/picorv32) | `install_picorv32.sh` | `generate_picorv32.sh` | — |
-| **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — |
-| **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — |
-| **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — |
-| **SCR1** | [syntacore/scr1](https://github.com/syntacore/scr1) | `install_scr1.sh` | `generate_scr1.sh` | — |
-| **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — |
-| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` (full clone + venv/FuseSoC + Verilator 4.210) | `generate_opentitan.sh` (`//hw:verilator`) | — |
-| **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — |
-| **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — |
 
 **Ibex:** the upstream core is not listed as a git submodule in `.gitmodules`; clone or link it under `tools/ibex` as expected by `install_ibex.sh` / `generate_ibex.sh`.
 
 ### Other submodules (no `generate_*.sh` in this repo)
 
 `.gitmodules` also pins auxiliary repos (for example Chipyard, Verilator, Chisel, Amaranth, XLS, Bambu, PeakRDL, and others) for local development or future automation. They are **not** described here as fully scripted dataset flows until a matching `scripts/generate_*.sh` exists.
-
 ## Repository layout
 
 ```
