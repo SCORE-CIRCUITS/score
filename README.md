@@ -53,7 +53,7 @@ SCORE collects **versioned RTL snapshots** under `datasets/<architecture>/<commi
 | `generate_*.sh` | Build or export RTL into the dataset tree and write logs alongside the snapshot. |
 | `run_*.sh` | Simulation, smoke tests, or other checks where implemented. |
 
-Not every architecture defines a `run_*.sh` script yet (for example, **SoC Automation** and **RISC-V VHDL** currently stop after generation).
+Not every architecture has benchmark runners implemented yet — those are marked *(pending)* in the tables below.
 
 **Licensing:** RTL snapshots and submodule trees follow **each upstream project’s license**. SCORE-authored material in this repo (for example `scripts/` and docs) is offered under **CC BY 4.0** — see [Licensing](#licensing).
 
@@ -87,6 +87,9 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 | **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — | coremark ✅ |
 | **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark ✅ |
 | **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — | coremark, dhrystone ✅ |
+| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | — *(pending)* |
+| **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — | — *(pending)* |
+| **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` | — *(pending)* |
 
 ### Phase 2 — 64-bit Application Cores
 
@@ -134,18 +137,9 @@ Workloads: TBD (RISC-V compliance, multi-core scaling, OS boot, memory bandwidth
 | **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
 | **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | — |
 | **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster.sh` | — |
+| **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` | — |
+| **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — | — |
 
-### Other Architectures (RTL generation only)
-
-No benchmark phase assigned; dataset generation only.
-
-| Architecture | Upstream | `install_*` | `generate_*` | `run_*` |
-|---|---|---|---|---|
-| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — |
-| **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — |
-| **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` |
-| **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` |
-| **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — |
 
 **Ibex:** the upstream core is not listed as a git submodule in `.gitmodules`; clone or link it under `tools/ibex` as expected by `install_ibex.sh` / `generate_ibex.sh`.
 
