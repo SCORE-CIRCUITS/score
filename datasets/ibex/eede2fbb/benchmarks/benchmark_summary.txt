@@ -1,0 +1,5 @@
+Ibex CoreMark benchmark summary (SCORE)
+Commit: eede2fbb
+Profile: mcu_verilator
+Configs: small
+Results: /home/yongfu/proj/score/datasets/ibex/eede2fbb/benchmarks

@@ -14,10 +14,10 @@
     "vexriscv_config": "GenSmallest",
     "rtl_source": "/home/yongfu/proj/score/datasets/vexriscv/68075606/rtl_generated/GenSmallest/VexRiscv.v"
   },
-  "generated_utc": "2026-08-30T01:46:41Z",
+  "generated_utc": "2026-11-14T16:01:06Z",
   "host": {
-    "hostname": "river",
-    "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
     "python": "3.9.25"
   },
   "tool_versions": {

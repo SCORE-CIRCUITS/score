@@ -21,6 +21,7 @@ Thumbs.db
 # IDE files
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~ 
@@ -41,7 +42,7 @@ tools/*-host-tools/
 **/venv/
 **/.venv/
 
-# Compiled simulation binaries (too large for GitHub, rebuild from source)
+# Compiled simulation binaries and simulator workdirs
 **/Vchip_sim_tb
 **/Vara_tb_verilator
 **/*.verilator
@@ -49,6 +50,14 @@ tools/*-host-tools/
 **/verilator_bin_dbg
 **/*.jar
 **/*.gds
+*.cf
+*.dasm
+test_bootrom.bin
+out/
+**/obj_dir/
+**/work-vlt/
+**/.ghdl_build.lock.d/
+verification_results_*.txt
 
 # Generated build artifacts and environment wrappers
 setup_gemmini_env.sh
@@ -58,3 +67,9 @@ tools/neorv32-verilog/
 tools/iob_soc_V*/
 tools/py2hwsw/
 datasets/rocket-chip/*/out/
+
+# Nested source_snapshot third-party clones
+datasets/croc/*/source_snapshot/artistic/artistic/
+datasets/croc/*/source_snapshot/ihp13/pdk/
+datasets/mempool/*/source_snapshot/toolchain/llvm-project/
+datasets/gemmini/workshop/chipyard/

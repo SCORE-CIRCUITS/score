@@ -1,0 +1,8 @@
+Configuration: rocket_rocc_example
+Category: special
+Rocket Chip Class: freechips.rocketchip.system.RoccExampleConfig
+Generated: Sun Nov 15 08:40:15 AM +08 2026
+Generator: Rocket Chip Generator (Chisel/FIRRTL)
+Description: RISC-V processor configuration generated from Rocket Chip
+Build Method: Multiple mill targets (mfccompiler.compile, generator.elaborate, generator.chirrtl)
+Files Generated: 14

@@ -15,10 +15,10 @@
     "veer_test": "cmark",
     "firmware_source": "canned_hex"
   },
-  "generated_utc": "2026-09-03T09:38:21Z",
+  "generated_utc": "2026-11-14T17:17:54Z",
   "host": {
-    "hostname": "river",
-    "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
     "python": "3.9.25"
   },
   "tool_versions": {

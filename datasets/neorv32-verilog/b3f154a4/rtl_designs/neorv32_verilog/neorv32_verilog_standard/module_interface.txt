@@ -1,0 +1,5 @@
+module neorv32_verilog_wrapper
+  (input  clk_i,
+   input  rstn_i,
+   output uart0_txd_o,
+   input  uart0_rxd_i);

@@ -1,0 +1,9 @@
+core_type: bf16
+config_name: GemminiBF16DefaultConfig
+simulator: vlt
+generation_date: Sun Nov 15 09:07:35 AM +08 2026
+rtl_only: true
+description: "Gemmini bf16 configuration"
+workshop_env: true
+gemmini_home: /home/yongfu/proj/score/datasets/gemmini/workshop/gemmini_env/gemmini
+chipyard_home: /home/yongfu/proj/score/datasets/gemmini/workshop/chipyard

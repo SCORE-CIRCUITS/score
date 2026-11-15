@@ -1,0 +1,15 @@
+Configuration: maxperf
+Build Type: csr-test
+Generated: Sun Nov 15 08:50:07 AM +08 2026
+Build Location: /home/yongfu/proj/score/tools/ibex/build
+Output Directory: /home/yongfu/proj/score/datasets/ibex/3d524f19/rtl_designs/maxperf/csr-test
+
+Configuration Details:
+- IBEX_CONFIG: maxperf
+- Build Type: csr-test
+- Build Directory: /home/yongfu/proj/score/tools/ibex/build
+
+Files:
+- RTL Files: 179
+- Simulation Models: 3
+- Total Files: 183

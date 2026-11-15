@@ -7,18 +7,18 @@
   "workload": "coremark",
   "config": "default",
   "metrics": {
-    "coremark_per_mhz": 3.1737,
-    "iterations": 10,
-    "total_cycles": 3150906,
+    "coremark_per_mhz": 3.1734,
+    "iterations": 1,
+    "total_cycles": 315124,
     "validated": true,
-    "tb_cycles": 3191908,
+    "tb_cycles": 356161,
     "simulator": "cxxrtl",
     "hazard3_config": "default"
   },
-  "generated_utc": "2026-08-31T16:58:38Z",
+  "generated_utc": "2026-11-14T17:12:40Z",
   "host": {
-    "hostname": "river",
-    "platform": "Linux-5.14.0-611.54.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
     "python": "3.9.25"
   },
   "tool_versions": {

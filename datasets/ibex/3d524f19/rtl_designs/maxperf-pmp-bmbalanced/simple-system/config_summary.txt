@@ -1,0 +1,15 @@
+Configuration: maxperf-pmp-bmbalanced
+Build Type: simple-system
+Generated: Sun Nov 15 08:51:36 AM +08 2026
+Build Location: /home/yongfu/proj/score/tools/ibex/build
+Output Directory: /home/yongfu/proj/score/datasets/ibex/3d524f19/rtl_designs/maxperf-pmp-bmbalanced/simple-system
+
+Configuration Details:
+- IBEX_CONFIG: maxperf-pmp-bmbalanced
+- Build Type: simple-system
+- Build Directory: /home/yongfu/proj/score/tools/ibex/build
+
+Files:
+- RTL Files: 179
+- Simulation Models: 3
+- Total Files: 183

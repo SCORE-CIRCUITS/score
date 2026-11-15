@@ -1,0 +1,14 @@
+design_name: neorv32_verilog_complete
+design_category: neorv32_verilog
+description: "Complete"
+generation_date: Sun Nov 15 08:45:54 AM +08 2026
+source_repository: neorv32-verilog
+vhdl_files: 2
+verilog_files: 2
+total_lines: 149938
+synthesis_ready: true
+conversion_method: "GHDL synthesis"
+target_frequency: "100MHz"
+architecture: "RISC-V"
+isa_extensions: "RV32I/M/A/C/B/U/Zicsr/Zifencei"
+conversion_tool: "GHDL synth"
