@@ -388,8 +388,12 @@ ASTRAL_DIR="$BUNDLE_DIR"
 prepare_dataset_workdir() {
     info "Staging Astral sources into dataset workdir: $ASTRAL_DIR"
     mkdir -p "$ASTRAL_DIR"
+    if [[ "$SKIP_CHECKOUT" != true ]] && [[ -d "$ASTRAL_DIR/.bender" ]]; then
+        rm -rf "$ASTRAL_DIR/.bender"
+    fi
     rsync -a --delete \
         --exclude '.git/' \
+        --exclude '.bender/' \
         "$SOURCE_ASTRAL_DIR/" "$ASTRAL_DIR/"
 }
 

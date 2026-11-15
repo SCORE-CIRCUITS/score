@@ -53,6 +53,9 @@ make -C "$TB_DIR" CLANGXX="$CXX" CONFIG="$CONFIG"
 
 log_info "Building CoreMark (ITERATIONS=$ITERATIONS MARCH=$COREMARK_MARCH)"
 MEMMAP_LD="$PROJECT_ROOT/benchmarks/core/hazard3_coremark/memmap.ld"
+if [[ ! -f "$MEMMAP_LD" ]]; then
+    MEMMAP_LD="$PROJECT_ROOT/tools/hazard3/test/sim/common/memmap.ld"
+fi
 HAZARD3_LFLAGS="-T $MEMMAP_LD -Wl,--noinhibit-exec -march=$COREMARK_MARCH"
 make -C "$COREMARK_DIR" clean
 make -C "$COREMARK_DIR" ITERATIONS="$ITERATIONS" CROSS_PREFIX="$CROSS_PREFIX" MARCH="$COREMARK_MARCH" \

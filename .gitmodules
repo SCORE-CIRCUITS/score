@@ -166,6 +166,10 @@
 [submodule "tools/veer-el2"]
 	path = tools/veer-el2
 	url = https://github.com/chipsalliance/Cores-VeeR-EL2.git
+
+[submodule "tools/ibex"]
+	path = tools/ibex
+	url = https://github.com/lowRISC/ibex.git
 [submodule "publications"]
 	path = publications
 	url = git@github.com:SJTU-YONGFU-RESEARCH-GRP/score_publications.git

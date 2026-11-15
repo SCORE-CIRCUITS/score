@@ -421,8 +421,12 @@ CVA6_DIR="$BUNDLE_DIR"
 prepare_dataset_workdir() {
     info "Staging CVA6 sources into dataset workdir: $CVA6_DIR"
     mkdir -p "$CVA6_DIR"
+    if [[ "$SKIP_CHECKOUT" != true ]] && [[ -d "$CVA6_DIR/.bender" ]]; then
+        rm -rf "$CVA6_DIR/.bender"
+    fi
     rsync -a --delete \
         --exclude '.git/' \
+        --exclude '.bender/' \
         "$SOURCE_CVA6_DIR/" "$CVA6_DIR/"
 }
 

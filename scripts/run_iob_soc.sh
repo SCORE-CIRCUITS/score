@@ -16,6 +16,8 @@ IOB_SUBMODULE="tools/iob-soc"
 INSTALL_SCRIPT="$SCRIPT_DIR/install_iob_soc.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate_iob_soc.sh"
 
+export PY2HWSW_ROOT="${PY2HWSW_ROOT:-$PROJECT_ROOT/tools/py2hwsw}"
+
 SKIP_SUBMODULE=false
 SKIP_INSTALL=false
 SKIP_GENERATE=false

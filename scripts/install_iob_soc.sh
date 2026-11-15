@@ -15,6 +15,7 @@ INSTALL_LOG="$LOG_DIR/install_iob_soc.log"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 # IOb-SoC specific paths
+export PY2HWSW_ROOT="${PY2HWSW_ROOT:-$PROJECT_ROOT/tools/py2hwsw}"
 IOB_SOC_DIR="$TOOLS_DIR/iob-soc"
 NIX_PROFILE_PATH="$HOME/.nix-profile"
 

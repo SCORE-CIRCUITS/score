@@ -9,8 +9,20 @@ PAPERS="$ROOT/papers"
 REF="$PAPERS/references"
 LOG="$PAPERS/pass0.log"
 
+mkdir -p "$PAPERS" "$REF"
 : > "$LOG"
-for pdf in "$REF"/*.pdf; do
+
+shopt -s nullglob
+pdfs=("$REF"/*.pdf)
+shopt -u nullglob
+
+if [[ ${#pdfs[@]} -eq 0 ]]; then
+  echo "No PDF references found in $REF, skipping pass0." | tee -a "$LOG"
+  echo "PASS0_COMPLETE" | tee -a "$LOG"
+  exit 0
+fi
+
+for pdf in "${pdfs[@]}"; do
   echo "=== $(basename "$pdf") ===" | tee -a "$LOG"
   bash "$SKILL/scripts/scaffold_paper.sh" "$pdf" "$PAPERS" >> "$LOG" 2>&1
   slug=$(basename "$pdf" .pdf | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')

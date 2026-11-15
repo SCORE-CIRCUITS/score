@@ -232,7 +232,7 @@ verify_bender_config() {
     local verification_dir="$2"
     local flog="$verification_dir/bender_spyglass_files_${cfg}.log"
     info "Bender Verilator file list (config=${cfg})..."
-    if ! make -C "$MEMPOOL_DIR/hardware" "config=${cfg}" spyglass/tmp/files >"$flog" 2>&1; then
+    if ! make -C "$MEMPOOL_DIR/hardware" MEMPOOL_DIR="$MEMPOOL_DIR" "config=${cfg}" spyglass/tmp/files >"$flog" 2>&1; then
         warning "config=${cfg}: make spyglass/tmp/files failed — see $flog"
         return 1
     fi
@@ -348,9 +348,9 @@ fi
 
 if [[ "$SKIP_CHECKOUT" != true ]]; then
     info "Running make bender (upstream: install/bender/)"
-    make -C "$MEMPOOL_DIR" bender
+    make -C "$MEMPOOL_DIR" MEMPOOL_DIR="$MEMPOOL_DIR" bender
     info "Running make update-deps (bender checkout)"
-    make -C "$MEMPOOL_DIR" update-deps
+    make -C "$MEMPOOL_DIR" MEMPOOL_DIR="$MEMPOOL_DIR" update-deps
 else
     warning "Skipped make bender / make update-deps (--skip-checkout)"
 fi

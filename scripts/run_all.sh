@@ -137,11 +137,11 @@ verilator_mode_supported() {
     local base="$1"
     case "$base" in
         # Verilator is default or available via project options.
-        run_ara.sh|run_araxl.sh|run_astral.sh|run_auteur.sh|run_carfield.sh|run_cheshire.sh|run_cheshire_ihp130_o.sh|run_chimera.sh|run_croc.sh|run_cva6.sh|run_gemmini.sh|run_hero.sh|run_ibex.sh|run_magia.sh|run_mempool.sh|run_occamy.sh|run_openpiton.sh|run_picobello.sh|run_pulp_cluster.sh|run_pulp_soc.sh|run_pulpissimo.sh|run_rocket_chip.sh|run_rv12.sh|run_rv_tracer.sh|run_safety_island.sh|run_snitch_cluster.sh|run_spatz.sh)
+        run_ara.sh|run_araxl.sh|run_astral.sh|run_auteur.sh|run_carfield.sh|run_cheshire.sh|run_cheshire_ihp130_o.sh|run_chimera.sh|run_croc.sh|run_cva6.sh|run_gemmini.sh|run_hero.sh|run_ibex.sh|run_iob_soc.sh|run_magia.sh|run_mempool.sh|run_occamy.sh|run_openpiton.sh|run_picobello.sh|run_pulp_cluster.sh|run_pulp_soc.sh|run_pulpissimo.sh|run_rocket_chip.sh|run_rv12.sh|run_rv_tracer.sh|run_safety_island.sh|run_snitch_cluster.sh|run_spatz.sh)
             return 0
             ;;
         # Known non-Verilator-focused flows.
-        run_iob_soc.sh|run_neorv32_vhdl.sh|run_neorv32_verilog.sh)
+        run_neorv32_vhdl.sh|run_neorv32_verilog.sh)
             return 1
             ;;
         *)

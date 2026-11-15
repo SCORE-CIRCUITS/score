@@ -421,8 +421,12 @@ CHESHIRE_DIR="$BUNDLE_DIR"
 prepare_dataset_workdir() {
     info "Staging Cheshire sources into dataset workdir: $CHESHIRE_DIR"
     mkdir -p "$CHESHIRE_DIR"
+    if [[ "$SKIP_CHECKOUT" != true ]] && [[ -d "$CHESHIRE_DIR/.bender" ]]; then
+        rm -rf "$CHESHIRE_DIR/.bender"
+    fi
     rsync -a --delete \
         --exclude '.git/' \
+        --exclude '.bender/' \
         "$SOURCE_CHESHIRE_DIR/" "$CHESHIRE_DIR/"
 }
 

@@ -650,21 +650,21 @@ fi
 
 # Check tools
 if command -v bender >/dev/null 2>&1; then
-    local bender_version=$(bender --version 2>/dev/null || echo "unknown")
+    bender_version=$(bender --version 2>/dev/null || echo "unknown")
     echo "✅ Bender: $bender_version"
 else
     echo "❌ Bender: Not found"
 fi
 
 if command -v verilator >/dev/null 2>&1; then
-    local verilator_version=$(verilator --version 2>/dev/null | head -1)
+    verilator_version=$(verilator --version 2>/dev/null | head -1)
     echo "✅ Verilator: $verilator_version"
 else
     echo "⚠️  Verilator: Not found (optional)"
 fi
 
 if command -v rustc >/dev/null 2>&1; then
-    local rust_version=$(rustc --version)
+    rust_version=$(rustc --version)
     echo "✅ Rust: $rust_version"
 else
     echo "❌ Rust: Not found (required for Bender)"

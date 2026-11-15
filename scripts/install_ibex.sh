@@ -540,17 +540,13 @@ setup_virtual_environment() {
     
     # Check if venv already exists
     if [ -d "venv" ]; then
-        print_warning "Virtual environment already exists at $VENV_DIR"
-        read -p "Do you want to recreate it? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            print_status "Removing existing virtual environment..."
-            rm -rf venv
-        else
+        if [[ "${FORCE_REINSTALL:-false}" != true ]]; then
             print_status "Using existing virtual environment"
             cd - > /dev/null
             return 0
         fi
+        print_status "Recreating virtual environment (--force)..."
+        rm -rf venv
     fi
     
     # Create virtual environment
@@ -871,12 +867,12 @@ install_verilator_from_github() {
     
     # Check if Verilator directory already exists
     if [ -d "$VERILATOR_DIR" ]; then
-        print_warning "Verilator directory already exists at $VERILATOR_DIR"
-        read -p "Do you want to recreate it? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            print_status "Removing existing Verilator directory..."
-            rm -rf "$VERILATOR_DIR"
+        if [[ "${FORCE_REINSTALL:-false}" != true ]]; then
+            print_status "Using existing Verilator directory"
+            return 0
+        fi
+        print_status "Removing existing Verilator directory..."
+        rm -rf "$VERILATOR_DIR"
             
             # If it was a submodule, remove it from git
             if git ls-files --error-unmatch "$VERILATOR_DIR" >/dev/null 2>&1; then
@@ -884,10 +880,6 @@ install_verilator_from_github() {
                 git rm -rf "$VERILATOR_DIR" 2>/dev/null || true
                 git commit -m "Remove existing Verilator directory" 2>/dev/null || true
             fi
-        else
-            print_status "Using existing Verilator directory"
-            return 0
-        fi
     fi
     
     # Create tools directory if it doesn't exist

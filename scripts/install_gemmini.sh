@@ -199,6 +199,14 @@ ensure_conda_for_chipyard() {
         return 0
     fi
 
+    if [[ -x "$CHIPYARD_DIR/.conda-env/bin/conda" ]]; then
+        info "Using existing Conda in Chipyard at $CHIPYARD_DIR/.conda-env"
+        export PATH="$CHIPYARD_DIR/.conda-env/bin:$PATH"
+        # shellcheck source=/dev/null
+        source "$CHIPYARD_DIR/.conda-env/etc/profile.d/conda.sh"
+        return 0
+    fi
+
     if [[ -x "$MINICONDA_ROOT/bin/conda" ]]; then
         info "Using existing Miniconda at $MINICONDA_ROOT"
         export PATH="$MINICONDA_ROOT/bin:$PATH"
@@ -512,8 +520,8 @@ detect_environment_status() {
     fi
 
     # Chipyard build-setup requires conda on PATH (or we install Miniconda under WORKSHOP_DIR)
-    if command_exists conda || [[ -x "$MINICONDA_ROOT/bin/conda" ]]; then
-        success "✅ Conda: $(command -v conda 2>/dev/null || echo "$MINICONDA_ROOT/bin/conda")"
+    if command_exists conda || [[ -x "$MINICONDA_ROOT/bin/conda" ]] || [[ -x "$CHIPYARD_DIR/.conda-env/bin/conda" ]]; then
+        success "✅ Conda: $(command -v conda 2>/dev/null || echo "${CHIPYARD_DIR}/.conda-env/bin/conda")"
     elif [[ "$chipyard_installed" != true && "$INSTALL_CHIPYARD" == "true" ]]; then
         info "📦 Conda: not on PATH yet (Miniconda will be installed under $MINICONDA_ROOT for Chipyard)"
     else
@@ -1222,7 +1230,9 @@ WORKSHOP_DIR="${SCORE_GEMMINI_WORKSHOP:-$SCRIPT_DIR/datasets/gemmini/workshop}"
 CHIPYARD_DIR="$WORKSHOP_DIR/chipyard"
 
 # Chipyard env expects `conda` on PATH (install_gemmini.sh may install Miniconda here).
-if [[ -x "$WORKSHOP_DIR/miniconda3/bin/conda" ]]; then
+if [[ -x "$WORKSHOP_DIR/chipyard/.conda-env/bin/conda" ]]; then
+    export PATH="$WORKSHOP_DIR/chipyard/.conda-env/bin:$PATH"
+elif [[ -x "$WORKSHOP_DIR/miniconda3/bin/conda" ]]; then
     export PATH="$WORKSHOP_DIR/miniconda3/bin:$PATH"
 fi
 
@@ -1247,6 +1257,7 @@ if [[ -d "$TOOLS_DIR/sbt/bin" ]]; then
 fi
 
 # Source Chipyard environment if available
+export RISCV="${RISCV:-}"
 if [[ -f "$CHIPYARD_DIR/env.sh" ]]; then
     echo "Loading Chipyard environment..."
     cd "$CHIPYARD_DIR"
@@ -1254,6 +1265,11 @@ if [[ -f "$CHIPYARD_DIR/env.sh" ]]; then
     # Spike / libgemmini expect RISCV; Chipyard installs collateral under CONDA_PREFIX/riscv-tools.
     if [[ -z "${RISCV:-}" && -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/riscv-tools/include" ]]; then
         export RISCV="${CONDA_PREFIX}/riscv-tools"
+    fi
+    # Prefer system Java 11 over conda JVM
+    if [[ -d "/usr/lib/jvm/java-11-openjdk" ]]; then
+        export JAVA_HOME="/usr/lib/jvm/java-11-openjdk"
+        export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
     fi
     cd "$SCRIPT_DIR"
 else
@@ -1267,7 +1283,7 @@ echo "=== Gemmini Environment Status ==="
 if [[ -d "$GEMMINI_DIR" && -f "$GEMMINI_DIR/build.sbt" ]]; then
     echo "✅ Gemmini: Available in $GEMMINI_DIR"
     if [[ -f "$GEMMINI_DIR/build.sbt" ]]; then
-        local gemmini_version=$(grep 'version := ' "$GEMMINI_DIR/build.sbt" | sed 's/.*"\(.*\)".*/\1/')
+        gemmini_version=$(grep 'version := ' "$GEMMINI_DIR/build.sbt" | sed 's/.*"\(.*\)".*/\1/')
         echo "  Version: $gemmini_version"
     fi
 else
@@ -1286,21 +1302,21 @@ fi
 
 # Check tools
 if command -v java >/dev/null 2>&1; then
-    local java_version=$(java -version 2>&1 | head -1)
+    java_version=$(java -version 2>&1 | head -1)
     echo "✅ Java: $java_version"
 else
     echo "❌ Java: Not found"
 fi
 
 if command -v sbt >/dev/null 2>&1; then
-    local sbt_version=$(sbt --version 2>/dev/null | grep "sbt version" | awk '{print $4}' || echo "unknown")
+    sbt_version=$(/usr/local/bin/sbt --version 2>/dev/null | grep "sbt version" | awk '{print $4}' || echo "installed")
     echo "✅ SBT: $sbt_version"
 else
     echo "❌ SBT: Not found"
 fi
 
 if command -v verilator >/dev/null 2>&1; then
-    local verilator_version=$(verilator --version 2>/dev/null | head -1)
+    verilator_version=$(verilator --version 2>/dev/null | head -1)
     echo "✅ Verilator: $verilator_version"
 else
     echo "⚠️  Verilator: Not found (optional)"

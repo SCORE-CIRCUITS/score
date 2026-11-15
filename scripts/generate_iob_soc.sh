@@ -16,6 +16,7 @@ get_commit_id() {
     git -C "$repo_path" rev-parse HEAD 2>/dev/null | cut -c1-8 || echo "unknown"
 }
 
+export PY2HWSW_ROOT="${PY2HWSW_ROOT:-$PROJECT_ROOT/tools/py2hwsw}"
 IOB_SOC_ROOT="$PROJECT_ROOT/tools/iob-soc"
 COMMIT_ID=$(get_commit_id "$IOB_SOC_ROOT")
 DATASET_DIR="$PROJECT_ROOT/datasets/iob-soc/$COMMIT_ID"
@@ -33,7 +34,7 @@ USE_INTMEM_LIST=(1 0)
 USE_EXTMEM_LIST=(1 0)
 INIT_MEM_LIST=(1 0)
 BOARDS=(iob_cyclonev_gt_dk iob_aes_ku040_db_g iob_zybo_z7)
-SIMULATORS=(icarus verilator)
+SIMULATORS=(${SIMULATORS:-verilator})
 
 # Setup local environment if available
 if [[ -f "$PROJECT_ROOT/scripts/setup_local_env.sh" ]]; then
@@ -88,14 +89,16 @@ DO_SIM=false
 DO_FPGA=false
 DO_DOC=false
 FPGA_EXPLICIT=false
+DOC_EXPLICIT=false
 if [[ $# -eq 0 ]]; then DO_SIM=true; DO_FPGA=true; DO_DOC=true; fi
 for arg in "$@"; do
   case $arg in
     --help) show_help; exit 0;;
     --sim) DO_SIM=true;;
     --fpga) DO_FPGA=true; FPGA_EXPLICIT=true;;
-    --doc) DO_DOC=true;;
+    --doc) DO_DOC=true; DOC_EXPLICIT=true;;
     --all) DO_SIM=true; DO_FPGA=true; DO_DOC=true;;
+    --simulator=*) SIMULATORS=("${arg#*=}");;
     *) error "Unknown option: $arg"; show_help; exit 1;;
   esac
 done
@@ -111,9 +114,24 @@ if [[ "$DO_FPGA" == true ]] && ! command -v nios2_command_shell.sh >/dev/null 2>
   DO_FPGA=false
 fi
 
+# IOb-SoC doc-build invokes LibreOffice (soffice) to convert figures; without it, builds fail.
+if [[ "$DO_DOC" == true ]] && ! command -v soffice >/dev/null 2>&1; then
+  if [[ "$DOC_EXPLICIT" == true ]]; then
+    warning "LibreOffice not detected (soffice not in PATH). Skipping documentation builds."
+  else
+    info "Skipping documentation (LibreOffice soffice not in PATH). Simulation still runs."
+  fi
+  DO_DOC=false
+fi
+
 if ! $DO_SIM && ! $DO_FPGA && ! $DO_DOC; then
   error "No build steps left (e.g. --fpga only needs Quartus on PATH). Try --sim, --doc, or --all."
   exit 1
+fi
+
+# In simulation-only mode, board target does not alter simulation RTL. Use primary board.
+if [[ "$DO_FPGA" != true ]]; then
+  BOARDS=(iob_cyclonev_gt_dk)
 fi
 
 # Main loop
@@ -122,6 +140,9 @@ successes=0
 failures=0
 for USE_INTMEM in "${USE_INTMEM_LIST[@]}"; do
   for USE_EXTMEM in "${USE_EXTMEM_LIST[@]}"; do
+    if [[ "$USE_INTMEM" -eq 0 && "$USE_EXTMEM" -eq 0 ]]; then
+      continue
+    fi
     for INIT_MEM in "${INIT_MEM_LIST[@]}"; do
       for BOARD in "${BOARDS[@]}"; do
         for SIM in "${SIMULATORS[@]}"; do

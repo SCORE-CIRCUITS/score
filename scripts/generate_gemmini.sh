@@ -102,6 +102,7 @@ debug() {
 
 ensure_conda_for_chipyard() {
     local conda_root="$GEMMINI_WORKSHOP/miniconda3"
+    local cy_conda="$GEMMINI_WORKSHOP/chipyard/.conda-env"
     if command -v conda >/dev/null 2>&1; then
         local conda_base
         conda_base=$(conda info --base 2>/dev/null) || true
@@ -109,6 +110,12 @@ ensure_conda_for_chipyard() {
             # shellcheck source=/dev/null
             source "$conda_base/etc/profile.d/conda.sh"
         fi
+        return 0
+    fi
+    if [[ -x "$cy_conda/bin/conda" && -f "$cy_conda/etc/profile.d/conda.sh" ]]; then
+        export PATH="$cy_conda/bin:$PATH"
+        # shellcheck source=/dev/null
+        source "$cy_conda/etc/profile.d/conda.sh"
         return 0
     fi
     if [[ -x "$conda_root/bin/conda" && -f "$conda_root/etc/profile.d/conda.sh" ]]; then
@@ -244,18 +251,18 @@ check_prerequisites() {
     local prereq_failed=0
     
     # Check essential tools
-    check_command "java" "Java runtime" || ((prereq_failed++))
-    check_command "sbt" "Scala Build Tool" || ((prereq_failed++))
-    check_command "make" "Make build tool" || ((prereq_failed++))
-    check_command "gcc" "GCC compiler" || ((prereq_failed++))
-    check_command "git" "Git version control" || ((prereq_failed++))
+    check_command "java" "Java runtime" || prereq_failed=$((prereq_failed + 1))
+    check_command "sbt" "Scala Build Tool" || prereq_failed=$((prereq_failed + 1))
+    check_command "make" "Make build tool" || prereq_failed=$((prereq_failed + 1))
+    check_command "gcc" "GCC compiler" || prereq_failed=$((prereq_failed + 1))
+    check_command "git" "Git version control" || prereq_failed=$((prereq_failed + 1))
     
     # Check for RISC-V toolchain
     if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
         success "RISC-V toolchain found: $(which riscv64-unknown-elf-gcc)"
     else
         warning "RISC-V toolchain not found - will be installed during setup"
-        ((prereq_failed++))
+        prereq_failed=$((prereq_failed + 1))
     fi
     
     # Check for Chipyard environment
@@ -269,7 +276,7 @@ check_prerequisites() {
     log "Checking simulator environment for: $SIMULATOR"
     if ! check_simulator_env "$SIMULATOR"; then
         error "Simulator $SIMULATOR not properly configured"
-        ((prereq_failed++))
+        prereq_failed=$((prereq_failed + 1))
     fi
     
     return $prereq_failed
@@ -1676,21 +1683,21 @@ main() {
         
         # Count successes and failures by type
         for job in "${COMPLETED_JOBS[@]}"; do
-            [[ "$job" == *"default"* ]] && ((default_success++))
-            [[ "$job" == *"fp32"* ]] && ((fp32_success++))
-            [[ "$job" == *"fp16"* ]] && ((fp16_success++))
-            [[ "$job" == *"bf16"* ]] && ((bf16_success++))
-            [[ "$job" == *"dse"* ]] && ((dse_success++))
-            [[ "$job" == *"custom"* ]] && ((custom_success++))
+            [[ "$job" == *"default"* ]] && default_success=$((default_success + 1))
+            [[ "$job" == *"fp32"* ]] && fp32_success=$((fp32_success + 1))
+            [[ "$job" == *"fp16"* ]] && fp16_success=$((fp16_success + 1))
+            [[ "$job" == *"bf16"* ]] && bf16_success=$((bf16_success + 1))
+            [[ "$job" == *"dse"* ]] && dse_success=$((dse_success + 1))
+            [[ "$job" == *"custom"* ]] && custom_success=$((custom_success + 1))
         done
         
         for job in "${FAILED_JOBS[@]}"; do
-            [[ "$job" == *"default"* ]] && ((default_failed++))
-            [[ "$job" == *"fp32"* ]] && ((fp32_failed++))
-            [[ "$job" == *"fp16"* ]] && ((fp16_failed++))
-            [[ "$job" == *"bf16"* ]] && ((bf16_failed++))
-            [[ "$job" == *"dse"* ]] && ((dse_failed++))
-            [[ "$job" == *"custom"* ]] && ((custom_failed++))
+            [[ "$job" == *"default"* ]] && default_failed=$((default_failed + 1))
+            [[ "$job" == *"fp32"* ]] && fp32_failed=$((fp32_failed + 1))
+            [[ "$job" == *"fp16"* ]] && fp16_failed=$((fp16_failed + 1))
+            [[ "$job" == *"bf16"* ]] && bf16_failed=$((bf16_failed + 1))
+            [[ "$job" == *"dse"* ]] && dse_failed=$((dse_failed + 1))
+            [[ "$job" == *"custom"* ]] && custom_failed=$((custom_failed + 1))
         done
         
     else
