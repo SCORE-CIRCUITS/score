@@ -47,7 +47,7 @@ SCORE exists to **lower that friction**: treat RTL generation as a **documented,
 
 SCORE collects **versioned RTL snapshots** under `datasets/<architecture>/<commit>/` so EDA experiments can pin the same upstream revision and directory layout. Each supported architecture has shell automation in `scripts/`:
 
-| Phase | Role |
+| Stage | Role |
 |--------|------|
 | `install_*.sh` | Prepare toolchains, dependencies, or environment (often sources `*_env.sh` helpers). |
 | `generate_*.sh` | Build or export RTL into the dataset tree and write logs alongside the snapshot. |
@@ -69,9 +69,9 @@ Survey manuscript and evidence corpus live in the private [`score_publications`]
 
 Each row lists the **upstream GitHub repository** and the **script basename** (full path: `scripts/<name>.sh`). Dataset output generally lives under `datasets/<folder>/` with a short Git commit directory; exact layout is defined per `generate_*.sh`.
 
-Architectures are grouped by **benchmark phase** — each phase validates and benchmarks a different class of circuits using real RTL simulation (zero fake data or hardcoding), producing `score.benchmark_results.v1` JSON files under `datasets/<arch>/<commit>/benchmarks/`.
+Architectures are grouped by **benchmark category** — each category validates and benchmarks a different class of circuits using real RTL simulation (zero fake data or hardcoding), producing `score.benchmark_results.v1` JSON files under `datasets/<arch>/<commit>/benchmarks/`.
 
-### Phase 1 — MCU / Scalar Cores
+### Category 1 — MCU / Scalar Cores
 
 Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`benchmarks/core/suite.json`](benchmarks/core/suite.json)
 
@@ -87,11 +87,11 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 | **SERV** | [olofk/serv](https://github.com/olofk/serv) | `install_serv.sh` | `generate_serv.sh` | — | coremark ✅ |
 | **VeeR EL2** | [chipsalliance/Cores-VeeR-EL2](https://github.com/chipsalliance/Cores-VeeR-EL2) | `install_veer_el2.sh` | `generate_veer_el2.sh` | — | coremark, dhrystone ✅ |
 | **VexRiscv** | [SpinalHDL/VexRiscv](https://github.com/SpinalHDL/VexRiscv) | `install_vexriscv.sh` | `generate_vexriscv.sh` | — | coremark, dhrystone ✅ |
-| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | Core (Ibex opentitan) ✅ / SoC *(Phase 4)* |
+| **OpenTitan** | [lowRISC/opentitan](https://github.com/lowRISC/opentitan) | `install_opentitan.sh` | `generate_opentitan.sh` | — | Core (Ibex opentitan) ✅ / SoC *(Category 4)* |
 | **RISC-V VHDL** | [sergeykhbr/riscv_vhdl](https://github.com/sergeykhbr/riscv_vhdl) | `install_riscv_vhdl.sh` | `generate_riscv_vhdl.sh` | — | — *(submodule placeholder)* |
 | **RV12** | [RoaLogic/RV12](https://github.com/RoaLogic/RV12) | `install_rv12.sh` | `generate_rv12.sh` | `run_rv12.sh` | Verilator lint-only ✅ *(TB requires commercial EDA)* |
 
-### Phase 2 — 64-bit Application Cores
+### Category 2 — 64-bit Application Cores
 
 Workloads: **CoreMark**, **Dhrystone**, **memcpy**, **pmp**, **riscv-tests** (median, mm, multiply, qsort, rsort, spmv, towers, vvadd) · Profile: `app_verilator` · Suite: [`benchmarks/app/suite.json`](benchmarks/app/suite.json)
 
@@ -100,7 +100,7 @@ Workloads: **CoreMark**, **Dhrystone**, **memcpy**, **pmp**, **riscv-tests** (me
 | **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
 | **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
 
-### Phase 3 — Vector & Coprocessor Engines
+### Category 3 — Vector & Coprocessor Engines
 
 Workloads: **fmatmul**, **fconv2d**, **fconv3d**, **fdotproduct**, **fft**, **imatmul**, **roi_align**, **softmax** (Ara/Spatz); **matmul_ws**, **conv_2d**, **mvin_mvout**, **resadd**, **tiled_matmul** (Gemmini) · Profile: `vector_verilator` · Suite: [`benchmarks/vector/suite.json`](benchmarks/vector/suite.json)
 
@@ -110,7 +110,7 @@ Workloads: **fmatmul**, **fconv2d**, **fconv3d**, **fdotproduct**, **fft**, **im
 | **Gemmini** | [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini) | `install_gemmini.sh` | `generate_gemmini.sh` | `run_gemmini.sh` | 6 systolic workloads ✅ |
 | **Spatz** | [pulp-platform/spatz](https://github.com/pulp-platform/spatz) | `install_spatz.sh` | `generate_spatz.sh` | `run_spatz.sh` | 6 vector kernels ✅ |
 
-### Phase 4 — Full SoC Platforms & Multi-Core Clusters
+### Category 4 — Full SoC Platforms & Multi-Core Clusters
 
 Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kernels** (conv2d, dotp, dct, axpy, fibonacci, fir, keccak, bubblesort), **Peripheral Subsystems** (CLINT, OBI timer, GPIO, UART, interrupt controller) · Profile: `soc_verilator` · Suite: [`benchmarks/soc/suite.json`](benchmarks/soc/suite.json) · Aggregated: [`benchmarks/soc/aggregated_results.json`](benchmarks/soc/aggregated_results.json)
 
