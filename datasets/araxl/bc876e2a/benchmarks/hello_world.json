@@ -1,0 +1,37 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "araxl",
+  "upstream_commit": "bc876e2a",
+  "profile": "soc_vector_verilator",
+  "workload": "hello_world",
+  "config": "cva6_2clusters_8lanes_vlen4096",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gcv",
+    "configuration": "cva6_2clusters_8lanes_vlen4096",
+    "clock_frequency_hz": 500000000,
+    "num_clusters": 2,
+    "nr_lanes_per_cluster": 4,
+    "total_lanes": 8,
+    "vlen": 4096,
+    "wall_time_s": 1.148,
+    "exit_code": 0,
+    "execution_cycles": 1216,
+    "total_simulation_cycles": 1216,
+    "simulation_speed_khz": 1.05923,
+    "description": "CVA6 + AraXL dual cluster vector hello world sanity test",
+    "stdout_verified": true
+  },
+  "generated_utc": "2026-11-15T22:24:51+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "11.5.0"
+  }
+}

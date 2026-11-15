@@ -1,0 +1,37 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "snitch_cluster",
+  "upstream_commit": "1defbef7",
+  "profile": "soc_verilator",
+  "workload": "simple",
+  "config": "snitch_cluster_8cores_1dma",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imafd_xfrep_xssr_xdma",
+    "configuration": "snitch_cluster_8cores_1dma",
+    "clock_frequency_hz": 500000000,
+    "cores": 9,
+    "compute_cores": 8,
+    "dma_cores": 1,
+    "wall_time_s": 5.98,
+    "exit_code": 0,
+    "simulation_cycles": 2596,
+    "total_simulation_cycles": 2596,
+    "simulation_speed_khz": 0.43,
+    "description": "Sanity test of Snitch core and cluster boot"
+  },
+  "generated_utc": "2026-11-16T05:40:00+00:00",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "llvm_snitch": "15.0.0",
+    "gcc": "11.5.0"
+  }
+}
+

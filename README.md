@@ -120,7 +120,7 @@ Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kerne
 | **CROC** | [pulp-platform/croc](https://github.com/pulp-platform/croc) | `install_croc.sh` | `generate_croc.sh` | `run_croc.sh` | 9 workloads (compute, idma, soc_ctrl, obi_timer, clint, gpio, uart, interrupts, helloworld) ✅ |
 | **MemPool** | [pulp-platform/mempool](https://github.com/pulp-platform/mempool) | `install_mempool.sh` | `generate_mempool.sh` | `run_mempool.sh` | 5 parallel workloads on 16 Snitch cores (conv2d_i32, dotp_i32, dct_i32, axpy_i32, hello_world) ✅ |
 | **PULPissimo** | [pulp-platform/pulpissimo](https://github.com/pulp-platform/pulpissimo) | `install_pulpissimo.sh` | `generate_pulpissimo.sh` | `run_pulpissimo.sh` | 5 workloads on CV32E40P (conv2d, fibonacci, fir, keccak, bubblesort) ✅ |
-| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl.sh` | — |
+| **AraXL** | [pulp-platform/AraXL](https://github.com/pulp-platform/AraXL) | `install_araxl.sh` | `generate_araxl.sh` | `run_araxl_benchmarks.sh` | hello_world, fmatmul (CVA6 + dual Ara cluster, 8 lanes, VLEN=4096, verified on Verilator) ✅ |
 | **Astral** | [pulp-platform/astral](https://github.com/pulp-platform/astral) | `install_astral.sh` | `generate_astral.sh` | `run_astral.sh` | — |
 | **Auteur** | [pulp-platform/auteur](https://github.com/pulp-platform/auteur) | `install_auteur.sh` | `generate_auteur.sh` | `run_auteur.sh` | — |
 | **BlackParrot** | [black-parrot/black-parrot](https://github.com/black-parrot/black-parrot) | `install_black_parrot.sh` | `generate_black_parrot.sh` | — | — |
@@ -136,7 +136,7 @@ Workloads: **Baremetal Compute**, **DMA Transfers**, **Multi-Core Parallel Kerne
 | **PULP cluster** | [pulp-platform/pulp_cluster](https://github.com/pulp-platform/pulp_cluster) | `install_pulp_cluster.sh` | `generate_pulp_cluster.sh` | `run_pulp_cluster.sh` | — |
 | **PULP SoC** | [pulp-platform/pulp_soc](https://github.com/pulp-platform/pulp_soc) | `install_pulp_soc.sh` | `generate_pulp_soc.sh` | `run_pulp_soc.sh` | — |
 | **Safety Island** | [pulp-platform/safety_island](https://github.com/pulp-platform/safety_island) | `install_safety_island.sh` | `generate_safety_island.sh` | `run_safety_island.sh` | — |
-| **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster.sh` | — |
+| **Snitch cluster** | [pulp-platform/snitch_cluster](https://github.com/pulp-platform/snitch_cluster) | `install_snitch_cluster.sh` | `generate_snitch_cluster.sh` | `run_snitch_cluster_benchmarks.sh` | simple, barrier, matmul_i32 (9 cores: 8 compute + 1 DMA, 108.3k sim cyc, verified on Verilator) ✅ |
 | **rv_tracer** | [pulp-platform/rv_tracer](https://github.com/pulp-platform/rv_tracer) | `install_rv_tracer.sh` | `generate_rv_tracer.sh` | `run_rv_tracer.sh` | — |
 | **SoC Automation** | [habibagamal/SoC\_Automation](https://github.com/habibagamal/SoC_Automation) | `install_soc_automation.sh` | `generate_soc_automation.sh` | — | — |
 

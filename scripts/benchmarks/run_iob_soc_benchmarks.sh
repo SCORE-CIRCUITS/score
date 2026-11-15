@@ -92,3 +92,4 @@ EOF
 echo "=== Running collector ==="
 python3 "$SCORE_ROOT/scripts/benchmarks/collect_soc_benchmark_results.py"
 echo "=== Done ==="
+

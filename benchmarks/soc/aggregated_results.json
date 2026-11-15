@@ -1,9 +1,88 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-15T19:06:21+00:00",
-  "count": 39,
+  "generated_utc": "2026-11-15T22:28:23+00:00",
+  "count": 44,
   "results": [
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "fmatmul",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 26.155,
+        "exit_code": 0,
+        "execution_cycles": 24897,
+        "total_simulation_cycles": 24897,
+        "simulation_speed_khz": 0.951902,
+        "kernel_execution_cycles": 3319,
+        "performance_ops_per_cycle": 2.468213,
+        "vector_utilization_pct": 15.426333,
+        "description": "Double precision floating-point matrix multiplication across 2 vector clusters (8 lanes)",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T22:28:04+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/fmatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "hello_world",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 1.148,
+        "exit_code": 0,
+        "execution_cycles": 1216,
+        "total_simulation_cycles": 1216,
+        "simulation_speed_khz": 1.05923,
+        "description": "CVA6 + AraXL dual cluster vector hello world sanity test",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T22:24:51+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/hello_world.json"
+    },
     {
       "schema": "score.benchmark_results.v1",
       "evidence_class": "score_measured",
@@ -1372,6 +1451,123 @@
         "gcc": "10.2.0"
       },
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/keccak.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "snitch_cluster",
+      "upstream_commit": "1defbef7",
+      "profile": "soc_verilator",
+      "workload": "barrier",
+      "config": "snitch_cluster_8cores_1dma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imafd_xfrep_xssr_xdma",
+        "configuration": "snitch_cluster_8cores_1dma",
+        "clock_frequency_hz": 500000000,
+        "cores": 9,
+        "compute_cores": 8,
+        "dma_cores": 1,
+        "wall_time_s": 6.81,
+        "exit_code": 0,
+        "simulation_cycles": 2825,
+        "total_simulation_cycles": 2825,
+        "simulation_speed_khz": 0.41,
+        "barrier_type": "cluster_hardware_barrier",
+        "participating_cores": 8
+      },
+      "generated_utc": "2026-11-16T05:41:00+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "llvm_snitch": "15.0.0",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/snitch_cluster/1defbef7/benchmarks/barrier.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "snitch_cluster",
+      "upstream_commit": "1defbef7",
+      "profile": "soc_verilator",
+      "workload": "matmul_i32",
+      "config": "snitch_cluster_8cores_1dma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imafd_xfrep_xssr_xdma",
+        "configuration": "snitch_cluster_8cores_1dma",
+        "clock_frequency_hz": 500000000,
+        "cores": 9,
+        "compute_cores": 8,
+        "dma_cores": 1,
+        "wall_time_s": 329.47,
+        "user_time_s": 325.2,
+        "max_rss_kb": 23808,
+        "exit_code": 0,
+        "simulation_cycles": 108322,
+        "total_simulation_cycles": 108322,
+        "kernel_execution_cycles": 37838,
+        "simulation_speed_khz": 0.33,
+        "matrix_size": "32x32",
+        "data_type": "int32",
+        "result": "OK"
+      },
+      "generated_utc": "2026-11-16T05:57:15+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "llvm_snitch": "15.0.0",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/snitch_cluster/1defbef7/benchmarks/matmul_i32.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "snitch_cluster",
+      "upstream_commit": "1defbef7",
+      "profile": "soc_verilator",
+      "workload": "simple",
+      "config": "snitch_cluster_8cores_1dma",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imafd_xfrep_xssr_xdma",
+        "configuration": "snitch_cluster_8cores_1dma",
+        "clock_frequency_hz": 500000000,
+        "cores": 9,
+        "compute_cores": 8,
+        "dma_cores": 1,
+        "wall_time_s": 5.98,
+        "exit_code": 0,
+        "simulation_cycles": 2596,
+        "total_simulation_cycles": 2596,
+        "simulation_speed_khz": 0.43,
+        "description": "Sanity test of Snitch core and cluster boot"
+      },
+      "generated_utc": "2026-11-16T05:40:00+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "llvm_snitch": "15.0.0",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/snitch_cluster/1defbef7/benchmarks/simple.json"
     }
   ]
 }

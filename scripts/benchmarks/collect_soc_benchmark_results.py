@@ -19,6 +19,7 @@ SOC_PLATFORMS = {
     "openpiton",
     "snitch-cluster",
     "snitch_cluster",
+    "araxl",
     "iob-soc",
     "iob_soc",
     "carfield",
