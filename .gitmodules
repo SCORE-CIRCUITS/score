@@ -1,12 +1,15 @@
 [submodule "tools/rocket-chip"]
 	path = tools/rocket-chip
-	url = git@github.com:chipsalliance/rocket-chip.git
+	url = https://github.com/SCORE-CIRCUITS/rocket-chip.git
+	branch = score-v1.0
 [submodule "tools/openpiton"]
 	path = tools/openpiton
-	url = git@github.com:PrincetonUniversity/openpiton.git
+	url = https://github.com/SCORE-CIRCUITS/openpiton.git
+	branch = score-v1.0
 [submodule "tools/gemmini"]
 	path = tools/gemmini
-	url = git@github.com:ucb-bar/gemmini.git
+	url = https://github.com/SCORE-CIRCUITS/gemmini.git
+	branch = score-v1.0
 [submodule "tools/SoC_Automation"]
 	path = tools/SoC_Automation
 	url = git@github.com:habibagamal/SoC_Automation.git
@@ -15,13 +18,15 @@
 	url = git@github.com:sergeykhbr/riscv_vhdl.git
 [submodule "tools/hero"]
 	path = tools/hero
-	url = git@github.com:pulp-platform/hero.git
+	url = https://github.com/SCORE-CIRCUITS/hero.git
+	branch = score-v1.0
 [submodule "tools/iob-soc"]
 	path = tools/iob-soc
 	url = git@github.com:IObundle/iob-soc.git
 [submodule "tools/neorv32"]
 	path = tools/neorv32
-	url = git@github.com:stnolting/neorv32.git
+	url = https://github.com/SCORE-CIRCUITS/neorv32.git
+	branch = score-v1.0
 [submodule "tools/mflowgen"]
 	path = tools/mflowgen
 	url = git@github.com:mflowgen/mflowgen.git
@@ -69,13 +74,15 @@
 	url = https://github.com/pulp-platform/rv_tracer.git
 [submodule "tools/ara"]
 	path = tools/ara
-	url = https://github.com/pulp-platform/ara.git
+	url = https://github.com/SCORE-CIRCUITS/ara.git
+	branch = score-v1.0
 [submodule "tools/mempool"]
 	path = tools/mempool
 	url = https://github.com/pulp-platform/mempool.git
 [submodule "tools/spatz"]
 	path = tools/spatz
-	url = https://github.com/pulp-platform/spatz.git
+	url = https://github.com/SCORE-CIRCUITS/spatz.git
+	branch = score-v1.0
 [submodule "tools/snitch-cluster"]
 	path = tools/snitch-cluster
 	url = https://github.com/pulp-platform/snitch_cluster.git
@@ -90,7 +97,8 @@
 	url = https://github.com/pulp-platform/cheshire.git
 [submodule "tools/cva6"]
 	path = tools/cva6
-	url = https://github.com/pulp-platform/cva6.git
+	url = https://github.com/SCORE-CIRCUITS/cva6.git
+	branch = score-v1.0
 [submodule "tools/carfield"]
 	path = tools/carfield
 	url = https://github.com/pulp-platform/carfield.git
@@ -137,11 +145,13 @@
 
 [submodule "tools/darkriscv"]
 	path = tools/darkriscv
-	url = https://github.com/darklife/darkriscv.git
+	url = https://github.com/SCORE-CIRCUITS/darkriscv.git
+	branch = score-v1.0
 
 [submodule "tools/serv"]
 	path = tools/serv
-	url = https://github.com/olofk/serv.git
+	url = https://github.com/SCORE-CIRCUITS/serv.git
+	branch = score-v1.0
 
 [submodule "tools/hazard3"]
 	path = tools/hazard3
@@ -149,7 +159,8 @@
 
 [submodule "tools/scr1"]
 	path = tools/scr1
-	url = https://github.com/syntacore/scr1.git
+	url = https://github.com/SCORE-CIRCUITS/scr1.git
+	branch = score-v1.0
 
 [submodule "tools/vexriscv"]
 	path = tools/vexriscv
@@ -165,11 +176,13 @@
 
 [submodule "tools/veer-el2"]
 	path = tools/veer-el2
-	url = https://github.com/chipsalliance/Cores-VeeR-EL2.git
+	url = https://github.com/SCORE-CIRCUITS/Cores-VeeR-EL2.git
+	branch = score-v1.0
 
 [submodule "tools/ibex"]
 	path = tools/ibex
-	url = https://github.com/lowRISC/ibex.git
+	url = https://github.com/SCORE-CIRCUITS/ibex.git
+	branch = score-v1.0
 [submodule "publications"]
 	path = publications
 	url = git@github.com:SJTU-YONGFU-RESEARCH-GRP/score_publications.git
