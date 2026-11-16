@@ -1,0 +1,129 @@
+// Copyright © 2019-2023
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include "types.h"
+#include "constants.h"
+#include "cache.h"
+#include "mem/tlb_types.h"
+#ifdef VX_CFG_EXT_DXA_ENABLE
+#include "dxa_core.h"
+#endif
+#ifdef VX_CFG_EXT_TEX_ENABLE
+#include "tex_core.h"
+#endif
+#ifdef VX_CFG_EXT_RTU_ENABLE
+#include "rtu_core.h"
+#endif
+
+namespace vortex {
+
+class Cluster;
+class Core;
+
+class Socket : public SimObject<Socket> {
+public:
+  struct PerfStats {
+    Cache::PerfStats icache;
+    Cache::PerfStats dcache;
+#ifdef VX_CFG_EXT_DXA_ENABLE
+    DxaCore::PerfStats dxa;
+#endif
+#ifdef VX_CFG_EXT_TEX_ENABLE
+    TexCore::PerfStats tex;
+    Cache::PerfStats   tcache;
+#endif
+#ifdef VX_CFG_EXT_RTU_ENABLE
+    RtuCore::PerfStats rtu;
+    Cache::PerfStats   rtcache;
+#endif
+  };
+
+  std::vector<SimChannel<MemReq>> mem_req_out;
+  std::vector<SimChannel<MemRsp>> mem_rsp_in;
+
+  Socket(const SimContext& ctx,
+         const char* name,
+         uint32_t socket_id,
+         Cluster* cluster,
+         uint32_t unit_tlb_client = 0);
+
+  ~Socket();
+
+  uint32_t id() const { return socket_id_; }
+
+  // The unit MMU's client index at the cluster TLB.
+  uint32_t unit_tlb_client() const { return unit_tlb_client_; }
+
+  Cluster* cluster() const { return cluster_; }
+
+  bool running() const;
+
+  int get_exitcode() const;
+
+  PerfStats perf_stats() const;
+
+  int dcr_write(uint32_t addr, uint32_t value);
+
+  int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
+
+  std::shared_ptr<Core>& core(uint32_t idx);
+
+  // Forwarded cache flush (write-back eviction walk). The walk is a no-op
+  // on write-through caches (`Cache::flush_begin` early-exits); forwarding
+  // ensures a future write-back config exercises the same code path.
+  void dcache_flush_begin(bool l1_only);
+  bool dcache_flush_done() const;
+  void icache_flush_begin();
+  bool icache_flush_done() const;
+#ifdef VX_CFG_EXT_TEX_ENABLE
+  void tcache_flush_begin();
+  bool tcache_flush_done() const;
+#endif
+#ifdef VX_CFG_EXT_RTU_ENABLE
+  void rtcache_flush_begin();
+  bool rtcache_flush_done() const;
+#endif
+
+#ifdef VX_CFG_EXT_DXA_ENABLE
+  DxaCore::Ptr& dxa_core();
+#endif
+
+#ifdef VX_CFG_EXT_RTU_ENABLE
+  RtuCore::Ptr& rtu_core();
+#endif
+
+#ifdef SIMX_SOCKET_UNIT_MMU
+  // Unit MMU: its miss/fill link to the cluster TLB, and the device satp
+  // (Cluster::set_mmu_satp), which flushes its TLB on an actual change.
+  SimChannel<TlbReq>& tlb_miss_out();
+  SimChannel<TlbRsp>& tlb_fill_in();
+  void set_satp(uint64_t satp);
+#endif
+
+protected:
+  void on_reset();
+
+private:
+  uint32_t socket_id_;
+  Cluster* cluster_;
+  uint32_t unit_tlb_client_;
+
+  class Impl;
+  Impl* impl_;
+
+  friend class SimObject<Socket>;
+};
+
+} // namespace vortex

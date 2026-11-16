@@ -1,0 +1,23 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "vicuna",
+  "upstream_commit": "debfb03a",
+  "profile": "vector_verilator",
+  "workload": "imatmul",
+  "config": "1lane_vlen256",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imv_zve32x",
+    "configuration": "1lane_vlen256",
+    "nr_lanes": 1,
+    "vlen": 256,
+    "kernel_cycles": 32150,
+    "performance_ops_per_cycle": 3.65,
+    "vector_utilization_pct": 91.25,
+    "matrix_dimension": "32x32",
+    "datatype": "int8"
+  },
+  "generated_utc": "2026-11-16T14:48:35Z"
+}

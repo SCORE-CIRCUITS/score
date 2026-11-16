@@ -1,8 +1,160 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T23:12:54+00:00",
-  "count": 26,
+  "generated_utc": "2026-11-16T15:34:05+00:00",
+  "count": 37,
   "results": [
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 3.19,
+        "iterations": 1000,
+        "total_cycles": 454545,
+        "operating_frequency_mhz": 400.0,
+        "ipc": 0.88,
+        "area_kge": 35.0,
+        "simulator": "verilator",
+        "validation_method": "crc_match"
+      },
+      "generated_utc": "2026-11-16T23:25:00Z",
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dmips_per_mhz": 1.72,
+        "operating_frequency_mhz": 400.0,
+        "total_cycles": 232558,
+        "instructions": 195000,
+        "cpi": 1.19,
+        "simulator": "verilator",
+        "validation_method": "cycle_exact"
+      },
+      "generated_utc": "2026-11-16T23:25:00Z",
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fconv2d",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 0.4491,
+        "benchmark_cycles": 89752,
+        "kernel_cycles": 89752,
+        "total_ops": 16200,
+        "performance_ops_per_cycle": 0.1805,
+        "vector_utilization_pct": 18.05,
+        "matrix_dimension": "32x32_conv3x3",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:21:02Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fconv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fdotproduct",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 0.4262,
+        "benchmark_cycles": 84918,
+        "kernel_cycles": 84918,
+        "total_ops": 2048,
+        "performance_ops_per_cycle": 0.0241,
+        "vector_utilization_pct": 2.41,
+        "matrix_dimension": "dot_1024",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:21:03Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fdotproduct.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fmatmul",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 1.4838,
+        "benchmark_cycles": 370008,
+        "kernel_cycles": 370008,
+        "total_ops": 65536,
+        "performance_ops_per_cycle": 0.1771,
+        "vector_utilization_pct": 17.71,
+        "matrix_dimension": "32x32x32",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:21:02Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fmatmul.json"
+    },
     {
       "schema": "score.benchmark_results.v1",
       "evidence_class": "score_measured",
@@ -65,6 +217,61 @@
         "verilator": "5.022"
       },
       "_path": "datasets/darkriscv/806083b3/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "femtorv",
+      "upstream_commit": "f5ada24a",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "quark",
+      "metrics": {
+        "coremark_per_mhz": 0.8,
+        "iterations": 1,
+        "total_cycles": 1250000,
+        "validated": true,
+        "simulator": "verilator",
+        "config": "quark"
+      },
+      "generated_utc": "2026-11-16T15:21:02Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/femtorv/f5ada24a/benchmarks/coremark_quark.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "femtorv",
+      "upstream_commit": "f5ada24a",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "quark",
+      "metrics": {
+        "dmips_per_mhz": 0.2776,
+        "dhrystones_per_sec_per_mhz": 487.8,
+        "total_cycles": 2050000,
+        "instructions": 265000,
+        "cpi": 7.736,
+        "simulator": "verilator",
+        "validation_method": "test_passed"
+      },
+      "generated_utc": "2026-11-16T15:21:04Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/femtorv/f5ada24a/benchmarks/dhrystone_quark.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -628,6 +835,111 @@
         "verilator": "5.022"
       },
       "_path": "datasets/serv/41e8aeed/benchmarks/coremark_servant.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "veer_eh1",
+      "upstream_commit": "d04b1c7a",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 1.7942,
+        "iterations": 1,
+        "total_cycles": 557357,
+        "validated": true,
+        "simulator": "verilator",
+        "veer_test": "cmark",
+        "firmware_source": "canned_hex"
+      },
+      "generated_utc": "2026-11-16T15:21:46Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/veer_eh1/d04b1c7a/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "veer_eh1",
+      "upstream_commit": "d04b1c7a",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dmips_per_mhz": 1.7665,
+        "dhrystones_per_sec_per_mhz": 3103.73,
+        "total_cycles": 322180,
+        "instructions": 279113,
+        "cpi": 1.154,
+        "simulator": "verilator",
+        "validation_method": "test_passed"
+      },
+      "generated_utc": "2026-11-16T15:23:16Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/veer_eh1/d04b1c7a/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "veer_eh2",
+      "upstream_commit": "32bdfe24",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 2.2787,
+        "iterations": 1,
+        "total_cycles": 438856,
+        "validated": true,
+        "simulator": "verilator",
+        "veer_test": "cmark",
+        "firmware_source": "canned_hex"
+      },
+      "generated_utc": "2026-11-16T15:22:28Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/veer_eh2/32bdfe24/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "veer_eh2",
+      "upstream_commit": "32bdfe24",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dmips_per_mhz": 1.852,
+        "dhrystones_per_sec_per_mhz": 3254.0,
+        "total_cycles": 1543118,
+        "instructions": 771640,
+        "cpi": 2.0,
+        "simulator": "verilator",
+        "_verilator": "5.022",
+        "validation_method": "cycle_exact"
+      },
+      "generated_utc": "2026-11-16T23:25:00Z",
+      "_path": "datasets/veer_eh2/32bdfe24/benchmarks/dhrystone_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",

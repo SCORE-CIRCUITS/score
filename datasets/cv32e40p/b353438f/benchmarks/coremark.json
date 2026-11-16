@@ -1,0 +1,10 @@
+{
+  "core": "cv32e40p",
+  "archetype": "Archetype 1: Packed Sub-Word SIMD",
+  "workload": "coremark",
+  "iterations": 1000,
+  "coremark_per_mhz": 3.19,
+  "operating_frequency_mhz": 400.0,
+  "ipc": 0.88,
+  "total_cycles": 454545
+}

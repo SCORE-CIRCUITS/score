@@ -1,0 +1,36 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "vicuna",
+  "upstream_commit": "debfb03a",
+  "profile": "vector_verilator",
+  "workload": "fmatmul",
+  "config": "default_vlen128",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imf_zve32f",
+    "configuration": "default_vlen128",
+    "nr_lanes": 1,
+    "vlen": 128,
+    "wall_time_s": 23.6193,
+    "benchmark_cycles": 5196353,
+    "kernel_cycles": 5196353,
+    "total_ops": 33554432,
+    "performance_ops_per_cycle": 6.4573,
+    "vector_utilization_pct": 80.72,
+    "matrix_dimension": "256x256x256",
+    "datatype": "int8",
+    "exit_code": 0
+  },
+  "generated_utc": "2026-11-16T15:06:40Z",
+  "host": {
+    "hostname": "score-bench",
+    "platform": "Linux-5.14.0",
+    "python": "3.9.21"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "clang": "20.1.8"
+  }
+}

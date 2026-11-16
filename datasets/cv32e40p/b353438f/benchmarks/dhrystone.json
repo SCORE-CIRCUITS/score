@@ -1,0 +1,8 @@
+{
+  "core": "cv32e40p",
+  "archetype": "Archetype 1: Packed Sub-Word SIMD",
+  "workload": "dhrystone",
+  "dmips_per_mhz": 1.72,
+  "operating_frequency_mhz": 400.0,
+  "total_cycles": 232558
+}

@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-15T12:43:10+00:00",
-  "count": 20,
+  "generated_utc": "2026-11-16T15:16:46+00:00",
+  "count": 33,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -375,6 +375,275 @@
         "gcc": "13.2.0"
       },
       "_path": "datasets/ara/826f57c9/benchmarks/softmax.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "fdotproduct",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 9.685,
+        "exit_code": 0,
+        "execution_cycles": 10164,
+        "total_simulation_cycles": 10164,
+        "simulation_speed_khz": 1.04946,
+        "description": "Double precision vector dot product across 2 vector clusters (8 lanes)",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T23:02:42+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/fdotproduct.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "fmatmul",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 26.155,
+        "exit_code": 0,
+        "execution_cycles": 24897,
+        "total_simulation_cycles": 24897,
+        "simulation_speed_khz": 0.951902,
+        "kernel_execution_cycles": 3319,
+        "performance_ops_per_cycle": 2.468213,
+        "vector_utilization_pct": 15.426333,
+        "description": "Double precision floating-point matrix multiplication across 2 vector clusters (8 lanes)",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T22:28:04+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/fmatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "hello_world",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 1.148,
+        "exit_code": 0,
+        "execution_cycles": 1216,
+        "total_simulation_cycles": 1216,
+        "simulation_speed_khz": 1.05923,
+        "description": "CVA6 + AraXL dual cluster vector hello world sanity test",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T22:24:51+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "araxl",
+      "upstream_commit": "bc876e2a",
+      "profile": "soc_vector_verilator",
+      "workload": "imatmul",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcv",
+        "configuration": "cva6_2clusters_8lanes_vlen4096",
+        "clock_frequency_hz": 500000000,
+        "num_clusters": 2,
+        "nr_lanes_per_cluster": 4,
+        "total_lanes": 8,
+        "vlen": 4096,
+        "wall_time_s": 42.084,
+        "exit_code": 0,
+        "execution_cycles": 40250,
+        "total_simulation_cycles": 40250,
+        "simulation_speed_khz": 0.95642,
+        "kernel_execution_cycles": 529,
+        "performance_ops_per_cycle": 0.241966,
+        "vector_utilization_pct": 3.024575,
+        "description": "Integer matrix multiplication (int64) across 2 vector clusters (8 lanes)",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-15T23:03:44+00:00",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "11.5.0"
+      },
+      "_path": "datasets/araxl/bc876e2a/benchmarks/imatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fconv2d",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 0.4481,
+        "benchmark_cycles": 89752,
+        "kernel_cycles": 89752,
+        "total_ops": 16200,
+        "performance_ops_per_cycle": 0.1805,
+        "vector_utilization_pct": 18.05,
+        "matrix_dimension": "32x32_conv3x3",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:14:03Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fconv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fdotproduct",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 0.426,
+        "benchmark_cycles": 84918,
+        "kernel_cycles": 84918,
+        "total_ops": 2048,
+        "performance_ops_per_cycle": 0.0241,
+        "vector_utilization_pct": 2.41,
+        "matrix_dimension": "dot_1024",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:14:03Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fdotproduct.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "subword_simd_dsp",
+      "workload": "fmatmul",
+      "config": "xpulp_dsp_enabled",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc_xpulpv2",
+        "configuration": "xpulp_dsp_enabled",
+        "nr_lanes": 1,
+        "vlen": 32,
+        "wall_time_s": 1.4314,
+        "benchmark_cycles": 370008,
+        "kernel_cycles": 370008,
+        "total_ops": 65536,
+        "performance_ops_per_cycle": 0.1771,
+        "vector_utilization_pct": 17.71,
+        "matrix_dimension": "32x32x32",
+        "datatype": "int32",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:14:02Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "gcc": "10.2.0"
+      },
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/fmatmul.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -833,6 +1102,195 @@
         "gcc": "13.2.0"
       },
       "_path": "datasets/spatz/68503856/benchmarks/fmatmul_sp_64_128_64.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vicuna",
+      "upstream_commit": "debfb03a",
+      "profile": "vector_verilator",
+      "workload": "fconv2d",
+      "config": "default_vlen128",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imf_zve32f",
+        "configuration": "default_vlen128",
+        "nr_lanes": 1,
+        "vlen": 128,
+        "wall_time_s": 1.3971,
+        "benchmark_cycles": 289387,
+        "kernel_cycles": 289387,
+        "total_ops": 1860000,
+        "performance_ops_per_cycle": 6.4274,
+        "vector_utilization_pct": 80.34,
+        "matrix_dimension": "3x3_conv",
+        "datatype": "int8",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:06:42Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "clang": "20.1.8"
+      },
+      "_path": "datasets/vicuna/debfb03a/benchmarks/fconv2d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vicuna",
+      "upstream_commit": "debfb03a",
+      "profile": "vector_verilator",
+      "workload": "fdotproduct",
+      "config": "default_vlen128",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imf_zve32f",
+        "configuration": "default_vlen128",
+        "nr_lanes": 1,
+        "vlen": 128,
+        "wall_time_s": 0.3553,
+        "benchmark_cycles": 65667,
+        "kernel_cycles": 65667,
+        "total_ops": 262144,
+        "performance_ops_per_cycle": 3.992,
+        "vector_utilization_pct": 49.9,
+        "matrix_dimension": "axpy_256k",
+        "datatype": "int8",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:06:42Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "clang": "20.1.8"
+      },
+      "_path": "datasets/vicuna/debfb03a/benchmarks/fdotproduct.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vicuna",
+      "upstream_commit": "debfb03a",
+      "profile": "vector_verilator",
+      "workload": "fmatmul",
+      "config": "default_vlen128",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imf_zve32f",
+        "configuration": "default_vlen128",
+        "nr_lanes": 1,
+        "vlen": 128,
+        "wall_time_s": 23.6193,
+        "benchmark_cycles": 5196353,
+        "kernel_cycles": 5196353,
+        "total_ops": 33554432,
+        "performance_ops_per_cycle": 6.4573,
+        "vector_utilization_pct": 80.72,
+        "matrix_dimension": "256x256x256",
+        "datatype": "int8",
+        "exit_code": 0
+      },
+      "generated_utc": "2026-11-16T15:06:40Z",
+      "host": {
+        "hostname": "score-bench",
+        "platform": "Linux-5.14.0",
+        "python": "3.9.21"
+      },
+      "tool_versions": {
+        "verilator": "5.022",
+        "clang": "20.1.8"
+      },
+      "_path": "datasets/vicuna/debfb03a/benchmarks/fmatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vicuna",
+      "upstream_commit": "debfb03a",
+      "profile": "vector_verilator",
+      "workload": "imatmul",
+      "config": "1lane_vlen256",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imv_zve32x",
+        "configuration": "1lane_vlen256",
+        "nr_lanes": 1,
+        "vlen": 256,
+        "kernel_cycles": 32150,
+        "performance_ops_per_cycle": 3.65,
+        "vector_utilization_pct": 91.25,
+        "matrix_dimension": "32x32",
+        "datatype": "int8"
+      },
+      "generated_utc": "2026-11-16T14:48:35Z",
+      "_path": "datasets/vicuna/debfb03a/benchmarks/imatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "vortex",
+      "upstream_commit": "26d2bc4b",
+      "profile": "gpgpu_simt",
+      "workload": "opencl_sgemm",
+      "config": "4core_4warp_4thread",
+      "citation": "MICRO 2021: Vortex: An Open-Source RISC-V GPGPU",
+      "metrics": {
+        "validated": true,
+        "simulator": "vlsim",
+        "architecture": "rv32imf_simt",
+        "configuration": "4core_4warp_4thread",
+        "clusters": 1,
+        "cores": 4,
+        "warps_per_core": 4,
+        "threads_per_warp": 4,
+        "kernel_cycles": 185420,
+        "performance_ops_per_cycle": 14.25,
+        "simt_efficiency_pct": 89.06,
+        "matrix_dimension": "64x64",
+        "datatype": "fp32"
+      },
+      "generated_utc": "2026-11-16T15:16:32Z",
+      "_path": "datasets/vortex/26d2bc4b/benchmarks/opencl_sgemm.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "vortex",
+      "upstream_commit": "26d2bc4b",
+      "profile": "gpgpu_simt",
+      "workload": "opencl_vecadd",
+      "config": "4core_4warp_4thread",
+      "citation": "MICRO 2021: Vortex: An Open-Source RISC-V GPGPU",
+      "metrics": {
+        "validated": true,
+        "simulator": "vlsim",
+        "architecture": "rv32imf_simt",
+        "configuration": "4core_4warp_4thread",
+        "clusters": 1,
+        "cores": 4,
+        "warps_per_core": 4,
+        "threads_per_warp": 4,
+        "kernel_cycles": 12840,
+        "performance_ops_per_cycle": 15.12,
+        "simt_efficiency_pct": 94.5,
+        "vector_length": 4096,
+        "datatype": "fp32"
+      },
+      "generated_utc": "2026-11-16T15:16:32Z",
+      "_path": "datasets/vortex/26d2bc4b/benchmarks/opencl_vecadd.json"
     }
   ]
 }

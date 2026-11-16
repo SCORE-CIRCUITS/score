@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATASETS = ROOT / "datasets"
 OUT = ROOT / "benchmarks" / "vector" / "aggregated_results.json"
-VECTOR_CORES = {"ara", "araxl", "spatz", "gemmini"}
+VECTOR_CORES = {"ara", "araxl", "spatz", "gemmini", "vicuna", "vortex", "cv32e40p"}
 
 
 def collect() -> list[dict]:

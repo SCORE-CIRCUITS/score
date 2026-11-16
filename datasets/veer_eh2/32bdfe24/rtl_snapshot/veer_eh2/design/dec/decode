@@ -1,0 +1,548 @@
+
+.definition
+
+# Zbb
+
+clz       =  [011000000000.....001.....0010011]
+ctz       =  [011000000001.....001.....0010011]
+cpop      =  [011000000010.....001.....0010011]
+sext_b    =  [011000000100.....001.....0010011]
+sext_h    =  [011000000101.....001.....0010011]
+zext_h    =  [000010000000.....100.....0110011]
+
+min       =  [0000101..........100.....0110011]
+max       =  [0000101..........110.....0110011]
+minu      =  [0000101..........101.....0110011]
+maxu      =  [0000101..........111.....0110011]
+
+rol       =  [0110000..........001.....0110011]  # (also in ratified Zbkb)
+ror       =  [0110000..........101.....0110011]  # (also in ratified Zbkb)
+rori      =  [0110000..........101.....0010011]  # (also in ratified Zbkb)
+
+andn      =  [0100000..........111.....0110011]  # (also in ratified Zbkb)
+orn       =  [0100000..........110.....0110011]  # (also in ratified Zbkb)
+xnor      =  [0100000..........100.....0110011]  # (also in ratified Zbkb)
+
+# Zbkb
+#pack     =  [0000100..........100.....0110011]
+# for all values of rs2
+pack1     =  [000010000001.....100.....0110011]
+pack2     =  [000010000010.....100.....0110011]
+pack3     =  [000010000011.....100.....0110011]
+pack4     =  [000010000100.....100.....0110011]
+pack5     =  [000010000101.....100.....0110011]
+pack6     =  [000010000110.....100.....0110011]
+pack7     =  [000010000111.....100.....0110011]
+pack8     =  [000010001000.....100.....0110011]
+pack9     =  [000010001001.....100.....0110011]
+pack10    =  [000010001010.....100.....0110011]
+pack11    =  [000010001011.....100.....0110011]
+pack12    =  [000010001100.....100.....0110011]
+pack13    =  [000010001101.....100.....0110011]
+pack14    =  [000010001110.....100.....0110011]
+pack15    =  [000010001111.....100.....0110011]
+pack16    =  [000010010000.....100.....0110011]
+pack17    =  [000010010001.....100.....0110011]
+pack18    =  [000010010010.....100.....0110011]
+pack19    =  [000010010011.....100.....0110011]
+pack20    =  [000010010100.....100.....0110011]
+pack21    =  [000010010101.....100.....0110011]
+pack22    =  [000010010110.....100.....0110011]
+pack23    =  [000010010111.....100.....0110011]
+pack24    =  [000010011000.....100.....0110011]
+pack25    =  [000010011001.....100.....0110011]
+pack26    =  [000010011010.....100.....0110011]
+pack27    =  [000010011011.....100.....0110011]
+pack28    =  [000010011100.....100.....0110011]
+pack29    =  [000010011101.....100.....0110011]
+pack30    =  [000010011110.....100.....0110011]
+pack31    =  [000010011111.....100.....0110011]
+
+packh     =  [0000100..........111.....0110011]
+
+rev8      =  [011010011000.....101.....0010011]
+brev8     =  [011010000111.....101.....0010011]
+
+zip       =  [000010001111.....001.....0010011]
+unzip     =  [000010001111.....101.....0010011]
+
+# Zba
+
+sh1add    =  [0010000..........010.....0110011]
+sh2add    =  [0010000..........100.....0110011]
+sh3add    =  [0010000..........110.....0110011]
+
+# Zbs
+
+bset      =  [0010100..........001.....0110011]
+bclr      =  [0100100..........001.....0110011]
+binv      =  [0110100..........001.....0110011]
+bext      =  [0100100..........101.....0110011]
+
+bseti     =  [0010100..........001.....0010011]
+bclri     =  [0100100..........001.....0010011]
+binvi     =  [0110100..........001.....0010011]
+bexti     =  [0100100..........101.....0010011]
+
+# Zbb
+orc_b     =  [001010000111.....101.....0010011]
+
+# Zbc
+
+clmul     =  [0000101..........001.....0110011]
+clmulr    =  [0000101..........010.....0110011]
+clmulh    =  [0000101..........011.....0110011]
+
+# Zbkx
+
+xperm4    =  [0010100..........010.....0110011] # was xperm_n
+xperm8    =  [0010100..........100.....0110011] # was xperm_b
+
+# Base ISA
+
+add       =  [0000000..........000.....0110011]
+addi      =  [.................000.....0010011]
+
+# Zalrsc
+
+lr_w      =  [00010..00000.....010.....0101111]
+sc_w      =  [00011............010.....0101111]
+
+amoswap_w =  [00001............010.....0101111]
+amoadd_w  =  [00000............010.....0101111]
+amoxor_w  =  [00100............010.....0101111]
+amoand_w  =  [01100............010.....0101111]
+amoor_w   =  [01000............010.....0101111]
+amomin_w  =  [10000............010.....0101111]
+amomax_w  =  [10100............010.....0101111]
+amominu_w =  [11000............010.....0101111]
+amomaxu_w =  [11100............010.....0101111]
+
+# Base ISA
+
+sub       =  [0100000..........000.....0110011]
+
+and       =  [0000000..........111.....0110011]
+andi      =  [.................111.....0010011]
+
+or        =  [0000000..........110.....0110011]
+ori       =  [.................110.....0010011]
+
+xor       =  [0000000..........100.....0110011]
+xori      =  [.................100.....0010011]
+
+sll       =  [0000000..........001.....0110011]
+slli      =  [0000000..........001.....0010011]
+sra       =  [0100000..........101.....0110011]
+srai      =  [0100000..........101.....0010011]
+srl       =  [0000000..........101.....0110011]
+srli      =  [0000000..........101.....0010011]
+lui       =  [.........................0110111]
+auipc     =  [.........................0010111]
+
+slt       =  [0000000..........010.....0110011]
+sltu      =  [0000000..........011.....0110011]
+slti      =  [.................010.....0010011]
+sltiu     =  [.................011.....0010011]
+
+beq       =  [.................000.....1100011]
+bne       =  [.................001.....1100011]
+bge       =  [.................101.....1100011]
+blt       =  [.................100.....1100011]
+bgeu      =  [.................111.....1100011]
+bltu      =  [.................110.....1100011]
+jal       =  [.........................1101111]
+jalr      =  [.................000.....1100111]
+
+lb        =  [.................000.....0000011]
+lh        =  [.................001.....0000011]
+lw        =  [.................010.....0000011]
+
+sb        =  [.................000.....0100011]
+sh        =  [.................001.....0100011]
+sw        =  [.................010.....0100011]
+
+lbu       =  [.................100.....0000011]
+lhu       =  [.................101.....0000011]
+
+fence     =  [.................000.....0001111]
+fence.i   =  [.................001.....0001111] # Zifencei
+
+ebreak    =  [00000000000100000000000001110011]
+ecall     =  [00000000000000000000000001110011]
+
+# Machine ISA
+
+mret      =  [00110000001000000000000001110011] # trap-return instr
+
+wfi       =  [00010000010100000000000001110011] # interrupt management instr
+
+# Supervisor ISA (now in Zicsr extension)
+
+# specific variants of csrrc = [.................011.....1110011]
+csrrc_ro   = [............00000011.....1110011]
+csrrc_rw0  = [............1....011.....1110011]
+csrrc_rw1  = [.............1...011.....1110011]
+csrrc_rw2  = [..............1..011.....1110011]
+csrrc_rw3  = [...............1.011.....1110011]
+csrrc_rw4  = [................1011.....1110011]
+
+# specific variants of csrrci = [.................111.....1110011]
+csrrci_ro  = [............00000111.....1110011]
+csrrci_rw0 = [............1....111.....1110011]
+csrrci_rw1 = [.............1...111.....1110011]
+csrrci_rw2 = [..............1..111.....1110011]
+csrrci_rw3 = [...............1.111.....1110011]
+csrrci_rw4 = [................1111.....1110011]
+
+# specific variants of csrrs = [.................010.....1110011]
+csrrs_ro   = [............00000010.....1110011]
+csrrs_rw0  = [............1....010.....1110011]
+csrrs_rw1  = [.............1...010.....1110011]
+csrrs_rw2  = [..............1..010.....1110011]
+csrrs_rw3  = [...............1.010.....1110011]
+csrrs_rw4  = [................1010.....1110011]
+
+# specific variants of csrrsi = [.................110.....1110011]
+csrrsi_ro  = [............00000110.....1110011]
+csrrsi_rw0 = [............1....110.....1110011]
+csrrsi_rw1 = [.............1...110.....1110011]
+csrrsi_rw2 = [..............1..110.....1110011]
+csrrsi_rw3 = [...............1.110.....1110011]
+csrrsi_rw4 = [................1110.....1110011]
+
+# specific variants of csrrw = [.................001.....1110011]
+csrw       = [.................001000001110011] # csrrw x0, csr, rs1
+csrrw0     = [.................001....11110011]
+csrrw1     = [.................001...1.1110011]
+csrrw2     = [.................001..1..1110011]
+csrrw3     = [.................001.1...1110011]
+csrrw4     = [.................0011....1110011]
+
+# specific variants of csrrwi = [.................101.....1110011]
+csrwi      = [.................101000001110011] # csrrwi x0, csr, uimm
+csrrwi0    = [.................101....11110011]
+csrrwi1    = [.................101...1.1110011]
+csrrwi2    = [.................101..1..1110011]
+csrrwi3    = [.................101.1...1110011]
+csrrwi4    = [.................1011....1110011]
+
+# M Extension
+mul     =   [0000001..........000.....0110011]
+mulh    =   [0000001..........001.....0110011]
+mulhsu  =   [0000001..........010.....0110011]
+mulhu   =   [0000001..........011.....0110011]
+
+div     =   [0000001..........100.....0110011]
+divu    =   [0000001..........101.....0110011]
+rem     =   [0000001..........110.....0110011]
+remu    =   [0000001..........111.....0110011]
+
+.input
+
+rv32i = {
+        i[31]
+        i[30]
+        i[29]
+        i[28]
+        i[27]
+        i[26]
+        i[25]
+        i[24]
+        i[23]
+        i[22]
+        i[21]
+        i[20]
+        i[19]
+        i[18]
+        i[17]
+        i[16]
+        i[15]
+        i[14]
+        i[13]
+        i[12]
+        i[11]
+        i[10]
+        i[9]
+        i[8]
+        i[7]
+        i[6]
+        i[5]
+        i[4]
+        i[3]
+        i[2]
+        i[1]
+        i[0]
+}
+
+
+.output
+
+rv32i = {
+      alu
+      rs1
+      rs2
+      imm12
+      rd
+      shimm5
+      imm20
+      pc
+      load
+      store
+      lsu
+      add
+      sub
+      land
+      lor
+      lxor
+      sll
+      sra
+      srl
+      slt
+      unsign
+      condbr
+      beq
+      bne
+      bge
+      blt
+      jal
+      by
+      half
+      word
+      csr_read
+      csr_clr
+      csr_set
+      csr_write
+      csr_imm
+      presync
+      postsync
+      ebreak
+      ecall
+      mret
+      mul
+      rs1_sign
+      rs2_sign
+      low
+      div
+      rem
+      fence
+      fence_i
+      clz
+      ctz
+      cpop
+      sext_b
+      sext_h
+      zext_h
+      min
+      max
+      pack
+      packh
+      rol
+      ror
+      zbb
+      bset
+      bclr
+      binv
+      bext
+      zbs
+      zbkb
+      zbkx
+      clmul
+      clmulh
+      clmulr
+      zbc
+      grev
+      gorc
+      zip
+      unzip
+      xperm4
+      xperm8
+      sh1add
+      sh2add
+      sh3add
+      zba
+      pm_alu
+      atomic
+      lr
+      sc
+
+      i0_only
+}
+
+.decode
+
+# Zbb extension
+rv32i[clz]       =  { alu zbb     rs1     rd                       clz   }
+rv32i[ctz]       =  { alu zbb     rs1     rd                       ctz   }
+rv32i[cpop]      =  { alu zbb     rs1     rd                       cpop  }
+rv32i[sext_b]    =  { alu zbb     rs1     rd                       sext_b}
+rv32i[sext_h]    =  { alu zbb     rs1     rd                       sext_h}
+rv32i[zext_h]    =  { alu zbb     rs1 rs2 rd                       zext_h  }  # pack with rs2=x0
+rv32i[orc_b]     =  { alu zbb     rs1     rd         shimm5        gorc  }  # gorci7
+
+rv32i[min]       =  { alu zbb     rs1 rs2 rd                sub    min   }
+rv32i[max]       =  { alu zbb     rs1 rs2 rd                sub    max   }
+rv32i[minu]      =  { alu zbb     rs1 rs2 rd  unsign        sub    min   }
+rv32i[maxu]      =  { alu zbb     rs1 rs2 rd  unsign        sub    max   }
+
+# Zbb/Zbkb extension
+rv32i[rol]       =  { alu zbb rs1 rs2 rd                       rol   }
+rv32i[ror]       =  { alu zbb rs1 rs2 rd                       ror   }
+rv32i[rori]      =  { alu zbb rs1     rd         shimm5        ror   }
+rv32i[andn]      =  { alu zbb rs1 rs2 rd                       land  }
+rv32i[orn]       =  { alu zbb rs1 rs2 rd                       lor   }
+rv32i[xnor]      =  { alu zbb rs1 rs2 rd                       lxor  }
+rv32i[rev8]      =  { alu zbb rs1     rd         shimm5        grev  } # grevi24
+
+
+# Zbkb extension
+#rv32i[pack]      =  { alu     rs1 rs2 rd                       pack  zbkb}
+rv32i[pack{1-31}] =  { alu     rs1 rs2 rd                       pack  zbkb}
+rv32i[packh]      =  { alu     rs1 rs2 rd                       packh zbkb}
+rv32i[brev8]      =  { mul     rs1     rd         shimm5        grev  zbkb} # grevi7
+rv32i[zip]        =  { mul     rs1     rd         shimm5        zip   zbkb}
+rv32i[unzip]      =  { mul     rs1     rd         shimm5        unzip zbkb}
+
+# Zbs extension
+rv32i[bset]      =  { alu zbs     rs1 rs2 rd                       bset  }
+rv32i[bclr]      =  { alu zbs     rs1 rs2 rd                       bclr  }
+rv32i[binv]      =  { alu zbs     rs1 rs2 rd                       binv  }
+rv32i[bext]      =  { alu zbs     rs1 rs2 rd                       bext  }
+rv32i[bseti]     =  { alu zbs     rs1     rd         shimm5        bset  }
+rv32i[bclri]     =  { alu zbs     rs1     rd         shimm5        bclr  }
+rv32i[binvi]     =  { alu zbs     rs1     rd         shimm5        binv  }
+rv32i[bexti]     =  { alu zbs     rs1     rd         shimm5        bext  }
+
+# Zba extension
+rv32i[sh1add]    =  { alu zba     rs1 rs2 rd                       sh1add}
+rv32i[sh2add]    =  { alu zba     rs1 rs2 rd                       sh2add}
+rv32i[sh3add]    =  { alu zba     rs1 rs2 rd                       sh3add}
+
+# M extension
+rv32i[mul]       =  { mul         rs1 rs2 rd low                         }
+rv32i[mulh]      =  { mul         rs1 rs2 rd rs1_sign rs2_sign           }
+rv32i[mulhu]     =  { mul         rs1 rs2 rd                             }
+rv32i[mulhsu]    =  { mul         rs1 rs2 rd rs1_sign                    }
+rv32i[div]       =  { div rs1 rs2 rd             i0_only}
+rv32i[divu]      =  { div rs1 rs2 rd unsign      i0_only}
+rv32i[rem]       =  { div rs1 rs2 rd         rem i0_only}
+rv32i[remu]      =  { div rs1 rs2 rd unsign  rem i0_only}
+
+# Zbc extension
+rv32i[clmul]     =  { mul zbc     rs1 rs2 rd                       clmul }
+rv32i[clmulh]    =  { mul zbc     rs1 rs2 rd                       clmulh}
+rv32i[clmulr]    =  { mul zbc     rs1 rs2 rd                       clmulr}
+
+# Zbkx extension
+rv32i[xperm4]    =  { mul     zbkx rs1 rs2 rd                       xperm4}
+rv32i[xperm8]    =  { mul     zbkx rs1 rs2 rd                       xperm8}
+
+# Base ISA
+rv32i[add]       =  { alu rs1 rs2   rd add pm_alu }
+rv32i[addi]      =  { alu rs1 imm12 rd add pm_alu }
+
+rv32i[sub]       =  { alu rs1 rs2   rd sub pm_alu }
+
+rv32i[and]       =  { alu rs1 rs2   rd land pm_alu }
+rv32i[andi]      =  { alu rs1 imm12 rd land pm_alu }
+
+rv32i[or]        =  { alu rs1 rs2   rd lor pm_alu }
+rv32i[ori]       =  { alu rs1 imm12 rd lor pm_alu }
+
+rv32i[xor]       =  { alu rs1 rs2   rd lxor pm_alu }
+rv32i[xori]      =  { alu rs1 imm12 rd lxor pm_alu }
+
+rv32i[sll]       =  { alu rs1 rs2    rd sll pm_alu }
+rv32i[slli]      =  { alu rs1 shimm5 rd sll pm_alu }
+
+rv32i[sra]       =  { alu rs1 rs2    rd sra pm_alu }
+rv32i[srai]      =  { alu rs1 shimm5 rd sra pm_alu }
+
+rv32i[srl]       =  { alu rs1 rs2    rd srl pm_alu }
+rv32i[srli]      =  { alu rs1 shimm5 rd srl pm_alu }
+
+rv32i[lui]       =  { alu imm20    rd lor pm_alu }
+rv32i[auipc]     =  { alu imm20 pc rd add pm_alu }
+
+
+rv32i[slt]    =     { alu rs1 rs2    rd sub slt        pm_alu }
+rv32i[sltu]    =    { alu rs1 rs2    rd sub slt unsign pm_alu }
+rv32i[slti]    =    { alu rs1 imm12  rd sub slt        pm_alu }
+rv32i[sltiu]    =   { alu rs1 imm12  rd sub slt unsign pm_alu }
+
+rv32i[beq]    =     { alu rs1 rs2 sub condbr beq }
+rv32i[bne]    =     { alu rs1 rs2 sub condbr bne }
+rv32i[bge]    =     { alu rs1 rs2 sub condbr bge }
+rv32i[blt]    =     { alu rs1 rs2 sub condbr blt }
+rv32i[bgeu]    =    { alu rs1 rs2 sub condbr bge unsign }
+rv32i[bltu]    =    { alu rs1 rs2 sub condbr blt unsign }
+
+rv32i[jal]    =     { alu imm20 rd pc    jal }
+rv32i[jalr]    =    { alu rs1   rd imm12 jal }
+
+rv32i[lb] =      { lsu load rs1 rd by    }
+rv32i[lh] =      { lsu load rs1 rd half  }
+rv32i[lw] =      { lsu load rs1 rd word  }
+rv32i[lbu] =     { lsu load rs1 rd by   unsign  }
+rv32i[lhu] =     { lsu load rs1 rd half unsign  }
+
+rv32i[sb] =      { lsu store rs1 rs2 by   }
+rv32i[sh] =      { lsu store rs1 rs2 half }
+rv32i[sw] =      { lsu store rs1 rs2 word }
+
+
+# fence.i has fence effect in addtion to flush I$ and redirect
+rv32i[fence]     =   { alu lor fence           i0_only presync}
+rv32i[fence.i]   =   { alu lor fence fence_i   i0_only presync postsync}
+
+# nops for now
+
+rv32i[ebreak] = {  alu rs1 imm12 rd lor ebreak i0_only postsync}
+rv32i[ecall] =  {  alu rs1 imm12 rd lor ecall  i0_only postsync}
+rv32i[mret] =   {  alu rs1 imm12 rd lor mret   i0_only postsync}
+
+rv32i[wfi] =    {  alu rs1 imm12 rd lor pm_alu }
+
+# csr means read
+
+# csr_read - put csr on rs2 and rs1 0's
+rv32i[csrrc_ro] =        { alu rd csr_read i0_only lor }
+
+# put csr on rs2 and make rs1 0's into alu.  Save rs1 for csr_clr later
+rv32i[csrrc_rw{0-4}] =   { alu rd csr_read i0_only rs1 csr_clr            lor presync postsync }
+
+rv32i[csrrci_ro] =       { alu rd csr_read i0_only lor }
+
+rv32i[csrrci_rw{0-4}] =  { alu rd csr_read i0_only rs1 csr_clr   csr_imm  lor presync postsync }
+
+rv32i[csrrs_ro] =        { alu rd csr_read i0_only lor }
+
+rv32i[csrrs_rw{0-4}] =   { alu rd csr_read i0_only rs1 csr_set            lor presync postsync }
+
+rv32i[csrrsi_ro] =       { alu rd csr_read i0_only lor }
+
+rv32i[csrrsi_rw{0-4}] =  { alu rd csr_read i0_only rs1 csr_set   csr_imm lor presync postsync }
+
+rv32i[csrrw{0-4}] =     { alu rd csr_read i0_only  rs1 csr_write         lor presync postsync }
+
+
+rv32i[csrrwi{0-4}] =         { alu rd csr_read i0_only  rs1 csr_write csr_imm lor presync postsync }
+
+# optimize csr write only - pipelined
+rv32i[csrw] =                { alu rd rs1 csr_write i0_only           }
+
+rv32i[csrwi]       =         { alu rd     csr_write i0_only csr_imm   }
+rv32i[lr_w]        =  { lsu load      rs1 rd word atomic i0_only presync lr}
+rv32i[sc_w]        =  { lsu store rs2 rs1 rd word atomic i0_only presync sc postsync}
+
+rv32i[amoswap_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amoadd_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amoxor_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amoand_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amoor_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amomin_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amomax_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync }
+rv32i[amominu_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync unsign}
+rv32i[amomaxu_w]  =  { lsu load store rs2 rs1 rd word atomic i0_only presync unsign}
+
+.end

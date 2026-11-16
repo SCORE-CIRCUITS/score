@@ -1,0 +1,3616 @@
+// Copyright © 2019-2023
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "cache.h"
+#include "mem_block_pool.h"
+#include "debug.h"
+#include "types.h"
+#include "addr_hash.h"
+#if VX_CFG_EXT_A_ENABLED
+#include "amo_unit.h"
+#endif
+#include <algorithm>
+#include <cstring>
+#include <list>
+#include <queue>
+#include <unordered_map>
+#include <util.h>
+#include <vector>
+
+using namespace vortex;
+
+namespace {
+
+constexpr uint32_t kMaxFanout = 8;
+
+// An arbiter over more than 1.5x the fan-out limit is split into a buffered
+// tree: slices of up to the fan-out limit each grant into their own buffer,
+// and those buffers are arbitrated the same way, one level per cycle, until
+// few enough remain for a single join arbiter. Returns each buffered level's
+// slice count, none for a single arbiter.
+std::vector<uint32_t> arb_tree_levels(uint32_t requesters) {
+  std::vector<uint32_t> levels;
+  for (uint32_t n = requesters; n > kMaxFanout + kMaxFanout / 2;) {
+    n = (n + kMaxFanout - 1) / kMaxFanout;
+    levels.push_back(n);
+  }
+  return levels;
+}
+
+// Slices of the tree's first level, 1 for a single arbiter.
+uint32_t arb_tree_slices(uint32_t requesters) {
+  auto levels = arb_tree_levels(requesters);
+  return levels.empty() ? 1 : levels.front();
+}
+
+// Registered stages of a radix-2 omega network between a and b ports; up to
+// two ports on each side it is a single crossbar.
+uint32_t omega_stages(uint32_t a, uint32_t b) {
+  uint32_t n = std::max(a, b);
+  return (n <= 2) ? 1 : log2ceil(n);
+}
+
+}
+
+struct params_t {
+  uint32_t sets_per_bank;
+  uint32_t lines_per_set;
+  uint32_t words_per_line;
+  uint32_t sectors_per_line;   // = 1 when S == L (no sectoring); the mem/fill/evict granule
+  uint32_t log2_num_inputs;
+
+  int32_t sector_select_addr_start; // sector index within the line (high part of the in-line offset)
+  int32_t sector_select_addr_end;
+
+  int32_t word_select_addr_start;
+  int32_t word_select_addr_end;
+
+  int32_t bank_select_addr_start;
+  int32_t bank_select_addr_end;
+
+  int32_t set_select_addr_start;
+  int32_t set_select_addr_end;
+
+  int32_t tag_select_addr_start;
+  int32_t tag_select_addr_end;
+
+  bool bank_hash;
+  bool set_hash;
+
+  params_t(const Cache::Config &config) : bank_hash(config.bank_hash), set_hash(config.set_hash) {
+    int32_t offset_bits = config.L - config.W;
+    // Any number of ways, but a power-of-two number of sets filling the size.
+    uint32_t way_bytes = config.num_ways << (config.L + config.B);
+    assert(offset_bits >= 0);
+    assert(config.num_ways != 0 && (config.size % way_bytes) == 0);
+    uint32_t sets = config.size / way_bytes;
+    assert(ispow2(sets));
+    int32_t index_bits = log2ceil(sets);
+
+    this->log2_num_inputs = log2ceil(config.num_inputs);
+
+    int32_t sector_bits = config.L - config.S; // sectors per line = 2^sector_bits
+    assert(sector_bits >= 0);
+
+    this->sets_per_bank = 1 << index_bits;
+    this->lines_per_set = config.num_ways;
+    this->words_per_line = 1 << offset_bits;
+    this->sectors_per_line = 1 << sector_bits;
+
+    // Sector select: high part of the in-line offset, bits [S .. L-1].
+    this->sector_select_addr_start = config.S;
+    this->sector_select_addr_end = (config.S + sector_bits - 1);
+
+    // Word select
+    this->word_select_addr_start = config.W;
+    this->word_select_addr_end = (this->word_select_addr_start + offset_bits - 1);
+
+    // Bank select
+    this->bank_select_addr_start = (1 + this->word_select_addr_end);
+    this->bank_select_addr_end = (this->bank_select_addr_start + config.B - 1);
+
+    // Set select
+    this->set_select_addr_start = (1 + this->bank_select_addr_end);
+    this->set_select_addr_end = (this->set_select_addr_start + index_bits - 1);
+
+    // Tag select
+    this->tag_select_addr_start = (1 + this->set_select_addr_end);
+    this->tag_select_addr_end = (config.addr_width - 1);
+    assert(!bank_hash || (config.B != 0 && config.B <= 8));
+    assert(!set_hash || index_bits <= 16);
+  }
+
+  // The bank is the raw bank bits XORed with a function of the bits above
+  // them, so power-of-two strides spread over the banks; applying the same
+  // XOR again restores the raw bits. IPOLY for 16/32 banks; other bank counts
+  // XOR-fold the higher bits (Frailong, Jalby, Lenfant, "XOR-schemes", ICPP 1985).
+  uint32_t bank_xor(uint64_t addr, uint32_t raw) const {
+    uint32_t bits = bank_select_addr_end - bank_select_addr_start + 1;
+    uint64_t hi = addr >> (bank_select_addr_end + 1);
+    if (bits == 4) {
+      return raw ^ ipoly16(hi);
+    }
+    if (bits == 5) {
+      return raw ^ ipoly32(hi);
+    }
+    uint32_t mask = (1u << bits) - 1, f = 0;
+    for (uint32_t i = 0; i < 15; i += bits) {
+      f ^= uint32_t(hi >> i) & mask;
+    }
+    return raw ^ f;
+  }
+
+  uint32_t addr_bank_id(uint64_t addr) const {
+    if (bank_select_addr_end < bank_select_addr_start) {
+      return 0;
+    }
+    uint32_t raw = (uint32_t)bit_getw(addr, bank_select_addr_start, bank_select_addr_end);
+    return bank_hash ? bank_xor(addr, raw) : raw;
+  }
+
+  // The set is the raw set bits XORed with an XOR fold of the tag's low 32
+  // bits, so power-of-two strides walk the sets; the tag is stored unchanged,
+  // so the same XOR restores the raw set bits.
+  uint32_t set_xor(uint64_t tag) const {
+    if (!set_hash || set_select_addr_end < set_select_addr_start) {
+      return 0;
+    }
+    uint32_t bits = set_select_addr_end - set_select_addr_start + 1;
+    uint32_t mask = (1u << bits) - 1, f = 0;
+    for (uint32_t i = 0; i < 32; i += bits) {
+      f ^= uint32_t(uint32_t(tag) >> i) & mask;
+    }
+    return f;
+  }
+
+  uint32_t addr_set_id(uint64_t addr) const {
+    if (set_select_addr_end >= set_select_addr_start)
+      return (uint32_t)bit_getw(addr, set_select_addr_start, set_select_addr_end) ^ set_xor(addr_tag(addr));
+    else
+      return 0;
+  }
+
+  uint64_t addr_tag(uint64_t addr) const {
+    if (tag_select_addr_end >= tag_select_addr_start)
+      return bit_getw(addr, tag_select_addr_start, tag_select_addr_end);
+    else
+      return 0;
+  }
+
+  uint32_t addr_sector_id(uint64_t addr) const {
+    if (sector_select_addr_end >= sector_select_addr_start)
+      return (uint32_t)bit_getw(addr, sector_select_addr_start, sector_select_addr_end);
+    else
+      return 0;
+  }
+
+  uint64_t mem_addr(uint32_t bank_id, uint32_t set_id, uint64_t tag) const {
+    uint64_t addr(0);
+    if (bank_select_addr_end >= bank_select_addr_start)
+      addr = bit_setw(addr, bank_select_addr_start, bank_select_addr_end, bank_id);
+    if (set_select_addr_end >= set_select_addr_start)
+      addr = bit_setw(addr, set_select_addr_start, set_select_addr_end, set_id ^ set_xor(tag));
+    if (tag_select_addr_end >= tag_select_addr_start)
+      addr = bit_setw(addr, tag_select_addr_start, tag_select_addr_end, tag);
+    if (bank_hash && bank_select_addr_end >= bank_select_addr_start) {
+      uint32_t raw = bank_xor(addr, bank_id);
+      addr = bit_setw(addr, bank_select_addr_start, bank_select_addr_end, raw);
+    }
+    return addr;
+  }
+
+  // Byte address of a specific sector within the line (line base + sector offset).
+  // The memory below transacts at this (sector) granule.
+  uint64_t mem_addr_sector(uint32_t bank_id, uint32_t set_id, uint64_t tag, uint32_t sector_id) const {
+    uint64_t addr = mem_addr(bank_id, set_id, tag);
+    if (sector_select_addr_end >= sector_select_addr_start)
+      addr = bit_setw(addr, sector_select_addr_start, sector_select_addr_end, sector_id);
+    return addr;
+  }
+};
+
+// One sector of a line: the fill / eviction / mem-request granule (= mem_block).
+struct sector_t {
+  bool valid;
+  bool dirty;
+  bool partial;                        // allocated by a store: only dirty_mask bytes are known
+  uint64_t dirty_mask;                 // per-byte dirty bits; the writeback byte-enable
+  std::shared_ptr<mem_block_t> data;  // sector bytes (= one mem_block)
+
+  void reset() {
+    valid = false;
+    dirty = false;
+    partial = false;
+    dirty_mask = 0;
+    data.reset();
+  }
+};
+
+// A store may hit a partial sector; a load or AMO needs every byte.
+static inline bool sector_hit(const sector_t& sec, bool needs_data) {
+  return sec.valid && !(needs_data && sec.partial);
+}
+
+// Every byte of the sector has been stored: a refetch of it reads nothing.
+static inline bool sector_written(const sector_t& sec) {
+  constexpr uint64_t full_mask = (VX_CFG_MEM_BLOCK_SIZE >= 64) ? ~0ull : ((1ull << VX_CFG_MEM_BLOCK_SIZE) - 1);
+  return sec.dirty_mask == full_mask;
+}
+
+struct line_t {
+  uint64_t tag;
+  uint32_t lru_ctr;
+  std::vector<sector_t> sectors;       // sectors_per_line (1 when no sectoring)
+
+  bool any_valid() const {
+    for (const auto &s : sectors) if (s.valid) return true;
+    return false;
+  }
+  bool any_dirty() const {
+    for (const auto &s : sectors) if (s.valid && s.dirty) return true;
+    return false;
+  }
+  void reset() {
+    lru_ctr = 0;
+    for (auto &s : sectors) s.reset();
+  }
+};
+
+static inline void sector_merge(sector_t& sec, const std::shared_ptr<mem_block_t>& src, uint64_t byteen) {
+  // Copy-on-write only when shared. sec.data may be aliased with in-flight
+  // responses, fill payloads, or writeback messages; mutating in place would
+  // corrupt them. When this sector is the sole owner, mutate in place to
+  // avoid a heap allocation on the hot path.
+  if (sec.data) {
+    if (sec.data.use_count() > 1) {
+      sec.data = make_mem_block_copy(*sec.data);
+    }
+  } else {
+    sec.data = make_mem_block();
+    std::memset(sec.data->data(), 0, sec.data->size());
+  }
+  if (src) {
+    for (uint32_t b = 0; b < VX_CFG_MEM_BLOCK_SIZE; ++b) {
+      if (byteen & (1ull << b)) {
+        (*sec.data)[b] = (*src)[b];
+      }
+    }
+  }
+}
+
+struct set_t {
+  std::vector<line_t> lines;
+  uint32_t fifo_ptr;    // next victim for FIFO policy
+
+  set_t(uint32_t num_ways, uint32_t sectors_per_line)
+      : lines(num_ways), fifo_ptr(0) {
+    for (auto &line : lines)
+      line.sectors.resize(sectors_per_line);
+  }
+
+  void reset() {
+    for (auto &line : lines) {
+      line.reset();
+    }
+    fifo_ptr = 0;
+  }
+
+  // Pure tag lookup: returns the line-resident way (tag match with any sector
+  // valid) or -1; fills free/repl line ids. No mutation. The caller derives a
+  // sector hit by checking the requested sector's valid bit on the returned way.
+  // Callers must invoke update_lru() *after* all stall checks pass, otherwise
+  // PLRU counters drift on retry.
+  int tag_match(uint64_t tag, uint8_t policy, uint32_t rand_idx,
+                int *free_line_id, int *repl_line_id) const {
+    int hit_line_id = -1;
+    *free_line_id = -1;
+    *repl_line_id = 0;
+
+    uint32_t max_cnt = 0;
+    bool has_valid = false;
+    bool plru_chosen = false;
+
+    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+      const auto &line = lines.at(i);
+
+      if (!line.any_valid()) {
+        if (*free_line_id == -1)
+          *free_line_id = i;
+        continue;
+      }
+      has_valid = true;
+
+      if (line.tag == tag)
+        hit_line_id = i;
+
+      if (policy == Cache::PLRU) {
+        if (!plru_chosen || line.lru_ctr >= max_cnt) {
+          max_cnt = line.lru_ctr;
+          *repl_line_id = i;
+          plru_chosen = true;
+        }
+      }
+    }
+
+    // Select victim per policy (for miss path).
+    switch (policy) {
+    case Cache::FIFO:
+      *repl_line_id = fifo_ptr % lines.size();
+      break;
+    case Cache::RANDOM:
+      *repl_line_id = rand_idx % lines.size();
+      break;
+    case Cache::PLRU:
+    default:
+      if (!has_valid)
+        *repl_line_id = (*free_line_id != -1) ? *free_line_id : 0;
+      break;
+    }
+
+    return hit_line_id;
+  }
+
+  // Apply PLRU age update for a tag access. Pass hit_line_id == -1 for a miss
+  // (all valid lines age, no reset). Call once per *committed* access.
+  void update_lru(int hit_line_id) {
+    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+      auto &line = lines.at(i);
+      if (!line.any_valid())
+        continue;
+      if ((int)i == hit_line_id) {
+        line.lru_ctr = 0;
+      } else {
+        ++line.lru_ctr;
+      }
+    }
+  }
+
+  // Choose a victim line for installing a fill. Does NOT mutate state.
+  int select_victim(uint8_t policy, uint32_t rand_idx,
+                    int *free_line_id, int *repl_line_id) const {
+    *free_line_id = -1;
+    *repl_line_id = 0;
+
+    uint32_t max_cnt = 0;
+    bool has_valid = false;
+
+    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+      const auto &line = lines.at(i);
+      if (!line.any_valid()) {
+        if (*free_line_id == -1)
+          *free_line_id = i;
+        continue;
+      }
+      has_valid = true;
+      if (policy == Cache::PLRU) {
+        if (line.lru_ctr >= max_cnt) {
+          max_cnt = line.lru_ctr;
+          *repl_line_id = i;
+        }
+      }
+    }
+
+    switch (policy) {
+    case Cache::FIFO:
+      *repl_line_id = fifo_ptr % lines.size();
+      break;
+    case Cache::RANDOM:
+      *repl_line_id = rand_idx % lines.size();
+      break;
+    case Cache::PLRU:
+    default:
+      if (!has_valid)
+        *repl_line_id = (*free_line_id != -1) ? *free_line_id : 0;
+      break;
+    }
+
+    return (*free_line_id != -1) ? *free_line_id : *repl_line_id;
+  }
+
+  // Find the way currently resident for `tag` (any sector valid), or -1.
+  int find_resident(uint64_t tag) const {
+    for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
+      if (lines.at(i).any_valid() && lines.at(i).tag == tag)
+        return (int)i;
+    }
+    return -1;
+  }
+};
+
+struct bank_req_t {
+
+  using Ptr = std::shared_ptr<bank_req_t>;
+
+  enum ReqType {
+    None = 0,
+    Fill = 1,
+    Replay = 2,
+    Core = 3,
+    AmoProbe = 4, // non-LLC AMO passthrough: probe-and-invalidate then forward
+    Park = 5,     // chain head parked on a partial sector: issues its refetch
+    AmoWb = 6     // an LLC atomic's result written back through the pipe
+  };
+
+  uint64_t addr;
+  uint32_t hart_id;
+  uint64_t req_tag;
+  std::shared_ptr<const std::vector<uint32_t>> merged_tags; // ride to the response
+  uint64_t uuid;
+  uint32_t mshr_id;
+  ReqType type;
+  bool write;
+  MemOp op;           // AMO state (op/width/rhs/hart_id) is derived from
+                      // this + byteen + data + hart_id without a sideband.
+  // For write-through write-misses that piggy-back on a pending fill MSHR:
+  // the core response was already sent at miss time, so Replay must not
+  // emit another response — only run sector_merge.
+  bool skip_core_rsp;
+
+  // Fill flavors under lazy fetch: a data-less allocation for a write-miss
+  // root, or a refetch of a resident partial sector (merges under its dirty
+  // bytes).
+  bool nodata;
+  bool refetch;
+  bool refetch_retry; // refetch re-issued after its sector was evicted
+
+  // TLM data:
+  //   For Core writes: incoming write data + byteen.
+  //   For Fill: captured fill data from below (mem_rsp.data).
+  std::shared_ptr<mem_block_t> data;
+  uint64_t byteen;
+
+  // Comparand, read only by compare-and-swap: data already carries the swap
+  // value, so the comparand cannot share it.
+  uint64_t amo_cmp;
+
+  // `flags.amo_unsigned` distinguishes signed vs unsigned MIN/MAX.
+  // Other bits ride along for future use.
+  MemFlags flags;
+
+  // Bank admission order, stamped once in processInputs. MSHR replay drains
+  // by this stamp, so chain order is admission order regardless of whether a
+  // request joins the chain at admission or later at pipe exit (a request
+  // still riding the pipe must not be ordered behind a younger request that
+  // coalesced at admission).
+  uint64_t adm_seq;
+
+  // AMO state. memop_is_atomic(op) classifies the request; the LSU
+  // packs rs2 into data at byte_off, so the cache extracts rhs via
+  // amo_load_word and width via byteen popcount.
+
+  bank_req_t() {
+    this->reset();
+  }
+
+  void reset() {
+    addr = 0;
+    hart_id = 0;
+    req_tag = 0;
+    merged_tags.reset();
+    uuid = 0;
+    mshr_id = 0;
+    type = ReqType::None;
+    write = false;
+    op = MemOp::LD;
+    skip_core_rsp = false;
+    nodata = false;
+    refetch = false;
+    refetch_retry = false;
+    data.reset();
+    byteen = 0;
+    amo_cmp = 0;
+    flags = MemFlags{};
+    adm_seq = 0;
+  }
+
+  friend std::ostream &operator<<(std::ostream &os, const bank_req_t &req) {
+    os << "addr=0x" << std::hex << req.addr;
+    os << ", rw=" << std::dec << req.write;
+    os << ", type=" << req.type;
+    os << ", req_tag=" << req.req_tag;
+    os << ", hart_id=" << req.hart_id;
+    os << " (#" << req.uuid << ")";
+    return os;
+  }
+};
+
+struct mshr_entry_t {
+  bank_req_t bank_req;
+  uint32_t set_id;
+  uint64_t addr_tag;
+  uint32_t sector_id;   // coalescing/fill granule: a miss is per-(set,tag,sector)
+  uint32_t line_id;
+  uint64_t seq;         // enqueue order; replays drain oldest-first to preserve
+                        // program order among coalesced same-line accesses.
+  bool refetch;         // root of a fill that refetches a resident partial sector
+  bool refetch_retry;   // ... re-issued after the previous refetch found it evicted
+
+  mshr_entry_t() {
+    this->reset();
+  }
+
+  void reset() {
+    bank_req.reset();
+    set_id = 0;
+    addr_tag = 0;
+    sector_id = 0;
+    line_id = 0;
+    seq = 0;
+    refetch = false;
+    refetch_retry = false;
+  }
+};
+
+class MSHR {
+public:
+  MSHR(uint32_t size)
+      : entries_(size), ready_reqs_(0), size_(0) {}
+
+  uint32_t capacity() const {
+    return entries_.size();
+  }
+
+  uint32_t size() const {
+    return size_;
+  }
+
+  bool empty() const {
+    return (0 == size_);
+  }
+
+  bool full() const {
+    assert(size_ <= entries_.size());
+    return (size_ == entries_.size());
+  }
+
+  bool has_ready_reqs() const {
+    return (ready_reqs_ != 0);
+  }
+
+  const mshr_entry_t &peek(uint32_t id) const {
+    return entries_.at(id);
+  }
+
+  // Returns true if there is an active pending request for the given
+  // set/tag/sector. Coalescing is per-sector: a fill installs one sector, so
+  // only same-sector misses share it (different-sector misses to the same line
+  // each get their own fill). If true, optionally returns the root entry id.
+  bool lookup(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id, uint32_t *root_id = nullptr) const {
+    for (uint32_t i = 0, n = entries_.size(); i < n; ++i) {
+      const auto &entry = entries_.at(i);
+      if (entry.bank_req.type != bank_req_t::None && entry.set_id == set_id && entry.addr_tag == addr_tag && entry.sector_id == sector_id) {
+        if (root_id)
+          *root_id = i;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // True if any matching entry OTHER than exclude_id is still Core-typed,
+  // i.e. the chain's fill hasn't run replay() over it yet. Distinguishes a
+  // fill-pending chain (a plain enqueue will be marked by the fill) from a
+  // draining chain (a new entry must be marked ready via defer_to_replay).
+  bool has_pending_fill(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id, int exclude_id) const {
+    for (int i = 0, n = (int)entries_.size(); i < n; ++i) {
+      if (i == exclude_id) {
+        continue;
+      }
+      const auto &entry = entries_.at(i);
+      if (entry.bank_req.type == bank_req_t::Core && entry.set_id == set_id && entry.addr_tag == addr_tag && entry.sector_id == sector_id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // True if any matching entry carries ordering weight for a later plain
+  // access: a write must merge before a younger same-line read responds, and
+  // an atomic needs its whole round-trip ordered. Pure-load chains carry no
+  // such constraint — a younger access may complete ahead of their drain.
+  bool has_ordered_reqs(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id) const {
+    for (const auto &entry : entries_) {
+      if (entry.bank_req.type == bank_req_t::None) {
+        continue;
+      }
+      if (entry.set_id != set_id || entry.addr_tag != addr_tag || entry.sector_id != sector_id) {
+        continue;
+      }
+      if (entry.bank_req.write || memop_is_atomic(entry.bank_req.op)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Enqueue a new core request and return the allocated entry id.
+  int enqueue(const bank_req_t &bank_req, uint32_t set_id, uint64_t addr_tag, uint32_t sector_id,
+              bool refetch = false) {
+    assert(bank_req.type == bank_req_t::Core);
+    for (uint32_t i = 0, n = entries_.size(); i < n; ++i) {
+      auto &entry = entries_.at(i);
+      if (entry.bank_req.type == bank_req_t::None) {
+        entry.bank_req = bank_req;
+        entry.set_id = set_id;
+        entry.addr_tag = addr_tag;
+        entry.sector_id = sector_id;
+        entry.line_id = 0; // victim is selected at Fill time
+        entry.seq = bank_req.adm_seq;
+        entry.refetch = refetch;
+        entry.refetch_retry = false;
+        ++size_;
+        return i;
+      }
+    }
+    std::abort(); // no free slot found!
+    return -1;
+  }
+
+  // Mark all pending requests matching the entry's (set,tag,sector) for replay.
+  mshr_entry_t &replay(uint32_t id) {
+    auto &root_entry = entries_.at(id);
+    assert(root_entry.bank_req.type == bank_req_t::Core);
+    // A prior fill's replay batch may still be draining: a stalled fill
+    // (writeback egress backpressure) can sit in the pipe while a second
+    // fill is admitted behind it, so two fills' replays can be live at once.
+    // This is safe — the MSHR coalesces misses, so the two fills are for
+    // distinct lines and this replay marks only its own line's waiters; the
+    // accumulated ready_reqs_ stays correct and dequeue drains oldest-first, so
+    // each line's waiters still replay in program order. Double-replaying the
+    // same fill is caught by the Core-type assert above.
+    for (auto &entry : entries_) {
+      if (entry.bank_req.type == bank_req_t::Core && entry.set_id == root_entry.set_id && entry.addr_tag == root_entry.addr_tag && entry.sector_id == root_entry.sector_id) {
+        entry.bank_req.type = bank_req_t::Replay;
+        ++ready_reqs_;
+      }
+    }
+    return root_entry;
+  }
+
+  // Convert a just-enqueued entry into a ready Replay. Used when a request
+  // targets a line whose same-(set,tag,sector) chain is already draining:
+  // nothing will mark the new entry, so it joins the replay stream itself
+  // and seq order keeps it behind the older chained accesses.
+  void defer_to_replay(uint32_t id) {
+    auto &entry = entries_.at(id);
+    assert(entry.bank_req.type == bank_req_t::Core);
+    entry.bank_req.type = bank_req_t::Replay;
+    ++ready_reqs_;
+  }
+
+  // Park the chain at its head: the oldest ready replay and the rest of its
+  // (set,tag,sector) chain return to waiting for a fill, which the head now
+  // roots as a refetch. Returns the head's id.
+  uint32_t park_next_replay(bool retry) {
+    int head = -1;
+    for (int i = 0, n = (int)entries_.size(); i < n; ++i) {
+      const auto &entry = entries_.at(i);
+      if (entry.bank_req.type != bank_req_t::Replay) {
+        continue;
+      }
+      if (head == -1 || entry.seq < entries_.at(head).seq) {
+        head = i;
+      }
+    }
+    assert(head != -1);
+    auto &root = entries_.at(head);
+    for (auto &entry : entries_) {
+      if (entry.bank_req.type == bank_req_t::Replay && entry.set_id == root.set_id
+       && entry.addr_tag == root.addr_tag && entry.sector_id == root.sector_id) {
+        entry.bank_req.type = bank_req_t::Core;
+        --ready_reqs_;
+      }
+    }
+    root.refetch = true;
+    root.refetch_retry = retry;
+    return head;
+  }
+
+  // Peek the entry dequeue() would return next (oldest ready replay), or
+  // nullptr. Lets the fill-forward drain inspect the chain head without
+  // consuming it.
+  const mshr_entry_t* peek_next_replay() const {
+    const mshr_entry_t *picked = nullptr;
+    for (auto &entry : entries_) {
+      if (entry.bank_req.type != bank_req_t::Replay)
+        continue;
+      if (picked == nullptr || entry.seq < picked->seq)
+        picked = &entry;
+    }
+    return picked;
+  }
+
+  // Dequeue the next ready replay request in program order (oldest enqueue
+  // sequence first). Coalesced accesses to the same line must replay in the
+  // order they were issued: a store that precedes a load to the same line has
+  // to merge its data before the load captures its response, and a load that
+  // precedes a store must capture the pre-store line. A blanket reads-before-
+  // writes policy gets the store-then-load case wrong — under write-allocate
+  // the fill only carries memory's stale data, so the store's own replay is
+  // what installs the new value.
+  void dequeue(bank_req_t *out) {
+    assert(ready_reqs_ > 0);
+    mshr_entry_t *picked = nullptr;
+    for (auto &entry : entries_) {
+      if (entry.bank_req.type != bank_req_t::Replay)
+        continue;
+      if (picked == nullptr || entry.seq < picked->seq)
+        picked = &entry;
+    }
+    *out = picked->bank_req;
+    picked->bank_req.type = bank_req_t::None;
+    --ready_reqs_;
+    --size_;
+  }
+
+  void reset() {
+    for (auto &entry : entries_) {
+      entry.reset();
+    }
+    ready_reqs_ = 0;
+    size_ = 0;
+  }
+
+private:
+  std::vector<mshr_entry_t> entries_;
+  uint32_t ready_reqs_;
+  uint32_t size_;
+};
+
+class CacheBank : public SimObject<CacheBank> {
+public:
+  // A memory-side request leaves the bank through a queue with a registered
+  // output stage, so it becomes visible downstream two cycles after the bank
+  // commits it, not one.
+  static constexpr uint32_t MEM_REQ_DELAY = 2;
+
+  // The socket's registered memory port stands for the request register of
+  // the non-cacheable bypass layer; a cache without that layer has no such
+  // register, so its requests reach the port one cycle sooner.
+  static uint32_t mem_req_delay(const Cache::Config &config) {
+    return (config.mem_rsp_slice && !config.nc_enable) ? (MEM_REQ_DELAY - 1) : MEM_REQ_DELAY;
+  }
+
+  // Non-LLC AMO passthrough table capacity. Also partitions the memory-side
+  // tag namespace and counts toward the response-sink credit on mem_rsp_in.
+  static constexpr uint32_t AMO_PASSTHRU_CAP = 8;
+
+  SimChannel<MemReq> core_req_in;
+  SimChannel<MemRsp> core_rsp_out;
+
+  SimChannel<MemReq> mem_req_out;
+  // Sized to sink every response this bank can solicit (one per MSHR fill
+  // plus one per AMO passthrough probe). A memory response must never
+  // back-pressure its sender: if it can, the request and response channels
+  // deadlock through each other across cache levels — this bank's pipe head
+  // stalls on a full mem_req_out while the downstream cache's pipe head
+  // stalls on the response it cannot deliver here.
+  SimChannel<MemRsp> mem_rsp_in;
+
+  CacheBank(const SimContext &ctx,
+            const char *name,
+            const Cache::Config &config,
+            const params_t &params,
+            uint32_t bank_id)
+      : SimObject<CacheBank>(ctx, name), core_req_in(this), core_rsp_out(this), mem_req_out(this), mem_rsp_in(this, config.mshr_size + AMO_PASSTHRU_CAP), config_(config), params_(params), bank_id_(bank_id), mem_req_delay_(mem_req_delay(config)), sets_(params.sets_per_bank, set_t(params.lines_per_set, params.sectors_per_line)), mshr_(config.mshr_size), pipe_req_(TFifo<bank_req_t>::Create("", config.latency, std::max<uint32_t>(2u, config.latency))), lazy_q_(TFifo<uint32_t>::Create("", 1, lazyq_size(config))), rand_ctr_(0), adm_seq_ctr_(0)
+#if VX_CFG_EXT_A_ENABLED
+      , amo_unit_(__MAX(2u, (uint32_t)VX_CFG_AMO_RS_SIZE))
+#endif
+  {
+    // Lazy allocation leaves unfetched bytes in the line: only a write-back
+    // LLC can hold them until a read merges or a writeback masks them out.
+    assert(!config.lazy_fetch || (config.write_back && config.is_llc));
+    this->on_reset();
+  }
+
+  const Cache::PerfStats &perf_stats() const {
+    return perf_stats_;
+  }
+
+  // Flush API.
+  // flush_begin() arms the bank; subsequent ticks scan all sets/ways and emit
+  // a writeback request for every dirty line via mem_req_out (write-back only;
+  // write-through caches have nothing to evict). flush_done() reports when the
+  // walk finishes AND the cache is otherwise idle.
+  // Drop every line, as an address-space change does to a read-only
+  // virtually tagged cache. Called between launches, with no line in flight.
+  void invalidate() {
+    for (auto &set : sets_) {
+      set.reset();
+    }
+  }
+
+  void flush_begin(bool keep_lines) {
+    keep_lines_ = keep_lines;
+    if (!config_.write_back || keep_lines) {
+      flushing_ = false;
+      flush_set_idx_ = 0;
+      flush_way_idx_ = 0;
+      flush_sector_idx_ = 0;
+      return;
+    }
+    // the two walks share the sector cursor
+    __assert(!token_flushing_, "flush walk started during a flush-token walk");
+    flushing_ = true;
+    flush_set_idx_ = 0;
+    flush_way_idx_ = 0;
+    flush_sector_idx_ = 0;
+    this->tick_wake();
+  }
+
+  bool flush_done() const {
+    return !flushing_;
+  }
+
+  // A flush token's walk: one entry per cycle, every set (every way of a
+  // write-back cache), writing back dirty data and invalidating the lines.
+  void token_flush_begin(bool skip) {
+    __assert(!flushing_, "flush-token walk started during a flush walk");
+    token_flushing_ = true;
+    token_flush_skip_ = skip;
+    token_flush_idx_ = 0;
+    token_flush_settle_ = 0;
+    token_flush_walking_ = false;
+    flush_sector_idx_ = 0;
+    this->tick_wake();
+  }
+
+  bool token_flush_done() const {
+    return !token_flushing_;
+  }
+
+protected:
+  void on_reset() {
+    // perf_stats_ survives: the MPM counters run from device reset.
+    pending_mshr_size_ = 0;
+    mshr_occupancy_ = 0;
+    pending_amo_probes_ = 0;
+    pipe_core_lines_.clear();
+    pending_read_reqs_ = 0;
+    pending_write_reqs_ = 0;
+    pending_fill_reqs_ = 0;
+    rand_ctr_ = 0;
+    adm_seq_ctr_ = 0;
+  #ifdef DBG_MEM_BANK0_WDELAY
+    dbg_mem_req_free_ = 0;
+  #endif
+    if (!keep_lines_) {
+      for (auto &set : sets_) {
+        set.reset();
+      }
+    }
+    keep_lines_ = false;
+    mshr_.reset();
+    fwd_active_ = false;
+    fwd_set_    = 0;
+    fwd_tag_    = 0;
+    fwd_sector_ = 0;
+    fwd_data_.reset();
+    crsp_sent_  = false;
+    chain_partial_ = false;
+    chain_retry_   = false;
+    chain_set_     = 0;
+    chain_tag_     = 0;
+    chain_sector_  = 0;
+    refetch_hold_  = false;
+    refetch_hold_retry_ = false;
+    amo_busy_ = false;
+    amo_wb_pending_ = false;
+    amo_wb_tick_ = 0;
+    flushing_ = false;
+    flush_set_idx_ = 0;
+    flush_way_idx_ = 0;
+    flush_sector_idx_ = 0;
+    token_flushing_ = false;
+    token_flush_idx_ = 0;
+    token_flush_walking_ = false;
+#if VX_CFG_EXT_A_ENABLED
+    amo_unit_.reset();
+    for (auto &e : amo_passthru_) {
+      e = amo_passthru_entry_t{};
+    }
+#endif
+  }
+
+  void on_tick() {
+    // The core-response port takes one response per tick; the pipeline has
+    // priority and the forward drain yields (crsp_sent_).
+    crsp_sent_ = false;
+
+    // MSHR occupancy is a registered count: slots a forward, replay or
+    // release frees this tick admit a new request only from the next one.
+    mshr_occupancy_ = mshr_.size() + pending_mshr_size_;
+
+    // Process next request at the head of the pipeline.
+    if (!pipe_req_->empty()) {
+        this->processRequests();
+    }
+
+    // Fill-forward drain: complete the read-prefix of a fill's pending chain
+    // directly (one per tick), leaving the input slot free for new requests.
+    // On response backpressure the head falls back to the replay path.
+    bool fwd_consumed = false;
+    if (fwd_active_) {
+        fwd_consumed = this->processForward();
+    }
+
+    // Accept one new input if there's room.
+    if (!pipe_req_->full()) {
+        this->processInputs(fwd_consumed);
+    }
+
+    // flush walk: emit writebacks for dirty lines.
+    if (flushing_) {
+      this->processFlush();
+    }
+    if (token_flushing_) {
+      this->processTokenFlush();
+    }
+
+    // calculate memory latency
+    perf_stats_.mem_latency += pending_fill_reqs_;
+
+    // sleep when fully drained: no queued or in-flight input, an empty pipe,
+    // and no replay/forward/flush work. pending_fill_reqs_ == 0 also keeps
+    // the mem_latency accumulation exact. flush_begin() re-arms explicitly;
+    // any packet reserved toward core_req_in/mem_rsp_in re-arms on arrival.
+    if (this->core_req_in.size() == 0 && this->mem_rsp_in.size() == 0
+     && pipe_req_->size() == 0 && lazy_q_->size() == 0 && !mshr_.has_ready_reqs()
+     && !fwd_active_ && !flushing_ && !token_flushing_ && pending_fill_reqs_ == 0
+     && !amo_wb_pending_) {
+      this->tick_sleep();
+    }
+  }
+
+private:
+  // Pipeline front: per-tick input arbitration.
+  //
+  // Priority (highest → lowest):
+  //   1) replay   — drains an already-marked Replay entry from the MSHR
+  //                 (guaranteed hit; no miss path)
+  //   2) fill     — memory response; installs the line and marks pending
+  //                 MSHR entries for replay (gated on no pending replay so
+  //                 a fill never preempts an in-flight replay's line)
+  //   3) flush    — handled by processFlush() (separate state machine)
+  //   4) core_req — new core request (may miss and allocate an MSHR slot)
+  //
+  // At most one input fires per tick. All inputs flow through pipe_req_.
+  void processInputs(bool fwd_consumed) {
+    // A refetch fill learns whether its sector is still resident at its tag
+    // lookup, the tick after it enters: nothing enters behind it meanwhile,
+    // and its chain then replays, or parks again if the sector was evicted.
+    if (refetch_hold_) {
+      refetch_hold_ = false;
+      bool evicted = false;
+      if (!refetch_hold_retry_) {
+        const auto &set = sets_.at(chain_set_);
+        int resident_id = set.find_resident(chain_tag_);
+        evicted = (resident_id == -1) || !set.lines.at(resident_id).sectors.at(chain_sector_).valid;
+      }
+      chain_partial_ = evicted;
+      chain_retry_   = evicted;
+      return;
+    }
+
+    // 1) replay: one chain entry leaves per tick — when the fill-forward
+    // drain completed the head this tick, this slot goes to new core
+    // requests instead
+    if (mshr_.has_ready_reqs() && !fwd_consumed) {
+      // A chain whose sector is partial cannot serve a load or AMO: park at
+      // that head and refetch the sector; the rest of the chain waits.
+      if (chain_partial_) {
+        const auto *head = mshr_.peek_next_replay();
+        if (head != nullptr
+         && head->set_id == chain_set_ && head->addr_tag == chain_tag_ && head->sector_id == chain_sector_
+         && !head->bank_req.write) {
+          bank_req_t park_req = head->bank_req;
+          park_req.mshr_id = mshr_.park_next_replay(chain_retry_);
+          park_req.type    = bank_req_t::Park;
+          pipe_req_->push(park_req);
+          DT(3, this->name() << " mshr-park: " << park_req);
+          return;
+        }
+      }
+      bank_req_t bank_req;
+      mshr_.dequeue(&bank_req);
+      pipe_req_->push(bank_req);
+      DT(3, this->name() << " replay-deq: " << bank_req);
+      return;
+    }
+
+    // 2) fill only when no replay is pending and no forward drain is in
+    // progress (a new fill would re-arm the window mid-chain). Each fill
+    // carries its own sector down the pipe, so fills may follow each other
+    // back to back. The fill wakes its chain on accept, so a same-line core
+    // request still in the pipe must reach its chain first (the hardware
+    // links it at S0): the fill waits, and so does any further request to
+    // that line, which keeps a stream of them from starving the fill.
+    bool fill_held = false;
+    uint32_t held_set_id = 0;
+    uint64_t held_addr_tag = 0;
+    if (!this->mem_rsp_in.empty() && !fwd_active_) {
+      auto &mem_rsp = this->mem_rsp_in.peek();
+#if VX_CFG_EXT_A_ENABLED
+      // Non-LLC AMO passthrough response: forward straight to core
+      // without filling. The original tag was rewritten to
+      // (mshr_capacity + pid) when the bank emitted the request from
+      // the AmoProbe handler — that namespace partition survives
+      // arbiter tag mangling.
+      if (mem_rsp.tag >= amo_passthru_tag_base()
+       && mem_rsp.tag <  amo_passthru_tag_base() + AMO_PASSTHRU_CAP) {
+        uint32_t pid = mem_rsp.tag - amo_passthru_tag_base();
+        auto &e = amo_passthru_.at(pid);
+        assert(e.valid && "AMO passthru response without entry");
+        if (this->core_rsp_out.full()) {
+          return; // stall
+        }
+        MemRsp core_rsp{e.req_tag, e.cid, e.uuid};
+        core_rsp.data = mem_rsp.data;
+        this->core_rsp_out.send(core_rsp);
+        DT(3, this->name() << " amo-passthru-rsp: " << core_rsp);
+        e.valid = false;
+        this->mem_rsp_in.pop();
+        --pending_fill_reqs_;
+        return;
+      }
+#endif
+      uint32_t mshr_id = mem_rsp.tag;
+      const auto &root_peek = mshr_.peek(mshr_id);
+      const uint32_t set_id    = root_peek.set_id;
+      const uint64_t addr_tag  = root_peek.addr_tag;
+      const uint32_t sector_id = root_peek.sector_id;
+      if (this->pipeLineBusy(set_id, addr_tag)) {
+        fill_held     = true;
+        held_set_id   = set_id;
+        held_addr_tag = addr_tag;
+      } else {
+        bank_req_t bank_req;
+        bank_req.reset();
+        bank_req.type    = bank_req_t::Fill;
+        bank_req.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+        bank_req.hart_id     = root_peek.bank_req.hart_id;
+        bank_req.uuid    = root_peek.bank_req.uuid;
+        bank_req.mshr_id = mshr_id;
+        bank_req.data    = mem_rsp.data;
+        bank_req.refetch = root_peek.refetch;
+        bank_req.refetch_retry = root_peek.refetch_retry;
+        pipe_req_->push(bank_req);
+        // The chain wakes at accept: its replays enter the pipe behind the fill,
+        // so they reach the array after the install. The forward window answers
+        // the chain's leading reads from the staged sector meanwhile; a refetch
+        // cannot, its staged sector lacks the dirty bytes the install merges in.
+        mshr_.replay(mshr_id);
+        this->setChain(set_id, addr_tag, sector_id, false);
+        if (bank_req.refetch) {
+          refetch_hold_       = true;
+          refetch_hold_retry_ = bank_req.refetch_retry;
+        } else {
+          fwd_active_ = true;
+          fwd_set_    = set_id;
+          fwd_tag_    = addr_tag;
+          fwd_sector_ = sector_id;
+          fwd_data_   = mem_rsp.data;
+        }
+        DT(3, this->name() << " fill-rsp: " << mem_rsp);
+        this->mem_rsp_in.pop();
+        --pending_fill_reqs_;
+        return;
+      }
+    } else if (!lazy_q_->empty() && !fwd_active_) {
+      // A data-less fill through the same path, below memory fills in
+      // priority: the allocation of a write-miss root, or the refetch of a
+      // sector every store has covered.
+      uint32_t mshr_id = lazy_q_->peek();
+      const auto &root_peek = mshr_.peek(mshr_id);
+      const uint32_t set_id    = root_peek.set_id;
+      const uint64_t addr_tag  = root_peek.addr_tag;
+      const uint32_t sector_id = root_peek.sector_id;
+      if (this->pipeLineBusy(set_id, addr_tag)) {
+        fill_held     = true;
+        held_set_id   = set_id;
+        held_addr_tag = addr_tag;
+      } else {
+        bank_req_t bank_req;
+        bank_req.reset();
+        bank_req.type    = bank_req_t::Fill;
+        bank_req.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+        bank_req.hart_id = root_peek.bank_req.hart_id;
+        bank_req.uuid    = root_peek.bank_req.uuid;
+        bank_req.mshr_id = mshr_id;
+        bank_req.nodata  = true;
+        bank_req.refetch = root_peek.refetch;
+        bank_req.refetch_retry = root_peek.refetch_retry;
+        pipe_req_->push(bank_req);
+        mshr_.replay(mshr_id);
+        // A looped-back refetch completes a fully written sector: like a
+        // memory refetch, its chain waits for it to install.
+        this->setChain(set_id, addr_tag, sector_id, !bank_req.refetch);
+        if (bank_req.refetch) {
+          refetch_hold_       = true;
+          refetch_hold_retry_ = bank_req.refetch_retry;
+        }
+        DT(3, this->name() << " lazy-fill: " << bank_req);
+        lazy_q_->pop();
+        return;
+      }
+    }
+
+#if VX_CFG_EXT_A_ENABLED
+    // An LLC atomic's result goes back into the line as a synthetic write
+    // through the core-request slot, one compute cycle after its commit.
+    if (amo_wb_pending_ && SimPlatform::instance().cycles() >= amo_wb_tick_) {
+      bank_req_t wb_req;
+      wb_req.reset();
+      wb_req.type = bank_req_t::AmoWb;
+      pipe_req_->push(wb_req);
+      amo_wb_pending_ = false;
+      amo_busy_ = false;
+      return;
+    }
+#endif
+
+    // 3) core request
+    if (!this->core_req_in.empty()) {
+#if VX_CFG_EXT_A_ENABLED
+      // A store-bearing atomic holds new core requests off from its lookup
+      // until its result is written back.
+      if (amo_busy_) {
+        return;
+      }
+#endif
+      auto &core_req = this->core_req_in.peek();
+      if (fill_held
+       && params_.addr_set_id(core_req.addr) == held_set_id
+       && params_.addr_tag(core_req.addr) == held_addr_tag) {
+        return;
+      }
+      // Conservative MSHR occupancy check: any request that may miss must
+      // reserve a slot. Counts both currently-allocated entries and
+      // in-flight pipe requests that haven't reached MSHR allocation yet.
+      // AMO requests always need a return; at the LLC they reserve like
+      // a load; at non-LLC they don't fill so no MSHR slot is needed
+      // but a passthru side-table slot is.
+      const bool is_amo = memop_is_amo(core_req.op);
+#if VX_CFG_EXT_A_ENABLED
+      const bool is_amo_passthru = is_amo && !config_.is_llc;
+      if (is_amo_passthru) {
+        // Reserve a passthru-table slot at admission, counting probes still
+        // in the pipe. A probe that reaches the pipe head with no free slot
+        // cannot retire, and a full pipe blocks the response processing that
+        // frees slots — a deadlock the input gate must make unreachable.
+        uint32_t free_slots = 0;
+        for (const auto &e : amo_passthru_) { if (!e.valid) ++free_slots; }
+        if (free_slots <= pending_amo_probes_) {
+          ++perf_stats_.mshr_stalls;
+          return;
+        }
+        // Age-ordering: if a fill is in flight for this AMO's line, an
+        // older load/store missed on it and is awaiting its replay. Defer
+        // the AMO until that access completes — otherwise the AMO's
+        // self-invalidation removes the line after the fill installs it
+        // but before the replay (which re-queues behind this AMO) reads
+        // it, turning the replay into a miss.
+        uint32_t amo_set_id   = params_.addr_set_id(core_req.addr);
+        uint64_t amo_addr_tag = params_.addr_tag(core_req.addr);
+        uint32_t amo_sector   = params_.addr_sector_id(core_req.addr);
+        if (mshr_.lookup(amo_set_id, amo_addr_tag, amo_sector)) {
+          ++perf_stats_.mshr_stalls;
+          return;
+        }
+        // An older same-line access still inside the bank pipe allocates its
+        // MSHR entry only at pipe exit; defer on those too, or the AMO
+        // overtakes it and a younger same-address load can chain onto the
+        // pre-AMO fill (and the fill installs a pre-AMO line).
+        if (this->pipeLineBusy(amo_set_id, amo_addr_tag)) {
+          ++perf_stats_.mshr_stalls;
+          return;
+        }
+      }
+#else
+      const bool is_amo_passthru = false;
+#endif
+      // Gate ALL non-AMO-passthru requests on MSHR occupancy because a
+      // write-through store can need a wt-merge MSHR slot if a fill is
+      // pending on the same line. Letting writes in past a full MSHR
+      // causes them to stall on the wt-merge enqueue, blocking fill
+      // responses from draining — a deadlock. Reserve at admission.
+      bool needs_mshr = !is_amo_passthru;
+      (void)is_amo;
+      if (needs_mshr && mshr_occupancy_ >= mshr_.capacity()) {
+        ++perf_stats_.mshr_stalls;
+        return;
+      }
+      // Any admitted request may become a write-miss root: the lazy queue
+      // keeps room for every request already in the pipe.
+      if (config_.lazy_fetch && !this->lazyRoom()) {
+        return;
+      }
+
+      // Admission-time coalescing: a request whose (set,tag,sector) chain is
+      // still awaiting its fill must join it here, not enter the pipe as an
+      // independent Core request. Deciding at pipe exit is too late — the
+      // chain's fill can ride the pipe ahead of this request and install the
+      // line, and the chain's replays dequeue (clearing their entries) while
+      // this request is still in the pipe. A chain that is merely DRAINING
+      // (its fill already installed the line) does not capture new arrivals:
+      // the line is resident, so they proceed through the pipe as ordinary
+      // hits, completing ahead of the drain. The exception is a draining
+      // chain that still carries a write or atomic — a younger access must
+      // not overtake those, so it joins the chain and drains in seq order.
+      // Write-through stores are exempt: their downstream write must be
+      // emitted at the commit stage so same-line stores reach memory in
+      // pipeline order (an at-admission emission could overtake an older
+      // store still riding the pipe). The pipe-exit paths order them
+      // correctly and defer only the line merge when a chain is pending.
+      const bool is_wt_store = (core_req.op == MemOp::ST) && !config_.write_back;
+      if (!is_amo_passthru && !is_wt_store && mshr_.size() != 0) {
+        uint32_t adm_set_id   = params_.addr_set_id(core_req.addr);
+        uint64_t adm_addr_tag = params_.addr_tag(core_req.addr);
+        uint32_t adm_sector   = params_.addr_sector_id(core_req.addr);
+        uint32_t chain_root = 0;
+        if (mshr_.lookup(adm_set_id, adm_addr_tag, adm_sector, &chain_root)) {
+          bool fill_pending = mshr_.has_pending_fill(adm_set_id, adm_addr_tag, adm_sector, -1);
+          bool must_order   = !fill_pending
+                           && mshr_.has_ordered_reqs(adm_set_id, adm_addr_tag, adm_sector);
+          if (fill_pending || must_order) {
+            bank_req_t coalesced;
+            coalesced.reset();
+            coalesced.adm_seq = adm_seq_ctr_++;
+            coalesced.type    = bank_req_t::Core;
+            coalesced.addr    = core_req.addr;
+            coalesced.hart_id = core_req.hart_id;
+            coalesced.uuid    = core_req.uuid;
+            coalesced.req_tag = core_req.tag;
+            coalesced.merged_tags = core_req.merged_tags;
+            coalesced.write   = (core_req.op == MemOp::ST);
+            coalesced.op      = core_req.op;
+            coalesced.data    = core_req.data;
+            coalesced.byteen  = core_req.byteen;
+            coalesced.amo_cmp = core_req.amo_cmp;
+            coalesced.flags   = core_req.flags;
+            assert(!mshr_.full());
+            int id = mshr_.enqueue(coalesced, adm_set_id, adm_addr_tag, adm_sector);
+            // Drain-only join (ordering case): nothing will mark our entry —
+            // make it replay-ready ourselves, seq-ordered behind the
+            // in-flight replays.
+            if (!fill_pending) {
+              mshr_.defer_to_replay(id);
+            }
+            DT(3, this->name() << " mshr-coalesce@admission: " << coalesced);
+            // Chain joiners count as misses, matching the pipe-exit chaining
+            // they replace.
+            if (core_req.is_write()) {
+              ++perf_stats_.writes;
+              ++perf_stats_.write_misses;
+            } else {
+              ++perf_stats_.reads;
+              ++perf_stats_.read_misses;
+            }
+            this->core_req_in.pop();
+            return;
+          }
+        }
+      }
+
+      bank_req_t bank_req;
+      bank_req.reset();
+      bank_req.adm_seq = adm_seq_ctr_++;
+      bank_req.type    = is_amo_passthru ? bank_req_t::AmoProbe : bank_req_t::Core;
+      bank_req.addr    = core_req.addr;
+      bank_req.hart_id = core_req.hart_id;
+      bank_req.uuid    = core_req.uuid;
+      bank_req.req_tag = core_req.tag;
+      bank_req.merged_tags = core_req.merged_tags;
+      // bank_req.write means "route through the cache write path" — true only
+      // for plain stores. AMOs (op == AMO_SC / AMO RMW) are write-bearing
+      // semantically (memop_is_write returns true) but use the dedicated AMO
+      // commit path, not the write-path; keep bank_req.write false for them.
+      bank_req.write   = (core_req.op == MemOp::ST);
+      bank_req.op      = core_req.op;
+      bank_req.data    = core_req.data;
+      bank_req.byteen  = core_req.byteen;
+      bank_req.amo_cmp = core_req.amo_cmp;
+      bank_req.flags   = core_req.flags;
+      pipe_req_->push(bank_req);
+      DT(3, this->name() << " core-req: " << core_req);
+      // pending_mshr_size_ tracks Core-typed in-flight requests so the
+      // MSHR pre-reservation in processInputs is conservative. AmoProbe
+      // doesn't allocate an MSHR slot (no fill on the response), so it
+      // stays out of this counter.
+      if (!is_amo_passthru) {
+        ++pending_mshr_size_;
+        pipe_core_lines_.push_back({params_.addr_set_id(core_req.addr),
+                                    params_.addr_tag(core_req.addr)});
+      }
+#if VX_CFG_EXT_A_ENABLED
+      if (is_amo_passthru) ++pending_amo_probes_;
+      if (is_amo && config_.is_llc && core_req.op != MemOp::AMO_LR) {
+        amo_busy_ = true;
+      }
+#endif
+      if (core_req.is_write()) ++perf_stats_.writes;
+      else                ++perf_stats_.reads;
+      this->core_req_in.pop();
+      return;
+    }
+  }
+
+  // Install a fill that reached the pipe head. Returns false when the
+  // victim's dirty writeback beats don't fit in the egress queue; the fill
+  // stays at the pipe head and retries.
+  //
+  // Replay is mutex with fill (priority gating in processInputs), so any
+  // line evicted here has no in-flight replay. If the line is already
+  // resident (another sector present) the fill is a sector refill into that
+  // same way — no eviction; otherwise allocate a victim way and write back
+  // each of its dirty sectors.
+  bool processFill(const bank_req_t &bank_req) {
+    uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+    uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+    uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+    auto &set          = sets_.at(set_id);
+
+    int resident_id = set.find_resident(addr_tag);
+    const bool is_refill = (resident_id != -1);
+    // Only a refetch finds its sector resident (partial): it merges. A refetch
+    // whose sector was evicted meanwhile may carry data older than that
+    // eviction's writeback, so it installs nothing and its chain parks again;
+    // the retry then fills like any miss (an absent sector cannot be dirtied).
+    const bool sector_resident = is_refill && set.lines.at(resident_id).sectors.at(sector_id).valid;
+    const bool refetch_first   = bank_req.refetch && !bank_req.refetch_retry;
+    assert(!sector_resident || refetch_first);
+    if (refetch_first) {
+      if (sector_resident) {
+        // Memory supplies the bytes no store wrote; the sector stays dirty
+        // in exactly the stored bytes, which are not in memory yet.
+        auto &sec = set.lines.at(resident_id).sectors.at(sector_id);
+        if (bank_req.nodata) {
+          assert(sector_written(sec) && "looped-back refetch of an incompletely written sector");
+        } else {
+          auto written = sec.data;
+          sec.data = bank_req.data;
+          sector_merge(sec, written, sec.dirty_mask);
+        }
+        sec.partial = false;
+      }
+      return true;
+    }
+
+    int line_id;
+    if (is_refill) {
+      line_id = resident_id; // add a sector to the resident copy; no eviction
+    } else {
+      int32_t free_id = -1, repl_id = 0;
+      line_id = set.select_victim(config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+      // The FIFO pointer names the victim even when another way is free.
+      if (config_.repl_policy == Cache::FIFO) {
+        line_id = repl_id;
+      }
+      auto &victim_line = set.lines.at(line_id);
+
+      // Count the victim's dirty sectors; the egress queue must accept all
+      // their writeback beats before we mutate any state.
+      uint32_t wb_count = 0;
+      if (config_.write_back) {
+        for (const auto &s : victim_line.sectors) {
+          if (s.valid && s.dirty) {
+            ++wb_count;
+          }
+        }
+      }
+      if (wb_count > 0 && (this->mem_req_out.size() + wb_count) > this->mem_req_out.capacity()) {
+        return false; // stall
+      }
+
+      if (config_.repl_policy == Cache::RANDOM) {
+        ++rand_ctr_;
+      }
+
+      // Emit one writeback per dirty sector.
+      for (uint32_t s = 0; s < victim_line.sectors.size(); ++s) {
+        auto &sec = victim_line.sectors.at(s);
+        if (!(config_.write_back && sec.valid && sec.dirty)) {
+          continue;
+        }
+        MemReq wb;
+        wb.addr   = params_.mem_addr_sector(bank_id_, set_id, victim_line.tag, s);
+        wb.op     = MemOp::ST;
+        wb.hart_id = bank_req.hart_id;
+        wb.uuid   = bank_req.uuid;
+        wb.data   = sec.data;
+        wb.byteen = sec.dirty_mask;
+        this->send_mem_req(wb);
+        DT(3, this->name() << " writeback: " << wb);
+        ++perf_stats_.evictions;
+      }
+
+      // Repurpose the victim way for the new line: all sectors invalid.
+      victim_line.reset();
+      victim_line.tag = addr_tag;
+      // Only a new line advances the FIFO pointer; a sector refill keeps it.
+      if (config_.repl_policy == Cache::FIFO) {
+        set.fifo_ptr = (set.fifo_ptr + 1) % set.lines.size();
+      }
+    }
+
+    auto &line = set.lines.at(line_id);
+    line.tag     = addr_tag;
+    line.lru_ctr = 0;
+    auto &sec    = line.sectors.at(sector_id);
+    if (bank_req.nodata) {
+      sec.valid      = true;
+      sec.dirty      = false;
+      sec.partial    = true;
+      sec.dirty_mask = 0;
+      sec.data.reset();
+    } else {
+      sec.valid      = true;
+      sec.dirty      = false;
+      sec.partial    = false;
+      sec.dirty_mask = 0;
+      sec.data       = bank_req.data;
+    }
+    return true;
+  }
+
+  // Track the partial state of the chain a fill just woke.
+  void setChain(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id, bool partial) {
+    chain_partial_ = partial;
+    chain_retry_   = false;
+    chain_set_     = set_id;
+    chain_tag_     = addr_tag;
+    chain_sector_  = sector_id;
+  }
+
+  // Lazy-fetch loopback depth: room for twice the pipe, so a few queued
+  // entries leave admission and the refetch loopback open.
+  static uint32_t lazyq_size(const Cache::Config &config) {
+    return 1u << log2ceil(2 * config.latency);
+  }
+
+  // The loopback still fits every request in the pipe: a new request may be
+  // admitted, and a refetch with no data to read may loop back; one that
+  // cannot reads memory instead.
+  bool lazyRoom() const {
+    return lazy_q_->size() < lazyq_size(config_) - config_.latency;
+  }
+
+  // Fill-forward drain: complete the oldest ready replay directly when it is
+  // a plain read on the armed chain — no pipeline traversal, and the input
+  // slot stays free for new requests. The first write/AMO head closes the
+  // window; it and every later chain entry drain through the regular replay
+  // path, preserving program order (an older store must merge its data
+  // before a younger same-line read captures its response). Forwarded reads
+  // skip the replacement-state update: recency is tracked by pipelined
+  // lookups only.
+  bool processForward() {
+    if (!mshr_.has_ready_reqs()) {
+      fwd_active_ = false; // chain drained
+      fwd_data_.reset();
+      return false;
+    }
+    const auto *head = mshr_.peek_next_replay();
+    if (head == nullptr) {
+      return false;
+    }
+    if (head->set_id != fwd_set_
+     || head->addr_tag != fwd_tag_
+     || head->sector_id != fwd_sector_
+     || head->bank_req.write
+     || memop_is_atomic(head->bank_req.op)) {
+      fwd_active_ = false;
+      fwd_data_.reset();
+      return false;
+    }
+    if (crsp_sent_ || this->core_rsp_out.full()) {
+      return false; // the head falls back to the replay path this tick
+    }
+    bank_req_t req;
+    mshr_.dequeue(&req);
+    MemRsp rsp{req.req_tag, req.hart_id, req.uuid};
+    rsp.data = fwd_data_;
+    rsp.merged_tags = req.merged_tags;
+    this->core_rsp_out.send(rsp);
+    DT(3, this->name() << " fwd-rsp: " << rsp);
+    return true;
+  }
+
+#if VX_CFG_EXT_A_ENABLED
+  // AMO commit at the LLC bank. Returns false if the cycle stalls
+  // (caller leaves bank_req at the head of pipe_req_); returns true
+  // when the commit completes. Collects all stall conditions before
+  // any mutation.
+  bool commitAmo(const bank_req_t &bank_req, set_t &set, int hit_id, uint32_t set_id) {
+    const uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+    auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+    const uint64_t line_addr = (bank_req.addr >> config_.L) << config_.L;
+    const uint32_t byte_off  = (uint32_t)(bank_req.addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+    const MemOp    op        = bank_req.op;
+    // Width derived from byteen popcount (RVA mandates natural alignment, so
+    // byteen is contiguous: popcount==8 ⇒ .D, popcount==4 ⇒ .W).
+    const uint8_t  width     = (__builtin_popcountll(bank_req.byteen) >= 8) ? 3 : 2;
+    const uint32_t hid       = bank_req.hart_id;
+    // rhs is the lane's rs2 packed into bank_req.data at byte_off (LSU builds
+    // this the same way as for stores; mem_coalescer also merges it for AMOs).
+    const uint64_t rhs       = bank_req.data
+                             ? amo_load_word(bank_req.data->data(), byte_off, width)
+                             : 0ull;
+    // MIN/MAX signedness: signed by default, unsigned per flag.
+    const bool unsigned_minmax = bank_req.flags.amo_unsigned;
+
+    const bool sc_fail  = (op == MemOp::AMO_SC) && !amo_unit_.check(hid, line_addr);
+    const bool do_store = (op != MemOp::AMO_LR) && !sc_fail;
+
+    // Stall checks (collect all before mutating).
+    if (this->core_rsp_out.full())
+      return false;
+    if (do_store && !config_.write_back && this->mem_req_out.full())
+      return false;
+
+    // Pure compute: read old word, derive new and ret.
+    uint64_t old_word = 0;
+    if (hit_sec.data) {
+      old_word = amo_load_word(hit_sec.data->data(), byte_off, width);
+    }
+    auto rmw = amo_unit_.compute(op, width, old_word, rhs, unsigned_minmax,
+                                 bank_req.amo_cmp);
+
+    // Build response payload: a fresh block with the relevant word at byte_off.
+    // For LR/AMO* the word carries old_word (LSU sext at width gives rd).
+    // For SC it carries 0 (success) or 1 (failure).
+    auto rsp_block = make_mem_block();
+    std::memset(rsp_block->data(), 0, rsp_block->size());
+    uint64_t rsp_word = (op == MemOp::AMO_SC) ? (sc_fail ? 1ull : 0ull)
+                                            : rmw.ret_word;
+    amo_store_word(rsp_block->data(), byte_off, width, rsp_word);
+
+    // Reservation update before commit so a same-cycle invalidate
+    // from the store path doesn't kill our just-installed entry.
+    if (op == MemOp::AMO_LR) {
+      amo_unit_.reserve(hid, line_addr);
+    } else if (op == MemOp::AMO_SC) {
+      // RVA: SC always invalidates the reservation, success or fail.
+      amo_unit_.clear(hid, line_addr);
+    }
+
+    if (do_store) {
+      // Merge the new word at byte_off into the line.
+      auto store_block = make_mem_block();
+      std::memset(store_block->data(), 0, store_block->size());
+      amo_store_word(store_block->data(), byte_off, width, rmw.new_word);
+      uint64_t byteen = amo_byteen(byte_off, width);
+      sector_merge(hit_sec, store_block, byteen);
+      if (config_.write_back) {
+        hit_sec.dirty = true;
+        hit_sec.dirty_mask |= byteen;
+      } else {
+        // Write-through: emit a write of the merged word downstream.
+        MemReq w;
+        w.addr   = params_.mem_addr_sector(bank_id_, set_id, params_.addr_tag(bank_req.addr), sector_id);
+        w.op = MemOp::ST;
+        w.hart_id    = bank_req.hart_id;
+        w.uuid   = bank_req.uuid;
+        w.data   = store_block;
+        w.byteen = byteen;
+        this->send_mem_req(w);
+        DT(3, this->name() << " amo-writethrough: " << w);
+      }
+      // Break other harts' reservations on this line.
+      amo_unit_.invalidate(line_addr, /*except=*/hid);
+    }
+
+    // A stored result is written back into the line through the pipe; without
+    // a store the commit frees the bank at once.
+    if (do_store) {
+      amo_wb_pending_ = true;
+      amo_wb_tick_ = SimPlatform::instance().cycles() + 2;
+    } else {
+      amo_busy_ = false;
+    }
+
+    // Send AMO response.
+    MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
+    rsp.data = rsp_block;
+    this->core_rsp_out.send(rsp);
+    crsp_sent_ = true;
+    DT(3, this->name() << " amo-rsp op=" << op << " sc_fail=" << sc_fail << ": " << rsp);
+    return true;
+  }
+#endif
+
+  // Pipeline tail: process the head of pipe_req_ — at most one bank_req_t per tick.
+
+  // Send a request down the bank's in-order memory queue.
+  // Debug: a write-through cache holds each write at the head of bank 0's
+  // queue for a fixed delay, the requests behind it included, so requests
+  // through the other banks overtake it unless something orders them.
+  void send_mem_req(const MemReq& req) {
+  #ifdef DBG_MEM_BANK0_WDELAY
+    if (bank_id_ == 0 && !config_.write_back) {
+      constexpr uint64_t DBG_WDELAY = 2048;
+      uint64_t now  = SimPlatform::instance().cycles();
+      uint64_t head = std::max(now, dbg_mem_req_free_);
+      uint64_t leave = head + (req.is_write() ? DBG_WDELAY : 0);
+      dbg_mem_req_free_ = leave + 1;
+      this->mem_req_out.send(req, mem_req_delay_ + (leave - now));
+      return;
+    }
+  #endif
+    this->mem_req_out.send(req, mem_req_delay_);
+  }
+
+  // Emit a write-through store downstream, with the optional core response.
+  // All backpressure is checked before any send, so a false return stalls
+  // the caller with no partial effects.
+  bool emitWritethrough(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id,
+                        uint64_t full_addr, uint32_t hart_id, uint64_t uuid,
+                        const std::shared_ptr<mem_block_t>& data, uint64_t byteen,
+                        bool need_rsp, uint64_t rsp_tag) {
+    __unused(full_addr);
+    if (this->mem_req_out.full()) {
+      return false;
+    }
+    if (need_rsp && this->core_rsp_out.full()) {
+      return false;
+    }
+    MemReq w;
+    w.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+    w.op      = MemOp::ST;
+    w.hart_id = hart_id;
+    w.uuid    = uuid;
+    w.data    = data;
+    w.byteen  = byteen;
+    this->send_mem_req(w);
+    DT(3, this->name() << " writethrough: " << w);
+#if VX_CFG_EXT_A_ENABLED
+    // Committed write: break other harts' reservations.
+    if (config_.is_llc) {
+      uint64_t line_addr = (full_addr >> config_.L) << config_.L;
+      amo_unit_.invalidate(line_addr, /*except=*/hart_id);
+    }
+#endif
+    if (need_rsp) {
+      MemRsp rsp{rsp_tag, hart_id, uuid};
+      this->core_rsp_out.send(rsp);
+      crsp_sent_ = true;
+      DT(3, this->name() << " core-rsp: " << rsp);
+    }
+    return true;
+  }
+
+  void processRequests() {
+    const bank_req_t &bank_req = pipe_req_->peek();
+
+    // Stores get a response when (a) the cache is configured to always emit
+    // them (config_.write_reponse, global), or (b) the request opts in via
+    // MEM_FLAG_STRSP (per-request). Loads/AMOs always have a response.
+    auto need_core_rsp = [&](const bank_req_t &req) {
+      return (!req.write) || config_.write_reponse || req.flags.strsp;
+    };
+
+    switch (bank_req.type) {
+    case bank_req_t::None:
+    case bank_req_t::AmoWb:
+      pipe_req_->pop();
+      return;
+
+#if VX_CFG_EXT_A_ENABLED
+    case bank_req_t::AmoProbe: {
+      // Non-LLC AMO passthrough. Probe the local line first so any
+      // cached copy doesn't shadow the LLC's view: dirty line →
+      // writeback; any hit → invalidate. Then forward the original AMO
+      // MemReq downstream so the response routes back to core_rsp_out
+      // without installing a fill.
+      assert(!config_.is_llc && "AmoProbe at LLC is a wiring bug");
+      uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+      uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+      uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+      auto &set          = sets_.at(set_id);
+      int32_t free_id = -1, repl_id = 0;
+      int present_id = set.tag_match(addr_tag, config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+      // Probe targets only the sector the AMO addresses; other sectors of the
+      // same line are independent and stay resident.
+      int hit_id = (present_id != -1 && set.lines.at(present_id).sectors.at(sector_id).valid) ? present_id : -1;
+      const bool hit   = (hit_id != -1);
+      const bool dirty = hit && set.lines.at(hit_id).sectors.at(sector_id).dirty;
+
+      // Stall checks: writeback (if dirty) AND the AMO forward both
+      // need a mem_req_out slot.
+      const uint32_t out_slots_needed = (dirty ? 1u : 0u) + 1u;
+      if (this->mem_req_out.size() + out_slots_needed > this->mem_req_out.capacity()) {
+        return; // stall
+      }
+      // Pre-allocate a passthru-table slot before mutating state.
+      uint32_t pid = AMO_PASSTHRU_CAP;
+      for (uint32_t i = 0; i < AMO_PASSTHRU_CAP; ++i) {
+        if (!amo_passthru_.at(i).valid) { pid = i; break; }
+      }
+      if (pid == AMO_PASSTHRU_CAP) {
+        // Unreachable: admission reserves a slot per in-pipe probe. Kept as
+        // a defensive stall.
+        return;
+      }
+
+      if (dirty) {
+        auto &sec = set.lines.at(hit_id).sectors.at(sector_id);
+        MemReq wb;
+        wb.addr   = params_.mem_addr_sector(bank_id_, set_id, set.lines.at(hit_id).tag, sector_id);
+        wb.op = MemOp::ST;
+        wb.hart_id    = bank_req.hart_id;
+        wb.uuid   = bank_req.uuid;
+        wb.data   = sec.data;
+        wb.byteen = sec.dirty_mask;
+        this->send_mem_req(wb);
+        DT(3, this->name() << " amo-probe-wb: " << wb);
+        ++perf_stats_.evictions;
+      }
+      if (hit) {
+        set.lines.at(hit_id).sectors.at(sector_id).reset();
+      }
+
+      // Forward AMO downstream. Tag is rewritten so the response
+      // doesn't collide with the MSHR tag namespace.
+      auto &e = amo_passthru_.at(pid);
+      e.valid   = true;
+      e.req_tag = bank_req.req_tag;
+      e.cid     = bank_req.hart_id;
+      e.uuid    = bank_req.uuid;
+      MemReq amo_fwd;
+      amo_fwd.addr   = bank_req.addr;
+      // op already set below; default-construct sets MemOp::LD which we override.
+      amo_fwd.tag    = amo_passthru_tag_base() + pid;
+      amo_fwd.hart_id = bank_req.hart_id;
+      amo_fwd.uuid    = bank_req.uuid;
+      amo_fwd.op      = bank_req.op;
+      amo_fwd.byteen  = bank_req.byteen;  // carries width info (popcount-derived at LLC)
+      amo_fwd.amo_cmp = bank_req.amo_cmp;
+      amo_fwd.data    = bank_req.data;    // carries rhs (extracted at LLC)
+      amo_fwd.flags   = bank_req.flags;   // carry amo_unsigned (signed vs unsigned MIN/MAX)
+      this->send_mem_req(amo_fwd);
+      DT(3, this->name() << " amo-probe-fwd: " << amo_fwd);
+      ++pending_fill_reqs_; // counts as an outstanding mem-roundtrip for perf
+      --pending_amo_probes_; // reservation transferred to the table entry
+      pipe_req_->pop();
+      return;
+    }
+#endif
+
+    case bank_req_t::Fill: {
+      if (!this->processFill(bank_req)) {
+        return; // stall
+      }
+      pipe_req_->pop();
+    } break;
+
+    case bank_req_t::Park: {
+      uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+      uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+      uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+      auto &set          = sets_.at(set_id);
+      // A parked head needs memory room whichever way its refetch goes.
+      if (this->mem_req_out.full()) {
+        return; // stall
+      }
+      int resident_id = set.find_resident(addr_tag);
+      if (resident_id != -1) {
+        const auto &sec = set.lines.at(resident_id).sectors.at(sector_id);
+        if (sec.valid && sec.partial && sector_written(sec) && this->lazyRoom()) {
+          lazy_q_->push(bank_req.mshr_id);
+          DT(3, this->name() << " refetch-loop: " << bank_req);
+          pipe_req_->pop();
+          return;
+        }
+      }
+      MemReq fill;
+      fill.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+      fill.tag     = bank_req.mshr_id;
+      fill.hart_id = bank_req.hart_id;
+      fill.uuid    = bank_req.uuid;
+      this->send_mem_req(fill);
+      DT(3, this->name() << " refetch-req: " << fill);
+      ++pending_fill_reqs_;
+      pipe_req_->pop();
+    } break;
+
+    case bank_req_t::Replay: {
+      uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+      uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+      uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+      auto &set          = sets_.at(set_id);
+      int32_t free_id = -1, repl_id = 0;
+      int present_id = set.tag_match(addr_tag, config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+      // Sector hit: line resident AND the requested sector valid (and complete
+      // when the access reads it).
+      const bool needs_data = !bank_req.write;
+      int hit_id = (present_id != -1 && sector_hit(set.lines.at(present_id).sectors.at(sector_id), needs_data)) ? present_id : -1;
+
+      // The replayed sector is normally present — the fill that woke this
+      // replay just installed it. It can still be gone when a concurrent
+      // AMO passthrough invalidated the sector after the fill installed it
+      // but before this replay ran (the AMO request sat ahead of the
+      // replay in the bank pipeline). Handle the vanished-sector case
+      // instead of committing to an absent sector.
+      if (hit_id == -1) {
+        // A write-through merge already propagated its store downstream at
+        // miss time, so a vanished line needs no replay — drop it.
+        if (bank_req.write && bank_req.skip_core_rsp) {
+          pipe_req_->pop();
+          return;
+        }
+        // Load / AMO: the sector must be re-fetched before the access can
+        // complete. Re-issue as a fresh miss (chain onto an in-flight fill
+        // for the same sector if one exists).
+        // Key the fill decision on a chain that still awaits its fill:
+        // drain-only (Replay-typed) entries never mark new waiters, so
+        // chaining onto them without a fill would strand this entry.
+        bool fill_pending = mshr_.has_pending_fill(set_id, addr_tag, sector_id, -1);
+        if (!fill_pending && this->mem_req_out.full())
+          return; // stall
+        if (mshr_.full())
+          return; // stall: need a slot to re-track the miss
+        bank_req_t refill = bank_req;
+        refill.type = bank_req_t::Core;
+        const bool refetch = (present_id != -1) && set.lines.at(present_id).sectors.at(sector_id).valid;
+        int mshr_id = mshr_.enqueue(refill, set_id, addr_tag, sector_id, refetch);
+        if (!fill_pending) {
+          MemReq fill;
+          fill.addr    = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+          fill.tag     = mshr_id;
+          fill.hart_id = bank_req.hart_id;
+          fill.uuid    = bank_req.uuid;
+          this->send_mem_req(fill);
+          ++pending_fill_reqs_;
+        }
+        pipe_req_->pop();
+        return;
+      }
+
+#if VX_CFG_EXT_A_ENABLED
+      if (memop_is_atomic(bank_req.op)) {
+        assert(config_.is_llc && "AMO replay reached non-LLC bank");
+        if (!this->commitAmo(bank_req, set, hit_id, set_id))
+          return; // stall
+        if (config_.repl_policy == Cache::PLRU)
+          set.update_lru(hit_id);
+        pipe_req_->pop();
+        return;
+      }
+#endif
+
+      if (need_core_rsp(bank_req) && this->core_rsp_out.full())
+        return; // stall
+
+      auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+      if (bank_req.write) {
+        // Write-through replay only exists for the wt-merge case: the core
+        // response and the memory write were already issued at miss time.
+        // Guard so a future change doesn't silently drop a store.
+        if (!config_.write_back) {
+          assert(bank_req.skip_core_rsp && "WT replay without pre-sent store");
+        }
+        sector_merge(hit_sec, bank_req.data, bank_req.byteen);
+        if (config_.write_back) {
+          hit_sec.dirty = true;
+          hit_sec.dirty_mask |= bank_req.byteen;
+        }
+#if VX_CFG_EXT_A_ENABLED
+        // Write-back write-miss replay reaching the LLC tag array:
+        // break other harts' reservations. For the WT wt-merge replay,
+        // invalidation already fired at miss time.
+        if (config_.is_llc && config_.write_back) {
+          uint64_t line_addr = (bank_req.addr >> config_.L) << config_.L;
+          amo_unit_.invalidate(line_addr, /*except=*/bank_req.hart_id);
+        }
+#endif
+      }
+      if (need_core_rsp(bank_req) && !bank_req.skip_core_rsp) {
+        MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
+        if (!bank_req.write)
+          rsp.data = hit_sec.data;
+        rsp.merged_tags = bank_req.merged_tags;
+        this->core_rsp_out.send(rsp);
+        crsp_sent_ = true;
+        DT(3, this->name() << " replay-rsp: " << rsp);
+      }
+      if (config_.repl_policy == Cache::PLRU)
+        set.update_lru(hit_id);
+
+      pipe_req_->pop();
+    } break;
+
+    case bank_req_t::Core: {
+      uint32_t set_id    = params_.addr_set_id(bank_req.addr);
+      uint64_t addr_tag  = params_.addr_tag(bank_req.addr);
+      uint32_t sector_id = params_.addr_sector_id(bank_req.addr);
+      auto &set          = sets_.at(set_id);
+
+      int32_t free_id = -1, repl_id = 0;
+      // Pure tag match — no LRU mutation here. update_lru() commits below,
+      // after all stall checks pass, otherwise PLRU drifts on retry.
+      int present_id = set.tag_match(addr_tag, config_.repl_policy, rand_ctr_, &free_id, &repl_id);
+      // Sector hit: line resident AND the requested sector valid (a sector miss
+      // on a resident line takes the miss path and refills just that sector).
+      // A load or AMO to a partial sector misses and refetches it.
+      const bool needs_data = !bank_req.write;
+      int hit_id = (present_id != -1 && sector_hit(set.lines.at(present_id).sectors.at(sector_id), needs_data)) ? present_id : -1;
+      const bool partial_resident = (present_id != -1) && (hit_id == -1)
+                                 && set.lines.at(present_id).sectors.at(sector_id).valid;
+
+      if (hit_id != -1) {
+        // Hit while a same-(set,tag,sector) chain still carries a write or
+        // atomic: proceeding would overtake accesses a younger request must
+        // stay ordered behind. Defer into the replay stream and let seq
+        // order decide. A pure-load chain imposes no such ordering — the
+        // line is resident, so the hit completes ahead of the drain.
+        // Write-through stores keep their immediate memory write +
+        // response and defer only the line merge.
+        uint32_t chain_root = 0;
+        if (mshr_.lookup(set_id, addr_tag, sector_id, &chain_root)
+         && (mshr_.has_ordered_reqs(set_id, addr_tag, sector_id)
+          || bank_req.write || memop_is_atomic(bank_req.op))) {
+          if (bank_req.write && !config_.write_back) {
+            if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                        bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                        bank_req.data, bank_req.byteen,
+                                        need_core_rsp(bank_req), bank_req.req_tag)) {
+              return;
+            }
+            bank_req_t merge_req = bank_req;
+            merge_req.skip_core_rsp = true;
+            assert(!mshr_.full());
+            int id = mshr_.enqueue(merge_req, set_id, addr_tag, sector_id);
+            mshr_.defer_to_replay(id);
+            DT(3, this->name() << " mshr-defer (wt-merge): " << bank_req);
+          } else {
+            assert(!mshr_.full());
+            int id = mshr_.enqueue(bank_req, set_id, addr_tag, sector_id);
+            // A chain still awaiting its fill (a refetch of this partial
+            // sector) wakes this entry itself; only a draining chain needs it
+            // marked ready here.
+            if (!mshr_.has_pending_fill(set_id, addr_tag, sector_id, id)) {
+              mshr_.defer_to_replay(id);
+            }
+            DT(3, this->name() << " mshr-defer: " << bank_req);
+          }
+          --pending_mshr_size_;
+          this->pipeLineErase(set_id, addr_tag);
+          pipe_req_->pop();
+          return;
+        }
+#if VX_CFG_EXT_A_ENABLED
+        if (memop_is_atomic(bank_req.op)) {
+          assert(config_.is_llc && "AMO Core+hit reached non-LLC bank");
+          if (!this->commitAmo(bank_req, set, hit_id, set_id))
+            return; // stall
+          if (config_.repl_policy == Cache::PLRU)
+            set.update_lru(hit_id);
+          --pending_mshr_size_;
+          this->pipeLineErase(set_id, addr_tag);
+          pipe_req_->pop();
+          return;
+        }
+#endif
+        // Cache hit.
+        const bool need_rsp = need_core_rsp(bank_req);
+        const bool need_mem = bank_req.write && !config_.write_back;
+        if (need_mem && this->mem_req_out.full())
+          return;
+        if (need_rsp && this->core_rsp_out.full())
+          return;
+
+        auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
+        if (bank_req.write) {
+          sector_merge(hit_sec, bank_req.data, bank_req.byteen);
+          if (config_.write_back) {
+            hit_sec.dirty = true;
+            hit_sec.dirty_mask |= bank_req.byteen;
+          } else {
+            MemReq w;
+            w.addr   = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+            w.op = MemOp::ST;
+            w.hart_id    = bank_req.hart_id;
+            w.uuid   = bank_req.uuid;
+            w.data   = bank_req.data;
+            w.byteen = bank_req.byteen;
+            this->send_mem_req(w);
+            DT(3, this->name() << " writethrough: " << w);
+#if VX_CFG_EXT_A_ENABLED
+            // Writethrough commit: break other harts' reservations.
+            if (config_.is_llc) {
+              uint64_t line_addr = (bank_req.addr >> config_.L) << config_.L;
+              amo_unit_.invalidate(line_addr, /*except=*/bank_req.hart_id);
+            }
+#endif
+          }
+#if VX_CFG_EXT_A_ENABLED
+          // Write-back write-hit at LLC: break other harts' reservations.
+          if (config_.is_llc && config_.write_back) {
+            uint64_t line_addr = (bank_req.addr >> config_.L) << config_.L;
+            amo_unit_.invalidate(line_addr, /*except=*/bank_req.hart_id);
+          }
+#endif
+        }
+        if (need_rsp) {
+          MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
+          if (!bank_req.write)
+            rsp.data = hit_sec.data;
+          rsp.merged_tags = bank_req.merged_tags;
+          this->core_rsp_out.send(rsp);
+          crsp_sent_ = true;
+          DT(3, this->name() << " core-rsp: " << rsp);
+        }
+      } else {
+        // Cache miss.
+        if (config_.write_around && bank_req.write && bank_req.flags.noalloc
+         && !mshr_.lookup(set_id, addr_tag, sector_id)) {
+          // A no-allocate write miss with no fill pending on its line goes to
+          // memory as is: nothing is allocated or fetched.
+          if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                      bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                      bank_req.data, bank_req.byteen,
+                                      need_core_rsp(bank_req), bank_req.req_tag)) {
+            return;
+          }
+        } else if (bank_req.write && !config_.write_back) {
+          // Write-through write miss: forward store to memory and respond
+          // immediately. No fill / no MSHR allocation (this store doesn't
+          // wait for a line). If a fill for this line is already in flight
+          // from an earlier miss, also enqueue a wt-merge replay so the
+          // bytes get folded into the line once the fill arrives — without
+          // this, a subsequent read could see the pre-store fill data.
+          bool fill_pending = mshr_.has_pending_fill(set_id, addr_tag, sector_id, -1);
+          // wt-merge needs an MSHR slot; processInputs's MSHR gate doesn't
+          // reserve one for write-through writes. Stall rather than abort.
+          if (fill_pending && mshr_.full())
+            return;
+          if (!this->emitWritethrough(set_id, addr_tag, sector_id,
+                                      bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                      bank_req.data, bank_req.byteen,
+                                      need_core_rsp(bank_req), bank_req.req_tag)) {
+            return;
+          }
+          if (fill_pending) {
+            bank_req_t merge_req = bank_req;
+            merge_req.skip_core_rsp = true;
+            mshr_.enqueue(merge_req, set_id, addr_tag, sector_id);
+            DT(3, this->name() << " mshr-enqueue (wt-merge): " << bank_req);
+          }
+        } else {
+          // Read miss, or write-back write miss → MSHR-backed.
+          // First miss for this line sends the fill request; subsequent
+          // misses to the same line just chain into the existing entry.
+          // Fill-send keys on a chain that still awaits its fill; drain-only
+          // entries never mark new waiters, so they must not suppress the
+          // fill for this fresh miss.
+          bool fill_pending = mshr_.has_pending_fill(set_id, addr_tag, sector_id, -1);
+          // Lazy fetch: a write-miss root allocates through the loopback
+          // instead of fetching the sector, and so does the refetch of a
+          // partial sector every store has already covered.
+          const bool lazy_alloc = config_.lazy_fetch && bank_req.write && !fill_pending;
+          const bool refetch_loop = partial_resident && !fill_pending
+                                 && sector_written(set.lines.at(present_id).sectors.at(sector_id))
+                                 && this->lazyRoom();
+          if ((lazy_alloc || refetch_loop) && lazy_q_->full()) {
+            return;
+          }
+          if (!fill_pending && !lazy_alloc && !refetch_loop && this->mem_req_out.full()) {
+            return;
+          }
+
+          assert(!mshr_.full());
+          int mshr_id = mshr_.enqueue(bank_req, set_id, addr_tag, sector_id, partial_resident);
+          DT(3, this->name() << " mshr-enqueue: " << bank_req);
+          if (lazy_alloc || refetch_loop) {
+            lazy_q_->push(mshr_id);
+            DT(3, this->name() << (lazy_alloc ? " lazy-alloc: " : " refetch-loop: ") << bank_req);
+          } else if (!fill_pending) {
+            MemReq fill;
+            fill.addr  = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
+            // op defaults to MemOp::LD — fill is a load.
+            fill.tag   = mshr_id; // routes the fill response back here
+            fill.hart_id   = bank_req.hart_id;
+            fill.uuid  = bank_req.uuid;
+            this->send_mem_req(fill);
+            DT(3, this->name() << " fill-req: " << fill);
+            ++pending_fill_reqs_;
+          }
+        }
+        if (bank_req.write) ++perf_stats_.write_misses;
+        else                ++perf_stats_.read_misses;
+      }
+
+      if (config_.repl_policy == Cache::PLRU)
+        set.update_lru(hit_id);
+      --pending_mshr_size_;
+      this->pipeLineErase(set_id, addr_tag);
+      pipe_req_->pop();
+    } break;
+
+    default:
+      std::abort();
+    }
+  }
+
+  void processFlush() {
+    // Wait for in-flight requests to drain before walking lines, otherwise an
+    // outstanding fill could install a fresh line behind our scan and leave
+    // a dirty victim un-evicted. The pipeline test must use occupancy, not
+    // queue emptiness: an entry sent into the pipe this cycle is in flight
+    // and invisible to empty(), and a replay in that window still carries a
+    // store that must merge before its line is walked.
+    if (pending_fill_reqs_ != 0
+     || pipe_req_->size() != 0
+     || !mshr_.empty()) {
+      return;
+    }
+    while (flush_set_idx_ < params_.sets_per_bank) {
+      auto &set = sets_.at(flush_set_idx_);
+      while (flush_way_idx_ < set.lines.size()) {
+        auto &line = set.lines.at(flush_way_idx_);
+        // Emit one writeback per dirty sector (resumable across stalls).
+        while (flush_sector_idx_ < line.sectors.size()) {
+          auto &sec = line.sectors.at(flush_sector_idx_);
+          if (sec.valid && sec.dirty) {
+            if (this->mem_req_out.full())
+              return; // stall — resume at this sector next cycle
+            MemReq mem_req;
+            mem_req.addr = params_.mem_addr_sector(bank_id_, flush_set_idx_, line.tag, flush_sector_idx_);
+            mem_req.op   = MemOp::ST;
+            mem_req.data = sec.data;
+            mem_req.byteen = sec.dirty_mask;
+            this->send_mem_req(mem_req);
+            DT(3, this->name() << " flush-wb: " << mem_req);
+            ++perf_stats_.evictions;
+            sec.dirty = false;
+            sec.dirty_mask = 0;
+          }
+          ++flush_sector_idx_;
+        }
+        flush_sector_idx_ = 0;
+        ++flush_way_idx_;
+      }
+      ++flush_set_idx_;
+      flush_way_idx_ = 0;
+    }
+    flushing_ = false;
+    DT(3, this->name() << " flush-done");
+  }
+
+  void processTokenFlush() {
+    // the bank leaves its write-backs, then signals the end, a cycle each
+    if (token_flush_settle_ != 0) {
+      if (--token_flush_settle_ == 0) {
+        token_flushing_ = false;
+        DT(3, this->name() << (token_flush_skip_ ? " token-quiesce-done" : " token-flush-done"));
+      }
+      return;
+    }
+    if (pending_fill_reqs_ != 0
+     || this->core_req_in.size() != 0
+     || pipe_req_->size() != 0
+     || !mshr_.empty()) {
+      return;
+    }
+    if (token_flush_skip_) {
+      token_flush_settle_ = TOKEN_FLUSH_SETTLE;
+      return;
+    }
+    // the walk starts the cycle after the bank is seen quiet
+    if (!token_flush_walking_) {
+      token_flush_walking_ = true;
+      return;
+    }
+    uint32_t ways = config_.write_back ? params_.lines_per_set : 1;
+    uint32_t set_id = token_flush_idx_ % params_.sets_per_bank;
+    uint32_t way_id = token_flush_idx_ / params_.sets_per_bank;
+    auto &set = sets_.at(set_id);
+    if (config_.write_back) {
+      auto &line = set.lines.at(way_id);
+      while (flush_sector_idx_ < line.sectors.size()) {
+        auto &sec = line.sectors.at(flush_sector_idx_);
+        if (sec.valid && sec.dirty) {
+          if (this->mem_req_out.full()) {
+            return;
+          }
+          MemReq mem_req;
+          mem_req.addr = params_.mem_addr_sector(bank_id_, set_id, line.tag, flush_sector_idx_);
+          mem_req.op   = MemOp::ST;
+          mem_req.data = sec.data;
+          mem_req.byteen = sec.dirty_mask;
+          this->send_mem_req(mem_req);
+          DT(3, this->name() << " flush-wb: " << mem_req);
+          ++perf_stats_.evictions;
+        }
+        ++flush_sector_idx_;
+      }
+      flush_sector_idx_ = 0;
+      line.reset();
+    } else {
+      for (auto &line : set.lines) {
+        line.reset();
+      }
+    }
+    if (++token_flush_idx_ == params_.sets_per_bank * ways) {
+      // the last line leaves the pipeline before the bank sees it empty
+      token_flush_settle_ = config_.latency + TOKEN_FLUSH_SETTLE;
+    }
+  }
+
+  Cache::Config config_;
+  params_t params_;
+  uint32_t bank_id_;
+  uint32_t mem_req_delay_;
+
+  std::vector<set_t> sets_;
+  MSHR mshr_;
+  uint32_t pending_mshr_size_;
+  uint32_t mshr_occupancy_;
+  uint32_t pending_amo_probes_; // AmoProbe requests in the pipe, each holding a table reservation
+  // {set, tag} of Core requests inside the pipe: their MSHR entries exist
+  // only from pipe exit, so ordering checks against in-flight lines (the AMO
+  // admission defer) must consult this mirror as well.
+  struct pipe_line_t {
+    uint32_t set_id;
+    uint64_t addr_tag;
+  };
+  std::vector<pipe_line_t> pipe_core_lines_;
+
+  bool pipeLineBusy(uint32_t set_id, uint64_t addr_tag) const {
+    for (const auto &l : pipe_core_lines_) {
+      if (l.set_id == set_id && l.addr_tag == addr_tag) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The pipe is in order, so the oldest match is the request leaving it.
+  void pipeLineErase(uint32_t set_id, uint64_t addr_tag) {
+    for (auto it = pipe_core_lines_.begin(); it != pipe_core_lines_.end(); ++it) {
+      if (it->set_id == set_id && it->addr_tag == addr_tag) {
+        pipe_core_lines_.erase(it);
+        return;
+      }
+    }
+    assert(false && "in-pipe line mirror underflow");
+  }
+
+  TFifo<bank_req_t>::Ptr pipe_req_;
+  TFifo<uint32_t>::Ptr   lazy_q_;   // roots awaiting a data-less fill: write misses and written refetches
+
+  Cache::PerfStats perf_stats_;
+
+  uint64_t pending_read_reqs_;
+  uint64_t pending_write_reqs_;
+  uint64_t pending_fill_reqs_;
+  uint32_t rand_ctr_;
+  uint64_t adm_seq_ctr_;  // bank admission-order stamp (see bank_req_t::adm_seq)
+
+  // Fill-forward window: chain key and sector staged by the last accepted fill.
+  bool     fwd_active_;
+  uint32_t fwd_set_;
+  uint64_t fwd_tag_;
+  uint32_t fwd_sector_;
+  std::shared_ptr<mem_block_t> fwd_data_;
+  bool     crsp_sent_;  // core-response port used this tick (pipeline priority)
+
+  // Partial state of the chain the last fill woke (lazy fetch).
+  bool     chain_partial_;
+  bool     chain_retry_;  // the partial state came from an evicted refetch
+  uint32_t chain_set_;
+  uint64_t chain_tag_;
+  uint32_t chain_sector_;
+  bool     refetch_hold_; // a refetch fill is at its tag lookup: its chain waits
+  bool     refetch_hold_retry_;
+  bool     amo_busy_;       // a store-bearing LLC atomic holds core requests off
+  bool     amo_wb_pending_; // its result still has to be written back
+  uint64_t amo_wb_tick_;    // ... from this cycle on
+#ifdef DBG_MEM_BANK0_WDELAY
+  uint64_t dbg_mem_req_free_ = 0; // the memory queue's next free departure cycle
+#endif
+
+  // Flush walk state.
+  bool     flushing_;
+  bool     keep_lines_ = false; // the next launch reset keeps the lines
+  uint32_t flush_set_idx_;
+  uint32_t flush_way_idx_;
+  uint32_t flush_sector_idx_;
+  bool     token_flushing_;
+  bool     token_flush_skip_ = false;
+  static constexpr uint32_t TOKEN_FLUSH_SETTLE = 2;
+  uint32_t token_flush_settle_ = 0;
+  bool     token_flush_walking_ = false;
+  uint32_t token_flush_idx_;
+
+#if VX_CFG_EXT_A_ENABLED
+  AmoUnit  amo_unit_;
+
+  // Non-LLC AMO passthrough table. When config_.is_llc==false, AMOs
+  // probe-and-invalidate the local line, forward the MemReq downstream,
+  // and route the response straight to core_rsp_out without a fill.
+  // Tag namespace is partitioned: fill responses use [0, mshr_capacity),
+  // passthru responses use [mshr_capacity, mshr_capacity + AMO_PASSTHRU_CAP).
+  // Arbiters add bits at the LSB, preserving the partition across the round-trip.
+  struct amo_passthru_entry_t {
+    bool     valid   = false;
+    uint64_t req_tag = 0;
+    uint32_t cid     = 0;
+    uint64_t uuid    = 0;
+  };
+  std::array<amo_passthru_entry_t, AMO_PASSTHRU_CAP> amo_passthru_;
+  uint32_t amo_passthru_tag_base() const { return mshr_.capacity(); }
+#endif
+
+  friend class SimObject<CacheBank>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+// The cache's core-port arbiter: a port's request is accepted only when its
+// bank grants it, one per bank per cycle, round-robin over the ports, and only
+// while the bank's input buffer has room; non-cacheable requests are split off
+// for the bypass path. It ticks ahead of the banks, so a grant reaches its bank
+// in the same cycle unless the crossbar registers its output.
+// With read merging, plain reads of the same word with the same tag from ports
+// of one group in the same cycle are served by one bank access: the lowest
+// such port leads, the others stay out of arbitration and are accepted with
+// it. The merged ports' mask rides below the tag through the bank. Line
+// merging takes any plain read of the same line instead, whatever its word
+// and tag.
+class CachePortArb : public SimObject<CachePortArb> {
+public:
+  std::vector<SimChannel<MemReq>> ReqIn;  // core ports
+  std::vector<SimChannel<MemReq>> ReqOut; // banks
+  std::vector<SimChannel<MemReq>> IoOut;  // non-cacheable requests, per port
+
+  CachePortArb(const SimContext& ctx, const char* name, const params_t& params,
+               uint32_t num_inputs, uint32_t num_banks, uint32_t merge_group,
+               bool merge_line, bool skid)
+    : SimObject<CachePortArb>(ctx, name)
+    , ReqIn(num_inputs, this)
+    , ReqOut(num_banks, this)
+    , IoOut(num_inputs, this)
+    , params_(params)
+    , lg2_inputs_(log2ceil(num_inputs))
+    // the request crossbar registers its output when it has more than two inputs
+    , delay_((num_inputs > 2) ? 1 : 0)
+    , levels_(arb_tree_levels(num_inputs))
+    , merge_group_(merge_group)
+    , merge_line_(merge_line)
+    , skid_(skid)
+  {
+    __assert(merge_group_ <= 1 || (merge_group_ <= 64 && ispow2(merge_group_) && (num_inputs % merge_group_) == 0),
+             "a read-merge group must be a power of two of at most 64 dividing the ports");
+    tree_stage_.reserve(levels_.size());
+    for (auto slices : levels_) {
+      tree_stage_.emplace_back(num_banks * slices, this);
+    }
+    rr_.resize(levels_.size() + 1);
+    for (uint32_t s = 0; s <= levels_.size(); ++s) {
+      rr_.at(s).resize(num_banks * this->arb_slices(s));
+    }
+    realign_.resize(num_inputs);
+  }
+
+  // Without a registered tree level the hardware crossbar is combinational
+  // (no request buffer ahead of a bank): a request stays at its port until the
+  // bank takes it, where a later same-word read can still merge with it. The
+  // arbiter then offers each bank one request per cycle and dequeues the ports
+  // only when the bank pops the offer; an offer still pending next cycle is
+  // withdrawn and the ports are arbitrated afresh. With a bank skid register
+  // the untaken offer is caught there instead and the ports are released; the
+  // register's occupancy is the bank's ready, so the bank is offered nothing
+  // while it holds a request, the cycle the bank takes it included.
+  void attach_bank(uint32_t b, SimChannel<MemReq>* bank_in) {
+    if (!this->offers_enabled()) {
+      return;
+    }
+    offers_.resize(ReqOut.size());
+    offers_.at(b).bank_in = bank_in;
+    bank_in->pop_callback([this, b]() { this->on_bank_pop(b); });
+  }
+
+  // Bits of the merged-port mask carried below the request tag.
+  uint32_t merge_bits() const { return (merge_group_ > 1) ? merge_group_ : 0; }
+
+  uint64_t collisions() const { return collisions_; }
+
+  // Tree levels register requests ahead of the banks.
+  bool has_tree() const { return !levels_.empty(); }
+
+  bool is_token(uint32_t i) const {
+    return !ReqIn.at(i).empty() && ReqIn.at(i).peek().flags.flush;
+  }
+
+  // While any port's head is a flush token, cacheable requests are held at
+  // every port.
+  bool any_token() const {
+    for (uint32_t i = 0, n = ReqIn.size(); i < n; ++i) {
+      if (this->is_token(i)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Ports whose head is a flush token.
+  std::vector<bool> tokens() const {
+    std::vector<bool> mask(ReqIn.size(), false);
+    for (uint32_t i = 0, n = ReqIn.size(); i < n; ++i) {
+      mask.at(i) = this->is_token(i);
+    }
+    return mask;
+  }
+
+  // Tokens owing no walk: IO and release tokens, and L1-only or acquire ones
+  // unless they still need a walk here.
+  std::vector<bool> tokens(bool l1_needs_walk) const {
+    std::vector<bool> mask(ReqIn.size(), false);
+    for (uint32_t i = 0, n = ReqIn.size(); i < n; ++i) {
+      if (!this->is_token(i)) {
+        continue;
+      }
+      auto &flags = ReqIn.at(i).peek().flags;
+      bool io  = flags.io && !flags.flush_l1;
+      bool rel = !flags.io && flags.flush_l1 && flags.noalloc;
+      mask.at(i) = io || rel || (flags.flush_l1 && !l1_needs_walk);
+    }
+    return mask;
+  }
+
+  // A bank's skid register holds a request: its occupancy as of the start of
+  // the cycle, as the RTL's registered ready sees it, even if the bank takes
+  // the request later this cycle.
+  bool any_held() const { return held_; }
+
+  // No cacheable request is left between the ports and the banks.
+  bool drained() const {
+    for (auto &level : tree_stage_) {
+      for (auto &stage : level) {
+        if (stage.size() != 0) {
+          return false;
+        }
+      }
+    }
+    for (auto &out : ReqOut) {
+      if (out.size() != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  MemReq take_token(uint32_t i) {
+    auto req = ReqIn.at(i).peek();
+    ReqIn.at(i).pop();
+    return req;
+  }
+
+  // The cache's line initialization holds the core ports for these cycles.
+  void set_init_cycles(uint32_t cycles) { init_cycles_ = cycles; }
+
+protected:
+  void on_reset() {
+    for (auto &rr : rr_) {
+      std::fill(rr.begin(), rr.end(), 0);
+    }
+    collisions_ = 0;
+    for (auto& offer : offers_) {
+      offer.valid = false;
+      offer.withdrawing = false;
+      offer.held = false;
+    }
+    held_ = false;
+    std::fill(realign_.begin(), realign_.end(), realign_t());
+  }
+
+  // Slices of the arbiter level s: level 0 grants the ports, each level above
+  // the buffers of the level below, and the last level is the join arbiter.
+  uint32_t arb_slices(uint32_t s) const {
+    return (s < levels_.size()) ? levels_.at(s) : 1;
+  }
+
+  // Inputs of slice sl of the arbiter level s.
+  uint32_t arb_slice_size(uint32_t s, uint32_t sl) const {
+    uint32_t inputs = (s == 0) ? ReqIn.size() : levels_.at(s - 1);
+    if (s == levels_.size()) {
+      return inputs;
+    }
+    return std::min(kMaxFanout, inputs - sl * kMaxFanout);
+  }
+
+  void on_tick() {
+    if (init_cycles_ != 0) {
+      --init_cycles_;
+      return;
+    }
+    uint32_t nb = ReqOut.size();
+    uint32_t nl = levels_.size();
+    held_ = false;
+    for (uint32_t b = 0, n = offers_.size(); b < n; ++b) {
+      auto& offer = offers_.at(b);
+      held_ |= offer.held;
+      if (!offer.valid) {
+        continue;
+      }
+      if (skid_) {
+        this->release_ports(b);
+        offer.held = true;
+        held_ = true;
+      } else {
+        offer.withdrawing = true;
+        offer.bank_in->pop();
+        offer.withdrawing = false;
+        offer.valid = false;
+      }
+    }
+    // the tree's buffered levels, join first: each slice passes one buffer of
+    // the level below per cycle
+    for (uint32_t s = nl; s > 0; --s) {
+      uint32_t slices = this->arb_slices(s);
+      uint32_t inputs = levels_.at(s - 1);
+      for (uint32_t b = 0; b < nb; ++b) {
+        for (uint32_t sl = 0; sl < slices; ++sl) {
+          auto& out = (s < nl) ? tree_stage_.at(s).at(b * slices + sl) : ReqOut.at(b);
+          if (out.full()) {
+            continue;
+          }
+          uint32_t lo = (s < nl) ? sl * kMaxFanout : 0;
+          uint32_t size = this->arb_slice_size(s, sl);
+          auto& rr = rr_.at(s).at(b * slices + sl);
+          for (uint32_t k = 0; k < size; ++k) {
+            uint32_t j = (rr + k) % size;
+            auto& in = tree_stage_.at(s - 1).at(b * inputs + lo + j);
+            if (!in.empty()) {
+              out.send(in.peek(), (s < nl) ? 1 : delay_);
+              in.pop();
+              rr = (j + 1) % size;
+              break;
+            }
+          }
+        }
+      }
+    }
+    uint32_t n = ReqIn.size();
+    const bool hold = this->any_token();
+    this->update_realign();
+    // merged ports riding each leader's bank access, by offset in its group
+    std::vector<bool> followers(n, false);
+    std::vector<uint64_t> merged(n, 0);
+    if (merge_group_ > 1 && !hold) {
+      for (uint32_t i = 0; i < n; ++i) {
+        if (!this->is_plain_read(i) || this->realign_hold(i)) {
+          continue;
+        }
+        auto& req_i = ReqIn.at(i).peek();
+        uint32_t base = (i / merge_group_) * merge_group_;
+        for (uint32_t j = base; j < i; ++j) {
+          if (followers.at(j) || !this->is_plain_read(j) || this->realign_hold(j)) {
+            continue;
+          }
+          auto& req_j = ReqIn.at(j).peek();
+          bool same = merge_line_
+            ? ((req_j.addr >> params_.bank_select_addr_start) == (req_i.addr >> params_.bank_select_addr_start))
+            : ((req_j.addr >> params_.word_select_addr_start) == (req_i.addr >> params_.word_select_addr_start)
+               && req_j.tag == req_i.tag);
+          if (same) {
+            merged.at(j) |= 1ull << (i - base);
+            followers.at(i) = true;
+            break;
+          }
+        }
+      }
+    }
+    // requesting ports per bank and first-level slice; non-cacheable requests
+    // leave on their own port
+    uint32_t slices = this->arb_slices(0);
+    uint32_t slice_ports = (nl != 0) ? kMaxFanout : n;
+    std::vector<uint32_t> want(nb * slices, 0);
+    std::vector<uint32_t> wants(nb, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+      auto& in = ReqIn.at(i);
+      if (in.empty() || followers.at(i)) {
+        continue;
+      }
+      auto& req = in.peek();
+      if (req.flags.flush) {
+        continue;
+      }
+      if (req.flags.io) {
+        if (IoOut.at(i).try_send(req, 0)) {
+          in.pop();
+        }
+        continue;
+      }
+      if (!hold && !this->realign_hold(i)) {
+        uint32_t b = params_.addr_bank_id(req.addr);
+        want.at(b * slices + i / slice_ports) |= 1u << (i % slice_ports);
+        ++wants.at(b);
+      }
+    }
+    // each bank's arbiter, or each slice of its tree, grants one port per cycle
+    for (uint32_t b = 0; b < nb; ++b) {
+      if (wants.at(b) == 0) {
+        continue;
+      }
+      if (this->offers_enabled() && offers_.at(b).held) {
+        continue;
+      }
+      bool granted = false;
+      for (uint32_t sl = 0; sl < slices; ++sl) {
+        uint32_t slice_want = want.at(b * slices + sl);
+        auto& out = (nl != 0) ? tree_stage_.at(0).at(b * slices + sl) : ReqOut.at(b);
+        if (slice_want == 0 || out.full()) {
+          continue;
+        }
+        uint32_t size = this->arb_slice_size(0, sl);
+        auto& rr = rr_.at(0).at(b * slices + sl);
+        uint32_t j = rr;
+        while (!(slice_want & (1u << j))) {
+          j = (j + 1) % size;
+        }
+        if (this->offers_enabled()) {
+          this->offer(b, sl * slice_ports + j, out, merged, wants.at(b) - 1, &rr, (j + 1) % size);
+          continue;
+        }
+        this->grant(sl * slice_ports + j, out, merged);
+        rr = (j + 1) % size;
+        granted = true;
+      }
+      if (granted) {
+        collisions_ += wants.at(b) - 1;
+      }
+    }
+  }
+
+  // Offer port i's request, with the ports merged into it, to bank b; the
+  // ports are dequeued when the bank takes it (on_bank_pop).
+  void offer(uint32_t b, uint32_t i, SimChannel<MemReq>& out, const std::vector<uint64_t>& merged,
+             uint32_t collisions, uint32_t* rr, uint32_t rr_next) {
+    auto req = ReqIn.at(i).peek();
+    uint64_t mask = (merge_group_ > 1) ? merged.at(i) : 0;
+    uint64_t tag = (((uint64_t(req.tag) << this->merge_bits()) | mask) << lg2_inputs_) | i;
+    __assert((tag >> 32) == 0, "cache bank tag overflow");
+    req.tag = uint32_t(tag);
+    req.merged_tags = this->merged_tags(i, mask);
+    auto& offer = offers_.at(b);
+    offer.valid      = true;
+    offer.port       = i;
+    offer.mask       = mask;
+    offer.collisions = collisions;
+    offer.rr         = rr;
+    offer.rr_next    = rr_next;
+    out.send(req, 0);
+  }
+
+  void on_bank_pop(uint32_t b) {
+    auto& offer = offers_.at(b);
+    if (offer.withdrawing) {
+      return;
+    }
+    if (offer.held) {
+      offer.held = false;
+      return;
+    }
+    __assert(offer.valid, "bank took a request the arbiter did not offer");
+    this->release_ports(b);
+  }
+
+  // Dequeue bank b's offered port, and the ports merged into it.
+  void release_ports(uint32_t b) {
+    auto& offer = offers_.at(b);
+    uint32_t i = offer.port;
+    if (offer.mask != 0) {
+      uint32_t base = (i / merge_group_) * merge_group_;
+      for (uint64_t f = offer.mask; f != 0; f &= f - 1) {
+        uint32_t port = base + __builtin_ctzll(f);
+        DT(3, this->name() << " read-merge: port=" << port << ", leader=" << i << ", " << ReqIn.at(port).peek());
+        ReqIn.at(port).pop();
+      }
+    }
+    ReqIn.at(i).pop();
+    *offer.rr = offer.rr_next;
+    collisions_ += offer.collisions;
+    offer.valid = false;
+  }
+
+  bool offers_enabled() const { return levels_.empty() && delay_ == 0; }
+
+  // Under line merging, the merged ports' own tags, which ride the leader's
+  // bank access and its response.
+  std::shared_ptr<const std::vector<uint32_t>> merged_tags(uint32_t i, uint64_t mask) const {
+    if (!merge_line_ || mask == 0) {
+      return nullptr;
+    }
+    uint32_t base = (i / merge_group_) * merge_group_;
+    auto tags = std::make_shared<std::vector<uint32_t>>(merge_group_, 0);
+    for (uint64_t f = mask; f != 0; f &= f - 1) {
+      uint32_t k = __builtin_ctzll(f);
+      tags->at(k) = ReqIn.at(base + k).peek().tag;
+    }
+    return tags;
+  }
+
+  // Send port i's request to its bank, with the ports merged into it.
+  void grant(uint32_t i, SimChannel<MemReq>& out, const std::vector<uint64_t>& merged) {
+    auto req = ReqIn.at(i).peek();
+    uint64_t mask = 0;
+    if (merge_group_ > 1) {
+      uint32_t base = (i / merge_group_) * merge_group_;
+      mask = merged.at(i);
+      req.merged_tags = this->merged_tags(i, mask);
+      for (uint64_t f = mask; f != 0; f &= f - 1) {
+        uint32_t port = base + __builtin_ctzll(f);
+        DT(3, this->name() << " read-merge: port=" << port << ", leader=" << i << ", " << req);
+        ReqIn.at(port).pop();
+      }
+    }
+    uint64_t tag = (((uint64_t(req.tag) << this->merge_bits()) | mask) << lg2_inputs_) | i;
+    __assert((tag >> 32) == 0, "cache bank tag overflow");
+    req.tag = uint32_t(tag);
+    out.send(req, levels_.empty() ? delay_ : 1);
+    ReqIn.at(i).pop();
+  }
+
+  // A load or store with no flush, IO or local attribute.
+  bool is_regular(uint32_t i) const {
+    if (ReqIn.at(i).empty()) {
+      return false;
+    }
+    auto& req = ReqIn.at(i).peek();
+    return (req.op == MemOp::LD || req.op == MemOp::ST) && !req.flags.flush && !req.flags.io && !req.flags.local;
+  }
+
+  // Whether port j holds a regular request with this tag in this line.
+  bool owes(uint32_t j, uint32_t tag, uint64_t line) const {
+    return this->is_regular(j) && ReqIn.at(j).peek().tag == tag && this->line_of(j) == line;
+  }
+
+  uint64_t line_of(uint32_t i) const {
+    return ReqIn.at(i).peek().addr >> params_.bank_select_addr_start;
+  }
+
+  // The ports of a same-word pair carry the two parts of one request in
+  // order, and a bank serves two parts of one request in one line a cycle
+  // apart. A port that moved past such a part its partner still holds waits
+  // for the partner, so the pair's next same-word reads reach the merge in the
+  // same cycle. The wait is decided from the last cycle's heads. Stores can
+  // share a tag, so the line tells a part from a later store, and a pair that
+  // waited on each other is released.
+  void update_realign() {
+    if (!this->realigns()) {
+      return;
+    }
+    uint32_t n = ReqIn.size();
+    std::vector<bool> start(n), owes_head(n);
+    for (uint32_t i = 0; i < n; ++i) {
+      auto& r = realign_.at(i);
+      auto& in = ReqIn.at(i);
+      uint32_t p = i ^ 1;
+      start.at(i) = r.shared && r.head_valid
+                 && !(!in.empty() && in.peek().tag == r.head_tag && this->line_of(i) == r.head_line);
+      owes_head.at(i) = this->owes(p, r.head_tag, r.head_line);
+      r.waits = (start.at(i) && owes_head.at(i)) || (r.ahead && this->owes(p, r.ahead_tag, r.ahead_line));
+      r.hold = r.waits && !r.mutual;
+    }
+    // the registers, from this cycle's heads
+    for (uint32_t i = 0; i < n; ++i) {
+      auto& r = realign_.at(i);
+      auto& in = ReqIn.at(i);
+      uint32_t p = i ^ 1;
+      if (start.at(i) && owes_head.at(i)) {
+        r.ahead_tag  = r.head_tag;
+        r.ahead_line = r.head_line;
+      }
+      r.ahead  = r.waits;
+      r.mutual = r.waits && realign_.at(p).waits;
+      r.head_valid = !in.empty();
+      if (r.head_valid) {
+        r.head_tag  = in.peek().tag;
+        r.head_line = this->line_of(i);
+      }
+      r.shared = this->is_regular(i) && this->owes(p, r.head_tag, r.head_line);
+    }
+  }
+
+  bool realign_hold(uint32_t i) const {
+    return this->realigns() && realign_.at(i).hold;
+  }
+
+  // A same-word pair of ports carries the two parts of one request; a
+  // line-merge group's ports are independent clients. A wider group waits on
+  // more parts, and the wait costs the overlap of the next request's parts on
+  // other banks more than the merges it restores.
+  bool realigns() const {
+    return (merge_group_ == 2) && !merge_line_;
+  }
+
+  // A plain read: no write, flush, IO, local or atomic attribute.
+  bool is_plain_read(uint32_t i) const {
+    if (ReqIn.at(i).empty()) {
+      return false;
+    }
+    auto& req = ReqIn.at(i).peek();
+    return req.op == MemOp::LD && !req.flags.flush && !req.flags.io && !req.flags.local;
+  }
+
+private:
+  params_t params_;
+  uint32_t lg2_inputs_;
+  uint32_t delay_;
+  uint32_t init_cycles_ = 0;
+  std::vector<uint32_t> levels_;                            // [level] slices per bank
+  std::vector<std::vector<SimChannel<MemReq>>> tree_stage_; // [level][bank][slice]
+  std::vector<std::vector<uint32_t>> rr_;                   // [arbiter level][bank][slice] next to grant
+  uint32_t merge_group_;
+  bool merge_line_;
+  bool skid_;
+  bool held_ = false; // some bank's skid register is occupied this cycle
+  uint64_t collisions_ = 0;
+  // pair realignment, per port
+  struct realign_t {
+    bool     head_valid = false; // registered copy of the last cycle's head
+    uint32_t head_tag   = 0;
+    uint64_t head_line  = 0;
+    bool     shared     = false; // the partner held the head's tag with it
+    bool     ahead      = false;
+    uint32_t ahead_tag  = 0;     // the part the partner owes
+    uint64_t ahead_line = 0;
+    bool     mutual     = false;
+    bool     waits      = false;
+    bool     hold       = false;
+  };
+  std::vector<realign_t> realign_;
+  struct offer_t {
+    SimChannel<MemReq>* bank_in = nullptr;
+    bool     valid       = false;
+    bool     withdrawing = false;
+    bool     held        = false; // caught by the bank's skid register
+    uint32_t port        = 0;
+    uint64_t mask        = 0;
+    uint32_t collisions  = 0;
+    uint32_t* rr         = nullptr;
+    uint32_t rr_next     = 0;
+  };
+  std::vector<offer_t> offers_; // [bank], combinational crossbar only
+
+  friend class SimObject<CachePortArb>;
+};
+
+// The core-response network under read merging: a flat crossbar of one
+// round-robin arbiter per core port over the bank lanes. A merged read's
+// response goes to the port that sent it and to every merged port; each port
+// takes it when its arbiter grants that lane, and the lane is released once
+// all of them have. Over many banks a port's arbiter is a tree: each slice of
+// lanes grants into its own buffer, and a join picks among the slices.
+class CacheRspMcast : public SimObject<CacheRspMcast> {
+public:
+  using Ptr = std::shared_ptr<CacheRspMcast>;
+
+  std::vector<SimChannel<MemRsp>> RspIn;  // banks
+  std::vector<SimChannel<MemRsp>> RspOut; // core ports
+
+  CacheRspMcast(const SimContext& ctx, const char* name, uint32_t num_banks,
+                uint32_t num_outputs, uint32_t merge_group, bool merge_line)
+    : SimObject<CacheRspMcast>(ctx, name)
+    , RspIn(num_banks, this)
+    , RspOut(num_outputs, this)
+    , lg2_outputs_(log2ceil(num_outputs))
+    , merge_group_(merge_group)
+    , merge_line_(merge_line)
+    , slices_(arb_tree_slices(num_banks))
+    , sent_(num_banks, 0)
+    , last_grant_(num_outputs * slices_, num_banks - 1)
+    , join_rr_(num_outputs, slices_ - 1)
+    , tree_stage_((slices_ > 1) ? num_outputs * slices_ : 0, this)
+  {
+    __assert(num_outputs <= 64 && merge_group < 64, "the read-merge response network takes at most 64 ports");
+    __assert(arb_tree_levels(num_banks).size() <= 1, "the read-merge response network takes one tree level");
+  }
+
+protected:
+  void on_reset() {
+    std::fill(sent_.begin(), sent_.end(), 0);
+    std::fill(last_grant_.begin(), last_grant_.end(), RspIn.size() - 1);
+    std::fill(join_rr_.begin(), join_rr_.end(), slices_ - 1);
+  }
+
+  void on_tick() {
+    uint32_t nb = RspIn.size();
+    uint32_t no = RspOut.size();
+    bool idle = true;
+    // the tree's join level: one slice buffer per port per cycle
+    for (uint32_t o = 0; o < no && slices_ > 1; ++o) {
+      for (uint32_t k = 1; k <= slices_; ++k) {
+        uint32_t sl = (join_rr_.at(o) + k) % slices_;
+        auto& stage = tree_stage_.at(o * slices_ + sl);
+        if (stage.empty()) {
+          continue;
+        }
+        if (RspOut.at(o).try_send(stage.peek(), 0)) {
+          stage.pop();
+          join_rr_.at(o) = sl;
+        }
+        break;
+      }
+    }
+    for (auto& stage : tree_stage_) {
+      idle &= (stage.size() == 0);
+    }
+    std::vector<uint64_t> pending(nb, 0);
+    for (uint32_t b = 0; b < nb; ++b) {
+      if (RspIn.at(b).empty()) {
+        continue;
+      }
+      idle = false;
+      auto tag = RspIn.at(b).peek().tag;
+      uint32_t port = tag & ((1u << lg2_outputs_) - 1);
+      uint64_t mask = (tag >> lg2_outputs_) & ((1ull << merge_group_) - 1);
+      uint64_t targets = (1ull << port) | (mask << ((port / merge_group_) * merge_group_));
+      pending.at(b) = targets & ~sent_.at(b);
+    }
+    if (idle) {
+      this->tick_sleep();
+      return;
+    }
+    for (uint32_t o = 0; o < no; ++o) {
+      for (uint32_t sl = 0; sl < slices_; ++sl) {
+        uint32_t lo = (slices_ > 1) ? sl * kMaxFanout : 0;
+        uint32_t hi = (slices_ > 1) ? std::min(lo + kMaxFanout, nb) : nb;
+        auto& out = (slices_ > 1) ? tree_stage_.at(o * slices_ + sl) : RspOut.at(o);
+        auto& rr = last_grant_.at(o * slices_ + sl);
+        for (uint32_t k = 1; k <= nb; ++k) {
+          uint32_t b = (rr + k) % nb;
+          if (b < lo || b >= hi || !(pending.at(b) & (1ull << o))) {
+            continue;
+          }
+          auto rsp = RspIn.at(b).peek();
+          uint32_t lane_tag = rsp.tag;
+          rsp.tag >>= (lg2_outputs_ + merge_group_);
+          if (merge_line_ && o != (lane_tag & ((1u << lg2_outputs_) - 1))) {
+            __assert(rsp.merged_tags, "a line-merged response lost its merged tags");
+            rsp.tag = rsp.merged_tags->at(o % merge_group_);
+          }
+          if (out.try_send(rsp, (slices_ > 1) ? 1 : 0)) {
+            DT(4, this->name() << " rsp" << b << "_" << o << ": " << rsp);
+            sent_.at(b) |= 1ull << o;
+            rr = b;
+          }
+          break;
+        }
+      }
+    }
+    for (uint32_t b = 0; b < nb; ++b) {
+      if (pending.at(b) != 0 && (pending.at(b) & ~sent_.at(b)) == 0) {
+        RspIn.at(b).pop();
+        sent_.at(b) = 0;
+      }
+    }
+  }
+
+private:
+  uint32_t lg2_outputs_;
+  uint32_t merge_group_;
+  bool merge_line_;
+  uint32_t slices_;
+  std::vector<uint64_t> sent_;       // [bank] ports that took the lane's response
+  std::vector<uint32_t> last_grant_; // [port][slice] round-robin pointer
+  std::vector<uint32_t> join_rr_;    // [port]
+  std::vector<SimChannel<MemRsp>> tree_stage_; // [port][slice]
+
+  friend class SimObject<CacheRspMcast>;
+};
+
+// Sits on one memory port's cache-side response path, ahead of the response
+// network. While the port's flush token is out the cache is quiescent, so the
+// port's next response is the token's answer and stops here; every other
+// response passes on, crossing the port's registered response stages.
+class FlushTap : public SimObject<FlushTap> {
+public:
+  using Ptr = std::shared_ptr<FlushTap>;
+
+  SimChannel<MemRsp> RspIn;
+  SimChannel<MemRsp> RspOut;
+
+  FlushTap(const SimContext& ctx, const char* name, uint32_t delay)
+    : SimObject<FlushTap>(ctx, name)
+    , RspIn(this)
+    , RspOut(this)
+    , delay_(delay)
+  {}
+
+  // the port's flush token has been sent
+  void arm() {
+    armed_ = true;
+    answered_ = false;
+  }
+
+  // the token's answer has arrived; reading it disarms the tap
+  bool take_answer() {
+    bool answered = answered_;
+    answered_ = false;
+    return answered;
+  }
+
+protected:
+  void on_reset() {
+    armed_ = false;
+    answered_ = false;
+  }
+
+  void on_tick() {
+    if (RspIn.empty()) {
+      this->tick_sleep();
+      return;
+    }
+    if (armed_) {
+      DT(3, this->name() << " flush-fwd-rsp");
+      armed_ = false;
+      answered_ = true;
+      RspIn.pop();
+    } else if (RspOut.try_send(RspIn.peek(), delay_)) {
+      RspIn.pop();
+    }
+  }
+
+private:
+  uint32_t delay_;
+  bool armed_ = false;
+  bool answered_ = false;
+
+  friend class SimObject<FlushTap>;
+};
+
+class Cache::Impl {
+public:
+  Impl(Cache *simobject, const Config &config)
+      : simobject_(simobject), config_(config), params_(config), banks_(1 << config.B), nc_mem_arbs_(config.mem_ports) {
+    char sname[100];
+
+    uint32_t num_banks = (1 << config.B);
+
+    if (config_.bypass) {
+      snprintf(sname, 100, "%s-bypass_arb", simobject->name().c_str());
+      auto bypass_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, config_.num_inputs, config_.mem_ports);
+      for (uint32_t i = 0; i < config_.num_inputs; ++i) {
+        simobject->core_req_in.at(i).bind(&bypass_arb->ReqIn.at(i));
+        bypass_arb->RspOut.at(i).bind(&simobject->core_rsp_out.at(i));
+      }
+      for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+        bypass_arb->ReqOut.at(i).bind(&simobject->mem_req_out.at(i));
+        simobject->mem_rsp_in.at(i).bind(&bypass_arb->RspIn.at(i));
+      }
+      return;
+    }
+
+    // create non-cacheable arbiter
+    for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+      snprintf(sname, 100, "%s-nc_arb%d", simobject->name().c_str(), i);
+      nc_mem_arbs_.at(i) = MemArbiter::Create(sname, ArbiterType::Priority, 2, 1);
+    }
+
+    // Bank memory arbiter delays. Each level of the memory-side request
+    // network beyond the first is a registered stage; the request path
+    // buffers the levels the arbiter's own register does not cover in
+    // mem_req_net_.
+    uint32_t mem_arb_delay = ((num_banks != config_.mem_ports) && (num_banks > 2 || config_.mem_ports > 2)) ? 1 : 0;
+    uint32_t mem_net_delay = omega_stages(num_banks, config_.mem_ports) - 1;
+    uint32_t mem_net_extra = (mem_net_delay > mem_arb_delay) ? (mem_net_delay - mem_arb_delay) : 0;
+    uint32_t mem_arb_rsp_delay = (num_banks != config_.mem_ports) ? (mem_arb_delay + mem_net_extra) : 0;
+    __assert(num_banks >= config_.mem_ports, "a cache needs a bank per memory port");
+
+    // A memory response reaches its bank through the port's response queue,
+    // when there is one, and a response network registered at every level.
+    // The taps carry what the bank arbiter's response delay does not.
+    uint32_t mem_rsp_regs = omega_stages(config_.mem_ports, num_banks) + (config_.mem_rsp_queue ? 1 : 0);
+    uint32_t mem_rsp_credit = mem_arb_rsp_delay + (config_.mem_rsp_slice ? 1 : 0);
+    __assert(mem_rsp_regs >= mem_rsp_credit, "memory response path shorter than its arbiter");
+    uint32_t tap_delay = mem_rsp_regs - mem_rsp_credit;
+
+    // flush-token taps, ticking after the arbiters that feed them and before
+    // the response network they feed
+    flush_taps_.resize(config_.mem_ports);
+    for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+      snprintf(sname, 100, "%s-flush_tap%d", simobject->name().c_str(), i);
+      flush_taps_.at(i) = FlushTap::Create(sname, tap_delay);
+      nc_mem_arbs_.at(i)->RspOut.at(0).bind(&flush_taps_.at(i)->RspIn);
+    }
+
+    // Connect non-cacheable arbiter output port 0 to outgoing memory ports
+    for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+      nc_mem_arbs_.at(i)->ReqOut.at(0).bind(&simobject->mem_req_out.at(i));
+      simobject->mem_rsp_in.at(i).bind(&nc_mem_arbs_.at(i)->RspIn.at(0));
+    }
+
+    snprintf(sname, 100, "%s-mem_arb", simobject->name().c_str());
+    auto bank_mem_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, num_banks, config_.mem_ports,
+                                           mem_arb_delay + mem_net_extra, mem_arb_rsp_delay);
+
+    // Connect bank's memory arbiter to non-cacheable arbiter's input port 0
+    if (mem_net_extra != 0) {
+      mem_req_net_.reserve(config_.mem_ports);
+      for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+        mem_req_net_.emplace_back(simobject, mem_arb_delay + mem_net_extra + 1);
+      }
+    }
+    for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+      if (mem_net_extra != 0) {
+        bank_mem_arb->ReqOut.at(i).bind(&mem_req_net_.at(i));
+      } else {
+        bank_mem_arb->ReqOut.at(i).bind(&nc_mem_arbs_.at(i)->ReqIn.at(0));
+      }
+    }
+    for (uint32_t i = 0; i < config_.mem_ports; ++i) {
+      flush_taps_.at(i)->RspOut.bind(&bank_mem_arb->RspIn.at(i));
+    }
+    bank_arb_ = bank_mem_arb;
+
+    // Create the core-port arbiter ahead of the banks it feeds
+    snprintf(sname, 100, "%s-port_arb", simobject->name().c_str());
+    uint32_t merge_group = std::min<uint32_t>(config_.read_merge, config_.num_inputs);
+    const bool merge_line = config_.merge_line && merge_group > 1;
+    port_arb_ = CachePortArb::Create(sname, params_, config_.num_inputs, num_banks, merge_group, merge_line,
+                                     config_.core_req_skid);
+    for (uint32_t i = 0; i < config_.num_inputs; ++i) {
+      simobject->core_req_in.at(i).bind(&port_arb_->ReqIn.at(i));
+    }
+
+    // Create bank's core crossbar; it carries the bank responses back to the
+    // core ports. A registered core-response port is a network registered at
+    // every level, applied as the response leaves the cache.
+    snprintf(sname, 100, "%s-core_xbar", simobject->name().c_str());
+    auto bank_sel = [&](const MemCrossBar::ReqType &req) {
+      return params_.addr_bank_id(req.addr);
+    };
+    if (port_arb_->merge_bits() != 0) {
+      // one buffered arbiter per core port over the bank lanes
+      __assert(config_.core_out_buf, "read merging needs a registered core-response port");
+      rsp_mcast_ = CacheRspMcast::Create(sname, num_banks, config_.num_inputs, port_arb_->merge_bits(), merge_line);
+      core_rsp_delay_ = 1;
+    } else if (config_.core_out_buf) {
+      bank_core_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, config_.num_inputs, num_banks, bank_sel, 0, 0);
+      core_rsp_delay_ = omega_stages(num_banks, config_.num_inputs);
+    } else {
+      bank_core_xbar_ = MemCrossBar::Create(sname, ArbiterType::RoundRobin, config_.num_inputs, num_banks, bank_sel);
+    }
+    if (config_.nc_enable) {
+      ++core_rsp_delay_;
+    }
+
+    // Create cache banks
+    for (uint32_t i = 0, n = num_banks; i < n; ++i) {
+      snprintf(sname, 100, "%s-bank%d", simobject->name().c_str(), i);
+      banks_.at(i) = CacheBank::Create(sname, config, params_, i);
+
+      // bind core ports
+      port_arb_->ReqOut.at(i).bind(&banks_.at(i)->core_req_in);
+      port_arb_->attach_bank(i, &banks_.at(i)->core_req_in);
+      banks_.at(i)->core_rsp_out.bind(rsp_mcast_ ? &rsp_mcast_->RspIn.at(i) : &bank_core_xbar_->RspIn.at(i));
+
+      // bind memory ports
+      banks_.at(i)->mem_req_out.bind(&bank_mem_arb->ReqIn.at(this->bank_lane(i)));
+      bank_mem_arb->RspOut.at(this->bank_lane(i)).bind(&banks_.at(i)->mem_rsp_in);
+    }
+  }
+
+  void reset() {
+    if (config_.bypass)
+      return;
+    // calculate cache initialization cycles
+    init_cycles_ = keep_lines_ ? 0 : params_.sets_per_bank;
+    port_arb_->set_init_cycles(init_cycles_);
+    keep_lines_ = false;
+  }
+
+  void tick() {
+    if (config_.bypass)
+      return;
+
+    // wait on cache initialization cycles
+    if (init_cycles_ != 0) {
+      --init_cycles_;
+      DT(3, simobject_->name() << " init: line=" << init_cycles_);
+      return;
+    }
+
+    // handle cache bypasss responses
+    for (uint32_t i = 0, n = config_.mem_ports; i < n; ++i) {
+      // Forward non-cacheable arbiter's output (1) to core response ports
+      auto &bypass = nc_mem_arbs_.at(i)->RspOut.at(1);
+      if (!bypass.empty()) {
+        auto &mem_rsp = bypass.peek();
+        if (this->processBypassResponse(mem_rsp)) {
+          bypass.pop();
+        }
+      }
+    }
+
+    this->flush_step();
+
+    // bank memory requests through the memory-side network's deeper levels
+    for (uint32_t i = 0, n = mem_req_net_.size(); i < n; ++i) {
+      auto &net = mem_req_net_.at(i);
+      if (!net.empty() && nc_mem_arbs_.at(i)->ReqIn.at(0).try_send(net.peek(), 0)) {
+        net.pop();
+      }
+    }
+
+    // schedule core responses
+    for (uint32_t req_id = 0, n = config_.num_inputs; req_id < n; ++req_id) {
+      auto &bank_rsp = rsp_mcast_ ? rsp_mcast_->RspOut.at(req_id) : bank_core_xbar_->RspOut.at(req_id);
+      if (bank_rsp.empty())
+        continue;
+      auto &core_rsp = bank_rsp.peek();
+      if (simobject_->core_rsp_out.at(req_id).try_send(core_rsp, core_rsp_delay_)) {
+        DT(3, simobject_->name() << " core-rsp: " << core_rsp);
+        bank_rsp.pop();
+      }
+    }
+
+    // non-cacheable core requests split off by the port arbiter
+    for (uint32_t req_id = 0, n = config_.num_inputs; req_id < n; ++req_id) {
+      auto &io_req = port_arb_->IoOut.at(req_id);
+      if (!io_req.empty() && this->processBypassRequest(io_req.peek(), req_id)) {
+        io_req.pop();
+      }
+    }
+  }
+
+  // Flush tokens (fences) at any port start one walk: the ports hold their
+  // cacheable requests, in-flight ones drain, every bank writes back and
+  // invalidates its lines, a token goes down each memory port behind that
+  // port's write-backs, and once every port has answered, each token
+  // visible at the end of the walk is answered through the response path,
+  // one per cycle.
+  void flush_step() {
+    switch (flush_state_) {
+    case FlushState::Idle:
+      if (!port_arb_->any_token()) {
+        break;
+      }
+      // a request tree can hold requests apart from their port order, and a
+      // bank's skid register one its port already released, so both drain
+      // first; without either the tokens are served at once
+      if (port_arb_->has_tree() || port_arb_->any_held()) {
+        flush_state_ = FlushState::Drain;
+        break;
+      }
+      this->flush_serve();
+      break;
+    case FlushState::Drain: {
+      if (!port_arb_->drained()) {
+        break;
+      }
+      for (auto &bank : banks_) {
+        if (bank->core_req_in.size() != 0) {
+          return;
+        }
+      }
+      this->flush_serve();
+      break;
+    }
+    case FlushState::Begin:
+      for (auto &bank : banks_) {
+        bank->token_flush_begin(walk_skip_);
+      }
+      flush_state_ = FlushState::Walk;
+      break;
+    case FlushState::Walk: {
+      for (auto &bank : banks_) {
+        if (!bank->token_flush_done()) {
+          return;
+        }
+      }
+      auto kinds = this->token_kinds();
+      // a quiesce without a walk serves only the tokens owing none, and
+      // forwards IO if it serves an IO token, else release
+      rsp_pending_ = walk_skip_ ? port_arb_->tokens(!config_.shared_llc) : port_arb_->tokens();
+      // after a walk: full if a full token or an IO one asks for more than the
+      // point of coherence, L1-only if any token owes a drain to it, acquire
+      // if only acquire tokens were visible
+      bool fwd_acq = !walk_skip_ && kinds.any_acq && !kinds.any_full && !kinds.any_io
+                  && !kinds.any_l1 && !kinds.any_rel;
+      bool fwd_l1  = !walk_skip_ && (kinds.any_l1 || kinds.any_rel) && !kinds.any_full && !kinds.any_io;
+      if (walk_skip_) {
+        this->forward_begin(kinds.any_io, !kinds.any_io, !kinds.any_io);
+      } else {
+        this->forward_begin(fwd_acq, fwd_l1 || fwd_acq, false);
+      }
+      // an acquire walk owes the next level nothing unless it too may hold
+      // stale lines
+      flush_state_ = (fwd_acq && !config_.acq_forward) ? FlushState::Respond : FlushState::Forward;
+      break;
+    }
+    case FlushState::Forward: {
+      bool mem_req_empty = true;
+      for (auto &lane : bank_arb_->ReqIn) {
+        mem_req_empty &= (lane.size() == 0);
+      }
+      for (auto &net : mem_req_net_) {
+        mem_req_empty &= (net.size() == 0);
+      }
+      // an IO token also waits for the non-cacheable path, which carries the
+      // IO writes it orders
+      if (fwd_io_ && !fwd_l1_ && mem_req_empty) {
+        for (uint32_t i = 0, n = config_.num_inputs; i < n; ++i) {
+          mem_req_empty &= (port_arb_->IoOut.at(i).size() == 0);
+        }
+        for (auto &arb : nc_mem_arbs_) {
+          mem_req_empty &= (arb->ReqIn.at(0).size() == 0) && (arb->ReqIn.at(1).size() == 0);
+        }
+      }
+      fwd_go_ |= mem_req_empty;
+      for (uint32_t i = 0, n = config_.mem_ports; i < n && fwd_go_; ++i) {
+        if (fwd_sent_ & (1ull << i)) {
+          continue;
+        }
+        // the token for port i is a read of the port's first line, sent down
+        // bank i's lane (bank i maps to port i) behind its write-backs
+        MemReq token;
+        token.addr = uint64_t(i) << config_.L;
+        token.flags.flush = 1;
+        token.flags.io = fwd_io_;
+        token.flags.flush_l1 = fwd_l1_;
+        token.flags.noalloc = fwd_noalloc_;
+        token.tag = 0;
+        if (bank_arb_->ReqIn.at(this->bank_lane(i)).try_send(token, 1)) {
+          DT(3, simobject_->name() << " flush-fwd: " << token);
+          flush_taps_.at(i)->arm();
+          fwd_sent_ |= 1ull << i;
+        }
+      }
+      for (uint32_t i = 0, n = config_.mem_ports; i < n; ++i) {
+        if (flush_taps_.at(i)->take_answer()) {
+          fwd_done_ |= 1ull << i;
+        }
+      }
+      uint64_t all = (config_.mem_ports < 64) ? ((1ull << config_.mem_ports) - 1) : ~0ull;
+      if (fwd_done_ == all) {
+        flush_state_ = FlushState::Respond;
+      }
+      break;
+    }
+    case FlushState::Respond: {
+      auto next = std::find(rsp_pending_.begin(), rsp_pending_.end(), true);
+      if (next == rsp_pending_.end()) {
+        flush_state_ = FlushState::Idle;
+        break;
+      }
+      uint32_t i = std::distance(rsp_pending_.begin(), next);
+      auto &token = port_arb_->ReqIn.at(i).peek();
+      MemRsp rsp{token.tag, token.hart_id, token.uuid};
+      if (simobject_->core_rsp_out.at(i).try_send(rsp, core_rsp_delay_)) {
+        DT(3, simobject_->name() << " flush-rsp: " << rsp);
+        if (std::find(next + 1, rsp_pending_.end(), true) == rsp_pending_.end()) {
+          flush_state_ = FlushState::Idle;
+        }
+        port_arb_->take_token(i);
+        rsp_pending_.at(i) = false;
+      }
+      break;
+    }
+    }
+  }
+
+  // Tokens owing nothing are answered from the next cycle; otherwise the
+  // banks start their walk, or only quiesce, the next cycle.
+  void flush_serve() {
+    auto kinds = this->token_kinds();
+    bool walk = kinds.walk(config_.shared_llc);
+    if (!walk && !kinds.drain(config_.shared_llc)) {
+      rsp_pending_ = port_arb_->tokens();
+      flush_state_ = FlushState::Respond;
+      return;
+    }
+    // with no walk owed, an IO or release token still quiesces the banks
+    // and goes down
+    walk_skip_ = !walk;
+    flush_state_ = FlushState::Begin;
+  }
+
+  struct token_kinds_t {
+    bool any_full = false;
+    bool any_l1 = false;
+    bool any_io = false;
+    bool any_acq = false;
+    bool any_rel = false;
+    // a walk is owed to a full token, and to an L1-only or acquire one above
+    // the point of coherence
+    bool walk(bool shared_llc) const { return any_full || ((any_l1 || any_acq) && !shared_llc); }
+    // a drain with no walk is owed to an IO token, and to a release one above
+    // the point of coherence
+    bool drain(bool shared_llc) const { return any_io || (any_rel && !shared_llc); }
+  };
+
+  // Kinds of the visible tokens. Several kinds together combine to the
+  // weakest one that serves them all.
+  token_kinds_t token_kinds() const {
+    token_kinds_t kinds;
+    for (uint32_t i = 0, n = config_.num_inputs; i < n; ++i) {
+      if (!port_arb_->is_token(i)) {
+        continue;
+      }
+      auto &flags = port_arb_->ReqIn.at(i).peek().flags;
+      if (flags.io) {
+        if (flags.flush_l1) {
+          kinds.any_acq = true;
+        } else {
+          kinds.any_io = true;
+        }
+      } else if (flags.flush_l1) {
+        if (flags.noalloc) {
+          kinds.any_rel = true;
+        } else {
+          kinds.any_l1 = true;
+        }
+      } else {
+        kinds.any_full = true;
+      }
+    }
+    return kinds;
+  }
+
+  void forward_begin(bool io, bool l1_only, bool noalloc) {
+    fwd_io_ = io;
+    fwd_l1_ = l1_only;
+    fwd_noalloc_ = noalloc;
+    fwd_go_ = false;
+    fwd_sent_ = 0;
+    fwd_done_ = 0;
+  }
+
+  PerfStats perf_stats() const {
+    PerfStats perf_stats;
+    if (!config_.bypass) {
+      for (const auto &bank : banks_) {
+        perf_stats += bank->perf_stats();
+      }
+      perf_stats.bank_stalls = port_arb_->collisions();
+    }
+    return perf_stats;
+  }
+
+  void invalidate() {
+    if (config_.bypass) {
+      return;
+    }
+    for (auto &bank : banks_) {
+      bank->invalidate();
+    }
+  }
+
+  void flush_begin(bool l1_only) {
+    if (config_.bypass) return;
+    // The shared last-level cache stays the point of coherence across an
+    // L1-only flush and keeps its lines into the next launch.
+    keep_lines_ = l1_only && config_.shared_llc;
+    for (auto &bank : banks_) {
+      bank->flush_begin(keep_lines_);
+    }
+  }
+
+  void keep_lines() {
+    if (config_.bypass || !config_.shared_llc) return;
+    keep_lines_ = true;
+    for (auto &bank : banks_) {
+      bank->flush_begin(true);
+    }
+  }
+
+  bool flush_done() const {
+    if (config_.bypass) return true;
+    for (const auto &bank : banks_) {
+      if (!bank->flush_done()) return false;
+    }
+    return true;
+  }
+
+private:
+
+  bool processBypassResponse(const MemRsp &mem_rsp) {
+    // core response backpressure check
+    uint32_t req_id = mem_rsp.tag & ((1 << params_.log2_num_inputs) - 1);
+    if (simobject_->core_rsp_out.at(req_id).full())
+      return false; // stall
+    uint64_t tag = mem_rsp.tag >> params_.log2_num_inputs;
+    MemRsp core_rsp{tag, mem_rsp.hart_id, mem_rsp.uuid};
+    core_rsp.data = mem_rsp.data;  // forward TLM payload through bypass
+    simobject_->core_rsp_out.at(req_id).send(core_rsp, 0);
+    DT(3, simobject_->name() << " bypass-core-rsp: " << core_rsp);
+    return true;
+  }
+
+  bool processBypassRequest(const MemReq &core_req, uint32_t req_id) {
+    // Push core request to non-cacheable arbiter's input (1)
+    uint32_t mem = req_id % config_.mem_ports;
+    if (nc_mem_arbs_.at(mem)->ReqIn.at(1).full())
+      return false; // stall
+    MemReq mem_req(core_req);
+    mem_req.tag = (core_req.tag << params_.log2_num_inputs) + req_id;
+    nc_mem_arbs_.at(mem)->ReqIn.at(1).send(mem_req, 0);
+    DT(3, simobject_->name() << " bypass-dram-req: " << mem_req);
+    return true;
+  }
+
+  Cache *const simobject_;
+  Config config_;
+  params_t params_;
+  std::vector<CacheBank::Ptr> banks_;
+  MemArbiter::Ptr bank_arb_;
+  std::vector<MemArbiter::Ptr> nc_mem_arbs_;
+  CachePortArb::Ptr port_arb_;
+  MemCrossBar::Ptr bank_core_xbar_;
+  CacheRspMcast::Ptr rsp_mcast_;
+  // the core-response network's levels, then the non-cacheable bypass
+  // layer's response arbiter
+  uint32_t core_rsp_delay_ = 0;
+  enum class FlushState { Idle, Drain, Begin, Walk, Forward, Respond };
+  FlushState flush_state_ = FlushState::Idle;
+  std::vector<bool> rsp_pending_;
+  uint64_t fwd_sent_ = 0;
+  uint64_t fwd_done_ = 0;
+  bool fwd_go_ = false;   // nothing is left ahead of the forwarded tokens
+  bool fwd_io_ = false;   // the forwarded tokens' kind
+  bool fwd_l1_ = false;
+  bool fwd_noalloc_ = false;
+  bool walk_skip_ = false;  // the banks only quiesce: no walk is owed
+  std::vector<SimChannel<MemReq>> mem_req_net_;
+  std::vector<FlushTap::Ptr> flush_taps_;
+
+  // Bank i drives memory port i mod mem_ports: its lane into the bank-to-port
+  // arbiter, which serves each port from a contiguous range of lanes.
+  uint32_t bank_lane(uint32_t bank_id) const {
+    uint32_t num_banks = 1 << config_.B;
+    uint32_t banks_per_port = num_banks / config_.mem_ports;
+    return (bank_id % config_.mem_ports) * banks_per_port + bank_id / config_.mem_ports;
+  }
+  uint32_t init_cycles_;
+  bool     keep_lines_ = false;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+Cache::Cache(const SimContext &ctx, const char *name, const Config &config)
+    : SimObject<Cache>(ctx, name), core_req_in(config.num_inputs, this), core_rsp_out(config.num_inputs, this), mem_req_out(config.mem_ports, this), mem_rsp_in(config.mem_ports, this), impl_(new Impl(this, config)) {}
+
+Cache::~Cache() {
+  delete impl_;
+}
+
+void Cache::on_reset() {
+  impl_->reset();
+}
+
+void Cache::on_tick() {
+  impl_->tick();
+}
+
+Cache::PerfStats Cache::perf_stats() const {
+  return impl_->perf_stats();
+}
+
+void Cache::flush_begin(bool l1_only) {
+  impl_->flush_begin(l1_only);
+}
+
+bool Cache::flush_done() const {
+  return impl_->flush_done();
+}
+
+void Cache::invalidate() {
+  impl_->invalidate();
+}
+
+void Cache::keep_lines() {
+  impl_->keep_lines();
+}

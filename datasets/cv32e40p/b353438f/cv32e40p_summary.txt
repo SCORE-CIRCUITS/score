@@ -1,0 +1,5 @@
+cv32e40p SCORE snapshot (openhwgroup/cv32e40p)
+Commit: b353438f
+Dataset: /home/yongfu/proj/score/datasets/cv32e40p/b353438f
+Lint: PASS
+RTL files: 29

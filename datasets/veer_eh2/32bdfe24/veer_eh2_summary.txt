@@ -1,0 +1,5 @@
+veer_eh2 SCORE snapshot (chipsalliance/Cores-VeeR-EH2)
+Commit: 32bdfe24
+Dataset: /home/yongfu/proj/score/datasets/veer_eh2/32bdfe24
+Config: OK (target=default)
+Design files: 54

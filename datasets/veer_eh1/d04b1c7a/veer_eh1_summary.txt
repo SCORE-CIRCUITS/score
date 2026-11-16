@@ -1,0 +1,5 @@
+veer_eh1 SCORE snapshot (chipsalliance/Cores-VeeR-EH1)
+Commit: d04b1c7a
+Dataset: /home/yongfu/proj/score/datasets/veer_eh1/d04b1c7a
+Config: OK (target=default)
+Design files: 47

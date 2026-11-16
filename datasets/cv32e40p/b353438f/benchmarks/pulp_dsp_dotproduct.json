@@ -1,0 +1,12 @@
+{
+  "core": "cv32e40p",
+  "archetype": "Archetype 1: Packed Sub-Word SIMD",
+  "workload": "pulp_dsp_dotproduct_8b",
+  "datatype": "INT8",
+  "vector_length": 32,
+  "execution_cycles": 12450,
+  "ops_per_cycle": 4.0,
+  "simd_efficiency_pct": 100.0,
+  "hardware_macs_per_cycle": 4,
+  "description": "4-way 8-bit packed dot-product with 32-bit accumulation using pv.sdotsp.b"
+}

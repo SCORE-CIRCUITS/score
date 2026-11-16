@@ -1,0 +1,9 @@
+{
+  "project": "chipsalliance/Cores-VeeR-EH1",
+  "commit_short": "d04b1c7a",
+  "dataset_name": "veer_eh1",
+  "generated_at_utc": "2026-11-16T15:20:58Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

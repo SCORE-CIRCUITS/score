@@ -1,0 +1,65 @@
+ROOT_DIR := $(realpath ../..)
+include $(ROOT_DIR)/config.mk
+
+# --- master list ------------------------------------------------------
+TESTS := \
+    minimal                                                           \
+    basic demo dogfood dropout dotproduct dotproduct2 mstress io_addr \
+    arith printf diverge diverge_large sort fence fence_mp ldst_order \
+    vecadd vecadd_v1 sgemm sgemmx sgemm_v1 conv3 relu sgemv           \
+    sgemm2 sgemm2_v1 madmax mixfu stencil3d raycast bfs jacobi pathfinder   \
+    softmax uniform_ld lmem_access ldst_wide ldst_matrix tfu zfhmin              \
+    flash_attn flash_attn_tcu_wg                                      \
+    sgemm_tcu sgemm_tcu_mx sgemm_tcu_sp_mx sgemm_tcu_wg sgemm_tcu_wg_mx sgemm_tcu_sp sgemm_tcu_wg_sp  \
+    sgemm2_dxa sgemm2_tcu sgemm_tcu_wg_dxa sgemm_tcu_wg_sp_dxa        \
+    sgemm2_dxa_mcast sgemm_tcu_wg_dxa_mcast                           \
+    dxa_copy dxa_copy_mcast dxa_kmajor_check                          \
+    async_barrier async_gbarrier gbar_phase bar_slot_phase packld wgather wsync quad_lod \
+    occupancy multikernel reopen module_reload single_cta            \
+    flush_coherence lazy_fetch sector_merge raw_order cache_ways chase \
+    vm_test vm_fault vm_stress
+
+# --- common exclude list ---------------------------------------------
+EXCLUDE :=
+
+# --- per-backend exclude lists ---------------------------------------
+EXCLUDE_simx   :=
+# The flash_attn tests' default sizes run tens of millions of cycles; their
+# rtlsim coverage is the small cases in ci/testcases.
+EXCLUDE_rtlsim := flash_attn flash_attn_tcu_wg
+EXCLUDE_opae   :=
+EXCLUDE_xrt    :=
+
+BACKENDS := simx rtlsim opae xrt
+
+# --- aggregate targets ------------------------------------------------
+.PHONY: all clean $(addprefix run-,$(BACKENDS))
+
+# `all` and every `run-<backend>` honor BOTH the common EXCLUDE and the
+# backend-specific EXCLUDE_<backend>. `clean` walks the FULL list so a
+# disabled tree still gets scrubbed.
+ACTIVE_TESTS = $(filter-out $(EXCLUDE),$(TESTS))
+backend_tests = $(filter-out $(EXCLUDE) $(EXCLUDE_$(1)),$(TESTS))
+
+all:   $(addprefix build-,$(ACTIVE_TESTS))
+clean: $(addprefix clean-,$(TESTS))
+
+define backend_rule
+.PHONY: run-$(1)
+run-$(1): $$(addprefix run-$(1)-,$$(call backend_tests,$(1)))
+endef
+$(foreach b,$(BACKENDS),$(eval $(call backend_rule,$(b))))
+
+# --- pattern recipes --------------------------------------------------
+.PHONY: build-% clean-%
+
+build-%:
+	$(MAKE) -C $* all
+
+clean-%:
+	$(MAKE) -C $* clean
+
+# run-<backend>-<test>: split "<backend>-<test>" on the first dash.
+# Subdir names must not contain '-' (none currently do).
+run-%:
+	$(MAKE) -C $(word 2,$(subst -, ,$*)) run-$(word 1,$(subst -, ,$*))

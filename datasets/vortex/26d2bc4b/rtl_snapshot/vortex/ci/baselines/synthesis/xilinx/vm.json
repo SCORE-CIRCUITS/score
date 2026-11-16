@@ -1,0 +1,179 @@
+{
+  "vm": {
+    "clock_mhz": 250,
+    "config_hash": "d31a7583648c7f54",
+    "configs": "-DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_CORES=2",
+    "dut": "vm",
+    "result": {
+      "bram": 188,
+      "build_time_s": 9066,
+      "critical_paths": [
+        {
+          "endpoint": "g_sockets[1].dmmu/g_pipe[0].out_pipe/g_eb2.stream_buffer/g_buffer.valid_out_r_reg/D",
+          "group": "core_clock",
+          "levels": 9,
+          "logic_ns": 0.733,
+          "route_ns": 3.325,
+          "route_pct": 81.935,
+          "slack_ns": -0.076,
+          "startpoint": "g_sockets[1].dmmu/g_lane_bus[0].req_skid/g_buffer.has_data_reg_inv_replica_1/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][0]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.338,
+          "route_ns": 2.635,
+          "route_pct": 66.324,
+          "slack_ns": -0.076,
+          "startpoint": "g_sockets[1].g_dmmu_bind[0].req_out_buf/g_eb2.stream_buffer/g_buffer.g_out_reg.data_out_r_reg[181]/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][1]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.338,
+          "route_ns": 2.634,
+          "route_pct": 66.316,
+          "slack_ns": -0.076,
+          "startpoint": "g_sockets[1].g_dmmu_bind[0].req_out_buf/g_eb2.stream_buffer/g_buffer.g_out_reg.data_out_r_reg[181]/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][0]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.191,
+          "route_ns": 2.778,
+          "route_pct": 69.992,
+          "slack_ns": -0.073,
+          "startpoint": "g_sockets[1].dmmu/g_lane_bus[0].req_skid/g_buffer.buffer_reg[183]/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][1]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.191,
+          "route_ns": 2.777,
+          "route_pct": 69.984,
+          "slack_ns": -0.073,
+          "startpoint": "g_sockets[1].dmmu/g_lane_bus[0].req_skid/g_buffer.buffer_reg[183]/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][0]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.204,
+          "route_ns": 2.764,
+          "route_pct": 69.659,
+          "slack_ns": -0.073,
+          "startpoint": "g_sockets[1].dmmu/g_lane_bus[1].req_skid/g_buffer.buffer_reg[190]/C"
+        },
+        {
+          "endpoint": "g_sockets[1].dmmu/tlb/mshr/count_r_reg[1][1]/CE",
+          "group": "core_clock",
+          "levels": 11,
+          "logic_ns": 1.204,
+          "route_ns": 2.763,
+          "route_pct": 69.651,
+          "slack_ns": -0.073,
+          "startpoint": "g_sockets[1].dmmu/g_lane_bus[1].req_skid/g_buffer.buffer_reg[190]/C"
+        },
+        {
+          "endpoint": "l2cache/g_cache.cache/g_banks[1].bank/g_lazyq.lazy_queue/pending_size/g_size_gt1.g_single_step.alm_full_r_reg/D",
+          "group": "core_clock",
+          "levels": 7,
+          "logic_ns": 1.472,
+          "route_ns": 2.529,
+          "route_pct": 63.213,
+          "slack_ns": -0.068,
+          "startpoint": "l2cache/g_cache.cache/g_banks[1].bank/cache_data/g_dirty_bytes.g_mask_sync.byteen_store/g_no_asic.g_sync.g_bram.g_read_first.g_no_wren.ram_reg_0/CLKARDCLK"
+        },
+        {
+          "endpoint": "l2cache/g_cache.cache/g_banks[1].bank/g_lazyq.lazy_queue/pending_size/g_size_gt1.g_single_step.g_size_gt2.empty_r_reg/D",
+          "group": "core_clock",
+          "levels": 7,
+          "logic_ns": 1.471,
+          "route_ns": 2.53,
+          "route_pct": 63.238,
+          "slack_ns": -0.068,
+          "startpoint": "l2cache/g_cache.cache/g_banks[1].bank/cache_data/g_dirty_bytes.g_mask_sync.byteen_store/g_no_asic.g_sync.g_bram.g_read_first.g_no_wren.ram_reg_0/CLKARDCLK"
+        },
+        {
+          "endpoint": "l2cache/g_cache.cache/g_banks[1].bank/g_lazyq.lazy_queue/pending_size/g_size_gt1.g_single_step.alm_full_r_reg/D",
+          "group": "core_clock",
+          "levels": 7,
+          "logic_ns": 1.474,
+          "route_ns": 2.526,
+          "route_pct": 63.148,
+          "slack_ns": -0.066,
+          "startpoint": "l2cache/g_cache.cache/g_banks[1].bank/cache_data/g_dirty_bytes.g_mask_sync.byteen_store/g_no_asic.g_sync.g_bram.g_read_first.g_no_wren.ram_reg_0/CLKARDCLK"
+        }
+      ],
+      "dsp": 0,
+      "env": {
+        "device": "xcu55c-fsvh2892-2L-e",
+        "opt_level": 3,
+        "vivado": "2024.2",
+        "xlen": 32
+      },
+      "ff": 126260,
+      "fmax_mhz": 245.3,
+      "high_fanout_nets": [
+        {
+          "driver": "LUT6",
+          "fanout": 4479,
+          "net": "l2cache/g_cache.cache/g_banks[1].bank/reg_cmt/enable0"
+        },
+        {
+          "driver": "LUT6",
+          "fanout": 4447,
+          "net": "l2cache/g_cache.cache/g_banks[3].bank/reg_cmt/enable0"
+        },
+        {
+          "driver": "LUT6",
+          "fanout": 4406,
+          "net": "l2cache/g_cache.cache/g_banks[0].bank/reg_cmt/enable0"
+        },
+        {
+          "driver": "LUT6",
+          "fanout": 4395,
+          "net": "l2cache/g_cache.cache/g_banks[2].bank/reg_cmt/enable0"
+        },
+        {
+          "driver": "PORT",
+          "fanout": 3835,
+          "net": "reset"
+        },
+        {
+          "driver": "MUXF7",
+          "fanout": 1815,
+          "net": "l2tlb/mshr/A[0]"
+        },
+        {
+          "driver": "MUXF7",
+          "fanout": 1691,
+          "net": "l2tlb/mshr/A[1]"
+        },
+        {
+          "driver": "MUXF7",
+          "fanout": 1568,
+          "net": "l2tlb/mshr/A[2]"
+        },
+        {
+          "driver": "MUXF7",
+          "fanout": 1460,
+          "net": "l2tlb/mshr/A[5]"
+        },
+        {
+          "driver": "MUXF7",
+          "fanout": 1458,
+          "net": "l2tlb/mshr/A[3]"
+        }
+      ],
+      "lut": 125964,
+      "lutram": 9726,
+      "uram": 0,
+      "wns_ns": -0.076
+    }
+  }
+}

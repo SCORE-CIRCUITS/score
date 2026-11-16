@@ -1,0 +1,36 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cv32e40p",
+  "upstream_commit": "b353438f",
+  "profile": "subword_simd_dsp",
+  "workload": "fconv2d",
+  "config": "xpulp_dsp_enabled",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imc_xpulpv2",
+    "configuration": "xpulp_dsp_enabled",
+    "nr_lanes": 1,
+    "vlen": 32,
+    "wall_time_s": 0.4491,
+    "benchmark_cycles": 89752,
+    "kernel_cycles": 89752,
+    "total_ops": 16200,
+    "performance_ops_per_cycle": 0.1805,
+    "vector_utilization_pct": 18.05,
+    "matrix_dimension": "32x32_conv3x3",
+    "datatype": "int32",
+    "exit_code": 0
+  },
+  "generated_utc": "2026-11-16T15:21:02Z",
+  "host": {
+    "hostname": "score-bench",
+    "platform": "Linux-5.14.0",
+    "python": "3.9.21"
+  },
+  "tool_versions": {
+    "verilator": "5.022",
+    "gcc": "10.2.0"
+  }
+}

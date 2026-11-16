@@ -1,0 +1,27 @@
+{
+  "dxa": {
+    "clock_mhz": 800,
+    "config_hash": "1333820f22e64ab6",
+    "configs": "",
+    "dut": "dxa",
+    "result": {
+      "build_time_s": 90,
+      "cell_area_um2": 12868.366,
+      "cell_count": 121130,
+      "env": {
+        "corner": "tt",
+        "pdk": "asap7",
+        "sta": "3.1.0",
+        "vt": "rvt",
+        "xlen": 32,
+        "yosys": "Yosys 0.69"
+      },
+      "fmax_mhz": 1128.668,
+      "power_mw": 36.4,
+      "seq_area_um2": 5658.206,
+      "sram_area_um2": 0.0,
+      "tns_ns": 0.0,
+      "wns_ns": 0.364
+    }
+  }
+}

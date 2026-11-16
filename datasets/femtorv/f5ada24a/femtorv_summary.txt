@@ -1,0 +1,5 @@
+femtorv SCORE snapshot (BrunoLevy/learn-fpga)
+Commit: f5ada24a
+Dataset: /home/yongfu/proj/score/datasets/femtorv/f5ada24a
+Lint: PASS
+RTL files: 59

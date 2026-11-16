@@ -1,0 +1,5 @@
+hwacha SCORE snapshot (ucb-bar/hwacha)
+Commit: bf799dc4
+Dataset: /home/yongfu/proj/score/datasets/hwacha/bf799dc4
+Paradigm: Decoupled Access-Execute (DAE)
+Chisel Sources: 53

@@ -1,0 +1,27 @@
+{
+  "vm": {
+    "clock_mhz": 800,
+    "config_hash": "45673f23cbf3b123",
+    "configs": "-DVX_CFG_NUM_THREADS=8 -DVX_CFG_NUM_WARPS=8",
+    "dut": "vm",
+    "result": {
+      "build_time_s": 889,
+      "cell_area_um2": 133457.913,
+      "cell_count": 1190756,
+      "env": {
+        "corner": "tt",
+        "pdk": "asap7",
+        "sta": "3.1.0",
+        "vt": "rvt",
+        "xlen": 32,
+        "yosys": "Yosys 0.69"
+      },
+      "fmax_mhz": 1265.983,
+      "power_mw": 348.0,
+      "seq_area_um2": 63571.424,
+      "sram_area_um2": 103470.4,
+      "tns_ns": 0.0,
+      "wns_ns": 0.46
+    }
+  }
+}

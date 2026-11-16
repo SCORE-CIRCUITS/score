@@ -1,0 +1,208 @@
+// Copyright © 2019-2023
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <array>
+#include <deque>
+#include <mempool.h>
+#include <ringqueue.h>
+#include "func_unit.h"
+#include "instr.h"
+#include "VX_config.h"
+
+// The TCU metadata SRAM is present when any metadata-consuming mode (MX or
+// sparse) is enabled. Internal derived macro — not a VX_CFG_* knob; same
+// derivation as tcu_unit.h.
+#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_SPARSE_ENABLE)
+#define TCU_META_ENABLE
+#endif
+
+// TCU_LD memory ports: one per TCU block, through the LSU block that serves
+// the same warps, when the LSU has one block per TCU block; otherwise all
+// TCU blocks share LSU block 0, as in the RTL (VX_tcu_unit).
+#ifndef TCU_AGU_PORTS
+#define TCU_AGU_PORTS (uint32_t((VX_CFG_NUM_LSU_BLOCKS == VX_CFG_NUM_TCU_BLOCKS) ? VX_CFG_NUM_TCU_BLOCKS : 1))
+#endif
+
+namespace vortex {
+
+// Micro-op generator for packed-load macro instructions (PACKLB.F / PACKLH.F).
+class LsuUopGen {
+public:
+  LsuUopGen(PoolAllocator<Instr, 64>& pool) : pool_(pool) {}
+
+  static uint32_t uop_count(const Instr& instr);
+
+  Instr::Ptr get(const Instr& macro_instr, uint32_t uop_index);
+
+private:
+  PoolAllocator<Instr, 64>& pool_;
+};
+
+// Fence controller
+class FenceController {
+public:
+  bool locked() const { return locked_; }
+
+  void engage(instr_trace_t* trace) {
+    trace_ = trace;
+    locked_ = true;
+  }
+
+  // Try to release the lock. Returns true on success (lock cleared,
+  // trace forwarded). Conditions: pending-requests table empty AND
+  // output channel can accept the trace.
+  bool try_release(SimChannel<instr_trace_t*>& out, bool pending_empty) {
+    if (!locked_) return false;
+    if (!pending_empty) return false;
+    if (!out.try_send(trace_)) return false;
+    locked_ = false;
+    trace_ = nullptr;
+    return true;
+  }
+
+  instr_trace_t* trace() const { return trace_; }
+
+  void reset() { trace_ = nullptr; locked_ = false; }
+
+private:
+  instr_trace_t* trace_ = nullptr;
+  bool locked_ = false;
+};
+
+class LsuUnit : public FuncUnit<VX_CFG_NUM_LSU_BLOCKS> {
+public:
+	LsuUnit(const SimContext& ctx, const char* name, Core*);
+	~LsuUnit();
+
+#ifdef TCU_META_ENABLE
+	// TCU metadata client ports (TCU_AGU_PORTS, starting at block 0): TCU_LD
+	// load requests arbitrate with the block's own traffic into its
+	// lmem_switch; response fragments return here with the client's own tag
+	// restored.
+	std::vector<SimChannel<LsuReq>> TcuReqIn;
+	std::vector<SimChannel<LsuRsp>> TcuRspOut;
+#endif
+
+	// Returns true when all LSU blocks have no in-flight requests.
+	bool drained() const;
+
+protected:
+	void on_reset() override;
+	void on_tick() override;
+
+private:
+
+	void compute_addrs(uint32_t b, instr_trace_t* trace);
+
+	// Per-cycle handlers.
+	void process_response_step(uint32_t b);
+	void process_request_step(uint32_t b);
+	void send_fence_token(uint32_t b);
+
+	// Drain Inputs[b] into req_queue.
+	void ingest_inputs(uint32_t b, bool queue_room, uint32_t reads_held);
+
+  struct mem_addr_size_t {
+		uint64_t addr;
+		uint32_t size;
+		uint64_t data;
+		uint64_t amo_cmp;
+		uint32_t tid;
+	};
+
+ 	struct pending_req_t {
+		instr_trace_t* trace;
+		uint32_t count;
+		bool eop;
+		std::vector<mem_addr_size_t> lanes;
+		IntrLsuArgs lsu_args;
+		bool        is_load;
+		// The instruction's response-tracking slot.
+		uint32_t    track      = 0;
+		// TCU metadata client entry: response fragments are forwarded to
+		// TcuRspOut with client_tag restored instead of written to registers.
+		bool        is_tcu     = false;
+		uint32_t    client_tag = 0;
+		// A fence's flush token: its response only releases the fence.
+		bool        is_flush   = false;
+	};
+
+	static constexpr uint32_t kNoTrack = -1u;
+
+	// Per-block LSU state. Each member is a named hardware sub-block.
+	struct lsu_state_t {
+		RingQueue<instr_trace_t*> req_queue{VX_CFG_LSU_QUEUE_IN_SIZE};
+		// In-flight LSU requests, keyed by the tag the LSU allocates on
+		// issue. Stores the originating trace + per-lane (tid, addr, size)
+		// info needed to write the response back to the right registers.
+		// (Not a miss-status table — the cache has its own MSHR for that.)
+		// Sized by the outstanding pool (MLP depth), decoupled from the
+		// input staging queue above.
+		HashTable<pending_req_t>  pending_reqs{VX_CFG_LSU_PENDING_SIZE};
+		// Reads waiting in req_queue hold a pending_reqs slot from the moment
+		// they enter it, so staged and outstanding reads share the pool.
+		uint32_t                  staged_reads = 0;
+		// TCU metadata requests granted a req_queue slot (a null entry there),
+		// and whether the TCU client took the last queue entry.
+		std::deque<LsuReq>        meta_reqs;
+		bool                      meta_last = false;
+		bool                      head_staged = false;
+		// A load or AMO's requests still awaiting their last response, and
+		// whether its final request has issued, in a slot the instruction
+		// takes with its first request and keeps until its last.
+		struct rsp_track_t {
+			uint32_t outstanding = 0;
+			bool     last_issued = false;
+		};
+		HashTable<rsp_track_t>    rsp_tracks{VX_CFG_LSU_PENDING_SIZE};
+		uint32_t                  open_track = kNoTrack;
+		FenceController           fence;
+		// the engaged fence's flush token is still to be sent
+		bool                      fence_token = false;
+		std::vector<mem_addr_size_t> addr_list;
+		uint32_t                  remain_addrs = 0;
+
+		void reset() {
+			this->req_queue.clear();
+			this->pending_reqs.clear();
+			this->staged_reads = 0;
+			this->meta_reqs.clear();
+			this->meta_last = false;
+			this->head_staged = false;
+			this->fence.reset();
+			this->fence_token = false;
+			this->addr_list.clear();
+			this->remain_addrs = 0;
+			this->rsp_tracks.clear();
+			this->open_track = kNoTrack;
+		}
+	};
+
+	std::array<lsu_state_t, VX_CFG_NUM_LSU_BLOCKS> states_;
+
+	// The result path's two input buffers, two entries each, ahead of the
+	// result arbiter, whose own two-entry buffer is Outputs: responses, and the
+	// instructions that commit without one (stores, skipped requests, fences).
+	// Each registers its ready.
+	std::vector<SimChannel<instr_trace_t*>> rsp_bufs_;
+	std::vector<SimChannel<instr_trace_t*>> no_rsp_bufs_;
+
+	// Moves one result into the arbiter's buffer, a response first.
+	void arbitrate_results(uint32_t b);
+
+	uint64_t pending_loads_;
+};
+
+}

@@ -1,0 +1,26 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "literature_reported",
+  "core": "vortex",
+  "upstream_commit": "26d2bc4b",
+  "profile": "gpgpu_simt",
+  "workload": "opencl_sgemm",
+  "config": "4core_4warp_4thread",
+  "citation": "MICRO 2021: Vortex: An Open-Source RISC-V GPGPU",
+  "metrics": {
+    "validated": true,
+    "simulator": "vlsim",
+    "architecture": "rv32imf_simt",
+    "configuration": "4core_4warp_4thread",
+    "clusters": 1,
+    "cores": 4,
+    "warps_per_core": 4,
+    "threads_per_warp": 4,
+    "kernel_cycles": 185420,
+    "performance_ops_per_cycle": 14.25,
+    "simt_efficiency_pct": 89.06,
+    "matrix_dimension": "64x64",
+    "datatype": "fp32"
+  },
+  "generated_utc": "2026-11-16T15:16:32Z"
+}

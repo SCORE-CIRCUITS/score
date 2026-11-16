@@ -1,0 +1,19 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cv32e40p",
+  "upstream_commit": "b353438f",
+  "profile": "mcu_verilator",
+  "workload": "dhrystone",
+  "config": "default",
+  "metrics": {
+    "dmips_per_mhz": 1.72,
+    "operating_frequency_mhz": 400.0,
+    "total_cycles": 232558,
+    "instructions": 195000,
+    "cpi": 1.19,
+    "simulator": "verilator",
+    "validation_method": "cycle_exact"
+  },
+  "generated_utc": "2026-11-16T23:25:00Z"
+}

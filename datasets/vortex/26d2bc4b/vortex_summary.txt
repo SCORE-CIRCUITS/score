@@ -1,0 +1,5 @@
+vortex SCORE snapshot (vortexgpgpu/vortex)
+Commit: 26d2bc4b
+Dataset: /home/yongfu/proj/score/datasets/vortex/26d2bc4b
+Lint: FAIL
+RTL files: 359

@@ -1,0 +1,27 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "femtorv",
+  "upstream_commit": "f5ada24a",
+  "profile": "mcu_verilator",
+  "workload": "dhrystone",
+  "config": "quark",
+  "metrics": {
+    "dmips_per_mhz": 0.2776,
+    "dhrystones_per_sec_per_mhz": 487.8,
+    "total_cycles": 2050000,
+    "instructions": 265000,
+    "cpi": 7.736,
+    "simulator": "verilator",
+    "validation_method": "test_passed"
+  },
+  "generated_utc": "2026-11-16T15:21:04Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022"
+  }
+}

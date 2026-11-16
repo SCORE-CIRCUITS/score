@@ -1,0 +1,134 @@
+ROOT_DIR := $(realpath ../../../../..)
+include $(ROOT_DIR)/config.mk
+# Exports CIRCT_VERILOG as an absolute path. gen_sources.sh resolves its
+# preprocessor from the environment, so without this the flow silently depends
+# on circt-verilog being on PATH.
+include $(VORTEX_HOME)/hw/syn/common.mk
+
+DEVICE ?= xcu55c-fsvh2892-2L-e
+
+MAX_JOBS ?= 8
+
+# Synthesis optimization level (standardized across hw/syn):
+#   0    -- fastest compile, minimal optimization (Flow_RuntimeOptimized)
+#   1, 2 -- Vivado defaults
+#   3    -- default: aggressive performance strategy
+# project.tcl reads this through the OPT_LEVEL env var.
+OPT_LEVEL ?= 3
+
+VIVADO := $(XILINX_VIVADO)/bin/vivado
+
+SRC_DIR := $(VORTEX_HOME)/hw/syn/xilinx/dut
+
+RTL_DIR := $(VORTEX_HOME)/hw/rtl
+DPI_DIR := $(VORTEX_HOME)/hw/dpi
+AFU_DIR := $(RTL_DIR)/afu/xrt
+AFU_COMMON_DIR := $(RTL_DIR)/afu/common
+SCRIPT_DIR := $(VORTEX_HOME)/hw/scripts
+UNITTEST_DIR := $(VORTEX_HOME)/hw/unittest
+
+NCPUS := $(shell lscpu | grep "^Core(s) per socket:" | awk '{print $$4}')
+JOBS ?= $(shell echo $$(( $(NCPUS) > $(MAX_JOBS) ? $(MAX_JOBS) : $(NCPUS) )))
+
+# `override`: these are facts about this flow, not preferences. A caller that
+# sets CONFIGS on the MAKE COMMAND LINE would otherwise kill every `CONFIGS +=`
+# here and in build.mk silently -- command-line variables win over `+=`, and
+# nothing warns. With `override`, a command-line CONFIGS is extra defines on
+# top, which is what it reads as.
+override CONFIGS += -DSYNTHESIS -DVIVADO -DNDEBUG
+
+XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+
+CFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+# raw CONFIGS carries only an enum *value* (e.g. VX_CFG_TCU_TYPE=TFR); append the
+# resolved type selectors so an enum override selects its RTL implementation.
+CFLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS))
+CFLAGS += $(RTL_INCLUDE)
+
+# Power analysis via SAIF switching-activity annotation.
+# SAIF_FILE : path to the SAIF file produced by rtlsim with SAIF=1 (required for 'power' target)
+# SAIF_INST : instance path of the DUT inside the simulation hierarchy, used to
+#             strip the testbench prefix from SAIF signal names so they align with
+#             the synthesized netlist (e.g. "TOP.rtlsim_shim.vortex").
+#             Leave empty when the SAIF root scope already matches the top module.
+SAIF_FILE ?=
+SAIF_INST ?=
+
+# Build targets
+all: $(PROJECT).xpr
+
+gen-sources: project_1/sources.txt
+project_1/sources.txt:
+	mkdir -p project_1
+	$(SCRIPT_DIR)/gen_sources.sh $(CFLAGS) -T$(TOP_LEVEL_ENTITY) -P -F -Cproject_1/src -Oproject_1/sources.txt $(RTL_PKGS)
+
+build: $(PROJECT).xpr
+$(PROJECT).xpr: project_1/sources.txt
+ifdef FPU_IP
+	MAX_JOBS=$(JOBS) OPT_LEVEL=$(OPT_LEVEL) FPU_IP=project_1/ip TOOL_DIR=$(SCRIPT_DIR) $(VIVADO) -mode batch -source $(SRC_DIR)/project.tcl -tclargs $(TOP_LEVEL_ENTITY) $(DEVICE) project_1/sources.txt $(SRC_DIR)/project.xdc
+else
+	MAX_JOBS=$(JOBS) OPT_LEVEL=$(OPT_LEVEL) TOOL_DIR=$(SCRIPT_DIR) $(VIVADO) -mode batch -source $(SRC_DIR)/project.tcl -tclargs $(TOP_LEVEL_ENTITY) $(DEVICE) project_1/sources.txt $(SRC_DIR)/project.xdc
+endif
+
+# Re-run power analysis on an existing post-implementation checkpoint.
+# Requires SAIF_FILE=<path>.  Does not rebuild the design.
+# Example: make power SAIF_FILE=/path/to/trace.saif SAIF_INST=TOP.rtlsim_shim.vortex
+power:
+	@if [ ! -f post_impl.dcp ]; then \
+	  echo "ERROR: post_impl.dcp not found. Run 'make build' first."; exit 1; \
+	fi
+	@if [ -z "$(SAIF_FILE)" ]; then \
+	  echo "ERROR: SAIF_FILE not specified. Usage: make power SAIF_FILE=<path/to/trace.saif>"; exit 1; \
+	fi
+	TOOL_DIR=$(SCRIPT_DIR) SAIF_FILE=$(SAIF_FILE) SAIF_INST=$(SAIF_INST) \
+	  $(VIVADO) -mode batch -source $(SCRIPT_DIR)/xilinx_power_analysis.tcl
+
+# Beacon (foldsim-estimate-timing, foldsim-estimate-area): the logic levels of
+# every register-to-register path of the design, counted as Vivado counts them
+# on DEVICE's family (hw/syn/xilinx/platforms), by RTL unit, and its LUTs,
+# flip-flops, distributed and block RAM and DSPs, in seconds and without
+# Vivado. It elaborates the same sources and defines as gen-sources into a
+# CIRCT netlist of its own, with the Xilinx floating-point cores as black
+# boxes, mapped once for depth and once for area. ci/logic_gate.py gates
+# beacon_summary.csv and beacon_units.json; beacon_paths.txt has every path
+# of at least BEACON_PATH_LEVELS (beacon_summary.py's watch threshold), op by
+# op, by unit, and beacon_area.txt the area by unit and where each memory
+# goes.
+BEACON_PATH_LEVELS ?= 8
+# The Beacon target: the family of the device, as hw/syn/xilinx/platforms names it.
+BEACON_TARGET = $(shell python3 $(SCRIPT_DIR)/gen_platform.py --device=$(DEVICE) --emit=family)
+# Modules whose interfaces must be registered (space separated): their
+# instances keep their ports through mapping, and beacon/ports.csv counts, per
+# output port, the bits a combinational path from outside the instance
+# reaches (`through`). beacon_summary.py records them for logic_gate.
+BEACON_INTERFACES ?=
+beacon_comma := ,
+beacon_empty :=
+beacon_space := $(beacon_empty) $(beacon_empty)
+beacon_keep   = $(subst $(beacon_space),$(beacon_comma),$(strip $(BEACON_INTERFACES)))
+BEACON_MAP    = $(if $(beacon_keep),foldsim-keep-modules{modules=$(beacon_keep)}$(beacon_comma))foldsim-beacon-map{target=$(BEACON_TARGET)}
+BEACON_PORTS  = $(if $(beacon_keep),ports=beacon/ports.csv port-modules=$(beacon_keep))
+beacon:
+	mkdir -p beacon
+	$(SCRIPT_DIR)/gen_sources.sh $(CFLAGS) -T$(TOP_LEVEL_ENTITY) -P -F -Cbeacon/src -Obeacon/sources.f $(RTL_PKGS)
+	$(SCRIPT_DIR)/circt_elaborate.sh -t $(TOP_LEVEL_ENTITY) -l beacon/sources.f \
+		-x $(SCRIPT_DIR)/xilinx_ip_stubs.sv -r beacon/memories.rpt -o beacon/netlist.mlir
+	$(FOLDSIM_OPT) beacon/netlist.mlir --pass-pipeline='builtin.module($(BEACON_MAP))' \
+		--emit-bytecode -o beacon/mapped.mlirbc
+	$(FOLDSIM_OPT) beacon/mapped.mlirbc -o /dev/null --pass-pipeline="builtin.module(foldsim-estimate-timing{top=$(TOP_LEVEL_ENTITY) target=$(BEACON_TARGET) output=beacon/endpoints.csv instances=beacon/instances.csv report=beacon/report.txt paths=beacon/paths.jsonl path-levels=$(BEACON_PATH_LEVELS) $(BEACON_PORTS)})"
+	$(FOLDSIM_OPT) beacon/netlist.mlir -o /dev/null --pass-pipeline="builtin.module(foldsim-beacon-map{target=$(BEACON_TARGET) area},foldsim-estimate-area{top=$(TOP_LEVEL_ENTITY) target=$(BEACON_TARGET) output=beacon/area.csv memories=beacon/area_memories.csv report=beacon/area.txt})"
+	python3 $(SCRIPT_DIR)/beacon_summary.py beacon --top $(TOP_LEVEL_ENTITY)
+
+clean:
+ifndef RESUME
+	rm -rf project_1 beacon beacon_summary.csv beacon_units.json beacon_paths.txt beacon_area.txt
+	rm -rf .Xil
+	rm -f *.rpt
+	rm -f *.log
+	rm -f *.jou
+	rm -f *.dcp
+else
+	@echo "RESUME is defined, skipping clean."
+endif
+
+.PHONY: all gen-sources build beacon clean power

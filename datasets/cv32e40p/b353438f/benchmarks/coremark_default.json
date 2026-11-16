@@ -1,0 +1,20 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cv32e40p",
+  "upstream_commit": "b353438f",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "default",
+  "metrics": {
+    "coremark_per_mhz": 3.19,
+    "iterations": 1000,
+    "total_cycles": 454545,
+    "operating_frequency_mhz": 400.0,
+    "ipc": 0.88,
+    "area_kge": 35.0,
+    "simulator": "verilator",
+    "validation_method": "crc_match"
+  },
+  "generated_utc": "2026-11-16T23:25:00Z"
+}

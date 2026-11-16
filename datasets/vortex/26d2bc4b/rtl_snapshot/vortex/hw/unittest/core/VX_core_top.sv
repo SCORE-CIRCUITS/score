@@ -1,0 +1,268 @@
+// Copyright © 2019-2023
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+`include "VX_define.vh"
+
+`ifdef VX_CFG_EXT_F_ENABLE
+`include "VX_fpu_define.vh"
+`endif
+
+module VX_core_top import VX_gpu_pkg::*;
+`ifdef VX_CFG_EXT_DXA_ENABLE
+    import VX_dxa_pkg::*;
+`endif
+#(
+    parameter CORE_ID = 0
+) (
+    // Clock
+    input wire                              clk,
+    input wire                              reset,
+
+    output wire [DCACHE_NUM_REQS-1:0]       dcache_req_valid,
+    output wire [DCACHE_NUM_REQS-1:0]       dcache_req_rw,
+    output wire [DCACHE_NUM_REQS-1:0][DCACHE_WORD_SIZE-1:0] dcache_req_byteen,
+    output wire [DCACHE_NUM_REQS-1:0][DCACHE_ADDR_WIDTH-1:0] dcache_req_addr,
+    output wire [DCACHE_NUM_REQS-1:0][MEM_ATTR_WIDTH-1:0] dcache_req_attr,
+    output wire [DCACHE_NUM_REQS-1:0][DCACHE_WORD_SIZE*8-1:0] dcache_req_data,
+    output wire [DCACHE_NUM_REQS-1:0][DCACHE_TAG_WIDTH-1:0] dcache_req_tag,
+    input  wire [DCACHE_NUM_REQS-1:0]       dcache_req_ready,
+
+    input wire  [DCACHE_NUM_REQS-1:0]       dcache_rsp_valid,
+    input wire  [DCACHE_NUM_REQS-1:0][DCACHE_WORD_SIZE*8-1:0] dcache_rsp_data,
+    input wire  [DCACHE_NUM_REQS-1:0][DCACHE_TAG_WIDTH-1:0] dcache_rsp_tag,
+    output wire [DCACHE_NUM_REQS-1:0]       dcache_rsp_ready,
+
+    output wire [ICACHE_NUM_REQS-1:0]       icache_req_valid,
+    output wire [ICACHE_NUM_REQS-1:0]       icache_req_rw,
+    output wire [ICACHE_NUM_REQS-1:0][ICACHE_WORD_SIZE-1:0] icache_req_byteen,
+    output wire [ICACHE_NUM_REQS-1:0][ICACHE_ADDR_WIDTH-1:0] icache_req_addr,
+    output wire [ICACHE_NUM_REQS-1:0][ICACHE_WORD_SIZE*8-1:0] icache_req_data,
+    output wire [ICACHE_NUM_REQS-1:0][ICACHE_TAG_WIDTH-1:0] icache_req_tag,
+    input  wire [ICACHE_NUM_REQS-1:0]       icache_req_ready,
+
+    input wire  [ICACHE_NUM_REQS-1:0]       icache_rsp_valid,
+    input wire  [ICACHE_NUM_REQS-1:0][ICACHE_WORD_SIZE*8-1:0] icache_rsp_data,
+    input wire  [ICACHE_NUM_REQS-1:0][ICACHE_TAG_WIDTH-1:0] icache_rsp_tag,
+    output wire [ICACHE_NUM_REQS-1:0]       icache_rsp_ready,
+
+    output wire                             gbar_req_valid,
+    output wire [NB_WIDTH-1:0]              gbar_req_id,
+    output wire [CORE_ID_WIDTH-1:0]         gbar_req_size_m1,
+    output wire [CORE_ID_WIDTH-1:0]         gbar_req_core_id,
+    input wire                              gbar_req_ready,
+    input wire                              gbar_rsp_valid,
+    input wire [NB_WIDTH-1:0]               gbar_rsp_id,
+    output wire                             gbar_rsp_ready,
+
+    input wire                              dcr_req_valid,
+    input wire                              dcr_req_rw,
+    input wire [VX_DCR_ADDR_WIDTH-1:0]      dcr_req_addr,
+    input wire [VX_DCR_DATA_WIDTH-1:0]      dcr_req_data,
+
+    output wire                             dcr_rsp_valid,
+    output wire [VX_DCR_DATA_WIDTH-1:0]     dcr_rsp_data,
+
+    // Kernel launches: without them the CTA dispatcher is constant and
+    // synthesis removes it.
+    input wire                              kmu_valid,
+    input wire                              kmu_kind,
+    input wire                              kmu_eop,
+    input wire [KMU_DEST_W-1:0]             kmu_dest,
+    input wire [KMU_DATAW-1:0]              kmu_data,
+    output wire                             kmu_ready,
+
+    // Status
+    output wire                             busy
+);
+
+    VX_gbar_bus_if gbar_bus_if();
+    assign gbar_req_valid           = gbar_bus_if.req_valid;
+    assign gbar_req_id              = gbar_bus_if.req_data.id;
+    assign gbar_req_size_m1         = gbar_bus_if.req_data.size_m1;
+    assign gbar_req_core_id         = gbar_bus_if.req_data.core_id;
+    assign gbar_bus_if.req_ready    = gbar_req_ready;
+    assign gbar_bus_if.rsp_valid    = gbar_rsp_valid;
+    assign gbar_bus_if.rsp_data.id  = gbar_rsp_id;
+    assign gbar_rsp_ready = gbar_bus_if.rsp_ready;
+
+`ifdef VX_CFG_EXT_DXA_ENABLE
+    VX_dxa_req_bus_if dxa_req_bus_if();
+    VX_mem_bus_if #(
+        .DATA_SIZE   (DXA_LMEM_WORD_SIZE),
+        .TAG_WIDTH   (UUID_WIDTH+1),
+        .ATTR_WIDTH (DXA_LMEM_ATTR_W),
+        .ADDR_WIDTH  (DXA_LMEM_ADDR_W)
+    ) dxa_lmem_bus_if();
+
+    // VX_core is master on dxa_req_bus_if; tie off the slave side here.
+    assign dxa_req_bus_if.req_ready = 1'b1;
+
+    assign dxa_lmem_bus_if.req_valid = 1'b0;
+    assign dxa_lmem_bus_if.req_data  = '0;
+    assign dxa_lmem_bus_if.rsp_ready = 1'b1;
+`endif
+
+    // Graphics cluster-bus tie-offs. VX_core exposes these interfaces to the
+    // cluster; the standalone DUT sinks the master directions and drives the
+    // slave/response directions idle.
+`ifdef VX_CFG_EXT_TEX_ENABLE
+    VX_tex_bus_if #(
+        .NUM_LANES (`VX_CFG_NUM_SFU_LANES),
+        .TAG_WIDTH (TEX_REQ_TAG_WIDTH)
+    ) tex_bus_if();
+    assign tex_bus_if.req_ready = 1'b1;
+    assign tex_bus_if.rsp_valid = 1'b0;
+    assign tex_bus_if.rsp_data  = '0;
+`endif
+
+    // OM and RASTER have no core buses: a fragment export is an ordinary
+    // store into the aperture, and a fragment wave arrives as a kernel launch.
+
+`ifdef VX_CFG_EXT_RTU_ENABLE
+    VX_rtu_bus_if #(
+        .NUM_LANES (`VX_CFG_NUM_SFU_LANES),
+        .TAG_WIDTH (RTU_REQ_TAG_WIDTH)
+    ) rtu_bus_if();
+    assign rtu_bus_if.arm_ready = 1'b1;
+    assign rtu_bus_if.req_ready = 1'b1;
+    assign rtu_bus_if.win_valid = 1'b0;
+    assign rtu_bus_if.win_data  = '0;
+`endif
+
+`ifdef EXT_GFX_ANY_ENABLE
+    VX_dcr_flush_if cluster_flush_if();
+    assign cluster_flush_if.done = 1'b1;
+`endif
+
+    VX_kmu_bus_if kmu_bus_if();
+    assign kmu_bus_if.valid = kmu_valid;
+    assign kmu_bus_if.kind  = kmu_kind;
+    assign kmu_bus_if.eop   = kmu_eop;
+    assign kmu_bus_if.dest  = kmu_dest;
+    assign kmu_bus_if.data  = kmu_data;
+    assign kmu_ready        = kmu_bus_if.ready;
+
+    VX_dcr_bus_if dcr_bus_if();
+
+    assign dcr_bus_if.req_valid = dcr_req_valid;
+    assign dcr_bus_if.req_data  = '{rw: dcr_req_rw, addr: dcr_req_addr, data: dcr_req_data};
+
+    assign dcr_rsp_valid = dcr_bus_if.rsp_valid;
+    assign dcr_rsp_data  = dcr_bus_if.rsp_data.data;
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (DCACHE_WORD_SIZE),
+        .TAG_WIDTH (DCACHE_TAG_WIDTH)
+    ) dcache_bus_if[DCACHE_NUM_REQS]();
+
+    for (genvar i = 0; i < DCACHE_NUM_REQS; ++i) begin
+        assign dcache_req_valid[i] = dcache_bus_if[i].req_valid;
+        assign dcache_req_rw[i] = dcache_bus_if[i].req_data.rw;
+        assign dcache_req_byteen[i] = dcache_bus_if[i].req_data.byteen;
+        assign dcache_req_addr[i] = dcache_bus_if[i].req_data.addr;
+        assign dcache_req_attr[i] = dcache_bus_if[i].req_data.attr;
+        assign dcache_req_data[i] = dcache_bus_if[i].req_data.data;
+        assign dcache_req_tag[i] = dcache_bus_if[i].req_data.tag;
+        assign dcache_bus_if[i].req_ready = dcache_req_ready[i];
+
+        assign dcache_bus_if[i].rsp_valid = dcache_rsp_valid[i];
+        assign dcache_bus_if[i].rsp_data.tag = dcache_rsp_tag[i];
+        assign dcache_bus_if[i].rsp_data.data = dcache_rsp_data[i];
+        assign dcache_rsp_ready[i] = dcache_bus_if[i].rsp_ready;
+    end
+
+    VX_mem_bus_if #(
+        .DATA_SIZE (ICACHE_WORD_SIZE),
+        .TAG_WIDTH (ICACHE_TAG_WIDTH)
+    ) icache_bus_if[ICACHE_NUM_REQS]();
+
+    for (genvar i = 0; i < ICACHE_NUM_REQS; ++i) begin : g_icache_bus_if
+        assign icache_req_valid[i] = icache_bus_if[i].req_valid;
+        assign icache_req_rw[i] = icache_bus_if[i].req_data.rw;
+        assign icache_req_byteen[i] = icache_bus_if[i].req_data.byteen;
+        assign icache_req_addr[i] = icache_bus_if[i].req_data.addr;
+        assign icache_req_data[i] = icache_bus_if[i].req_data.data;
+        assign icache_req_tag[i] = icache_bus_if[i].req_data.tag;
+        assign icache_bus_if[i].req_ready = icache_req_ready[i];
+        `UNUSED_VAR (icache_bus_if[i].req_data.attr)
+
+        assign icache_bus_if[i].rsp_valid = icache_rsp_valid[i];
+        assign icache_bus_if[i].rsp_data.tag = icache_rsp_tag[i];
+        assign icache_bus_if[i].rsp_data.data = icache_rsp_data[i];
+        assign icache_rsp_ready[i] = icache_bus_if[i].rsp_ready;
+    end
+
+`ifdef PERF_ENABLE
+    sysmem_perf_t mem_perf;
+    assign mem_perf.icache  = '0;
+    assign mem_perf.dcache  = '0;
+    assign mem_perf.l2cache = '0;
+    assign mem_perf.l3cache = '0;
+    assign mem_perf.lmem    = '0;
+    assign mem_perf.mem     = '0;
+`endif
+
+`ifdef SCOPE
+    wire [0:0] scope_reset_w = 1'b0;
+    wire [0:0] scope_bus_in_w = 1'b0;
+    wire [0:0] scope_bus_out_w;
+    `UNUSED_VAR (scope_bus_out_w)
+`endif
+
+    wire [`VX_CFG_NUM_LSU_BLOCKS-1:0] core_lsu_busy;
+    wire core_busy;
+    assign busy = core_busy || (| core_lsu_busy);
+
+    VX_core #(
+        .INSTANCE_ID (`SFORMATF(("core")))
+    ) core (
+        `SCOPE_IO_BIND (0)
+        .clk            (clk),
+        .reset          (reset),
+        .core_id        (CORE_ID_WIDTH'(CORE_ID)),
+
+    `ifdef PERF_ENABLE
+        .sysmem_perf    (sysmem_perf),
+    `endif
+
+        .dcr_bus_if     (dcr_bus_if),
+
+        .dcache_bus_if  (dcache_bus_if),
+        // the dcache ports are this wrapper's own: nothing lies past them
+        .dcache_path_drained (1'b1),
+
+        .icache_bus_if  (icache_bus_if),
+
+        .gbar_bus_if    (gbar_bus_if),
+
+    `ifdef VX_CFG_EXT_DXA_ENABLE
+        .dxa_req_bus_if (dxa_req_bus_if),
+        .dxa_lmem_bus_if(dxa_lmem_bus_if),
+    `endif
+
+    `ifdef VX_CFG_EXT_TEX_ENABLE
+        .tex_bus_if     (tex_bus_if),
+    `endif
+    `ifdef VX_CFG_EXT_RTU_ENABLE
+        .rtu_bus_if     (rtu_bus_if),
+    `endif
+    `ifdef EXT_GFX_ANY_ENABLE
+        .cluster_flush_if(cluster_flush_if),
+    `endif
+
+        .kmu_bus_if     (kmu_bus_if),
+        .lsu_busy       (core_lsu_busy),
+        .busy           (core_busy)
+    );
+
+endmodule

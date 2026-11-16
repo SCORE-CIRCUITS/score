@@ -1,0 +1,5 @@
+vicuna SCORE snapshot (vproc/vicuna)
+Commit: debfb03a
+Dataset: /home/yongfu/proj/score/datasets/vicuna/debfb03a
+Lint: FAIL
+RTL files: 24
