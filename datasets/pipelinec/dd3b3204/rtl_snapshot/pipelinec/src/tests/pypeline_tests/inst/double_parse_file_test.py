@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# In-process regression test: PY_TO_LOGIC.PARSE_FILE called twice in one
+# process (the pypelinec driver's AUTO_PIPELINE pin-and-confirm loop does
+# exactly this) must behave like two fresh parses.
+#
+# Guards two once-latent bugs:
+#  1. sys.modules staleness: a second exec_module only re-runs the TOP design
+#     file; imported sub-files stayed cached, so their @MAIN registrations
+#     vanished (registry is cleared per parse). PARSE_FILE now evicts every
+#     module imported as a consequence of executing a design.
+#  2. Trim-memo staleness: TRIM_COLLAPSE_FUNC_DEFS_RECURSIVE's func-name-keyed
+#     done-memo made the second parse skip trimming its freshly rebuilt Logic,
+#     leaking normally-pruned dead logic (built-in ops' unused clock-enable
+#     branch muxes, whose generated wire names GHDL rejects) into VHDL.
+import os
+import sys
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../")
+)
+
+import tempfile
+
+import C_TO_LOGIC
+import PY_TO_LOGIC
+import SYN
+import pypeline
+
+SYN.SYN_OUTPUT_DIRECTORY = tempfile.mkdtemp(prefix="double_parse_file_test_")
+
+INST_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def parse_twice_and_compare(design_path):
+    ps1 = PY_TO_LOGIC.PARSE_FILE(design_path)
+    mains1 = sorted(ps1.main_mhz)
+    funcs1 = {
+        name: len(logic.wires) for name, logic in ps1.FuncLogicLookupTable.items()
+    }
+
+    ps2 = PY_TO_LOGIC.PARSE_FILE(design_path)
+    mains2 = sorted(ps2.main_mhz)
+    funcs2 = {
+        name: len(logic.wires) for name, logic in ps2.FuncLogicLookupTable.items()
+    }
+
+    assert mains1 == mains2, (
+        f"{os.path.basename(design_path)}: @MAIN set changed on re-parse "
+        f"(sys.modules staleness): {mains1} vs {mains2}"
+    )
+    # Canonical func names must be a pure function of the design source --
+    # identical across re-executions (no repr-address-derived hashes). The
+    # pin-and-confirm loop matches funcs across passes by these names.
+    assert set(funcs1) == set(funcs2), (
+        f"{os.path.basename(design_path)}: canonical func-name set changed "
+        f"on re-parse:\n  only in parse1: {sorted(set(funcs1) - set(funcs2))}"
+        f"\n  only in parse2: {sorted(set(funcs2) - set(funcs1))}"
+    )
+    # Same-named funcs must have identically-sized logic on both parses --
+    # in particular the second parse's rebuilt built-ins must be trimmed the
+    # same way the first parse's were (trim-memo staleness).
+    for name in funcs1:
+        assert funcs1[name] == funcs2[name], (
+            f"{os.path.basename(design_path)}: {name} wire count changed on "
+            f"re-parse ({funcs1[name]} -> {funcs2[name]}): second parse's "
+            f"Logic was built/trimmed differently"
+        )
+    # No parse may leave untrimmed clock-enable branch-mux wires behind
+    # (their generated names contain '__' which GHDL rejects as identifiers)
+    for tag, ps in (("parse1", ps1), ("parse2", ps2)):
+        for name, logic in ps.FuncLogicLookupTable.items():
+            bad = [w for w in logic.wires if "CLOCK_ENABLE__" in w]
+            assert not bad, f"{tag}: {name} has untrimmed CE-mux wires: {bad[:3]}"
+    return ps1, ps2
+
+
+def test_multi_file_design_reparses():
+    # import_test.py imports design sub-files ('import file_a' style) whose
+    # @MAINs must survive a re-parse
+    parse_twice_and_compare(os.path.join(INST_DIR, "import_test.py"))
+
+
+def test_stream_auto_pipeline_design_reparses():
+    # Exercises AUTO_PIPELINE tagging + built-in C ops (the trim-memo repro)
+    parse_twice_and_compare(os.path.join(INST_DIR, "stream_auto_pipeline_test.py"))
+
+
+def test_fir_design_reparses():
+    # Deep factory-closure chains (make_fir -> make_fir_core -> resize
+    # callables etc.) whose canonical names come from the derived-closure-var
+    # hash branches -- the repr-address instability repro.
+    parse_twice_and_compare(os.path.join(INST_DIR, "fir_sweep_test.py"))
+
+
+def test_auto_fsm_design_reparses():
+    # AUTO_FSM tagging: the driver's schedule-and-confirm loop re-parses the
+    # design between passes, and AUTO_FSM leans hard on that being reproducible
+    # -- the generated FSM's entity name is a hash of the schedule, whose node
+    # ids come from source coordinates. Any re-parse instability here would
+    # rename the entity every pass and break cross-pass matching.
+    parse_twice_and_compare(os.path.join(INST_DIR, "auto_fsm_test.py"))
+
+
+def test_auto_goal_split_design_reparses():
+    # AUTO objects from one comprehension used at two clock goals: the first
+    # parse elaborates again until each object resolves with its goal's
+    # tables, and names products by goal; a re-parse starts from those tables
+    # and must reach the same names in one elaboration.
+    parse_twice_and_compare(os.path.join(INST_DIR, "auto_goal_split_design.py"))
+    pypeline.SET_AUTO_GOAL_TABLES({}, {})
+
+
+def test_scheduled_auto_fsm_cache_reparses():
+    # Re-execute an emitted datapath with the same source, target and geometry;
+    # model-only changes must keep its entity identity and complete provenance.
+    from auto_fsm_cache_test import (
+        test_schedule_cache_rejects_stale_source_target_and_version,
+    )
+
+    test_schedule_cache_rejects_stale_source_target_and_version()
+
+
+def test_repeated_auto_multi_cycle_design_reparses():
+    # make_stream_auto_multi_cycle over equal kernel closures, unnamed (keyed
+    # by the wrapped function) and under one shared name=: the keys, and the
+    # holder functions named from them, are the same in a second parse
+    ps1, ps2 = parse_twice_and_compare(
+        os.path.join(INST_DIR, "auto_multi_cycle_repeated_design.py")
+    )
+    import AUTO_MULTI_CYCLE
+
+    keys1 = sorted(AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(ps1))
+    keys2 = sorted(AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(ps2))
+    assert keys1 == keys2 and len(keys1) == 2, (keys1, keys2)
+
+
+def test_var_ref_naming_design_reparses():
+    # Two sequential runtime variable-index writes to the same array -- the
+    # second write's covering wire is the first write's own alias, whose
+    # ref_toks contains a Python AST node. In-process repro for the
+    # entity-name instability bug: str(ast_node) embeds a repr memory
+    # address, so VAR_REF_ASSIGN/VAR_REF_RD/CONST_REF_RD func names built
+    # from covering_ref_toks_list changed on every re-parse -- found via
+    # wireguard-fpga's --continue builds re-synthesizing instead of reusing
+    # existing logs despite an unchanged design. ps1 stays alive while ps2
+    # parses, so parse 2's AST nodes cannot land on parse 1's addresses --
+    # the fastest way to catch this without a real subprocess rebuild.
+    parse_twice_and_compare(os.path.join(INST_DIR, "var_ref_naming_design.py"))
+
+
+def test_user_names_design_reparses():
+    # Every form of name= gives the same keys in a second parse (the
+    # pin-and-confirm loop's re-elaboration); AUTO tag names are re-registered
+    # per design execution, so the second parse must not see the first's
+    import pypeline
+
+    parse_twice_and_compare(os.path.join(INST_DIR, "user_names_design.py"))
+    rows = pypeline.USER_NAMED_AUTO_TAGS()
+    assert sorted(row[1] for row in rows) == [
+        "square_decrypt", "square_encrypt", "triple", "triple_mcp"
+    ], rows
+    # Library-built tags name the design line that asked for them
+    sites = {row[1]: row[3] for row in rows}
+    assert "(via " in sites["triple"] and "user_names_design.py:" in sites["triple"], sites
+
+
+def test_reset_design_reparses():
+    # Resets name hardware: one function reset under one MAIN and not under
+    # another is two entities (the reset policy is in the entity hash). Both
+    # parses must give the same main_resets and the same entity names.
+    import AUTO_PIPELINE
+    import VHDL
+
+    def entity_names(ps):
+        timing = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(ps)
+        return {
+            inst: VHDL.GET_ENTITY_NAME(inst, ps.LogicInstLookupTable[inst], timing, ps)
+            for inst in sorted(ps.FuncToInstances["counter"])
+        }
+
+    path = os.path.join(INST_DIR, "self_check_reset_regs_test.py")
+    ps1 = PY_TO_LOGIC.PARSE_FILE(path)
+    resets1, names1 = dict(ps1.main_resets), entity_names(ps1)
+    ps2 = PY_TO_LOGIC.PARSE_FILE(path)
+    assert dict(ps2.main_resets) == resets1, (ps2.main_resets, resets1)
+    assert entity_names(ps2) == names1, (entity_names(ps2), names1)
+    assert len(set(names1.values())) == 2, names1  # reset and reset-free entities
+
+
+def test_design_source_is_frozen_across_reparses():
+    # pypelinec re-parses the design in later AUTO_PIPELINE passes, possibly
+    # hours later. Edits to design files in the meantime must not reach those
+    # passes: re-imports, AST reads and inspect.getsource keep the first-read
+    # bytes, and source_provenance.json records their hashes, byte counts and
+    # the drift. The compiler's own
+    # modules, stdlib and generated output-directory source are not frozen.
+    # A subprocess keeps the import hook out of this test process.
+    import subprocess
+
+    code = r"""
+import inspect, json, os, pathlib, sys
+import PY_TO_LOGIC, SYN
+temp = pathlib.Path(sys.argv[1])
+out = temp / "out"
+SYN.SYN_OUTPUT_DIRECTORY = str(out)
+helper = temp / "freeze_helper.py"
+helper.write_text("from pypeline import hw_func, uint8_t\n\n@hw_func\ndef helper(x: uint8_t) -> uint8_t:\n    return x + 1\n")
+design = temp / "freeze_design.py"
+design.write_text("from pypeline import MAIN, uint8_t\nfrom freeze_helper import helper\n\n@MAIN\ndef freeze_main(x: uint8_t) -> uint8_t:\n    return helper(x)\n")
+os.chdir(temp)
+PY_TO_LOGIC.FREEZE_DESIGN_SOURCES(str(out))
+first = set(PY_TO_LOGIC.PARSE_FILE("freeze_design.py").FuncLogicLookupTable)
+first_read = {str(p): p.read_bytes() for p in (helper, design)}
+helper.write_text(helper.read_text().replace("x + 1", "x * x"))
+design.write_text(design.read_text() + "\n# edited\n")
+second = set(PY_TO_LOGIC.PARSE_FILE("freeze_design.py").FuncLogicLookupTable)
+assert first == second, (sorted(first ^ second))
+assert not any("MULT" in f for f in second), sorted(second)
+assert "x + 1" in inspect.getsource(sys.modules["freeze_helper"].helper)
+assert "# edited" not in PY_TO_LOGIC.READ_SOURCE_TEXT("freeze_design.py")
+import linecache
+linecache.checkcache()  # inspect.getsource on the top design file reads this
+assert not any("# edited" in line for line in linecache.getlines(str(design)))
+assert not PY_TO_LOGIC._is_frozen_source(os.path.abspath(PY_TO_LOGIC.__file__))
+for packages in ("site-packages", "dist-packages"):
+    assert not PY_TO_LOGIC._is_frozen_source(str(temp / packages / "m.py"))
+assert PY_TO_LOGIC._is_frozen_source(str(temp / "lib" / "m.py"))
+generated = out / "generated.py"
+generated.write_text("x = 1")
+PY_TO_LOGIC.READ_SOURCE_TEXT(str(generated))
+generated.write_text("x = 2")
+assert PY_TO_LOGIC.READ_SOURCE_TEXT(str(generated)) == "x = 2"
+PY_TO_LOGIC.WRITE_SOURCE_PROVENANCE()
+sources = json.loads((out / "source_provenance.json").read_text())["sources"]
+assert sources[str(helper)]["disk_drift"] and sources[str(design)]["disk_drift"]
+import hashlib
+for path, data in first_read.items():  # the frozen bytes, not the edited disk
+    assert sources[path]["sha256"] == hashlib.sha256(data).hexdigest(), path
+    assert sources[path]["bytes"] == len(data), path
+assert not any(v["disk_drift"] for p, v in sources.items() if p not in first_read), sources
+assert any("/include/pypeline/" in p for p in sources), sorted(sources)
+assert not any(os.path.dirname(p) == os.path.dirname(PY_TO_LOGIC.__file__) for p in sources)
+assert json.__file__ not in sources and str(generated) not in sources
+import sysconfig
+stdlib = tuple(os.path.abspath(sysconfig.get_paths()[k]) + os.sep for k in ("stdlib", "platstdlib"))
+assert not any(p.startswith(stdlib) for p in sources), sorted(sources)
+assert not (out / "source_snapshot").exists()
+print("FROZEN OK")
+"""
+    with tempfile.TemporaryDirectory(prefix="design_source_freeze_") as temp:
+        result = subprocess.run(
+            [sys.executable, "-c", code, temp],
+            env=dict(os.environ, PYTHONPATH=os.path.join(INST_DIR, "../../../")),
+            capture_output=True,
+            text=True,
+        )
+    assert result.returncode == 0 and "FROZEN OK" in result.stdout, (
+        result.stdout[-2000:] + result.stderr[-3000:]
+    )
+
+
+if __name__ == "__main__":
+    test_multi_file_design_reparses()
+    test_stream_auto_pipeline_design_reparses()
+    test_fir_design_reparses()
+    test_auto_fsm_design_reparses()
+    test_auto_goal_split_design_reparses()
+    test_repeated_auto_multi_cycle_design_reparses()
+    test_var_ref_naming_design_reparses()
+    test_user_names_design_reparses()
+    test_reset_design_reparses()
+    test_design_source_is_frozen_across_reparses()
+    print("All double PARSE_FILE tests passed.")

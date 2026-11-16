@@ -1,0 +1,9 @@
+{
+  "project": "chipsalliance/chisel",
+  "commit_short": "2a75ff94",
+  "dataset_name": "chisel",
+  "generated_at_utc": "2026-11-16T23:26:33Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

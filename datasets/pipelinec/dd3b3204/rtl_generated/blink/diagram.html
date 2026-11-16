@@ -1,0 +1,1566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design diagram</title>
+<!-- Written by PypelineC (src/DIAGRAM.py) from src/diagram/viewer.html; see
+     docs/DIAGRAM_DESIGN.md. Self-contained: no network access. -->
+<style>
+:root {
+  --bg: #ffffff; --fg: #1d1d1f; --muted: #6b6b70; --line: #c8c8cc;
+  --pane: #f5f5f7; --node: #ffffff; --node-border: #8a8a90; --accent: #2563eb;
+  --edge: #7a7a80; --cross: #d62728; --ghost: #b0b0b5; --hl: #fde68a;
+  --cloud: #eaf0f8; --logic: #f4efe4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1b1e; --fg: #e6e6e9; --muted: #9a9aa2; --line: #3a3a40;
+    --pane: #242428; --node: #2b2b30; --node-border: #8a8a90; --accent: #60a5fa;
+    --edge: #9a9aa2; --cross: #ff6b6b; --ghost: #55555c; --hl: #6b5b1a;
+    --cloud: #263040; --logic: #3a3428;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#app { display: grid; grid-template-rows: auto 1fr; grid-template-columns: minmax(220px, 22%) 1fr;
+  height: 100%; }
+header { grid-column: 1 / 3; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+  padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--pane); }
+header .title { font-weight: 600; }
+#crumbs a, #crumbs span { white-space: nowrap; }
+#crumbs .sep { color: var(--muted); margin: 0 4px; }
+a { color: var(--accent); text-decoration: none; cursor: pointer; }
+a:hover { text-decoration: underline; }
+label { white-space: nowrap; cursor: pointer; }
+button, select { font: inherit; cursor: pointer; }
+#legend { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px;
+  vertical-align: -1px; }
+#tree { overflow: auto; padding: 6px 4px 20px 6px; border-right: 1px solid var(--line);
+  background: var(--pane); }
+#tree ul { list-style: none; margin: 0; padding-left: 14px; }
+#tree > ul { padding-left: 0; }
+#tree li { white-space: nowrap; }
+#tree.hide-wiring li.wiring { display: none; }
+#tree .tw { display: inline-block; width: 12px; color: var(--muted); cursor: pointer; }
+#tree .item { cursor: pointer; padding: 0 2px; border-radius: 3px; }
+#tree .item:hover { background: var(--hl); }
+#tree .item.sel { outline: 1px solid var(--accent); }
+#tree .dim { color: var(--muted); }
+#tree .badge, .badge { color: var(--muted); font-size: 11px; margin-left: 4px; }
+#tree input { margin: 0 3px 0 0; vertical-align: -2px; }
+#main { position: relative; overflow: hidden; }
+#svg { width: 100%; height: 100%; display: block; cursor: grab; }
+#svg text { fill: var(--fg); font-size: 12px; }
+#svg .n rect { fill: var(--node); stroke: var(--node-border); }
+#svg .n.port rect { rx: 10; }
+#svg .n.ghost rect { stroke-dasharray: 4 3; stroke: var(--ghost); }
+#svg .n.ghost text { fill: var(--muted); }
+#svg .n.cloud path { fill: var(--cloud); stroke: var(--node-border); }
+#svg .n.logic rect { fill: var(--logic); stroke-dasharray: 6 3; }
+#svg .n.hl rect, #svg .n.hl path { fill: var(--hl); }
+#svg .n.click { cursor: pointer; }
+#svg .n.click:hover rect { stroke: var(--accent); stroke-width: 2; }
+#svg .n .sub { fill: var(--muted); font-size: 11px; }
+#svg .e { fill: none; stroke: var(--edge); stroke-width: 1.3; }
+#svg .e.fb { stroke-dasharray: 5 4; }
+#svg .e.cross { stroke: var(--cross); }
+#svg .e.async { stroke-dasharray: 2 3; }
+#svg .el { fill: var(--muted); font-size: 10px; }
+#svg .note { fill: var(--muted); font-size: 12px; }
+#tip { position: fixed; pointer-events: none; display: none; max-width: 560px; z-index: 7;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+  white-space: pre-wrap; font: 12px/1.35 ui-monospace, Menlo, Consolas, monospace;
+  box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+#results { position: fixed; z-index: 4; max-height: 60vh; overflow: auto; display: none;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 4px; padding: 4px 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+#results div { padding: 1px 10px; white-space: nowrap; cursor: pointer; }
+#results div:hover { background: var(--hl); }
+.panel { position: fixed; z-index: 6; display: none; max-height: 80vh; overflow: auto;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+.panel td { padding: 2px 6px 2px 0; white-space: nowrap; }
+.panel .note { color: var(--muted); font-size: 11px; max-width: 520px; white-space: normal; }
+#hidden-list div { padding: 1px 0; white-space: nowrap; }
+#ctx { padding: 4px 0; min-width: 170px; }
+#ctx div { padding: 3px 12px; cursor: pointer; white-space: nowrap; }
+#ctx div:hover { background: var(--hl); }
+#ctx div.head, #ctx div.head:hover { color: var(--muted); cursor: default; background: none; font-size: 11px; }
+#mm { position: fixed; inset: 10% 15%; z-index: 6; display: none; flex-direction: column; gap: 6px;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+#mm textarea { flex: 1; font: 12px ui-monospace, Menlo, Consolas, monospace; background: var(--bg); color: var(--fg); }
+#svg .axis { stroke: var(--line); }
+#info { position: absolute; left: 10px; bottom: 8px; color: var(--muted); pointer-events: none; }
+#banner { position: absolute; left: 10px; top: 8px; display: none; padding: 2px 8px;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+@media (max-width: 700px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: auto 35% 1fr; }
+  header { grid-column: 1; }
+  #tree { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="title" id="title">Design diagram</span>
+    <span id="crumbs"></span>
+    <button id="filters-btn" type="button" title="what the views leave out, and how">filters ▾</button>
+    <button id="hidden-btn" type="button" title="nodes you hid (right-click a node to hide it)"></button>
+    <label title="x: start time and delay in ns, height: bus width (functions with measured delays)"><input type="checkbox" id="f-scale"> hardware scale</label>
+    <button id="fit" type="button">fit</button>
+    <button id="mermaid" type="button" title="copy the current view as Mermaid flowchart text">copy as Mermaid</button>
+    <input id="search" type="search" placeholder="find instance…" size="16">
+    <a id="src" title="open the definition in VS Code"></a>
+    <span id="legend"></span>
+  </header>
+  <nav id="tree"></nav>
+  <div id="main">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
+    <div id="banner"></div>
+    <div id="info"></div>
+  </div>
+</div>
+<div id="tip"></div>
+<div id="results"></div>
+<div id="filters" class="panel"></div>
+<div id="hidden-list" class="panel"></div>
+<div id="ctx" class="panel"></div>
+<div id="mm"><div>Mermaid text of this view (the clipboard was not available):</div>
+  <textarea id="mm-text" readonly></textarea><button id="mm-close" type="button">close</button></div>
+<script type="application/json" id="design">{"build":{"delays_known":0,"front_end":"c","part":null,"tool":null,"top":"/home/yongfu/proj/score/tools/pipelinec/examples/blink.c"},"clocks":{"33.33 MHz":{"goal_mhz":33.33,"group":null,"mhz":33.33,"name":null}},"files":{"/home/yongfu/proj/score/tools/pipelinec/examples/blink.c":{"imports":[],"kind":"design","mains":["blink"],"top":true}},"funcs":{"BIN_OP_EQ_uint25_t_uint25_t":{"kind":"op"},"BIN_OP_PLUS_uint25_t_uint1_t":{"kind":"op"},"MUX_uint1_t_uint1_t_uint1_t":{"kind":"op"},"MUX_uint1_t_uint25_t_uint25_t":{"kind":"op"},"UNARY_OP_NOT_uint1_t":{"kind":"op"},"blink":{"def":"blink","file":"/home/yongfu/proj/score/tools/pipelinec/examples/blink.c","graph":{"edges":[[0,"",11,"iftrue",1,[],0],[1,"",9,"right",0,[],0],[2,"",8,"right",1,[],0],[6,"",8,"left",1,["counter"],0],[6,"",9,"left",1,["counter"],0],[7,"",10,"expr",0,["led"],0],[7,"",12,"iffalse",0,["led"],0],[8,"return_output",11,"cond",0,[],0],[8,"return_output",12,"cond",0,[],0],[9,"return_output",11,"iffalse",2,["counter"],0],[10,"return_output",12,"iftrue",0,[],0],[11,"return_output",4,"",1,["counter"],0],[12,"return_output",3,"",0,["led"],0],[12,"return_output",5,"",0,["led"],0]],"nodes":[{"id":"c:CONST_0_blink_c_l25_c15_5606","kind":"const","name":"0"},{"id":"c:CONST_1_blink_c_l29_c16_6248","kind":"const","name":"1"},{"id":"c:CONST_33333332_blink_c_l20_c16_ceb6","kind":"const","name":"33333332"},{"id":"o:return_output","kind":"out","name":"return_output","t":0},{"id":"rd:counter","kind":"reg_next","name":"counter","t":1},{"id":"rd:led","kind":"reg_next","name":"led","t":0},{"id":"rq:counter","kind":"reg","name":"counter","t":1},{"id":"rq:led","kind":"reg","name":"led","t":0},{"callee":"BIN_OP_EQ_uint25_t_uint25_t","id":"s:BIN_OP_EQ[blink_c_l20_c6_31d2]","kind":"sub","name":"BIN_OP_EQ"},{"callee":"BIN_OP_PLUS_uint25_t_uint1_t","id":"s:BIN_OP_PLUS[blink_c_l29_c5_6d96]","kind":"sub","name":"BIN_OP_PLUS"},{"callee":"UNARY_OP_NOT_uint1_t","id":"s:UNARY_OP_NOT[blink_c_l23_c12_6e43]","kind":"sub","name":"UNARY_OP_NOT"},{"callee":"MUX_uint1_t_uint25_t_uint25_t","id":"s:counter_MUX[blink_c_l20_c3_d27f]","kind":"sub","name":"counter_MUX"},{"callee":"MUX_uint1_t_uint1_t_uint1_t","id":"s:led_MUX[blink_c_l20_c3_d27f]","kind":"sub","name":"led_MUX"}]},"inputs":[],"kind":"user","line":11,"outputs":[["return_output",0]],"regs":["counter","led"]}},"inst_latency":{},"links":[],"mains":{"blink":{"clock":"33.33 MHz","file":"/home/yongfu/proj/score/tools/pipelinec/examples/blink.c","kind":"main","latency":0,"line":11,"wiring":null}},"pins":{},"schema":2,"types":[{"bits":1,"c":"uint1_t"},{"bits":25,"c":"uint25_t"},{"bits":26,"c":"uint26_t"}],"wires":{}}</script>
+<script>
+"use strict";
+// Any uncaught error is recorded where the render test (#selftest) reads it
+addEventListener("error", (ev) => document.body.setAttribute("data-error", ev.message + " (line " + ev.lineno + ")"));
+const D = JSON.parse(document.getElementById("design").textContent);
+const MARK = "____";                       // LOGIC.SUBMODULE_MARKER
+const SVGNS = "http://www.w3.org/2000/svg";
+const PALETTE = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2",
+                 "#17becf", "#bcbd22", "#7f7f7f", "#aec7e8"];
+const SEP = "\u0001";                      // between the parts of a hidden node's key
+const $ = (id) => document.getElementById(id);
+// hidden: key -> "pass" | "drop" of the nodes the viewer hid by hand; last: the
+// drawn view ({nodes, edges}); size: its extent
+const state = { hidden: new Map(), view: null, last: null, size: null };
+
+// ---------- types ----------
+const NO_TYPE = { c: "", bits: null };
+function T(i) { return i == null ? NO_TYPE : D.types[i] || NO_TYPE; }
+function bitsOf(i) { return T(i).bits; }
+function roleOf(i) { return T(i).role || "plain"; }
+const ROLE_TEXT = { fwd: "forward (stream, fwd_t)", fb: "feedback (fb_t)", plain: "plain" };
+// "readable_t (8b)", cut to fit a label
+function typeShort(i) {
+  const t = T(i);
+  if (!t.c) return "";
+  const name = t.name || t.c;
+  return (name.length > 30 ? name.slice(0, 29) + "…" : name) + (t.bits != null ? " (" + t.bits + "b)" : "");
+}
+function typeLong(i) {
+  const t = T(i);
+  if (!t.c) return "";
+  return (t.name ? t.name + " = " + t.c : t.c) + (t.bits != null ? ", " + t.bits + " bits" : "") +
+    (t.role ? ", " + ROLE_TEXT[t.role] : "");
+}
+
+// ---------- filters ----------
+// What a view can leave out, per kind of node or edge: show it, group it (operators
+// only: each connected cluster becomes one logic block), hide it with its edges
+// passing through ("pass"), or hide it with its edges ("drop"). A typed kind's mode
+// applies to the interface roles its scope names, the rest are shown.
+const KINDS = [
+  { id: "in", label: "inputs", tip: "function inputs and top-level Input pins", modes: ["show", "drop"], typed: true, def: "show" },
+  { id: "out", label: "outputs", tip: "function outputs and top-level Output pins", modes: ["show", "drop"], typed: true, def: "show" },
+  { id: "reg", label: "registers", tip: "a Reg's current and next value; passing through joins them as one edge", modes: ["show", "pass", "drop"], typed: true, def: "show" },
+  { id: "wire", label: "global wire reads and writes", tip: "a function's global wire read and write stubs", modes: ["show", "drop"], typed: true, def: "show" },
+  { id: "fb", label: "Feedback edges", tip: "edges through a Feedback variable, by the type the variable carries", modes: ["show", "drop"], typed: true, def: "drop", scope: "fb" },
+  { id: "wiring", label: "wiring", tip: "@wires functions, MAINs, functions and operators with no logic (casts, constant field selects)", modes: ["show", "pass", "drop"], def: "pass" },
+  { id: "op", label: "operators", tip: "operators and other built-ins", modes: ["show", "group", "pass", "drop"], def: "group" },
+  { id: "const", label: "constants, clock enable", modes: ["show", "drop"], def: "drop" },
+  { id: "ghost", label: "other files' MAINs", tip: "in a file's view, the MAINs of other files it connects to", modes: ["show", "drop"], def: "show" },
+];
+const KIND = new Map(KINDS.map((k) => [k.id, k]));
+const SCOPES = [
+  ["all", "of every type", ["fwd", "fb", "plain"]],
+  ["nonfwd", "except forward (streams, fwd_t)", ["fb", "plain"]],
+  ["fwd", "forward only (streams, fwd_t)", ["fwd"]],
+  ["fb", "feedback only (fb_t)", ["fb"]],
+  ["plain", "plain only (no interface)", ["plain"]],
+];
+const SCOPE = new Map(SCOPES.map(([id, , roles]) => [id, roles]));
+const MODE_TEXT = { show: "show", group: "group into logic blocks", pass: "hide, edges pass through", drop: "hide with edges" };
+const LABELS = [["both", "name: type"], ["name", "name"], ["type", "type"], ["none", "none"]];
+function defaults() {
+  const f = { labels: "both" };
+  for (const k of KINDS) f[k.id] = { mode: k.def, scope: k.scope || "all" };
+  return f;
+}
+let filt = defaults();
+// Per-viewer conveniences in the browser's storage; a page without it uses the defaults
+const STORE = "pypelinec-diagram:";
+let storageOff = false;   // the self-test leaves the browser's storage alone
+function loadStored(key) {
+  try { const v = localStorage.getItem(STORE + key); return v ? JSON.parse(v) : null; } catch (e) { return null; }
+}
+function store(key, value) {
+  if (storageOff) return;
+  try { localStorage.setItem(STORE + key, JSON.stringify(value)); } catch (e) { /* storage blocked */ }
+}
+function loadSettings() {
+  const f = defaults(), saved = loadStored("filters");
+  if (saved && typeof saved === "object") {
+    for (const k of KINDS) {
+      const s = saved[k.id];
+      if (!s) continue;
+      if (k.modes.includes(s.mode)) f[k.id].mode = s.mode;
+      if (k.typed && SCOPE.has(s.scope)) f[k.id].scope = s.scope;
+    }
+    if (LABELS.some(([id]) => id === saved.labels)) f.labels = saved.labels;
+  }
+  filt = f;
+  const hid = loadStored("hidden:" + D.build.top);
+  state.hidden = new Map(Array.isArray(hid) ? hid.filter((h) => Array.isArray(h) && (h[1] === "pass" || h[1] === "drop")) : []);
+}
+function saveSettings() { store("filters", filt); store("hidden:" + D.build.top, [...state.hidden]); }
+// Whether kind k's mode applies to something with this interface role
+function applies(k, role) { return !KIND.get(k).typed || SCOPE.get(filt[k].scope).includes(role || "plain"); }
+
+// ---------- names and lookups ----------
+const clockIds = Object.keys(D.clocks).sort();
+function clockColor(cid) {
+  const i = clockIds.indexOf(cid);
+  return i < 0 ? "#999" : PALETTE[i % PALETTE.length];
+}
+function base(path) { return path ? path.split("/").pop() : "?"; }
+function loc(file, line) { return file ? base(file) + (line ? ":" + line : "") : ""; }
+function func(name) { return D.funcs[name] || { kind: "op" }; }
+function mainLabel(m) {
+  const e = D.mains[m], f = D.funcs[m];
+  if (e && e.name) return e.name;
+  return (f && f.def) || m;
+}
+function mainGroup(m) {
+  const e = D.mains[m];
+  return e && e.group ? "group:" + e.group : m;
+}
+function mainOf(inst) { return inst.startsWith("pin:") ? inst : inst.split(MARK)[0]; }
+function fmtNs(x) { return x == null ? "" : (Math.round(x * 100) / 100) + " ns"; }
+function hasGraph(fname) { const f = D.funcs[fname]; return !!(f && f.graph); }
+const topFile = Object.keys(D.files).find((p) => D.files[p].top) || null;
+// A function's graph as {nodes: {id: node}, edges: [{s, sp, d, dp, t, names, fb}]},
+// unpacked once from the page's compact form (edges name nodes by index)
+const graphs = new Map();
+function graphOf(fname) {
+  if (graphs.has(fname)) return graphs.get(fname);
+  const f = D.funcs[fname];
+  let g = null;
+  if (f && f.graph) {
+    const list = f.graph.nodes, nodes = {};
+    for (const n of list) nodes[n.id] = n;
+    const edges = f.graph.edges.map(([s, sp, d, dp, t, names, fb]) =>
+      ({ s: list[s].id, sp, d: list[d].id, dp, t, names, fb: !!fb }));
+    g = { nodes, edges };
+  }
+  graphs.set(fname, g);
+  return g;
+}
+// An operator's name from its function (BIN_OP_PLUS_uint8_t_uint8_t -> BIN_OP_PLUS)
+// and the symbol a logic block shows for it
+function opName(callee) {
+  const out = [];
+  for (const t of callee.split("_")) { if (/^[A-Z0-9]+$/.test(t)) out.push(t); else break; }
+  return out.length ? out.join("_") : callee;
+}
+const OP_SYMBOLS = { BIN_OP_PLUS: "+", BIN_OP_MINUS: "−", BIN_OP_MULT: "×", BIN_OP_INFERRED_MULT: "×",
+  BIN_OP_DIV: "÷", BIN_OP_MOD: "%", BIN_OP_EQ: "==", BIN_OP_NEQ: "!=", BIN_OP_LT: "<", BIN_OP_LTE: "<=",
+  BIN_OP_GT: ">", BIN_OP_GTE: ">=", BIN_OP_AND: "&", BIN_OP_OR: "|", BIN_OP_XOR: "^", BIN_OP_SL: "<<",
+  BIN_OP_SR: ">>", UNARY_OP_NOT: "~", UNARY_OP_NEGATE: "−x", MUX: "mux", VAR_REF_RD: "[i]",
+  VAR_REF_ASSIGN: "[i]=" };
+function opSymbol(name) { return OP_SYMBOLS[name] || name.toLowerCase(); }
+
+// Resolve an instance path (MAIN____local____local) to [[inst, func, local], ...]
+function resolve(inst) {
+  const toks = inst.split(MARK);
+  const main = toks[0];
+  if (!D.funcs[main]) return null;
+  const chain = [[main, main, null]];
+  let cur = main, path = main, i = 1;
+  while (i < toks.length) {
+    const g = graphOf(cur);
+    if (!g) return null;
+    let j = i, local = null;
+    for (; j < toks.length; j++) {     // a local name may itself hold the marker
+      const cand = toks.slice(i, j + 1).join(MARK);
+      if (g.nodes["s:" + cand]) { local = cand; break; }
+    }
+    if (local == null) return null;
+    cur = g.nodes["s:" + local].callee;
+    path += MARK + local;
+    chain.push([path, cur, local]);
+    i = j + 1;
+  }
+  return chain;
+}
+function instLatency(inst) {
+  if (!inst.includes(MARK) && D.mains[inst]) return D.mains[inst].latency;
+  return D.inst_latency[inst] || 0;
+}
+
+// ---------- files ----------
+const fileOrder = [];      // [path, parent or null] in tree order
+(function orderFiles() {
+  const seen = new Set();
+  const queue = topFile ? [[topFile, null]] : [];
+  while (queue.length) {
+    const [p, parent] = queue.shift();
+    if (seen.has(p) || !D.files[p]) continue;
+    seen.add(p);
+    fileOrder.push([p, parent]);
+    for (const q of D.files[p].imports) queue.push([q, p]);
+  }
+  for (const p of Object.keys(D.files).sort()) if (!seen.has(p)) fileOrder.push([p, null]);
+})();
+// The view a file's link shows: the top file is the whole design
+function fileRoute(p) { return D.files[p] && D.files[p].top ? { design: 1 } : { file: p }; }
+
+// ---------- tooltip ----------
+const tip = $("tip");
+function showTip(ev, text) {
+  tip.textContent = text;
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + w > innerWidth - 4) x = Math.max(4, ev.clientX - w - 14);
+  if (y + h > innerHeight - 4) y = Math.max(4, ev.clientY - h - 14);
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+function attachTip(el, textFn) {
+  el.addEventListener("mousemove", (ev) => showTip(ev, textFn()));
+  el.addEventListener("mouseleave", hideTip);
+}
+function funcTip(fname, extra) {
+  const f = func(fname), lines = [];
+  if (extra) lines.push(...extra);
+  lines.push("function: " + fname);
+  if (f.def && f.def !== fname) lines.push("def: " + f.def);
+  lines.push("kind: " + f.kind + (f.file ? "   " + loc(f.file, f.line) : ""));
+  if (f.wiring) lines.push("only wiring: " + f.wiring);
+  if (f.delay_ns != null) lines.push("delay: " + fmtNs(f.delay_ns) + (f.delay_estimated ? " (estimated)" : ""));
+  if (f.mcp) lines.push("multi-cycle paths");
+  const ports = (list) => list.map(([p, t]) => p + (T(t).c ? ": " + typeShort(t) : "")).join(", ");
+  if (f.inputs && f.inputs.length) lines.push("in:  " + ports(f.inputs));
+  if (f.outputs && f.outputs.length) lines.push("out: " + ports(f.outputs));
+  if (f.regs) lines.push("regs: " + f.regs.join(", "));
+  return lines.join("\n");
+}
+
+// ---------- tree pane ----------
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function treeItem(label, opts) {
+  const li = el("li", opts.cls || null);
+  const tw = el("span", "tw", opts.children ? "▸" : "");
+  li.appendChild(tw);
+  if (opts.check) li.appendChild(opts.check);
+  if (opts.color) { const s = el("span", "sw"); s.style.background = opts.color; li.appendChild(s); }
+  const it = el("span", "item" + (opts.dim ? " dim" : ""), label);
+  if (opts.route) it.dataset.route = opts.route;
+  li.appendChild(it);
+  if (opts.badge) li.appendChild(el("span", "badge", opts.badge));
+  if (opts.tip) attachTip(it, opts.tip);
+  if (opts.onclick) it.addEventListener("click", opts.onclick);
+  let ul = null;
+  const toggle = () => {
+    if (!opts.children) return;
+    if (!ul) { ul = el("ul"); opts.children(ul); li.appendChild(ul); tw.textContent = "▾"; return; }
+    const open = ul.style.display !== "none";
+    ul.style.display = open ? "none" : "";
+    tw.textContent = open ? "▸" : "▾";
+  };
+  tw.addEventListener("click", toggle);
+  if (opts.open) toggle();
+  return li;
+}
+function latBadge(n) { return n ? "L=" + n : ""; }
+function instChildren(inst, fname) {
+  return (ul) => {
+    const g = graphOf(fname);
+    if (!g) return;
+    for (const id of Object.keys(g.nodes).sort()) {
+      const n = g.nodes[id];
+      if (n.kind !== "sub") continue;
+      const cf = func(n.callee);
+      if (cf.kind === "op") continue;
+      const child = inst + MARK + id.slice(2);
+      const lat = instLatency(child);
+      ul.appendChild(treeItem(n.name, {
+        cls: cf.wiring ? "wiring" : null,
+        badge: [cf.def && !cf.def.startsWith(n.name) ? cf.def : "", latBadge(lat), n.auto_fsm ? "AUTO_FSM" : "",
+                cf.kind === "vhdl" ? "vhdl" : "", cf.wiring ? "wiring" : ""].filter(Boolean).join(" "),
+        route: "inst=" + (hasGraph(n.callee) ? child : inst),
+        onclick: () => go(hasGraph(n.callee) ? { inst: child } : { inst: inst, hl: id }),
+        children: hasGraph(n.callee) ? instChildren(child, n.callee) : null,
+        tip: () => funcTip(n.callee, ["instance: " + child, "latency: " + lat]),
+      }));
+    }
+  };
+}
+function buildTree() {
+  const root = el("ul");
+  root.appendChild(treeItem("⌂ whole design", {
+    route: "design", onclick: () => go({ design: 1 }),
+    tip: () => "every MAIN, joined by its global wires",
+  }));
+  const libs = [], byParent = new Map();
+  for (const [p, parent] of fileOrder) {
+    const f = D.files[p];
+    if (f.kind === "generated" && !f.mains.length) continue;
+    if (f.kind === "library") { if (!f.mains.length) { libs.push(p); continue; } }
+    const key = parent && byParent.has(parent) ? parent : null;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(p);
+    byParent.set(p, byParent.get(p) || []);
+  }
+  const fileItem = (p) => {
+    const f = D.files[p];
+    return treeItem(base(p), {
+      badge: f.top ? "top" : f.kind === "design" ? "" : f.kind,
+      route: f.top ? "design" : "file=" + p,
+      onclick: () => go(fileRoute(p)),
+      open: f.top,
+      tip: () => p + (f.top ? "\nthe top file: shows the whole design" : "\nshows this file's MAINs and what they connect to") +
+        "\nMAINs: " + f.mains.length + "\nimports: " + f.imports.map(base).join(", "),
+      children: (ul) => {
+        for (const m of f.mains) {
+          const e = D.mains[m], key = "main" + SEP + m;
+          const cb = el("input"); cb.type = "checkbox"; cb.checked = !state.hidden.has(key);
+          cb.title = "show in the design view";
+          cb.dataset.key = key;
+          cb.addEventListener("change", () => setHidden([key], cb.checked ? null : "pass"));
+          const side = e.group ? (m.endsWith("_wr") ? " write side" : m.endsWith("_rd") ? " read side" : "") : "";
+          ul.appendChild(treeItem(mainLabel(m) + side, {
+            check: cb, color: clockColor(e.clock), dim: !!e.wiring,
+            badge: [latBadge(e.latency), e.kind !== "main" ? e.kind.replace("_", " ") : "", e.wiring || ""].filter(Boolean).join(" "),
+            route: "inst=" + m,
+            onclick: () => go({ inst: m }),
+            tip: () => mainTip(m),
+            children: hasGraph(m) ? instChildren(m, m) : null,
+          }));
+        }
+        for (const q of byParent.get(p) || []) ul.appendChild(fileItem(q));
+      },
+    });
+  };
+  for (const p of byParent.get(null) || []) root.appendChild(fileItem(p));
+  if (libs.length) {
+    root.appendChild(treeItem("libraries (" + libs.length + ")", {
+      dim: true,
+      children: (ul) => { for (const p of libs) ul.appendChild(treeItem(base(p), { dim: true, tip: () => p })); },
+    }));
+  }
+  $("tree").replaceChildren(root);
+  treeFilterClass();
+}
+// Wiring instances leave the tree while the wiring filter hides them
+function treeFilterClass() { $("tree").classList.toggle("hide-wiring", filt.wiring.mode !== "show"); }
+function mainTip(m) {
+  const e = D.mains[m], c = D.clocks[e.clock] || {};
+  const lines = ["MAIN: " + m, "kind: " + e.kind + (e.decl ? "  " + e.decl : ""), "source: " + loc(e.file, e.line),
+    "clock: " + e.clock + (c.name ? " (" + c.name + ")" : "") + (c.goal_mhz != null ? ", goal " + c.goal_mhz + " MHz" : ""),
+    "latency: " + e.latency];
+  if (e.reset) lines.push("reset: " + e.reset);
+  return funcTip(m, lines);
+}
+
+// ---------- layered layout ----------
+// nodes: [{id, w, h, rank: "first"|"last"|null}], edges: [{s, d, fb}]; gapX: room
+// between layers
+function layout(nodes, edges, gapX) {
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  const N = nodes.length;
+  const out = Array.from({ length: N }, () => []);
+  const es = [];
+  for (const e of edges) {
+    const a = idx.get(e.s), b = idx.get(e.d);
+    if (a == null || b == null || a === b) continue;
+    es.push({ a, b, fb: !!e.fb, e });
+  }
+  // Break cycles: feedback edges first, then the narrower edge of a two-way
+  // pair (a stream's ready against its data), then DFS back edges, wide
+  // edges explored first so narrow ones end up reversed
+  const width = (x) => x.e.bits || 0;
+  const pair = new Map();
+  for (const x of es) pair.set(x.a + "," + x.b, Math.max(pair.get(x.a + "," + x.b) || 0, width(x)));
+  for (const x of es) {
+    const other = pair.get(x.b + "," + x.a);
+    if (other != null && (width(x) < other || (width(x) === other && x.a > x.b))) x.fb = true;
+  }
+  const fwd = es.filter((x) => !x.fb);
+  for (const x of fwd) out[x.a].push(x);
+  for (const list of out) list.sort((p, q) => width(q) - width(p));
+  const color = new Uint8Array(N), back = new Set();
+  for (let s = 0; s < N; s++) {
+    if (color[s]) continue;
+    const st = [[s, 0]]; color[s] = 1;
+    while (st.length) {
+      const top = st[st.length - 1], v = top[0];
+      if (top[1] < out[v].length) {
+        const x = out[v][top[1]++];
+        if (color[x.b] === 1) back.add(x);
+        else if (!color[x.b]) { color[x.b] = 1; st.push([x.b, 0]); }
+      } else { color[v] = 2; st.pop(); }
+    }
+  }
+  const dag = es.map((x) => (x.fb || back.has(x)) ? { a: x.b, b: x.a, x } : { a: x.a, b: x.b, x });
+  // Longest-path layers
+  const indeg = new Array(N).fill(0), succ = Array.from({ length: N }, () => []);
+  for (const y of dag) { succ[y.a].push(y.b); indeg[y.b]++; }
+  const layer = new Array(N).fill(0), q = [];
+  for (let i = 0; i < N; i++) if (!indeg[i]) q.push(i);
+  while (q.length) {
+    const v = q.shift();
+    for (const w of succ[v]) { layer[w] = Math.max(layer[w], layer[v] + 1); if (!--indeg[w]) q.push(w); }
+  }
+  for (let i = 0; i < N; i++) if (nodes[i].rank === "first") layer[i] = 0;
+  let maxL = 0;
+  for (let i = 0; i < N; i++) if (nodes[i].rank !== "last") maxL = Math.max(maxL, layer[i]);
+  for (let i = 0; i < N; i++) if (nodes[i].rank === "last") layer[i] = maxL + 1;
+  const used = [...new Set(layer)].sort((a, b) => a - b);   // close empty layers
+  const remap = new Map(used.map((l, i) => [l, i]));
+  for (let i = 0; i < N; i++) layer[i] = remap.get(layer[i]);
+  const L = used.length;
+  const layers = Array.from({ length: L }, () => []);
+  for (let i = 0; i < N; i++) layers[layer[i]].push(i);
+  // Barycenter ordering sweeps
+  const nb = Array.from({ length: N }, () => []);
+  for (const y of dag) { nb[y.a].push(y.b); nb[y.b].push(y.a); }
+  const pos = new Float64Array(N);
+  const setPos = () => layers.forEach((ly) => ly.forEach((v, i) => { pos[v] = i; }));
+  setPos();
+  for (let it = 0; it < 6; it++) {
+    const order = it % 2 ? [...layers.keys()].reverse() : [...layers.keys()];
+    for (const l of order) {
+      const ref = it % 2 ? l + 1 : l - 1;
+      const bc = (v) => {
+        const ns = nb[v].filter((w) => layer[w] === ref);
+        return ns.length ? ns.reduce((s, w) => s + pos[w], 0) / ns.length : pos[v];
+      };
+      const vals = new Map(layers[l].map((v) => [v, bc(v)]));
+      layers[l].sort((a, b) => vals.get(a) - vals.get(b) || a - b);
+      layers[l].forEach((v, i) => { pos[v] = i; });
+    }
+  }
+  // Coordinates
+  const GAPX = gapX || 70, GAPY = 18;
+  let x = 0;
+  const colH = layers.map((ly) => ly.reduce((s, v) => s + nodes[v].h + GAPY, -GAPY));
+  const H = Math.max(0, ...colH);
+  for (let l = 0; l < L; l++) {
+    const w = Math.max(...layers[l].map((v) => nodes[v].w));
+    let y = (H - colH[l]) / 2;
+    for (const v of layers[l]) {
+      nodes[v].x = x + (w - nodes[v].w) / 2; nodes[v].y = y; y += nodes[v].h + GAPY;
+    }
+    x += w + GAPX;
+  }
+  return { width: Math.max(0, x - GAPX), height: H };
+}
+
+// ---------- drawing ----------
+const vp = $("vp"), svg = $("svg");
+function svgEl(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const CH = 7.2;   // approximate character width at 12px
+const MAXCH = 40;  // longer names are cut on the block; the tooltip has them whole
+function isCloud(n) { return (n.cls || "").split(" ").includes("cloud"); }
+function measure(n) {
+  n.lines = n.lines.map((t) => t.length > MAXCH ? t.slice(0, MAXCH - 1) + "…" : t);
+  const lines = n.lines, pad = isCloud(n) ? 14 : 0;   // a cloud's bumps take room
+  n.w = Math.max(60, ...lines.map((t, i) => t.length * (i ? 6.4 : CH))) + 16 + 2 * pad;
+  n.h = Math.max(n.minH || 0, 10 + lines.length * 15 + pad);
+}
+// A cloud outline filling w x h: half-ellipse bumps around an inset rectangle
+function cloudPath(w, h) {
+  const r = Math.min(h / 2, 10), nx = Math.max(2, Math.round((w - 2 * r) / 26)), ny = Math.max(1, Math.round((h - 2 * r) / 26));
+  const dx = (w - 2 * r) / nx, dy = (h - 2 * r) / ny;
+  let d = `M${r},${r}`;
+  for (let i = 0; i < nx; i++) d += ` a${dx / 2},${r} 0 0 1 ${dx},0`;
+  for (let i = 0; i < ny; i++) d += ` a${r},${dy / 2} 0 0 1 0,${dy}`;
+  for (let i = 0; i < nx; i++) d += ` a${dx / 2},${r} 0 0 1 ${-dx},0`;
+  for (let i = 0; i < ny; i++) d += ` a${r},${dy / 2} 0 0 1 0,${-dy}`;
+  return d + " z";
+}
+const LABEL_CH = 5.6;   // approximate character width of an edge label
+function labelText(e) { return e.text.length > 48 ? e.text.slice(0, 46) + "…" : e.text; }
+// The gap between layers: room for most edge labels, within bounds
+function labelGap(edges) {
+  const w = edges.filter((e) => e.text).map((e) => labelText(e).length * LABEL_CH).sort((a, b) => a - b);
+  return w.length ? Math.min(220, Math.max(70, w[Math.floor(w.length * 0.75)] + 24)) : 70;
+}
+function draw(nodes, edges, size, note, decorate) {
+  vp.replaceChildren();
+  state.last = { nodes, edges };
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const eg = svgEl("g", {}, vp);
+  const labels = [];   // [edge, candidate label spots]
+  for (const e of edges) {
+    const a = byId.get(e.s), b = byId.get(e.d);
+    if (!a || !b) continue;
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
+    let d, spots;
+    if (x2 > x1 + 4) {
+      const c = Math.max(30, (x2 - x1) / 2);
+      d = `M${x1},${y1} C${x1 + c},${y1} ${x2 - c},${y2} ${x2},${y2}`;
+      const at = (t) => {   // a point on the curve
+        const u = 1 - t;
+        return [u * u * u * x1 + 3 * u * u * t * (x1 + c) + 3 * u * t * t * (x2 - c) + t * t * t * x2,
+                u * u * u * y1 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y2 - 4];
+      };
+      spots = [at(0.5), at(0.3), at(0.7)];
+    } else {   // back edge: under both nodes, its label at the bottom of the loop
+      const yb = Math.max(a.y + a.h, b.y + b.h) + 24;
+      d = `M${x1},${y1} C${x1 + 60},${y1} ${x1 + 60},${yb} ${(x1 + x2) / 2},${yb} S${x2 - 60},${y2} ${x2},${y2}`;
+      spots = [[(x1 + x2) / 2, yb + 12]];
+    }
+    const cls = "e" + (e.fb ? " fb" : "") + (e.cross ? " cross" : "") + (e.async ? " async" : "");
+    const w = e.bits ? Math.min(6, 1 + Math.log2(e.bits) / 2) : 1.3;
+    const p = svgEl("path", { d, class: cls, "stroke-width": w.toFixed(2), "marker-end": "url(#arr)" }, eg);
+    if (e.tip) attachTip(p, () => e.tip);
+    if (e.text) labels.push([e, spots]);
+  }
+  // Labels, widest buses first, each at the first spot that overlaps no block and
+  // no other label; the rest are left to the tooltip
+  const taken = nodes.map((n) => [n.x, n.y, n.x + n.w, n.y + n.h]);
+  const clear = (r) => !taken.some((q) => r[0] < q[2] && q[0] < r[2] && r[1] < q[3] && q[1] < r[3]);
+  labels.sort((p, q) => (q[0].bits || 0) - (p[0].bits || 0));
+  for (const [e, spots] of labels) {
+    const text = labelText(e), half = text.length * LABEL_CH / 2;
+    for (const [x, y] of spots) {
+      const r = [x - half, y - 9, x + half, y + 2];
+      if (!clear(r)) continue;
+      taken.push(r);
+      const t = svgEl("text", { class: "el", x, y, "text-anchor": "middle" }, eg);
+      t.textContent = text;
+      if (e.tip) attachTip(t, () => e.tip);
+      break;
+    }
+  }
+  const ng = svgEl("g", {}, vp);
+  for (const n of nodes) {
+    const g = svgEl("g", { class: "n " + (n.cls || ""), transform: `translate(${n.x},${n.y})` }, ng);
+    const pad = isCloud(n) ? 14 : 0;
+    if (pad) svgEl("path", { d: cloudPath(n.w, n.h) }, g);
+    else {
+      const r = svgEl("rect", { width: n.w, height: n.h, rx: 4 }, g);
+      if (n.color) { r.style.stroke = n.color; r.style.strokeWidth = "2"; }
+    }
+    n.lines.forEach((t, i) => {
+      const tx = svgEl("text", { x: 8 + pad, y: 17 + pad / 2 + i * 15, class: i ? "sub" : "" }, g);
+      tx.textContent = t;
+    });
+    if (n.tip) attachTip(g, n.tip);
+    if (n.onclick) g.addEventListener("click", (ev) => { if (!dragged) n.onclick(ev); });
+    if (n.onclick && !(n.cls || "").includes("click")) g.style.cursor = "default";
+    if (n.hide) g.addEventListener("contextmenu", (ev) => { ev.preventDefault(); hideTip(); openMenu(ev, n.hide); });
+  }
+  const defs = svgEl("defs", {}, vp);
+  const m = svgEl("marker", { id: "arr", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7,
+    markerHeight: 7, orient: "auto-start-reverse", markerUnits: "userSpaceOnUse" }, defs);
+  svgEl("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--edge)" }, m);
+  if (note) {
+    const t = svgEl("text", { x: 0, y: -14, class: "note" }, vp);
+    t.textContent = note;
+  }
+  if (decorate) decorate(vp);
+  state.size = size;
+  fit();
+}
+
+// ---------- pan and zoom ----------
+let view = { x: 0, y: 0, k: 1 }, dragged = false;
+function applyView() { vp.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`); }
+function fit() {
+  const s = state.size || { width: 1, height: 1 };
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 600, pad = 30;
+  const k = Math.min(1.1, (W - 2 * pad) / Math.max(1, s.width), (H - 2 * pad) / Math.max(1, s.height + 30));
+  view = { k, x: (W - s.width * k) / 2, y: (H - s.height * k) / 2 + 10 * k };
+  applyView();
+}
+svg.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const r = svg.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const f = Math.exp(-ev.deltaY * 0.0015);
+  view.x = mx - (mx - view.x) * f; view.y = my - (my - view.y) * f; view.k *= f;
+  applyView();
+}, { passive: false });
+let drag = null;
+svg.addEventListener("mousedown", (ev) => {
+  if (ev.button !== 0) return;
+  drag = { x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y }; dragged = false;
+});
+addEventListener("mousemove", (ev) => {
+  if (!drag) return;
+  const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) dragged = true;
+  view.x = drag.vx + dx; view.y = drag.vy + dy; applyView();
+});
+addEventListener("mouseup", () => { drag = null; setTimeout(() => { dragged = false; }, 0); });
+$("fit").addEventListener("click", fit);
+addEventListener("resize", fit);
+
+// ---------- edge contraction through hidden nodes ----------
+// edges: [{s, d, ...}]; keep(id) says whether a node is drawn. Returns edges
+// between kept nodes, one per (s, d) pair, merging the paths through hidden ones.
+// step(e, f) says whether a path entering a hidden node by e may leave it by f.
+function contract(nodeIds, edges, keep, merge, step) {
+  const out = new Map();
+  for (const e of edges) { if (!out.has(e.s)) out.set(e.s, []); out.get(e.s).push(e); }
+  const res = new Map();
+  for (const s of nodeIds) {
+    if (!keep(s)) continue;
+    const stack = (out.get(s) || []).map((e) => [e, [e]]), seen = new Set();
+    while (stack.length) {
+      const [e, path] = stack.pop();
+      if (keep(e.d)) {
+        const k = s + "\u0000" + e.d;
+        res.set(k, merge(res.get(k), s, e.d, path));
+      } else if (!seen.has(e)) {
+        seen.add(e);
+        for (const f of out.get(e.d) || []) {
+          if (f.d !== s && (!step || step(e, f))) stack.push([f, path.concat([f])]);
+        }
+      }
+    }
+  }
+  return [...res.values()];
+}
+// The (read wire, written wire) pairs a MAIN's own logic connects, from its
+// graph with everything but its global wire reads and writes contracted
+const passCache = new Map();
+function wirePairs(main) {
+  if (passCache.has(main)) return passCache.get(main);
+  const g = graphOf(main);
+  let pairs = null;
+  if (g) {
+    pairs = new Set();
+    const ids = Object.keys(g.nodes);
+    const keep = (id) => /^(gr|gw|i|o):/.test(id);
+    for (const e of contract(ids, g.edges, keep, (acc, s, d) => ({ s, d }))) {
+      if (e.s.startsWith("gr:") && e.d.startsWith("gw:")) pairs.add(e.s.slice(3) + "\u0000" + e.d.slice(3));
+    }
+  }
+  passCache.set(main, pairs);
+  return pairs;
+}
+// An edge label: its first variable and its type, as the labels filter says
+function edgeText(names, t) {
+  const nm = names[0] || "", ty = typeShort(t);
+  if (filt.labels === "name") return nm;
+  if (filt.labels === "type") return ty;
+  if (filt.labels === "none") return "";
+  return nm && ty ? nm + ": " + ty : nm || ty;
+}
+
+// ---------- design view ----------
+// A design-view node's mode: hidden by hand (every member MAIN), the wiring filter,
+// or a pin's inputs/outputs filter
+function designMode(g, members) {
+  if (g.startsWith("pin:")) {
+    const name = g.slice(4), p = D.pins[name] || {};
+    const own = state.hidden.get("pin" + SEP + name);
+    if (own) return own;
+    const k = p.dir === "in" ? "in" : "out";
+    return applies(k, roleOf(p.t)) ? filt[k].mode : "show";
+  }
+  const ms = members.get(g), own = ms.map((m) => state.hidden.get("main" + SEP + m));
+  if (own.every(Boolean)) return own.includes("drop") ? "drop" : "pass";
+  if (ms.every((m) => D.mains[m].wiring)) return filt.wiring.mode;
+  return "show";
+}
+function designView(file) {
+  const inFile = file ? new Set(D.files[file] ? D.files[file].mains : []) : null;
+  // Graph of MAIN groups and pins
+  const nodeOf = (inst) => inst.startsWith("pin:") ? inst : mainGroup(mainOf(inst));
+  const members = new Map();
+  for (const m of Object.keys(D.mains)) {
+    const g = mainGroup(m);
+    if (!members.has(g)) members.set(g, []);
+    members.get(g).push(m);
+  }
+  const raw = [];
+  for (const l of D.links) {
+    const s = nodeOf(l.src), d = nodeOf(l.dst);
+    if (s !== d) raw.push({ s, d, link: l });
+  }
+  const all = new Set([...members.keys()]);
+  for (const e of raw) { all.add(e.s); all.add(e.d); }
+  const mode = new Map([...all].map((g) => [g, designMode(g, members)]));
+  const kept = raw.filter((e) => mode.get(e.s) !== "drop" && mode.get(e.d) !== "drop");
+  const keep = (g) => mode.get(g) === "show";
+  // Through a hidden MAIN, a wire continues only into the wires its logic drives from it
+  const step = (e, f) => {
+    if (e.d.startsWith("pin:")) return true;
+    return members.get(e.d).some((m) => {
+      const pairs = wirePairs(m);
+      return !pairs || pairs.has(e.link.wire + "\u0000" + f.link.wire);
+    });
+  };
+  let edges = contract([...all], kept, keep, (acc, s, d, path) => {
+    acc = acc || { s, d, names: new Set(), bits: 0, async: false, t: null, links: [] };
+    const last = path[path.length - 1].link;
+    acc.names.add(path.map((p) => p.link.name).join(" → "));
+    acc.bits += bitsOf(last.t) || 0;
+    acc.async = acc.async || path.some((p) => p.link.async);
+    if (acc.t == null) acc.t = last.t;
+    acc.links.push(path);
+    return acc;
+  }, step);
+  let ids = [...all].filter(keep);
+  // Pins with no connection are left out; a file view keeps its MAINs and their neighbors
+  const connected = new Set();
+  for (const e of edges) { connected.add(e.s); connected.add(e.d); }
+  ids = ids.filter((g) => !g.startsWith("pin:") || connected.has(g));
+  let ghost = new Set();
+  if (inFile) {
+    const mine = (g) => !g.startsWith("pin:") && members.get(g).some((m) => inFile.has(m));
+    const near = new Set();
+    if (filt.ghost.mode === "show") {
+      for (const e of edges) {
+        if (mine(e.s)) near.add(e.d);
+        if (mine(e.d)) near.add(e.s);
+      }
+    }
+    ids = ids.filter((g) => mine(g) || near.has(g));
+    ghost = new Set(ids.filter((g) => !mine(g)));
+    edges = edges.filter((e) => ids.includes(e.s) && ids.includes(e.d) && (mine(e.s) || mine(e.d)));
+  }
+  const clockOf = (g) => g.startsWith("pin:") ? null : D.mains[members.get(g)[0]].clock;
+  const nodes = ids.sort().map((g) => {
+    if (g.startsWith("pin:")) {
+      const p = D.pins[g.slice(4)];
+      return { id: g, cls: "port", lines: [p.name, (p.dir === "in" ? "Input" : "Output") + (T(p.t).c ? "  " + typeShort(p.t) : "")],
+        rank: p.dir === "in" ? "first" : "last",
+        tip: () => "pin " + p.name + "\n" + (p.loc || "") + (T(p.t).c ? "\ntype: " + typeLong(p.t) : ""),
+        hide: { label: "pin " + p.name, keys: ["pin" + SEP + g.slice(4)], modes: ["drop"] } };
+    }
+    const ms = members.get(g), e = D.mains[ms[0]];
+    const clocks = [...new Set(ms.map((m) => D.mains[m].clock))];
+    const lat = Math.max(...ms.map((m) => D.mains[m].latency));
+    const kindTxt = e.kind === "main" ? "MAIN" : e.kind.replace("_", " ");
+    const label = ms.length > 1 ? e.name : mainLabel(ms[0]);
+    return {
+      id: g, cls: (ghost.has(g) ? "ghost " : "") + "click",
+      lines: [label, [kindTxt, lat ? "L=" + lat : "", clocks.join(" → "), mode.get(g) === "show" && ms.every((m) => D.mains[m].wiring) ? "wiring" : ""].filter(Boolean).join("  "),
+              loc(e.file, e.line)],
+      color: clockColor(clocks[0]),
+      tip: () => ms.map(mainTip).join("\n\n"),
+      onclick: () => go({ inst: ms[0] }),
+      hide: { label, keys: ms.map((m) => "main" + SEP + m), modes: ["pass", "drop"] },
+    };
+  });
+  nodes.forEach(measure);
+  const de = edges.map((e) => {
+    const names = [...e.names].sort();
+    const cs = clockOf(e.s), cd = clockOf(e.d);
+    const one = e.links.length === 1 && e.links[0].length === 1;
+    return { s: e.s, d: e.d, bits: e.bits, async: e.async, cross: cs && cd && cs !== cd,
+      text: names.length === 1 ? (one ? edgeText(names, e.t) : names[0]) : names.length + " wires",
+      tip: names.join("\n") + (one && T(e.t).c ? "\ntype: " + typeLong(e.t) : "") + (e.bits ? "\n" + e.bits + " bits" : "") };
+  });
+  if (de.length > 40) for (const e of de) e.text = "";   // hover for names
+  const size = layout(nodes, de, labelGap(de));
+  const hiddenN = [...all].filter((g) => !g.startsWith("pin:") && !keep(g)).length;
+  draw(nodes, de, size, (file ? base(file) + ": " : "") + nodes.length + " blocks" +
+    (hiddenN ? ", " + hiddenN + " MAINs hidden (filters)" : ""));
+  setSource(file || D.build.top, 1);
+  banner(file);
+  return { nodes, edges: de };
+}
+// A file view says so, with the way back to the whole design
+function banner(file) {
+  const b = $("banner");
+  b.replaceChildren();
+  if (!file) { b.style.display = "none"; return; }
+  b.appendChild(document.createTextNode("the MAINs of " + base(file) + (filt.ghost.mode === "show" ? " and what they connect to · " : " · ")));
+  const a = el("a", null, "whole design");
+  a.addEventListener("click", () => go({ design: 1 }));
+  b.appendChild(a);
+  b.style.display = "block";
+}
+
+// ---------- function view ----------
+// A function-graph node's filter kind, or null: drawn whatever the filters say
+function nodeKindOf(n) {
+  switch (n.kind) {
+    case "in": return "in";
+    case "out": return "out";
+    case "reg": case "reg_next": return "reg";
+    case "wire_read": case "wire_write": return "wire";
+    case "const": case "ce": return "const";
+    case "sub": {
+      const cf = func(n.callee);
+      if (cf.wiring) return "wiring";
+      return cf.kind === "op" ? "op" : null;
+    }
+  }
+  return null;
+}
+function nodeRole(n) {
+  if (n.kind === "wire_read" || n.kind === "wire_write") return roleOf((D.wires[n.name] || {}).t);
+  return roleOf(n.t);
+}
+function nodeMode(fname, n) {
+  const own = state.hidden.get(fname + SEP + n.id);
+  if (own) return own;
+  const k = nodeKindOf(n);
+  if (!k || !applies(k, nodeRole(n))) return "show";
+  return filt[k].mode;
+}
+// The keys that hide a node by hand: both values of a register
+function hideKeys(fname, n) {
+  if (n.kind === "reg" || n.kind === "reg_next") return [fname + SEP + "rq:" + n.name, fname + SEP + "rd:" + n.name];
+  return [fname + SEP + n.id];
+}
+// Operators in group mode, in connected clusters: group id ("g:" + first member)
+// -> {members, names: variables on the edges inside}
+function opGroups(ids, edges, mode) {
+  const parent = new Map();
+  for (const id of ids) if (mode.get(id) === "group") parent.set(id, id);
+  const find = (x) => {
+    while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); }
+    return x;
+  };
+  for (const e of edges) {
+    if (!parent.has(e.s) || !parent.has(e.d)) continue;
+    const a = find(e.s), b = find(e.d);
+    if (a < b) parent.set(b, a); else if (b < a) parent.set(a, b);
+  }
+  const groups = new Map();
+  for (const id of [...parent.keys()].sort()) {
+    const gid = "g:" + find(id);
+    if (!groups.has(gid)) groups.set(gid, { members: [], names: new Set() });
+    groups.get(gid).members.push(id);
+  }
+  return groups;
+}
+// [start, end] ns of a group's operators in its function's pipeline map, or null
+function groupSpan(members, f) {
+  if (!f.offsets) return null;
+  let lo = Infinity, hi = -Infinity;
+  for (const id of members) {
+    const o = f.offsets[id.slice(2)];
+    if (o) { lo = Math.min(lo, o[0]); hi = Math.max(hi, o[1]); }
+  }
+  return lo <= hi ? [lo, hi] : null;
+}
+// Merges the paths between two drawn nodes: their variables, the type into the
+// driven port, and the types of the Feedback variables on the way (fbTypes)
+function mergeEdges(acc, s, d, path) {
+  const first = path[0], last = path[path.length - 1];
+  acc = acc || { s, d, sp: first.sp, dp: last.dp, names: [], t: last.t, bits: 0, fbTypes: new Set(), reg: null, paths: 0 };
+  for (const e of path) for (const nm of e.names) if (!acc.names.includes(nm)) acc.names.push(nm);
+  acc.bits = Math.max(acc.bits, bitsOf(last.t) || 0);
+  for (const e of path) if (e.fb) acc.fbTypes.add(e.t);
+  if (!acc.reg) { const r = path.find((e) => e.reg); if (r) acc.reg = r.reg; }
+  acc.paths++;
+  return acc;
+}
+function functionView(inst, hl) {
+  const chain = resolve(inst);
+  if (!chain) throw new Error("unknown instance " + inst);
+  const fname = chain[chain.length - 1][1];
+  const f = func(fname), g = graphOf(fname);
+  if (!g) throw new Error("no graph for " + fname);
+  const main = chain[0][0], clock = D.mains[main] ? D.mains[main].clock : null;
+  const ids = Object.keys(g.nodes).sort();
+  const mode = new Map(ids.map((id) => [id, nodeMode(fname, g.nodes[id])]));
+  // Dropped nodes leave with their edges, as do the Feedback edges the filter drops
+  const dropFb = filt.fb.mode === "drop";
+  const raw = g.edges.filter((e) => mode.get(e.s) !== "drop" && mode.get(e.d) !== "drop" &&
+    !(e.fb && dropFb && applies("fb", roleOf(e.t))));
+  // A register passed through joins its next value to its current value
+  for (const id of ids) {
+    const n = g.nodes[id], next = "rd:" + n.name;
+    if (n.kind === "reg" && mode.get(id) === "pass" && mode.get(next) === "pass")
+      raw.push({ s: next, sp: "", d: id, dp: "", t: n.t, names: [n.name], fb: false, reg: n.name });
+  }
+  const groups = opGroups(ids, raw, mode);
+  const groupOf = new Map();
+  for (const [gid, grp] of groups) for (const id of grp.members) groupOf.set(id, gid);
+  const ep = (id) => groupOf.get(id) || id;
+  const edges0 = [];
+  for (const e of raw) {
+    const s = ep(e.s), d = ep(e.d);
+    if (s === d && groupOf.has(e.s)) { for (const nm of e.names) groups.get(s).names.add(nm); continue; }
+    edges0.push(s === e.s && d === e.d ? e : Object.assign({}, e, { s, d }));
+  }
+  const keep = (id) => groups.has(id) || mode.get(id) === "show";
+  const nodeIds = ids.filter((id) => !groupOf.has(id)).concat([...groups.keys()]);
+  const edges = contract(nodeIds, edges0, keep, mergeEdges);
+  const shown = nodeIds.filter(keep);
+  const nameOf = (id) => groups.has(id) ? "logic" : g.nodes[id].name;
+  const nodes = shown.map((id) => {
+    if (groups.has(id)) return groupNode(id, groups.get(id), fname, g, f, inst, hl);
+    const n = g.nodes[id];
+    if (n.kind === "sub") {
+      const child = inst + MARK + id.slice(2);
+      const cf = func(n.callee), lat = instLatency(child);
+      const tags = [];
+      if (cf.def && !cf.def.startsWith(n.name)) tags.push(cf.def);   // a factory's def extends the name
+      if (lat) tags.push("L=" + lat);
+      if (cf.delay_ns != null) tags.push(fmtNs(cf.delay_ns));
+      const badges = [n.auto_pipeline ? "AUTO_PIPELINE" : "", n.auto_fsm ? "AUTO_FSM" : "",
+        cf.kind === "vhdl" ? "vhdl" : "", cf.mcp ? "MCP" : "", cf.regs ? "regs" : "", cf.wiring ? "wiring" : ""].filter(Boolean);
+      const lines = [n.name];
+      if (tags.length) lines.push(tags.join("  "));
+      if (badges.length) lines.push(badges.join(" "));
+      const can = cf.kind !== "op" && hasGraph(n.callee);
+      return { id, cls: (can ? "click" : "") + (id === hl ? " hl" : ""), lines,
+        tip: () => funcTip(n.callee, ["instance: " + child, "latency: " + lat,
+          n.src ? "call: " + loc(n.src[0], n.src[1]) : "",
+          n.auto_pipeline ? "AUTO_PIPELINE " + n.auto_pipeline : "", n.auto_fsm ? "AUTO_FSM " + n.auto_fsm : ""].filter(Boolean)),
+        onclick: (ev) => {
+          if ((ev.ctrlKey || ev.metaKey) && n.src) { setSource(n.src[0], n.src[1]); $("src").click(); return; }
+          if (can) go({ inst: child });
+        },
+        hide: { label: n.name, keys: hideKeys(fname, n), modes: ["pass", "drop"] } };
+    }
+    const kinds = { in: ["input", "first"], out: ["output", "last"], reg: ["Reg", "first"], reg_next: ["Reg next", "last"],
+      wire_read: ["wire read", "first"], wire_write: ["wire write", "last"], const: ["const", null], ce: ["clock enable", "first"] };
+    const [what, rank] = kinds[n.kind] || [n.kind, null];
+    const wire = (n.kind === "wire_read" || n.kind === "wire_write") ? D.wires[n.name] : null;
+    const t = wire ? wire.t : n.t;
+    const lines = [wire ? wire.name : n.name, what + (T(t).c ? "  " + typeShort(t) : "")];
+    const hop = wire ? wireHop(n.name, n.kind, inst) : null;
+    const isReg = n.kind === "reg" || n.kind === "reg_next";
+    return { id, cls: "port" + (hop ? " click" : "") + (id === hl ? " hl" : ""), lines, rank,
+      color: n.kind === "in" || n.kind === "out" ? clockColor(clock) : null,
+      tip: () => what + " " + n.name + (wire && wire.loc ? "\ndeclared: " + wire.loc : "") +
+        (T(t).c ? "\ntype: " + typeLong(t) : "") + (wire && wire.async ? "\nASYNC" : "") + (hop ? "\n" + hop.text : ""),
+      onclick: hop ? () => go(hop.route) : null,
+      hide: { label: what + " " + n.name, keys: hideKeys(fname, n), modes: isReg ? ["pass", "drop"] : ["drop"] } };
+  });
+  nodes.forEach(measure);
+  const endText = (id, port) => nameOf(id) + (port ? "." + port : "");
+  const de = edges.map((e) => {
+    const lines = [e.names.length ? e.names.slice(0, 12).join(", ") + (e.names.length > 12 ? " …" : "")
+      : "(no variable) " + endText(e.s, e.sp) + " → " + endText(e.d, e.dp)];
+    if (T(e.t).c) lines.push("type: " + typeLong(e.t));
+    for (const t of e.fbTypes) lines.push("through a Feedback" + (T(t).c ? " of " + typeShort(t) + ", " + ROLE_TEXT[roleOf(t)] : ""));
+    if (e.reg) lines.push("through register " + e.reg);
+    if (e.paths > 1) lines.push(e.paths + " paths merged");
+    return { s: e.s, d: e.d, bits: e.bits, fb: e.fbTypes.size > 0 || !!e.reg, t: e.t,
+      feedbackRoles: [...e.fbTypes].map(roleOf), text: edgeText(e.names, e.t), tip: lines.join("\n") };
+  });
+  const scale = $("f-scale").checked ? hardwareScale(nodes, de, g, f) : null;
+  if (de.length > 60 || scale) for (const e of de) e.text = "";   // hover for names
+  let size = layout(nodes, de, labelGap(de));
+  if (scale) size = scale.place(nodes, size);
+  const title = chain.length > 1 ? g_name(chain[chain.length - 2][1], chain[chain.length - 1][2]) : mainLabel(main);
+  let grouped = 0;
+  for (const grp of groups.values()) grouped += grp.members.length;
+  const hiddenN = ids.length - shown.filter((id) => !groups.has(id)).length - grouped;
+  draw(nodes, de, size, title + ": " + nodes.length + " blocks" +
+    (grouped ? ", " + grouped + " operators in " + groups.size + " logic blocks" : "") +
+    (hiddenN ? ", " + hiddenN + " hidden (filters)" : "") + (scale ? scale.note : ""),
+    scale ? scale.axis : null);
+  setSource(f.file, f.line);
+  banner(null);
+  return { nodes, edges: de, groups };
+}
+// One logic block for a cluster of operators: a cloud when it is known to be
+// combinational. Pipelining puts its registers into operators, and lines up the
+// paths of a function with latency with more, between its submodules: so no
+// operator in it may have a latency, and its function instance none either.
+function groupNode(gid, grp, fname, g, f, inst, hl) {
+  const counts = new Map();
+  let lat = 0;
+  for (const id of grp.members) {
+    const k = opName(g.nodes[id].callee);
+    counts.set(k, (counts.get(k) || 0) + 1);
+    lat = Math.max(lat, instLatency(inst + MARK + id.slice(2)));
+  }
+  const ops = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const fnLat = instLatency(inst), comb = !lat && !fnLat;
+  const span = groupSpan(grp.members, f);
+  const n = grp.members.length;
+  const tags = [n + (n === 1 ? " op" : " ops")];
+  if (lat) tags.push("L=" + lat); else if (!comb) tags.push("in L=" + fnLat);
+  if (span) tags.push(fmtNs(span[1] - span[0]));
+  const tipText = () => {
+    const lines = ["logic: " + n + " operator" + (n === 1 ? "" : "s") + " (filters › operators: show draws each)"];
+    for (const [k, c] of ops.slice(0, 16)) lines.push("  " + c + "× " + opSymbol(k) + (opSymbol(k) !== k.toLowerCase() ? "  " + k : ""));
+    if (ops.length > 16) lines.push("  … " + (ops.length - 16) + " more kinds");
+    if (grp.names.size) {
+      const names = [...grp.names].sort();
+      lines.push("variables inside: " + names.slice(0, 12).join(", ") + (names.length > 12 ? " …" : ""));
+    }
+    lines.push(lat ? "an operator in it has latency " + lat : comb ? "combinational: no registers inside"
+      : "this function instance has latency " + fnLat + ": registers that line up its paths may sit among these operators");
+    if (span) lines.push("delay through it: " + fmtNs(span[1] - span[0]) + " (" + fmtNs(span[0]) + " to " + fmtNs(span[1]) + ")");
+    return lines.join("\n");
+  };
+  return { id: gid, cls: (comb ? "cloud" : "logic") + (grp.members.includes(hl) ? " hl" : ""), members: grp.members,
+    lines: [ops.slice(0, 4).map(([k]) => opSymbol(k)).join(" ") + (ops.length > 4 ? " …" : ""), tags.join("  ")],
+    tip: tipText,
+    hide: { label: "logic (" + n + (n === 1 ? " operator)" : " operators)"), keys: grp.members.map((id) => fname + SEP + id), modes: ["pass", "drop"] } };
+}
+// Hardware scale (as the old pipeline_map.png): a block is as wide as its
+// delay and as tall as its mean in/out bus width. With the compiler's
+// zero-added-clocks offsets (f.offsets) x is its start time; otherwise the
+// layered x positions stay.
+function hardwareScale(nodes, edges, g, f) {
+  const blocks = nodes.filter((n) => n.members || (g.nodes[n.id] && g.nodes[n.id].kind === "sub"));
+  const offsets = f.offsets || null;
+  const delayOf = (n) => {
+    if (!n.members) return func(g.nodes[n.id].callee).delay_ns;
+    const s = groupSpan(n.members, f);
+    if (s) return s[1] - s[0];
+    const most = Math.max(0, ...n.members.map((id) => func(g.nodes[id].callee).delay_ns || 0));
+    return most || null;
+  };
+  const startOf = (n) => {
+    if (!offsets) return null;
+    if (n.members) { const s = groupSpan(n.members, f); return s ? s[0] : null; }
+    const o = offsets[n.id.slice(2)];
+    return o ? o[0] : null;
+  };
+  const edgeBits = new Map();
+  for (const e of edges) for (const id of [e.s, e.d]) edgeBits.set(id, Math.max(edgeBits.get(id) || 0, e.bits || 0));
+  const busBits = (n) => {
+    const cf = n.members ? null : func(g.nodes[n.id].callee), sum = (l) => (l || []).reduce((s, [, t]) => s + (bitsOf(t) || 0), 0);
+    return cf && cf.inputs ? (sum(cf.inputs) + sum(cf.outputs)) / 2 : edgeBits.get(n.id) || 1;
+  };
+  const maxNs = offsets ? Math.max(0, ...Object.values(offsets).map((o) => o[1]))
+                        : Math.max(0, ...blocks.map((n) => delayOf(n) || 0));
+  if (!(maxNs > 0)) return null;
+  const K = 1200 / maxNs;   // px per ns
+  for (const n of blocks) {
+    n.h = Math.min(200, 16 + 3 * Math.sqrt(busBits(n)));
+    const d = delayOf(n);
+    if (d != null) n.w = Math.max(isCloud(n) ? 30 : 6, d * K);
+    const fit = Math.max(1, Math.floor((n.w - 10) / 6.4));   // name only, cut to the block
+    n.lines = [n.lines[0].length > fit ? n.lines[0].slice(0, Math.max(0, fit - 1)) + "…" : n.lines[0]];
+  }
+  let x0 = 0;   // where t = 0 lands once place() has shifted everything right
+  return {
+    note: offsets ? "  (x: start time, width: delay, height: bus bits)" : "  (width: delay, height: bus bits; no start times)",
+    place(nodes, size) {
+      if (!offsets) return size;
+      let right = 0;
+      for (const n of blocks) {
+        const s = startOf(n);
+        if (s != null) { n.x = s * K; right = Math.max(right, n.x + n.w); }
+      }
+      for (const n of nodes) {
+        if (n.rank === "first") n.x = -n.w - 40;
+        if (n.rank === "last") n.x = Math.max(right, maxNs * K) + 40;
+      }
+      const left = Math.min(...nodes.map((n) => n.x)), xe = nodes.map((n) => n.x + n.w);
+      for (const n of nodes) n.x -= left;
+      x0 = -left;
+      return { width: Math.max(...xe) - left, height: size.height };
+    },
+    axis(parent) {
+      if (!offsets) return;
+      const H = Math.max(...nodes.map((n) => n.y + n.h)) + 10;
+      const step = Math.pow(10, Math.floor(Math.log10(maxNs / 2))) * (maxNs / Math.pow(10, Math.floor(Math.log10(maxNs))) > 5 ? 2 : 1);
+      for (let t = 0; t <= maxNs + 1e-9; t += step) {
+        svgEl("line", { x1: x0 + t * K, x2: x0 + t * K, y1: -6, y2: H, class: "axis" }, parent.firstChild);
+        const tx = svgEl("text", { x: x0 + t * K + 2, y: H + 12, class: "el" }, parent);
+        tx.textContent = (Math.round(t * 100) / 100) + " ns";
+      }
+    },
+  };
+}
+// The header's "source" link: vscode://file/<path>:<line> (files on disk only)
+function setSource(file, line) {
+  const a = $("src");
+  if (file && file.startsWith("/") && !/^\/pypeline_/.test(file)) {
+    a.setAttribute("href", "vscode://file" + encodeURI(file) + ":" + (line || 1));
+    a.textContent = "source " + loc(file, line);
+  } else { a.removeAttribute("href"); a.textContent = ""; }
+}
+// The other ends of a global wire a function reads or writes
+function wireHop(wire, kind, inst) {
+  const mine = kind === "wire_read" ? "dst" : "src", other = kind === "wire_read" ? "src" : "dst";
+  const ends = [...new Set(D.links.filter((l) => l.wire === wire && l[mine] === inst).map((l) => l[other]))];
+  if (!ends.length) return null;
+  const route = ends[0].startsWith("pin:") ? { design: 1 } : { inst: ends[0] };
+  return { route, text: (kind === "wire_read" ? "written by " : "read by ") + ends.join(", ") };
+}
+
+// ---------- routing ----------
+function parseHash() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("inst=")) {
+    const rest = h.slice(5), at = rest.indexOf("&hl=");
+    return at < 0 ? { inst: rest } : { inst: rest.slice(0, at), hl: rest.slice(at + 4) };
+  }
+  if (h.startsWith("file=") && D.files[h.slice(5)] && !D.files[h.slice(5)].top) return { file: h.slice(5) };
+  return { design: 1 };
+}
+function go(r) {
+  const h = r.inst ? "inst=" + r.inst + (r.hl ? "&hl=" + r.hl : "") : r.file ? "file=" + r.file : "design";
+  if (decodeURIComponent(location.hash.slice(1)) === h) render(); else location.hash = encodeURIComponent(h);
+}
+function crumbs(r) {
+  const c = $("crumbs");
+  c.replaceChildren();
+  const add = (text, route) => {
+    if (c.childNodes.length) c.appendChild(el("span", "sep", "›"));
+    if (route) { const a = el("a", null, text); a.addEventListener("click", () => go(route)); c.appendChild(a); }
+    else c.appendChild(el("span", null, text));
+  };
+  add("design", r.design ? null : { design: 1 });
+  if (r.file) add(base(r.file) + " (its MAINs)", null);
+  if (r.inst) {
+    const chain = resolve(r.inst) || [];
+    const e = D.mains[chain.length ? chain[0][0] : ""];
+    if (e && e.file && !(D.files[e.file] && D.files[e.file].top)) add(base(e.file), fileRoute(e.file));
+    chain.forEach(([p, fn, local], i) => {
+      const name = local == null ? mainLabel(p) : g_name(chain[i - 1][1], local);
+      add(name, i === chain.length - 1 ? null : { inst: p });
+    });
+  }
+}
+function g_name(parent, local) { const n = graphOf(parent).nodes["s:" + local]; return n ? n.name : local; }
+function render() {
+  hideTip();
+  const r = parseHash();
+  state.view = r;
+  crumbs(r);
+  document.querySelectorAll("#tree .item.sel").forEach((e) => e.classList.remove("sel"));
+  const key = r.inst ? "inst=" + r.inst : r.file ? "file=" + r.file : "design";
+  document.querySelectorAll("#tree .item").forEach((e) => { if (e.dataset.route === key) e.classList.add("sel"); });
+  try {
+    if (r.inst) functionView(r.inst, r.hl);
+    else designView(r.file || null);
+    $("info").textContent = "";
+  } catch (err) {
+    vp.replaceChildren();
+    $("info").textContent = "cannot draw this view: " + err.message;
+  }
+}
+
+// ---------- panels: filters, hidden nodes, a node's menu ----------
+function closePanels() { for (const id of ["filters", "hidden-list", "ctx"]) $(id).style.display = "none"; }
+function placePanel(box, x, y) {
+  box.style.display = "block";
+  const w = box.offsetWidth, h = box.offsetHeight;
+  box.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
+  box.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
+}
+function placeBelow(box, anchor) { const r = anchor.getBoundingClientRect(); placePanel(box, r.left, r.bottom + 4); }
+function filtersChanged() { saveSettings(); treeFilterClass(); render(); }
+function buildFilters() {
+  const box = $("filters");
+  box.replaceChildren();
+  const table = el("table");
+  const select = (options, value, onchange) => {
+    const s = el("select");
+    for (const [v, text] of options) { const o = el("option", null, text); o.value = v; s.appendChild(o); }
+    s.value = value;
+    s.addEventListener("change", () => onchange(s.value));
+    const td = el("td"); td.appendChild(s);
+    return td;
+  };
+  for (const k of KINDS) {
+    const tr = el("tr");
+    const name = el("td", null, k.label);
+    if (k.tip) name.title = k.tip;
+    tr.appendChild(name);
+    const modes = k.modes.map((m) => [m, k.modes.length === 2 && m === "drop" ? "hide" : MODE_TEXT[m]]);
+    tr.appendChild(select(modes, filt[k.id].mode, (v) => { filt[k.id].mode = v; filtersChanged(); }));
+    if (k.typed) tr.appendChild(select(SCOPES.map(([id, text]) => [id, text]), filt[k.id].scope, (v) => { filt[k.id].scope = v; filtersChanged(); }));
+    table.appendChild(tr);
+  }
+  const tr = el("tr");
+  tr.appendChild(el("td", null, "edge labels"));
+  tr.appendChild(select(LABELS, filt.labels, (v) => { filt.labels = v; filtersChanged(); }));
+  table.appendChild(tr);
+  box.appendChild(table);
+  box.appendChild(el("div", "note", "Hidden things either pass their edges through or take them along; " +
+    "a typed kind's mode applies to the interface roles its second choice names (forward: streams " +
+    "{data, valid} and fwd_t; feedback: fb_t), the rest are shown. Right-click a node to hide just it."));
+  const reset = el("button", null, "defaults");
+  reset.type = "button";
+  reset.addEventListener("click", () => { filt = defaults(); buildFilters(); filtersChanged(); });
+  box.appendChild(reset);
+}
+$("filters-btn").addEventListener("click", (ev) => {
+  const open = $("filters").style.display === "block";
+  closePanels();
+  if (!open) placeBelow($("filters"), ev.currentTarget);
+});
+// The header button lists what was hidden by hand
+function hiddenButton() {
+  const b = $("hidden-btn");
+  b.textContent = state.hidden.size + " hidden";
+  b.style.display = state.hidden.size ? "" : "none";
+}
+function setHidden(keys, mode) {   // mode null shows them again
+  for (const k of keys) { if (mode) state.hidden.set(k, mode); else state.hidden.delete(k); }
+  saveSettings();
+  hiddenButton();
+  document.querySelectorAll("#tree input[data-key]").forEach((cb) => { cb.checked = !state.hidden.has(cb.dataset.key); });
+  render();
+}
+function hiddenLabel(key) {
+  const i = key.indexOf(SEP), a = key.slice(0, i), b = key.slice(i + 1);
+  if (a === "main") return "MAIN " + mainLabel(b);
+  if (a === "pin") return "pin " + ((D.pins[b] || {}).name || b);
+  const g = graphOf(a), n = g && g.nodes[b];
+  const what = n ? (n.kind === "sub" ? n.name : n.kind + " " + n.name) : b;
+  return what + " in " + ((D.funcs[a] || {}).def || a);
+}
+function showHiddenList() {
+  const box = $("hidden-list");
+  box.replaceChildren();
+  const keys = [...state.hidden.keys()].sort();
+  for (const k of keys) {
+    const row = el("div");
+    row.appendChild(document.createTextNode(hiddenLabel(k) + (state.hidden.get(k) === "pass" ? " (edges pass through) " : " (with edges) ")));
+    const a = el("a", null, "show");
+    a.addEventListener("click", () => { setHidden([k], null); if (state.hidden.size) showHiddenList(); else closePanels(); });
+    row.appendChild(a);
+    box.appendChild(row);
+  }
+  const all = el("button", null, "show all");
+  all.type = "button";
+  all.addEventListener("click", () => { closePanels(); setHidden(keys, null); });
+  box.appendChild(all);
+  placeBelow(box, $("hidden-btn"));
+}
+$("hidden-btn").addEventListener("click", () => {
+  const open = $("hidden-list").style.display === "block";
+  closePanels();
+  if (!open) showHiddenList();
+});
+function openMenu(ev, hide) {
+  closePanels();
+  const box = $("ctx");
+  box.replaceChildren(el("div", "head", hide.label));
+  for (const m of hide.modes) {
+    const item = el("div", null, hide.modes.length === 1 ? "hide" : MODE_TEXT[m]);
+    item.addEventListener("click", () => { closePanels(); setHidden(hide.keys, m); });
+    box.appendChild(item);
+  }
+  placePanel(box, ev.clientX, ev.clientY);
+}
+addEventListener("keydown", (ev) => { if (ev.key === "Escape") closePanels(); });
+
+// ---------- search ----------
+let instIndex = null;   // [display path, instance, parent instance, node id] of non-operator instances
+function buildIndex() {
+  instIndex = [];
+  const walk = (inst, fname, label, depth) => {
+    const g = graphOf(fname);
+    if (!g || depth > 64 || instIndex.length > 50000) return;
+    for (const id of Object.keys(g.nodes).sort()) {
+      const n = g.nodes[id];
+      if (n.kind !== "sub" || func(n.callee).kind === "op") continue;
+      const child = inst + MARK + id.slice(2), text = label + "/" + n.name;
+      instIndex.push([text, child, inst, id]);
+      walk(child, n.callee, text, depth + 1);
+    }
+  };
+  for (const m of Object.keys(D.mains).sort()) { instIndex.push([mainLabel(m), m, null, null]); walk(m, m, mainLabel(m), 0); }
+}
+function search(text) {
+  const box = $("results");
+  box.replaceChildren();
+  text = text.trim().toLowerCase();
+  if (!text) { box.style.display = "none"; return; }
+  if (!instIndex) buildIndex();
+  const hits = instIndex.filter((r) => r[0].toLowerCase().includes(text)).slice(0, 200);
+  for (const [label, child, parent, id] of hits) {
+    const d = el("div", null, label);
+    d.addEventListener("click", () => {
+      box.style.display = "none";
+      go(parent == null || hasGraph(resolve(child).pop()[1]) ? { inst: child } : { inst: parent, hl: id });
+    });
+    box.appendChild(d);
+  }
+  if (!hits.length) box.appendChild(el("div", "dim", "no instance matches"));
+  const r = $("search").getBoundingClientRect();
+  box.style.left = Math.max(4, Math.min(r.left, innerWidth - 420)) + "px";
+  box.style.top = r.bottom + 4 + "px";
+  box.style.display = "block";
+}
+$("search").addEventListener("input", (ev) => search(ev.target.value));
+addEventListener("click", (ev) => {
+  if (!$("results").contains(ev.target) && ev.target !== $("search")) $("results").style.display = "none";
+  for (const [panel, button] of [["filters", "filters-btn"], ["hidden-list", "hidden-btn"], ["ctx", null]]) {
+    if (!$(panel).contains(ev.target) && (!button || !$(button).contains(ev.target))) $(panel).style.display = "none";
+  }
+});
+
+// ---------- copy as Mermaid ----------
+function mermaidText() {
+  const { nodes, edges } = state.last || { nodes: [], edges: [] };
+  const q = (t) => '"' + String(t).replace(/"/g, "#quot;") + '"';
+  const ids = new Map(nodes.map((n, i) => [n.id, "n" + i]));
+  const lines = ["flowchart LR"];
+  for (const n of nodes) lines.push("    " + ids.get(n.id) + (isCloud(n) ? "((" + q(n.lines.join("<br>")) + "))" : "[" + q(n.lines.join("<br>")) + "]"));
+  for (const e of edges) {
+    if (!ids.has(e.s) || !ids.has(e.d)) continue;
+    const arrow = e.fb ? "-.->" : "-->";
+    lines.push("    " + ids.get(e.s) + " " + arrow + (e.text ? "|" + q(e.text) + "|" : "") + " " + ids.get(e.d));
+  }
+  return lines.join("\n") + "\n";
+}
+$("mermaid").addEventListener("click", () => {
+  const text = mermaidText();
+  const fallback = () => { $("mm-text").value = text; $("mm").style.display = "flex"; $("mm-text").select(); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => { $("info").textContent = "copied Mermaid text"; }, fallback);
+  } else fallback();
+});
+$("mm-close").addEventListener("click", () => { $("mm").style.display = "none"; });
+
+// ---------- self-test ----------
+// Draws every view with the default filters, everything shown and everything
+// hidden, checking what each must and must not draw, then marks <body>
+// data-ready="<views drawn>" (data-error on any failure), which the render test reads
+function withFilters(change, fn) {
+  const saved = JSON.stringify(filt);
+  change(filt);
+  try { return fn(); } finally { filt = JSON.parse(saved); }
+}
+const ALL_SHOWN = (f) => { for (const k of KINDS) f[k.id].mode = "show"; };
+const ALL_HIDDEN = (f) => {
+  for (const k of KINDS) { f[k.id].mode = k.modes.includes("pass") ? "pass" : "drop"; f[k.id].scope = "all"; }
+};
+function selftest() {
+  let views = 0;
+  const check = (ok, what) => { if (!ok) throw new Error("self-test: " + what); };
+  const drawnIds = (v) => new Set(v.nodes.map((n) => n.id));
+  // What a graph node is, from the data alone (not from the filters' own nodeKindOf)
+  const isOp = (gn) => gn.kind === "sub" && func(gn.callee).kind === "op" && !func(gn.callee).wiring;
+  const isWiring = (gn) => gn.kind === "sub" && !!func(gn.callee).wiring;
+  const isBlock = (gn) => gn.kind === "sub" && !isOp(gn) && !isWiring(gn);
+  try {
+    storageOff = true;
+    filt = defaults();
+    state.hidden = new Map();
+    const home = designView(null); views++;
+    check($("banner").style.display === "none", "the whole design has a file banner");
+    for (const n of home.nodes) {
+      if (n.id.startsWith("pin:")) continue;
+      const ms = Object.keys(D.mains).filter((m) => mainGroup(m) === n.id);
+      check(!ms.every((m) => D.mains[m].wiring), "wiring MAIN drawn by default: " + n.id);
+    }
+    if (topFile) check(fileRoute(topFile).design, "the top file does not open the whole design");
+    for (const p of Object.keys(D.files)) {
+      designView(p); views++;
+      check($("banner").style.display === "block", "a file view has no banner: " + p);
+    }
+    const done = new Set();
+    const walk = (inst, fname) => {
+      if (done.has(fname)) return;
+      done.add(fname);
+      const g = graphOf(fname);
+      const v = functionView(inst); views++;
+      const ids = drawnIds(v);
+      for (const e of v.edges) check(ids.has(e.s) && ids.has(e.d), "edge to an undrawn node in " + fname);
+      for (const n of v.nodes) {
+        const gn = g.nodes[n.id];
+        if (!gn) continue;
+        check(!isOp(gn), "a default view draws an operator " + n.id + " in " + fname);
+        check(!isWiring(gn), "a default view draws a wiring call site " + n.id + " in " + fname);
+        check(gn.kind !== "const" && gn.kind !== "ce", "a default view draws a constant " + n.id + " in " + fname);
+      }
+      for (const e of v.edges) check(!e.feedbackRoles.includes("fb"), "a default view draws an fb_t Feedback edge in " + fname);
+      // Operators joined by a surviving edge share one logic block
+      const gid = new Map();
+      for (const [id, grp] of v.groups) for (const m of grp.members) gid.set(m, id);
+      for (const e of g.edges) {
+        if (e.fb && roleOf(e.t) === "fb") continue;
+        if (gid.has(e.s) && gid.has(e.d)) check(gid.get(e.s) === gid.get(e.d), "joined operators in two logic blocks in " + fname);
+      }
+      withFilters(ALL_SHOWN, () => {
+        const w = functionView(inst); views++;
+        const shown = drawnIds(w);
+        for (const id of Object.keys(g.nodes)) check(shown.has(id), "not every node drawn with everything shown: " + id + " in " + fname);
+      });
+      withFilters(ALL_HIDDEN, () => {
+        const w = functionView(inst); views++;
+        for (const n of w.nodes) {
+          const gn = g.nodes[n.id];
+          check(gn && isBlock(gn), "drawn with everything hidden: " + n.id + " in " + fname);
+        }
+        for (const e of w.edges) check(!e.feedbackRoles.length, "Feedback edge drawn with everything hidden in " + fname);
+      });
+      if (func(fname).offsets) { $("f-scale").checked = true; functionView(inst); $("f-scale").checked = false; views++; }
+      for (const id of Object.keys(g.nodes)) {
+        const n = g.nodes[id];
+        if (n.kind === "sub" && func(n.callee).kind !== "op" && hasGraph(n.callee)) walk(inst + MARK + id.slice(2), n.callee);
+      }
+    };
+    for (const m of Object.keys(D.mains).sort()) if (hasGraph(m)) walk(m, m);
+    // Hiding one node by hand as its menu does (render() draws the design view
+    // at #selftest), with its edges passing through and with them
+    const rendered = () => check(!$("info").textContent, "render: " + $("info").textContent);
+    const first = home.nodes.find((n) => n.hide && n.hide.modes.includes("pass"));
+    if (first) {
+      openMenu({ clientX: 10, clientY: 10 }, first.hide);
+      for (const m of ["pass", "drop"]) {
+        setHidden(first.hide.keys, m); views++; rendered();
+        check(!drawnIds(state.last).has(first.id), "a MAIN hidden by hand is drawn (" + m + ")");
+        showHiddenList();
+        setHidden(first.hide.keys, null); views++; rendered();
+        check(drawnIds(state.last).has(first.id), "a MAIN shown again is not drawn (" + m + ")");
+      }
+    }
+    // A filter changed as the panel does
+    buildFilters();
+    filt.ghost.mode = "drop";
+    filtersChanged(); views++; rendered();
+    filt = defaults();
+    closePanels();
+    if (!mermaidText().startsWith("flowchart LR")) throw new Error("mermaid text");
+    buildIndex(); search("a"); search("");
+    document.body.setAttribute("data-ready", String(views));
+  } catch (err) {
+    document.body.setAttribute("data-error", String(err && err.stack || err));
+  }
+}
+
+// ---------- start ----------
+function legend() {
+  const lg = $("legend");
+  for (const cid of clockIds) {
+    const c = D.clocks[cid], s = el("span");
+    const sw = el("span", "sw"); sw.style.background = clockColor(cid);
+    s.appendChild(sw);
+    s.appendChild(document.createTextNode(cid + (c.name ? " (" + c.name + ")" : "")));
+    lg.appendChild(s);
+  }
+}
+$("title").textContent = base(D.build.top) + " — design diagram";
+document.title = base(D.build.top) + " diagram";
+if (location.hash !== "#selftest") loadSettings();
+legend();
+buildFilters();
+hiddenButton();
+$("f-scale").addEventListener("change", render);
+buildTree();
+if (location.hash === "#selftest") selftest();
+else { addEventListener("hashchange", render); render(); }
+</script>
+</body>
+</html>

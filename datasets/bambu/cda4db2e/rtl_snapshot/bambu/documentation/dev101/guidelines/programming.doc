@@ -1,0 +1,280 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+\page dev_guide_programming Coding guidelines for PandA project codebase
+
+\section programming_intro Introduction
+In this document we plan to shortly explain some useful guidelines to help you writing "good" code into the PandA Project. The main features which will be explained are:
+- \ref prog_style
+- \ref clang_format
+- \ref special_function
+- \ref check_errors
+- \ref header_including
+- \ref memory_management
+- \ref debugging_statements
+
+\section prog_style Coding Style
+This section explains the coding style used through out the PandA project; you are strongly advised to follow it.
+- Graph parenthesis are opened and close on a new line with respect to the instruction they refer to:
+\verbatim
+for(int i = 0; i < n; i++)
+{
+   ...........
+}
+\endverbatim
+- Indentation must be enforced by the use of 3 spaces, not the tabulator character.
+- All formatting conventions (brace style, column width, include ordering) are enforced by
+  \c .clang-format (Allman braces, 120-column lines, sorted includes). Run \c clang-format
+  (version 11 or newer) on touched files before committing.
+- Doxygen (see \ref dev_guide_documentation) comments of classes and methods must be written as:
+\verbatim
+/**
+ * ....your documentation.....
+ */
+\endverbatim
+while the comments of class attributes are indicated as:
+\verbatim
+///......your documentation....
+\endverbatim
+
+An important aspect, not only connected with the programming style, but also with the efficiency of the produced code regards the use of the \c const keyword; this keyword means that the object it refers to can't be modified. In presence of this keyword, the C++ compiler performs optimizations which speed-up the execution; in particular use it after a method declaration:
+\verbatim
+void print() const;
+\endverbatim
+This means that "this" (i.e. the internal representation of the class which contains the method) isn't modified by the method call.
+
+Finally something not directly connected with the programing style: when, in a class or in a struct you call methods belonging to the struct itself or access attributes of that structure (or class), use always the "this->" elements. This is absolutely not necessary in order to have a working code, but it helps understanding your code: it is, for example, immediately clear what are the local variables of the method you are in and what are the global attributes of the structure (or class). Example:
+\verbatim
+class MyClass
+{
+   int attr1;
+
+   void method1()
+   {
+      std::cout << this->attr1 << std::endl;
+   }
+};
+\endverbatim
+Note the use of "this->attr1" and not simply "attr1".
+
+\section clang_format Automated Formatting
+
+The project ships a version-controlled \c .clang-format that enforces:
+- Allman-style braces (opening brace on a new line)
+- 3-space indentation
+- 120-column line width
+- Sorted \#include directives
+
+Always run \c clang-format (v11+) on modified files before committing:
+\verbatim
+clang-format-11 -i path/to/file.hpp path/to/file.cpp
+\endverbatim
+The \c .clangd configuration references the same project and can auto-format on save.
+
+\section special_function C++ Specific Functions
+The project now targets C++23. Use idiomatic C++ over C-style functions: prefer \c std::cout / \c std::ostringstream over \c printf, and \c std::to_string or \c std::format (C++23) over \c sprintf / \c atoi. The \c boost::lexical_cast method is still available and commonly used in legacy PandA code; prefer \c std::to_string for new code.
+
+\section check_errors Error Checking
+Using exceptions and assertion to check errors is a good programming habit; you are strongly advised to used exceptions whenever you feel in order to signal that a method terminated because of an error or because of a particular condition. You may define your own exceptions and most of the time you should do this. Anyway PandA provides two mechanisms you may use to signal that en error occurred and that the program must terminate:
+-# \c THROW_ERROR(msg) is a macro included in src/utility/exceptions.hpp; when used, it terminates the program writing the "msg" string to the screen.
+-# \c THROW_ASSERT(cond, msg) is a macro included in src/utility/exceptions.hpp; it is used to check that the boolean condition "cond" is true, otherwise the program terminates and "msg" is written to the screen.
+
+You may also write your own exception types, but first of all give a look in src/exceptions: this directory contains the definition of many common exceptions which are used throughout PandA, so you may find what you need here. Moreover, when defining your own exceptions, you may use the ones in src/exceptions as example.
+
+\section header_including How to Deal with Header Files
+To reduce compilation times and avoid fragile dependency cycles, prefer putting all \c \#include directives in the .cpp file and use forward declarations in the .hpp. The project uses \c .clang-format with sorted includes, so include ordering is automated. An example to make the concept clearer; lets suppose I have file1.hpp and file1.cpp which need the declaration of the class contained in file2.hpp:
+\verbatim
+file2.hpp:
+
+   class class2
+   {
+      /**
+       * A method....
+       */
+      void doSomething();
+   };
+
+file1.hpp:
+
+   //Instead of including file2.hpp I make a
+   //forward declaration of class2
+   class class2;
+
+   /**
+    * This is class1
+    */
+   class class1
+   {
+      //Attribute of type Class2
+      class2 &attibuteClass2;
+
+      /**
+       * Constructor of class1
+       */
+      class1(class2 &_attr);
+
+      /**
+       * A method....
+       */
+      void oneMethod();
+   };
+
+file1.cpp:
+
+   #include "file1.hpp"
+   #include "file2.hpp"
+
+   /**
+    * Constructor of class1
+    */
+   class1::class1(class2 &_attr) : attibuteClass2(_attr){}
+
+   void class1::oneMethod()
+   {
+      this->attibuteClass2.doSomething();
+   }
+\endverbatim
+
+Of course you can do that unless the implementation of part (or of all) the functionality is in your .hpp file:
+\verbatim
+file2.hpp:
+
+   class class2
+   {
+      /**
+       * A method....
+       */
+      void doSomething();
+   };
+
+file1.hpp:
+
+   //I have to include file2.hpp, a forward declaration is not enough
+   #include "file2.hpp"
+
+   /**
+    * This is class1
+    */
+   class class1
+   {
+      //Attribute of type Class2
+      class2 &attibuteClass2;
+
+      /**
+       * Constructor of class1
+       */
+      class1(class2 &_attr);
+
+      /**
+       * A method....
+       */
+      void oneMethod()
+      {
+         this->attibuteClass2.doSomething();
+      }
+   };
+
+file1.cpp:
+
+   #include "file1.hpp"
+   #include "file2.hpp"
+
+   /**
+    * Constructor of class1
+    */
+   class1::class1(class2 &_attr) : attibuteClass2(_attr){}
+\endverbatim
+In this situation we are forced to include "file2.hpp" in "file1.hpp" file: this because in "file1.hpp" we don't simply use the declaration of class2 but also the details about its internal implementation (i.e. the knowledge of the method \c doSomething).
+
+Regarding header files, you know that at the beginning of the file you have to used an \c \#ifndef clause (this is done in order to avoid multiple compilations of the definitions contained in the file). The convention used is that the argument of the \c \#ifndef must be the upper case version of the name of the file itself. For example for file "nameExample.hpp":
+\verbatim
+#ifndef NAMEEXAMPLE_HPP
+#define NAMEEXAMPLE_HPP
+
+//your code here .......
+
+#endif
+\endverbatim
+
+\section memory_management Ownership and Smart Pointers
+
+The project targets C++23. Prefer standard smart pointers for ownership:
+- \c std::unique_ptr for exclusive ownership
+- \c std::shared_ptr when ownership must be shared across multiple owners
+- Raw pointers (non-owning) only for borrowing / observing references
+
+Legacy PandA code uses a custom \b refcount wrapper (defined in \c src/utility/refcount.hpp
+and conditionally backed by Boost when available). The \c REF_FORWARD_DECL(className)
+macro is required in .hpp files when the declaration wraps a type into refcount.
+
+For new code, prefer \c std::unique_ptr / \c std::shared_ptr. Only introduce custom refcount
+where a legacy dependency requires it or when a custom allocator strategy is needed.
+
+Example with smart pointers:
+\verbatim
+#include <memory>
+
+std::unique_ptr<class1> owner = std::make_unique<class1>();
+std::shared_ptr<class1> shared = std::make_shared<class1>();
+\endverbatim
+
+\section debugging_statements Debug Statements
+
+Debug helpers live in \c src/utility/dbgPrintHelper.hpp. The preferred macros are:
+- \c INDENT_DBG_MEX — respects the global indentation; automatically indents child lines
+- \c PRINT_DBG_MEX — prints at the current indentation level without structural changes
+
+Verbosity levels (lowest → highest):
+\verbatim
+DEBUG_LEVEL_NORMAL
+DEBUG_LEVEL_VERBOSE
+DEBUG_LEVEL_PEDANTIC
+\endverbatim
+
+For multi-line debug output that respects indentation hierarchy, use the \c INDENT_DBG_MEX
+pattern with \c "-->" and \c "<--" markers (the macro tracks indentation level
+internally):
+\verbatim
+INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debugLevel, "-->Analyzing state " + stateName);
+// ... detailed logging ...
+INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debugLevel, "<--Analyzed state " + stateName);
+\endverbatim
+
+Child lines that should align beneath the current level use a \c "---" prefix:
+\verbatim
+INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debugLevel, "---Child detail 1");
+INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debugLevel, "---Child detail 2");
+\endverbatim
+
+Do not modify the global \c indentation variable directly. Always balance \c "-->" with a
+matching \c "<--" on every exit path so that indentation returns to its previous value.
+
+For simple conditional debug output, wrap in \c #ifndef NDEBUG to skip in release builds:
+\verbatim
+#ifndef NDEBUG
+if(this->debugLevel >= DEBUG_LEVEL_PEDANTIC)
+{
+   for(int i = 0; i < this->numFunctions; i++)
+      this->taskGraph[i]->writeDot((std::string("TaskGraph") + std::to_string(i)).c_str());
+}
+#endif
+\endverbatim
+*/

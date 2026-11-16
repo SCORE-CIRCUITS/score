@@ -48,7 +48,7 @@ else
     log_info "Skipping system deps"
 fi
 
-if [[ ! -d "$TOOL_DIR/.git" ]]; then
+if [[ ! -e "$TOOL_DIR/.git" ]]; then
     log_info "Shallow-cloning BlackParrot…"
     git clone --depth 1 "$UPSTREAM_URL" "$TOOL_DIR"
 else

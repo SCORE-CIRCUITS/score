@@ -1,0 +1,81 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+
+\page dev_guide_documentation Write documentation for PandA project
+
+Documentation is an essential part of the PandA project.
+It explains what the code does, which assumptions a component relies on, and how users or contributors are expected to interact with the implemented functionality.
+
+The documentation of the PandA project is based on Doxygen.
+The repository ships a versioned \c documentation/Doxyfile, which is the authoritative starting point for generated project documentation.
+
+\section doc_code_how_to Documenting your Code
+Both public-facing documentation and implementation-oriented comments are useful:
+- public API documentation explains what a class, method, or data structure means and how it should be used;
+- local comments should be reserved for non-obvious implementation details, invariants, or algorithmic choices.
+
+For Doxygen comments in code, keep the style simple and consistent.
+The project primarily uses:
+-# Documentation of classes and methods must be indicated using Javadoc style
+\verbatim
+/**
+ * ....your documentation.....
+ */
+\endverbatim
+-# Documentation of class attributes is indicated in a C# style:
+\verbatim
+///......your documentation....
+\endverbatim
+Place these comments immediately before the declaration they describe.
+
+Documentation should be specific and useful:
+- \b Classes should explain the role of the abstraction and the responsibility it owns.
+- \b Attributes should explain what state they represent when that meaning is not obvious from the name alone.
+- \b Methods should document parameters, return values, preconditions, postconditions, and externally visible side effects when relevant.
+- Prefer documenting invariants, ownership rules, and error conditions over repeating what is already obvious from the signature.
+
+Regarding inline comments inside the implementation, ordinary source comments are enough:
+\verbatim
+//......comment.......
+\endverbatim
+Use them sparingly and only when they add information that the code structure itself does not already communicate.
+
+\section ext_docs_how_to Writing External Documentation Pages
+Standalone documentation pages are useful for workflows, subsystem overviews, and contributor guidance that do not fit well in API comments.
+Keep these pages close to the code or assets they describe, and prefer concise pages with stable guidance over long step-by-step procedures that are likely to go stale.
+
+PandA also uses conditional Doxygen sections for documentation that should only appear when a given project area is enabled. Use the existing section conventions already present in the tree when you need this behavior, for example:
+\verbatim
+\if BAMBU
+.....documentation about the BAMBU project.....
+\endif
+\endverbatim
+
+\section doc_compilation_how_to Compiling the Documentation
+The repository provides a versioned Doxygen configuration in \c documentation/Doxyfile.
+Use the documentation command exposed by your configured build tree when available, or invoke Doxygen directly with that file if you are working on the documentation setup itself.
+
+When updating these pages:
+- prefer references to checked-in files over references to external websites;
+- avoid hard-coding version matrices or host-specific package lists unless they are actively maintained;
+- remove or rewrite pages whose main content is no longer aligned with the current repository layout or build flow.
+*/

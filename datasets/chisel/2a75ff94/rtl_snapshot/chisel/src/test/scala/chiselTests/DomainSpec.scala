@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package chiselTests
+
+import chisel3._
+import chisel3.domain.{domainOf, Domain, Field}
+import chisel3.domains.ClockDomain
+import chisel3.experimental.dataview._
+import chisel3.properties.Property
+import chisel3.testing.FileCheck
+import chisel3.experimental.hierarchy.{instantiable, public, Instantiate}
+import circt.stage.ChiselStage
+import org.scalatest.flatspec.AnyFlatSpec
+import org.scalatest.matchers.should.Matchers
+import scala.annotation.nowarn
+
+class DomainSpec extends AnyFlatSpec with Matchers with FileCheck {
+
+  object PowerDomain extends Domain {
+
+    override def fields = Seq(
+      ("name", Field.String),
+      ("voltage", Field.Integer),
+      ("alwaysOn", Field.Boolean)
+    )
+
+    def apply(name: String, voltage: Int, alwaysOn: Boolean): domain.Type =
+      PowerDomain(Property(name), Property(voltage), Property(alwaysOn))
+
+  }
+
+  behavior of "Domains"
+
+  they should "emit FIRRTL for internal and user-defined domains" in {
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val B = IO(Input(PowerDomain.Type()))
+      val a = IO(Input(Bool()))
+      val b = IO(Output(Bool()))
+
+      associate(a, A)
+      associate(b, B)
+
+      b :<= domain.unsafeCast(a, B)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK:      circuit Foo :
+         |CHECK:        domain ClockDomain :
+         |CHECK-NEXT:     name : String
+         |CHECK-NEXT:     source : String
+         |CHECK-NEXT:     relationship : String
+         |
+         |CHECK:        domain PowerDomain :
+         |CHECK-NEXT:     name : String
+         |CHECK-NEXT:     voltage : Integer
+         |CHECK-NEXT:     alwaysOn : Bool
+         |
+         |CHECK:        public module Foo :
+         |CHECK-NEXT:     input A : Domain of ClockDomain
+         |CHECK-NEXT:     input B : Domain of PowerDomain
+         |CHECK-NEXT:     input a : UInt<1> domains [A]
+         |CHECK-NEXT:     output b : UInt<1> domains [B]
+         |
+         |CHECK:          node [[cast:.*]] = unsafe_domain_cast(a, B)
+         |CHECK-NEXT:     connect b, [[cast]]
+         |""".stripMargin
+    }
+
+  }
+
+  they should "fail to work with blackboxes" in {
+
+    @nowarn("cat=deprecation")
+    class Bar extends BlackBox {
+      val io = IO {
+        new Bundle {
+          val A = Input(ClockDomain.Type())
+          val a = Input(UInt(1.W))
+        }
+      }
+      associate(io.a, io.A)
+    }
+
+    class Foo extends Module {
+      private val bar = Module(new Bar)
+    }
+
+    intercept[ChiselException] {
+      ChiselStage.elaborate(new Foo, Array("--throw-on-first-error"))
+    }.getMessage should include("Unable to associate data")
+
+  }
+
+  they should "work for extmodules" in {
+
+    class Bar extends ExtModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val a = IO(Input(UInt(1.W)))
+      associate(a, A)
+    }
+
+    class Foo extends RawModule {
+      private val bar = Module(new Bar)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK:      extmodule Bar :
+         |CHECK-NEXT:   input A : Domain of ClockDomain
+         |CHECK-NEXT:   input a : UInt<1> domains [A]
+         |""".stripMargin
+    }
+
+  }
+
+  they should "be capable of being forwarded with the domain define operation" in {
+
+    class Foo extends RawModule {
+      val a = IO(Input(ClockDomain.Type()))
+      val b = IO(Output(ClockDomain.Type()))
+
+      domain.define(b, a)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   domain_define b = a
+         |""".stripMargin
+    }
+
+  }
+
+  they should "work if only a Definition has a domain" in {
+
+    @instantiable
+    class Baz extends RawModule {
+      @public
+      val a = IO(Input(ClockDomain.Type()))
+    }
+
+    @instantiable
+    class Bar extends RawModule {
+      private val baz = Instantiate(new Baz)
+    }
+
+    class Foo extends RawModule {
+      private val bar = Instantiate(new Bar)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: domain ClockDomain :
+         |""".stripMargin
+    }
+  }
+
+  behavior of "The associate method"
+
+  it should "error if given zero arguments" in {
+
+    class Foo extends RawModule {
+      val a = IO(Input(Bool()))
+      associate(a)
+    }
+
+    intercept[IllegalArgumentException] {
+      ChiselStage.elaborate(new Foo)
+    }.getMessage should include("cannot associate a port or wire with zero domains")
+
+  }
+
+  it should "work on views" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val a = IO(Input(Bool()))
+      associate(a.viewAs[Bool], A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input a : UInt<1> domains [A]
+         |""".stripMargin
+    }
+  }
+
+  it should "work with FlatIO" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val io = FlatIO(new Bundle {
+        val a = Input(Bool())
+      })
+      associate(io.a, A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input a : UInt<1> domains [A]
+         |""".stripMargin
+    }
+  }
+
+  it should "allow for multiple ports" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val a, b = IO(Input(Bool()))
+      associate(Seq(a, b), A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK:   input a : UInt<1> domains [A]
+         |CHECK:   input b : UInt<1> domains [A]
+         |""".stripMargin
+    }
+  }
+
+  behavior of "unsafe_domain_cast"
+
+  it should "work for zero, one, and two casts" in {
+
+    object DomainA extends Domain
+    object DomainB extends Domain
+
+    class Foo extends RawModule {
+      val A = IO(Input(DomainA.Type()))
+      val B = IO(Input(DomainB.Type()))
+      val in = IO(Input(Bool()))
+
+      val out = IO(Output(Bool()))
+
+      out :<= domain.unsafeCast(in)
+      out :<= domain.unsafeCast(in, A)
+      out :<= domain.unsafeCast(in, B)
+      out :<= domain.unsafeCast(in, A, B)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: unsafe_domain_cast(in)
+         |CHECK: unsafe_domain_cast(in, A)
+         |CHECK: unsafe_domain_cast(in, B)
+         |CHECK: unsafe_domain_cast(in, A, B)
+         |""".stripMargin
+    }
+
+  }
+
+  behavior of "domain subfield access"
+
+  it should "allow accessing fields of a domain port" in {
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val nameOut = IO(Output(Property[String]()))
+      val sourceOut = IO(Output(Property[String]()))
+
+      nameOut := A.field.name
+      sourceOut := A.field.source
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input A : Domain of ClockDomain
+         |CHECK:   output nameOut : String
+         |CHECK:   output sourceOut : String
+         |CHECK:   propassign nameOut, A.name
+         |CHECK:   propassign sourceOut, A.source
+         |""".stripMargin
+    }
+
+  }
+
+  behavior of "domain instantiation"
+
+  it should "allow instantiating a synchronous domain" in {
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val B = IO(Output(ClockDomain.Type()))
+
+      val b = ClockDomain.synchronous(A, "_1to4")
+      domain.define(B, b)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input A : Domain of ClockDomain
+         |CHECK:   output B : Domain of ClockDomain
+         |CHECK:   wire [[name:.+]] : String
+         |CHECK:   propassign [[name]], string_concat(A.name, String("_1to4"))
+         |CHECK:   domain [[b:.*]] of ClockDomain([[name]], A.name, String("synchronous"))
+         |CHECK:   domain_define B = [[b]]
+         |""".stripMargin
+    }
+
+  }
+
+  it should "allow instantiating a rational domain" in {
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val B = IO(Output(ClockDomain.Type()))
+
+      val b = ClockDomain.rational(A, "_2to3")
+      domain.define(B, b)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input A : Domain of ClockDomain
+         |CHECK:   output B : Domain of ClockDomain
+         |CHECK:   wire [[name:.+]] : String
+         |CHECK:   propassign [[name]], string_concat(A.name, String("_2to3"))
+         |CHECK:   domain [[b:.*]] of ClockDomain([[name]], A.name, String("rational"))
+         |CHECK:   domain_define B = [[b]]
+         |""".stripMargin
+    }
+
+  }
+
+  object ListDomain extends Domain {
+    override def fields = Seq(
+      "roots" -> Field.List(Field.Integer),
+      "nested" -> Field.List(Field.List(Field.Integer))
+    )
+
+    def apply(roots: Property[_], nested: Property[_]): chisel3.domain.Type = super.apply(roots, nested)
+  }
+
+  class ListDomainModule extends RawModule {
+    val A = IO(Input(ListDomain.Type()))
+    val B = IO(Output(ListDomain.Type()))
+    val roots = IO(Output(Property[Seq[Int]]()))
+    val nested = IO(Output(Property[Seq[Seq[Int]]]()))
+
+    roots := A.field.roots
+    nested := A.field.nested
+    domain.define(B, ListDomain(Property(Seq(1, 2)), Property(Seq(Seq(3), Seq.empty[Int]))))
+  }
+
+  it should "support list fields, including nested and empty lists" in {
+    ChiselStage.emitCHIRRTL(new ListDomainModule).fileCheck() {
+      """|CHECK:      domain ListDomain :
+         |CHECK-NEXT:   roots : List<Integer>{{$}}
+         |CHECK-NEXT:   nested : List<List<Integer>>{{$}}
+         |CHECK:        propassign roots, A.roots
+         |CHECK-NEXT:   propassign nested, A.nested
+         |CHECK:        domain [[instance:.+]] of ListDomain(List<Integer>(Integer(1), Integer(2)), List<List<Integer>>(List<Integer>(Integer(3)), List<Integer>()))
+         |CHECK:        domain_define B = [[instance]]
+         |""".stripMargin
+    }
+  }
+
+  it should "reject a mismatched element type in a nested list field" in {
+    class Foo extends RawModule {
+      ListDomain(Property(Seq(1)), Property(Seq(Seq("wrong"))))
+    }
+
+    intercept[ChiselException] {
+      ChiselStage.elaborate(new Foo, Array("--throw-on-first-error"))
+    }.getMessage should include("field 'nested' expects Property[List[List[Int]]] but got Property[List<List<String>>]")
+  }
+
+  it should "compile list-valued domains to SystemVerilog" in {
+    ChiselStage.emitSystemVerilog(new ListDomainModule, firtoolOpts = Array("--domain-mode=infer-all")) should include(
+      "module ListDomainModule"
+    )
+  }
+
+  it should "error when property type doesn't match field type" in {
+
+    object TestDomain extends Domain {
+      override def fields = Seq(
+        ("name", Field.String),
+        ("value", Field.Integer),
+        ("flag", Field.Boolean)
+      )
+      def apply(): chisel3.domain.Type = TestDomain(Property("test"), Property("wrong"), Property(true))
+    }
+
+    class WrongTypeModule extends RawModule {
+      // Wrong type for second field: String instead of Integer
+      val bad = TestDomain()
+    }
+
+    val exception = intercept[ChiselException] {
+      ChiselStage.elaborate(new WrongTypeModule, Array("--throw-on-first-error"))
+    }
+    exception.getMessage should include("field 'value' expects Property[Int] but got Property[String]")
+
+  }
+
+  it should "error when property count doesn't match field count" in {
+
+    object TestDomain extends Domain {
+      override def fields = Seq(
+        ("name", Field.String),
+        ("value", Field.Integer),
+        ("flag", Field.Boolean)
+      )
+      def apply(): chisel3.domain.Type = TestDomain(Property("test"))
+    }
+
+    class WrongCountModule extends RawModule {
+      // Only one property when three are expected
+      val bad = TestDomain()
+    }
+
+    val exception = intercept[ChiselException] {
+      ChiselStage.elaborate(new WrongCountModule, Array("--throw-on-first-error"))
+    }
+    exception.getMessage should include("requires 3 properties but got 1")
+
+  }
+
+  behavior of "Wire domain associations"
+
+  it should "allow associating a wire with a domain" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val w = Wire(UInt(8.W))
+      associate(w, A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   input A : Domain of ClockDomain
+         |CHECK:   wire w : UInt<8> domains [A]
+         |""".stripMargin
+    }
+  }
+
+  it should "allow associating a wire with multiple domains" in {
+    object PowerDomain extends Domain {
+      override def fields = Seq(
+        ("name", Field.String),
+        ("voltage", Field.Integer)
+      )
+    }
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val B = IO(Input(PowerDomain.Type()))
+      val w = Wire(UInt(16.W))
+      associate(w, A, B)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK: module Foo :
+         |CHECK:   wire w : UInt<16> domains [A, B]
+         |""".stripMargin
+    }
+  }
+
+  it should "error if associating a wire from another module" in {
+    class Bar extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val w = Wire(UInt(8.W))
+    }
+
+    class Foo extends RawModule {
+      val bar = Module(new Bar)
+      val A = IO(Input(ClockDomain.Type()))
+      // Try to associate a wire from another module
+      associate(bar.w, A)
+    }
+
+    intercept[ChiselException] {
+      ChiselStage.elaborate(new Foo, Array("--throw-on-first-error"))
+    }.getMessage should include("Unable to associate")
+  }
+
+  it should "error if associating a subfield of a wire" in {
+    class ClockReset extends Bundle {
+      val clock = Clock()
+      val reset = Reset()
+    }
+
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val source = IO(Input(new ClockReset))
+      val w = Wire(new ClockReset)
+      w := source
+      associate(w.clock, A)
+    }
+
+    intercept[ChiselException] {
+      ChiselStage.elaborate(new Foo, Array("--throw-on-first-error"))
+    }.getMessage should include("Unable to associate")
+  }
+
+  it should "allow associating a whole aggregate wire" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val w = Wire(new Bundle { val x = UInt(8.W) })
+      associate(w, A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo) should include("domains [A]")
+  }
+
+  it should "work with multiple wires" in {
+    class Foo extends RawModule {
+      val A = IO(Input(ClockDomain.Type()))
+      val w1 = Wire(UInt(8.W))
+      val w2 = Wire(UInt(8.W))
+      associate(Seq(w1, w2), A)
+    }
+
+    ChiselStage.emitCHIRRTL(new Foo).fileCheck() {
+      """|CHECK:   wire w1 : UInt<8> domains [A]
+         |CHECK:   wire w2 : UInt<8> domains [A]
+         |""".stripMargin
+    }
+  }
+
+  it should "error if given zero domains" in {
+    class Foo extends RawModule {
+      val w = Wire(UInt(8.W))
+      associate(w)
+    }
+
+    intercept[IllegalArgumentException] {
+      ChiselStage.elaborate(new Foo)
+    }.getMessage should include("cannot associate a port or wire with zero domains")
+  }
+
+  behavior of "The domainOf API"
+
+  it should "return the type of a port" in {
+    class Foo extends RawModule {
+      val a = IO(Input(Bool()))
+      val A = IO(Input(ClockDomain.Type()))
+      val B = IO(Output(ClockDomain.Type()))
+      associate(a, A)
+
+      domain.define(B, domainOf(a, ClockDomain.Type()))
+    }
+
+    // Test that domain port `B` is connected to domain port `A`.
+    //
+    // Note: this test is slightly brittle as the temporary wire is left in.  It
+    // is fine if this, in a later version of `firtool` does a direct
+    // connection.
+    ChiselStage
+      .emitFIRRTLDialect(new Foo, firtoolOpts = Array("-domain-mode=infer-all", "-strip-domain=false"))
+      .fileCheck() {
+        """|CHECK:      %[[D:.+]] = firrtl.wire : !firrtl.domain
+           |CHECK-NEXT: firrtl.domain.define %[[D]], %A
+           |CHECK-NEXT: firrtl.domain.define %B, %[[D]]
+           |firrtl.domain.define
+           |""".stripMargin
+      }
+  }
+
+  it should "error if the domain of a non-hardware type is queried" in {
+    intercept[ExpectedHardwareException] {
+      domainOf(Bool(), ClockDomain.Type())
+    }
+  }
+
+  behavior of "The domain.Mux API"
+
+  it should "allow connection of two muxed outputs" in {
+    class Bar extends Bundle {
+      val x = Bool()
+      val y = Bool()
+    }
+    class Foo extends RawModule {
+      val A, B, SEL = IO(Input(ClockDomain.Type()))
+      val OUT = IO(Output(ClockDomain.Type()))
+      val a, b = IO(Input(new Bar))
+      associate(a, A)
+      associate(b, B)
+      val sel = IO(Input(Bool()))
+      associate(sel, SEL)
+      val out = IO(Output(Bool()))
+      associate(out, OUT)
+
+      private val pair = domain.Mux(sel, a, b, ClockDomain("a_b_muxed"))
+
+      out :<= pair.x ^ pair.y
+    }
+
+    ChiselStage.emitSystemVerilog(new Foo, firtoolOpts = Array("--domain-mode=infer-all"))
+  }
+
+  it should "allow for multiple casts of different domain kinds" in {
+    class Foo extends RawModule {
+      val CLOCK_A, CLOCK_B = IO(Input(ClockDomain.Type()))
+      val POWER_A, POWER_B = IO(Input(PowerDomain.Type()))
+      val a, b, sel = IO(Input(Bool()))
+      val out = IO(Output(Bool()))
+
+      out :<= domain.Mux(sel, a, b, ClockDomain("clock_a_b_muxed"), PowerDomain("power_a_b_muxed", 42, false))
+    }
+
+    ChiselStage
+      .emitCHIRRTL(new Foo)
+      .fileCheck() {
+        """|CHECK-LABEL: module Foo :
+           |CHECK:         domain [[clock:.+]] of ClockDomain
+           |CHECK-NEXT:    domain [[power:.+]] of PowerDomain
+           |CHECK:         node [[sel:.+]] = unsafe_domain_cast(sel, [[clock]], [[power]])
+           |CHECK-NEXT:    node [[a:.+]] = unsafe_domain_cast(a, [[clock]], [[power]])
+           |CHECK-NEXT:    node [[b:.+]] = unsafe_domain_cast(b, [[clock]], [[power]])
+           |CHECK-NEXT:    mux([[sel]], [[a]], [[b]])
+           |""".stripMargin
+      }
+  }
+
+  behavior of "Clock Domains"
+
+  they should "check that two domains are synchronous" in {
+
+    class Foo extends RawModule {
+      val A = ClockDomain("A")
+      val B = ClockDomain.rational(A, "_4to3")
+      ClockDomain.Relationship.assertSynchronous(A, B)
+    }
+
+    intercept[Exception] {
+      ChiselStage.emitSystemVerilog(
+        new Foo,
+        firtoolOpts = Array(
+          "-default-layer-specialization=disable",
+          "-domain-mode=infer-all",
+          "-strip-domain=false",
+          "-output-final-mlir",
+          "/dev/null"
+        )
+      )
+    }.getMessage should include(
+      "Clock domain 'A' (with relationship 'synchronous' to clock domain 'A') and clock domain 'A_4to3' (with relationship 'rational' to clock domain 'A') are not synchronously related to each other.  They must have the same clock domain source and a synchronous relationship."
+    )
+
+  }
+
+  they should "check that two domains are rational" in {
+
+    class Foo extends RawModule {
+      val A = ClockDomain("A")
+      val B = ClockDomain("B")
+      ClockDomain.Relationship.assertRational(A, B)
+    }
+
+    intercept[Exception] {
+      ChiselStage.emitSystemVerilog(
+        new Foo,
+        firtoolOpts = Array(
+          "-default-layer-specialization=disable",
+          "-domain-mode=infer-all",
+          "-strip-domain=false",
+          "-output-final-mlir",
+          "/dev/null"
+        )
+      )
+    }.getMessage should include(
+      "Clock domain 'A' (with relationship 'synchronous' to clock domain 'A') and clock domain 'B' (with relationship 'synchronous' to clock domain 'B') are not synchronously or rationally related to each other.  They must have the same clock domain source and a synchronous or rational relationship."
+    )
+  }
+
+}

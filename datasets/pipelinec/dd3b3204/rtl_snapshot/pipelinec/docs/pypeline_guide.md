@@ -1,0 +1,7033 @@
+# Pypeline HDL Language Guide
+
+Pypeline is the Python front-end for PypelineC. This guide describes the
+Pypeline HDL source language: its syntax, types, APIs, hardware meaning, and
+source-level restrictions. Commands, build modes, synthesis backends, and
+generated files are documented in the [Tools & CLI](README.md#tools--cli) guide.
+
+For getting started information see the [README](README.md).
+
+## Table of Contents
+
+**Part I — The language**
+
+1. [What is Pypeline?](#what-is-pypeline)
+2. [Worked Example: VGA Test Pattern](#worked-example-vga-test-pattern)
+3. [Digital Logic Basics](#digital-logic-basics)
+4. [Python vs Hardware Execution](#python-vs-hardware-execution)
+5. [Simulation](#simulation)
+6. [Top-Level Entry Points](#top-level-entry-points)
+    - [MAINs made in code: `MAIN(fn, name=...)`](#mains-made-in-code-mainfn-name)
+7. [Your First Hardware Function](#your-first-hardware-function)
+8. [Calling Functions](#calling-functions)
+9. [Registers: `Reg[T]`](#registers-regt)
+10. [Feedback Wires: `Feedback[T]`](#feedback-wires-feedbackt)
+11. [Bit Manipulation](#bit-manipulation)
+12. [Basic Types](#basic-types)
+13. [Build Parameters: `param()` and `-D`](#build-parameters-param-and--d)
+14. [Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions)
+15. [Factory-Generated Types](#factory-generated-types)
+16. [Custom Operators](#custom-operators)
+17. [Global Signals](#global-signals)
+    - [`Inst[f]` — global instances](#instf--global-instances)
+    - [`Fifo[T]` — global FIFOs](#fifot--global-fifos)
+
+**Part II — Temporal behavior**
+
+18. [Resets](#resets)
+19. [Multi-Cycle Paths: `MULTI_CYCLE[...]`](#multi-cycle-paths-multi_cycle)
+20. [Automatic (HLS-like) Implementation](#automatic-hls-like-implementation)
+    - [`AUTO_PIPELINE(...)`](#auto_pipeline)
+      - [`AUTO_PIPELINE_RAM`](#auto_pipeline_ram)
+    - [`AUTO_MULTI_CYCLE(...)`](#auto_multi_cycle)
+    - [`AUTO_COMB_AREA_OPT(...)` / `AUTO_COMB_DELAY_OPT(...)` (Experimental)](#auto_comb_area_opt--auto_comb_delay_opt-experimental)
+    - [`AUTO_FSM(...)` (Experimental)](#auto_fsm-experimental)
+
+**Part III — Ports and streams**
+
+21. [Keep-Tagged Lanes: `kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t)
+22. [N-Dimensional Stream Fragments: `ndarray_fragment_t`](#n-dimensional-stream-fragments-ndarray_fragment_t)
+23. [Streams: `stream_t`](#streams-stream_t)
+24. [Bidirectional Ports: `@interface`](#bidirectional-ports-interface)
+25. [AXI-Stream: `axis_t`](#axi-stream-axis_t)
+26. [Byte-Stream Serialization: `make_serializer` / `make_deserializer`](#byte-stream-serialization-make_serializer--make_deserializer)
+27. [Struct ↔ AXI-Stream: `make_axis_to_type` / `make_type_to_axis`](#struct--axi-stream-make_axis_to_type--make_type_to_axis)
+28. [Host Type Export Declarations](#host-type-export-declarations)
+29. [FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo)
+30. [RAMs: `make_ram` / `make_stream_ram`](#rams-make_ram--make_stream_ram)
+31. [Skid Buffers: `make_skid_buffer`](#skid-buffers-make_skid_buffer)
+32. [Pipelined Stream Wrappers: `make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline)
+33. [Multi-Cycle Stream Wrapper: `make_stream_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle)
+34. [Combinational Optimization Stream Wrappers: `make_stream_auto_comb_area_opt` / `make_stream_auto_comb_delay_opt` (Experimental)](#combinational-optimization-stream-wrappers-make_stream_auto_comb_area_opt--make_stream_auto_comb_delay_opt-experimental)
+35. [Stream Wrapper for AUTO_FSM: `make_stream_auto_fsm` (Experimental)](#stream-wrapper-for-auto_fsm-make_stream_auto_fsm-experimental)
+36. [Stream Performance Measurement: Probes & Bottlenecks](#stream-performance-measurement-probes--bottlenecks)
+
+**Part IV — Multiple clock domains**
+
+37. [Clock Domains](#clock-domains)
+38. [Async Wires: `Wire[T, ASYNC]`](#async-wires-wiret-async)
+39. [Clock-Crossing FIFOs](#clock-crossing-fifos)
+40. [Building and Simulating Multi-Clock Designs](#building-and-simulating-multi-clock-designs)
+
+**Part V — Escape hatches**
+
+41. [Raw VHDL Passthrough: `vhdl()`](#raw-vhdl-passthrough-vhdl)
+42. [Fixed User Pipelines: `@pipeline_latency`](#fixed-user-pipelines)
+43. [Just-Wires Synthesis Hint: `@wires`](#just-wires-synthesis-hint-wires)
+
+**Part VI — Reference**
+
+44. [Simulation Reference](#simulation-reference)
+45. [DSP: Filters & Signal Conditioning](#dsp-filters--signal-conditioning)
+46. [Source Naming Rules](#source-naming-rules)
+47. [Limitations / Not Yet Supported](#limitations--not-yet-supported)
+
+---
+
+## What is Pypeline?
+
+Pypeline lets you describe digital hardware using Python syntax.
+A design file is a regular Python module.
+Module-level code (constants, type definitions, helper factories) runs as plain Python at
+compile time.
+Functions whose arguments and return value carry type annotations describe hardware
+circuits; the compiler translates their bodies into logic and emits VHDL via the
+PypelineC backend.
+
+The mental model: **a hardware-annotated function is a circuit module**,
+not a subroutine.
+Its inputs and outputs are wires, its local variables are signals, and every line of its
+body describes combinational or sequential logic.
+
+Pure (combinational) functions can be automatically pipelined by PypelineC to meet timing —
+you write the dataflow, the tool inserts pipeline registers wherever needed to hit the
+target clock frequency.
+
+Pypeline is actively evolving; see [Limitations](#limitations--not-yet-supported) for known gaps before you dive in.
+
+---
+
+## Worked Example: VGA Test Pattern
+
+This is a complete, real design example. Each piece used here (registers,
+bit-slicing, structs, top-level entry points, global wires, simulation hooks, factory
+functions) is explained in its own section later in this guide; this walkthrough links to
+each of them at first use.
+
+See the full design that generates a colour test pattern on a VGA monitor at `examples/pypeline/vga_test_pattern.py`.
+
+### Imports
+
+```python
+from pypeline import *
+
+import board.arty.part35t          # sets PART for the Arty A7-35T
+import board.arty.vga_pmod_ja_jb as board_vga   # board-level output wires
+
+from vga.types import vga_timing_signals_t, vga_12bpp_t
+from vga.timing import make_vga_timing, VGA_640_480
+
+vga_timing = make_vga_timing(VGA_640_480)  # factory: produces a timing generator function
+```
+
+`PART(...)` (called inside `board.arty.part35t`) sets the FPGA target device — see
+[Top-Level Entry Points](#top-level-entry-points).
+`vga_timing_signals_t` and `vga_12bpp_t` are struct types — see [Basic Types](#basic-types).
+`make_vga_timing` is a factory closure — see
+[Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions).
+Calling it with a resolution spec produces a hardware function (`vga_timing`) that
+generates VGA sync signals and pixel coordinates.
+
+### Combinational pixel function
+
+```python
+def test_pattern(sig: vga_timing_signals_t) -> vga_12bpp_t:
+    r: uint4_t = sig.pos.x[7:4]          # upper 4 bits of X coordinate
+    g: uint4_t = sig.pos.y[7:4]          # upper 4 bits of Y coordinate
+    b: uint4_t = sig.pos.x[3:0] ^ sig.pos.y[3:0]   # XOR diagonal
+    out_r: uint4_t = 0
+    out_g: uint4_t = 0
+    out_b: uint4_t = 0
+    if sig.active:          # only output colour inside the visible region
+        out_r = r
+        out_g = g
+        out_b = b
+    return vga_12bpp_t(r=out_r, g=out_g, b=out_b, hs=sig.hsync, vs=sig.vsync)
+```
+
+- `sig.pos.x[7:4]` — bit-slice of the X pixel coordinate; see
+  [Bit Manipulation](#bit-manipulation).
+- `sig.active` — hardware `if`, synthesised as a MUX: colour inside the image, black
+  outside; see [Your First Hardware Function](#your-first-hardware-function).
+- `vga_12bpp_t(...)` — compound struct initialiser; see [Basic Types](#basic-types).
+
+### Top-level entry point
+
+```python
+@MAIN(vga_timing.pixel_clk_mhz)   # frequency comes from the resolution spec
+def vga_test_pattern():
+    sig = vga_timing()             # call the timing generator (stateful — contains registers)
+    px  = test_pattern(sig)        # compute pixel colour (combinational)
+    board_vga.vga_pmod = px        # drive the board's output wire
+    capture_pixel(sig, px)         # @sim_output — invisible to the hardware compiler
+```
+
+`@MAIN(mhz)` declares a top-level entry point with a frequency constraint — see
+[Top-Level Entry Points](#top-level-entry-points).
+`vga_timing()` is a hardware function call (submodule instance) that contains
+registers — see [Registers: `Reg[T]`](#registers-regt).
+`board_vga.vga_pmod` is a `Wire[T]` declared in the imported board file; assigning to it
+drives the FPGA pins — see [Global Signals](#global-signals).
+
+### Simulation display
+
+```python
+@sim_output
+def capture_pixel(sig, px):
+    # accumulate pixels into a numpy array and refresh a matplotlib window
+    ...
+```
+
+`@sim_output` marks this as simulation-only — see [Simulation](#simulation).
+The hardware compiler skips it entirely; complete-design native simulation calls it once
+per clock cycle after wire convergence.
+
+One frame of 640×480 video at 25 MHz is 800 × 525 = 420,000 cycles. See
+[Tools & CLI](README.md#tools--cli) for commands that simulate this source or build it
+for the selected device.
+
+### Reference: HDL concept → Pypeline syntax
+
+For readers coming from a traditional HDL (or the PipelineC C front end):
+
+| HDL concept | Pypeline syntax |
+|---|---|
+| Flip-flop | `Reg[T]` |
+| Wire | `Wire[T]`, or a plain local variable |
+| Clock domain | `@MAIN` |
+| Module | `@hw_func` (or any type-annotated function) |
+| Input / output port | `Input[T]` / `Output[T]`, or a function argument / return value |
+| Combinational logic | A plain function (no `Reg`/`Feedback`) |
+| State machine | `AUTO_FSM(...)`, or a hand-written `Reg[state_t]`-based FSM |
+
+### Reference: Python construct → hardware meaning
+
+This is the positive-space complement to [Limitations](#limitations--not-yet-supported)
+(the negative space) — cross-reference the two rather than re-deriving restrictions here.
+
+| Python construct | Meaning | Restriction |
+|---|---|---|
+| `if` / `else` | Multiplexer selecting between both elaborated branches | No early return from inside a branch ([#343](https://github.com/JulianKemmerer/PipelineC/discussions/343)) |
+| `for range(N)` | Unrolled N times at compile time | `N` must be a compile-time constant ([#344](https://github.com/JulianKemmerer/PipelineC/discussions/344)) |
+| `while` | Unrolled at compile time | Condition must be compile-time evaluable ([#344](https://github.com/JulianKemmerer/PipelineC/discussions/344)) |
+| Function call | Instantiates a hardware submodule | Each call site is a distinct instance |
+| Assignment | Drives a wire/register | — |
+| Ternary (`a if c else b`) | Same MUX as `if`/`else`, as an expression | — |
+| `return` | Declares the module's output port(s) | At most one, as the final top-level statement ([#343](https://github.com/JulianKemmerer/PipelineC/discussions/343)) |
+| Augmented assignment (`+=`, etc.) | Sugar for `x = x <op> y` | — |
+| `and` / `or` | Boolean combine, each operand normalised to `uint1_t` | Result is always `uint1_t` |
+
+---
+
+## Digital Logic Basics
+
+This section is a brief primer for readers new to hardware description languages.
+Skip ahead if you already know VHDL or Verilog.
+
+### The clock
+
+Digital circuits are driven by a periodic clock signal.
+Every clock cycle — typically nanoseconds — all flip-flops sample their inputs and latch
+new values simultaneously.
+Everything that happens *between* two clock edges is **combinational logic**:
+pure boolean/arithmetic computation with no memory.
+
+### Combinational logic
+
+A circuit that computes an output purely from its current inputs, with no stored state,
+is called combinational.
+It is the hardware equivalent of a pure function: same inputs always produce the same
+output, instantaneously.
+
+```python
+def add(a: uint32_t, b: uint32_t) -> uint32_t:
+    return a + b
+```
+
+### Registers (sequential logic)
+
+A register is a flip-flop: it stores one value and updates it on every clock edge.
+Functions that contain registers are **sequential** — their output depends on past history
+as well as current inputs.
+
+```python
+@hw_func
+def counter(increment: uint1_t) -> uint32_t:
+    count: Reg[uint32_t]   # register, initialised to 0 at power-on
+    if increment:
+        count = count + 1
+    return count
+```
+
+`count` reads its stored value at the start of each clock cycle and writes a new value
+that will be latched at the next clock edge.
+
+### Wires
+
+Local variables inside a hardware function are **wires**: named signal paths that carry a
+value from one point in the circuit to another within the same clock cycle.
+They have no memory; they are recomputed fresh every cycle.
+
+### The execution model
+
+From a user's perspective:
+- Each clock cycle the `@MAIN` function (and everything it calls) runs once.
+- Registers hold their value from the *previous* cycle; their new value is committed at
+  the *end* of the cycle.
+- Everything else is combinational and happens "instantly" within the cycle.
+
+---
+
+## Python vs Hardware Execution
+
+**Python executes the elaboration; hardware is what the annotated function describes.**
+That single sentence is the whole mental model — every rule in this section is just that
+idea worked out for a specific piece of syntax.
+
+- **Module-level Python code runs once, at elaboration time.** Constants, type
+  definitions, factory calls — none of it is hardware; it's the plain Python that
+  *produces* hardware descriptions.
+- **A hardware-annotated function is a circuit module, not a subroutine.** Calling it
+  doesn't "run" it in the software sense — it instantiates hardware (see
+  [Calling Functions](#calling-functions)).
+- **`if`/`else` on a hardware value becomes a MUX**, not a branch. Both arms are
+  elaborated into real logic; a multiplexer picks between their results every cycle (see
+  [Control flow](#your-first-hardware-function)).
+- **`for`/`while` loops are unrolled at compile time.** The loop variable is a plain
+  Python value (an int, or any other compile-time-constant object — a tuple, a string,
+  whatever the loop iterates over); the compiler emits one copy of the loop body per
+  iteration (see [`for`/`while` → loop unrolling](#your-first-hardware-function)).
+- **Registers have cycle semantics, not variable semantics.** A `Reg[T]` read returns
+  the value latched at the *previous* clock edge; a write schedules the value latched at
+  the *next* one (see [Registers: `Reg[T]`](#registers-regt)).
+- **Each call site instantiates a distinct piece of hardware.** Two calls to the same
+  function are two separate circuits with independent state, not two invocations of
+  shared code (see [Each call site is a separate instance](#calling-functions)).
+
+### What compile-time Python may do
+
+Because module-level code (and the Python surrounding a hardware function's elaboration)
+runs before any hardware exists, it can do things a hardware function's body cannot:
+
+- **Build specialised hardware with factories** — an ordinary Python closure that
+  returns a hardware function, parameterised by type/width/count. See the
+  [size-parametric factory example](#size-parametric-example) in
+  [Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions).
+- **Use `range(N)` as a compile-time loop bound** — `N` must be a plain Python integer
+  known at elaboration time, not a hardware signal.
+- **Generate types and functions on demand** — `make_uint_t(N)`, `make_fixed_t(I, F)`,
+  a factory-built `@struct`, and similar all run as ordinary Python producing a new type
+  or function object.
+- **Compute constants** — arithmetic on plain Python `int`/`float` values, list/dict
+  comprehensions building lookup tables, anything that resolves to a fixed value before
+  synthesis.
+- **Introspect types** — `T.typeof(field)`, `hw_arg_types(func)`, `hw_return_type(func)`
+  read a type's/function's structure at elaboration time to build code that adapts to it.
+
+None of this produces hardware by itself — it produces the *Python objects* (functions,
+types, constants) that, once called/used inside a hardware-annotated function, do.
+
+### Glossary
+
+**Software vocabulary, as used in this guide:**
+
+| Term | Meaning here |
+|---|---|
+| Closure | A Python function that captures variables from an enclosing factory call — how parametric hardware is built |
+| Factory | A plain Python function that *returns* a hardware function or type, specialised by its arguments |
+| Decorator | `@hw_func`, `@MAIN`, `@struct`, etc. — Python syntax that tags a function/class for the elaborator |
+
+**Hardware vocabulary, as used in this guide:**
+
+| Term | Meaning here |
+|---|---|
+| Register | A flip-flop: stores one value, updates on the clock edge (`Reg[T]`) |
+| Wire | A named signal path with no memory, recomputed every cycle (a local variable, or `Wire[T]`) |
+| MUX | A multiplexer — the hardware an `if`/ternary compiles to |
+| Port | An input/output of a hardware module (`Input[T]`/`Output[T]`, or a function argument/return value) |
+
+**The four execution worlds this codebase has** — a given line of code or a given
+"cycle" always belongs to exactly one of these, and mixing them up is the single most
+common source of confusion:
+
+| World | What's actually running |
+|---|---|
+| Elaboration time | Plain Python, at compile time — module-level code, factories, `for` loop unrolling |
+| Hardware cycle time | Real clock edges on real (or synthesized) silicon |
+| Native simulation time | Python simulation of Pypeline source through `sim_call` or the complete-design simulator |
+| VHDL simulation time | cocotb + GHDL simulating the actual generated VHDL |
+
+This guide uses "elaboration time" and "compile time" interchangeably for the first row —
+"elaboration time" when describing *when* code runs, "compile-time constant"/"compile-time
+loop bound" as the idiomatic adjective form for a value known at that point. Both name the
+same world.
+
+Native and VHDL simulation *should* always agree. Do not collapse these two into one
+"simulation" world when a passage is distinguishing them. The
+[`sim_print(..., debug=True)`](#sim_print-debugtrue--tagged-prints) source annotation
+marks observations that the cycle-diff tooling can compare.
+
+Later sections use inline **Compile time:** / **Hardware:** / **Simulation:** labels
+wherever a passage risks ambiguity about which of these worlds is being discussed.
+
+---
+
+## Simulation
+
+Pypeline source can be simulated directly in Python. This section covers the language
+APIs for decorating and calling functions. The rest of the
+simulation feature set — `@sim_output`/`@sim_input`, `sim_print`/`sim_assert`/`sim_finish`,
+`@initial`/`@final` start/end hooks, `@sim_model`, and debug-tagged output — is reference
+material covered in
+[Simulation Reference](#simulation-reference) in Part VI, once you've got the basics down.
+
+**Testbenches run on the built design.** Keep the hardware top, with its real input and
+output ports, in its own file, and import its modules from the testbench. Build the top,
+then simulate the testbench in the top's output directory
+(`pypelinec tb.py --sim --run all --out_dir <the top's>`): the testbench runs natively with
+the latencies that build chose, and builds nothing itself. Building a testbench top would
+time hardware that synthesis may have cut down around constant or `@sim_input` stimulus.
+See [Simulating a testbench on built hardware](README.md#simulating-a-testbench-on-built-hardware).
+
+### `@hw_func`
+
+Decorate hardware helper functions with `@hw_func`.
+This is required for register simulation and is harmless on combinational-only functions.
+
+```python
+from pypeline import hw_func, uint32_t, Reg
+
+@hw_func
+def accumulator(data: uint32_t) -> uint32_t:
+    acc: Reg[uint32_t]
+    acc = acc + data
+    return acc
+```
+
+`@MAIN` implies `@hw_func`; you do not need both.
+
+### `sim_call` — single-function simulation
+
+```python
+from pypeline import sim_call, sim_reset, uint32_t
+
+sim_reset()                          # reset to power-on state (non-zero inits restored too)
+
+r0 = sim_call(accumulator, 10)       # cycle 1: acc=0+10=10, returns 10
+r1 = sim_call(accumulator, 5)        # cycle 2: acc=10+5=15, returns 15
+assert r0 == 10
+assert r1 == 15
+```
+
+Each call to `sim_call` advances the function by one clock cycle.
+Call `sim_reset()` at the start of each independent test.
+
+`sim_zero(T)` constructs the same correctly typed recursive zero that an
+uninitialized `Reg[T]` receives. It works for scalars, structs, arrays, and their
+combinations, and is useful when a generic `@sim_model` needs an empty output value.
+`sim_wire_reset()` clears only simulated global-wire values and ownership claims while
+leaving register/model state intact; ordinary tests normally want the broader
+`sim_reset()`.
+
+### Registers in simulation — multiple instances
+
+When the same function is called from two different call sites in a `@MAIN`, each site
+gets its own register state in simulation — matching hardware behaviour exactly.
+
+```python
+sim_reset()
+
+@MAIN
+def dual_accum(a: uint32_t, b: uint32_t) -> uint32_t:
+    sum_a = accumulator(a)   # instance 1
+    sum_b = accumulator(b)   # instance 2 — independent register
+    return sum_a + sum_b
+
+r = sim_call(dual_accum, 10, 5)   # sum_a: 0+10=10, sum_b: 0+5=5 → 15
+r = sim_call(dual_accum, 10, 5)   # sum_a: 10+10=20, sum_b: 5+5=10 → 30
+```
+
+Simulation tells call sites apart by source line. Two calls to the same stateful function
+on one line, such as `accumulator(a) + accumulator(b)`, currently share one register in
+simulation, while hardware has two, so the results differ ([#353](https://github.com/JulianKemmerer/PipelineC/issues/353)). Put each call on its
+own line.
+
+### Complete designs with multiple `@MAIN` functions
+
+Designs that communicate through global `Wire[T]` signals require all `@MAIN`
+functions to advance together. Within each simulated cycle, the complete-design
+simulator repeatedly evaluates affected functions until the global wires converge,
+then performs one final side-effect pass and commits register values. A failure to
+converge within 10,000 delta iterations reports a combinational loop or unstable model.
+
+Use `sim_call` for a single function and the complete-design simulator for a hierarchy
+with global wires or multiple `@MAIN` functions. Simulator selection, accuracy modes,
+and invocation belong to [Simulation](README.md#simulation) under Tools & CLI.
+
+---
+
+## Top-Level Entry Points
+
+### `@MAIN`
+
+`@MAIN` marks a function as a top-level entry point — a clock domain.
+The compiler generates one VHDL process per `@MAIN` function.
+
+```python
+from pypeline import MAIN, uint8_t
+
+@MAIN
+def blink() -> uint8_t:
+    cnt: Reg[uint32_t]
+    cnt = cnt + 1
+    return cnt[23]   # MSB of a 24-bit counter blinks an LED
+```
+
+Each argument of a `@MAIN` function becomes a top-level input port named
+`<main>_<argument>`, and its return value an output port named `<main>_return_output`
+(`blink_return_output` above). See
+[Top-level ports and clocks](README.md#top-level-ports-and-clocks) for every kind of port
+a design can have.
+
+Native simulation has nothing to drive those argument ports with, so they read as zero
+every cycle (it prints a notice saying so), and the return value is not observed. To
+give a design stimulus and check its results in simulation, use `Input[T]`/`Output[T]`
+globals with [`@sim_input`](#sim_input--driving-simulation-inputs) and `@sim_output`.
+
+### Frequency constraint
+
+Pass the target clock frequency in MHz to constrain the synthesis tool:
+
+```python
+@MAIN(100.0)
+def my_design(x: uint32_t) -> uint32_t:
+    ...
+
+# keyword form also works:
+@MAIN(mhz=25.0)
+def vga_pixel_gen():
+    ...
+```
+
+A sweep changes only pipelines implicated by failing timing reports. Identical
+functions in separate MAINs can retain independent depths. Results in
+`sweep_history.json` distinguish measured MHz, goal lower bounds, and unknown
+MAINs, and name the retained synthesis observation. Timing before `.latency`
+re-elaboration is provisional until the resulting hardware is confirmed.
+
+Vivado resource overflow warns by default. Use `--stop_on_over_capacity` to
+stop at the first whole-design netlist that exceeds device capacity, preserving
+its reports. Either way, a build that ends on an over-capacity netlist fails
+(`DOES NOT FIT`), even if that netlist met timing. Synthesis timing alone is not routed timing or fit. Complete logs
+are reused only for matching HDL, constraints, tool and report recipe; an
+incomplete matching log requires explicit manual handling.
+
+### MAINs made in code: `MAIN(fn, name=...)`
+
+`MAIN` can also be called on a function. Code can then make `@MAIN`s: one per lane or
+port in a loop, one returned by a factory, or one whose source was generated.
+
+```python
+from pypeline import MAIN, Reg, Wire, hw_func, uint8_t
+
+counts: Wire[uint8_t[4]]
+
+def make_lane(i):
+    @hw_func
+    def lane():
+        n: Reg[uint8_t]
+        counts[i] = n
+        n += i + 1
+    return lane
+
+lanes = [MAIN(make_lane(i), name=f"lane{i}") for i in range(4)]
+```
+
+Each call makes one `@MAIN`: four entities here, `lane0` to `lane3`, each with its own
+counter. `MAIN(fn, name="rx", mhz=100.0)` also gives a rate, and
+`MAIN(fn, name="rx", clock=eth_clk)` a [clock](#declaring-a-clock-make_clock). The decorator takes `name=`
+too: `@MAIN(name="top0")`, `@MAIN(100.0, name="top0")`.
+
+**Names.**
+- Without `name=`, a `@MAIN` is named after its function: `lane` above. In an imported
+  module the name gets the module's prefix (`io_lane`), as a `@MAIN` def's does. A
+  function with its own [`@hw_func(name=...)`](#naming-factory-produced-hardware-name)
+  keeps that name.
+- `name=` is used exactly as written, with no module prefix. It follows the same
+  identifier rules as `@hw_func(name=...)`.
+- The name starts the MAIN's port names: `lane0_<argument>` and `lane0_return_output`.
+- Two `@MAIN`s with one name are an error that names both and asks for `name=`. Names
+  that differ only in case count as one, as in VHDL. So lanes made in a loop each need a
+  `name=`. A `@MAIN` named like another function of the design is an error too.
+- A name must not change between runs of the design: the build runs it more than once,
+  and simulation after a build finds each `@MAIN` by its name.
+
+**Where.**
+- Call `MAIN()` in code that runs while the design is imported: at module level, in a
+  loop, or in a factory or library function the design calls.
+- Calling it from a hardware function or a simulation hook is an error, because by then
+  the design's `@MAIN`s have been collected.
+- Each `@MAIN` needs a function of its own. Passing one function to `MAIN()` twice is an
+  error: call the factory once per `@MAIN`.
+
+**Wires.** A made `@MAIN` uses global wires like any function. It can use the wires
+declared in its function's own module, and `module.w` for a module that module imports.
+So a factory in a library cannot reach the wires of the design that calls it. Write such
+a factory in the design's own module.
+
+**Simulation.** Native simulation runs every `@MAIN`, including made ones. Each keeps its
+own registers and [`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions)
+state, even when two are made by one factory from one source line.
+
+### FPGA target device
+
+Call `PART()` once at module level to tell the synthesiser which device to target:
+
+```python
+from pypeline import PART
+
+PART("xc7a35ticsg324-1l")   # Arty A7-35T
+```
+
+The part also determines the compatible synthesis backend. To make the backend the
+source-level declaration and use its default part, call `SYN_TOOL()` instead:
+
+```python
+from pypeline import SYN_TOOL
+
+SYN_TOOL("quartus")   # builds on Quartus, part 5CEBA4F23C8
+```
+
+Declare at most one `PART()` and one `SYN_TOOL()` per design. When both are present,
+they must describe a compatible pair. See [Synthesis backends and target
+selection](README.md#synthesis-backends-and-target-selection) for supported backend
+names, default parts, and command-line selection rules.
+
+### Naming a clock with `make_clock`
+
+By default the clock of `@MAIN(mhz)` is a top-level port named after its rate, such as
+`clk_100p0`. To bring a clock in on a pin with a fixed name, for example to match a board
+constraints file, bind a clock from `make_clock` to a global `Input[uint1_t]`: the pin
+replaces the rate-derived port. This is the Pypeline equivalent of PipelineC's
+`DECL_INPUT` + `CLK_MHZ` pragma pair.
+
+```python
+from pypeline import MAIN, Input, uint1_t, make_clock
+
+# External clock on a fixed-name port (e.g. to match a board constraints file)
+pll_clk: Input[uint1_t] = make_clock(85.0)
+
+@MAIN(85.0)
+def solution(x: uint1_t) -> uint1_t:
+    ...
+```
+
+`make_clock(85.0)` is the unnamed 85 MHz clock, the one `@MAIN(85.0)` runs on. A clock bound
+to a pin must be the clock of some `@MAIN`, and a clock has one pin: two clocks of one rate
+on two pins need names, `make_clock(85.0, name=...)`. A clock bound to a `Wire[uint1_t]` is
+driven by logic instead ([Clocks made by logic](#clocks-made-by-logic)). A clock cannot be
+bound to an `Output[T]`: a clock net needs exactly one driver, which an `Output` doesn't
+model.
+
+Clocks with names, synthesis targets, board clocks, and moving data between clocks through
+async wires and global FIFOs are described in
+[Part IV — Multiple clock domains](#part-iv--multiple-clock-domains).
+
+---
+
+## Your First Hardware Function
+
+### Functions as modules
+
+A Python function with type annotations on its arguments and return value is a hardware
+module.
+
+```python
+from pypeline import uint32_t
+
+def add(a: uint32_t, b: uint32_t) -> uint32_t:
+    return a + b
+```
+
+This describes a combinational adder: two 32-bit input ports, one 32-bit output port,
+and the logic `output = a + b`.
+
+### Void functions
+
+A function with no return annotation and no `return` statement is void — it has outputs
+only via global signals (see [Global Signals](#global-signals)).
+
+```python
+def drive_leds(val: uint8_t):   # no return type → void
+    leds_out = val
+```
+
+### Local variables
+
+Local variables that are assigned from hardware expressions become wires — they carry
+a value within the current clock cycle:
+
+```python
+def saturate(x: uint8_t, limit: uint8_t) -> uint8_t:
+    result: uint8_t = x
+    if x > limit:
+        result = limit
+    return result
+```
+
+Annotating a local variable (`result: uint8_t`) declares it with an explicit type.
+The annotation is optional if the type can be inferred from the right-hand side.
+
+### Control flow
+
+#### `if` / `else` → hardware MUX
+
+An `if` statement with a runtime condition does **not** branch in the traditional sense.
+Both branches are elaborated into hardware; a multiplexer selects the result based on the
+condition each clock cycle.
+
+```python
+def abs_val(x: int32_t) -> int32_t:
+    result: int32_t = x
+    if x < 0:
+        result = -x
+    return result
+```
+
+> **Required:** a hardware function may have **at most one** `return` statement, and it
+> must be the function's final top-level statement — there is no early return from
+> inside an `if`/`else` branch. To make a value conditional, assign to a variable in
+> each branch (as above) and return it once at the end.
+
+#### Ternary expression
+
+```python
+out: uint8_t = a if condition else b    # equivalent to the if/else above
+```
+
+> ⚠ **Both branches must be the same width**, and native simulation will not tell you
+> otherwise — a Python `int` literal has no width there, so a mixed-width ternary
+> simulates fine and is rejected only when the elaborator emits VHDL. Give a bare
+> constant a typed local first:
+> ```python
+> zero32: uint32_t = 0
+> flag_bit: uint32_t = STATUS_ADC_CLIP     # infers uint1_t if left bare
+> bits: uint32_t = flag_bit if clipped else zero32
+> ```
+
+#### Augmented assignment
+
+`+=`, `-=`, `*=`, `<<=`, `>>=`, `|=`, `&=` and `^=` are supported and expand to the equivalent binary operation:
+
+```python
+total: uint32_t = 0
+total += arr[0]   # equivalent to: total = total + arr[0]
+```
+
+The target can be any assignable path, not just a name: an array element, a struct field
+or a nested path, including on `Reg[T]` and `Feedback[T]` values. As with the expanded
+form, the result is truncated to the target's declared type. Simulation and hardware agree
+on this:
+
+```python
+count: Reg[uint8_t] = 254
+hist: Reg[uint8_t[4]]
+pkt: Reg[pkt_t]
+count += 1            # 254, 255, 0, 1, ... (wraps at uint8_t)
+hist[bin] += 1        # hist[bin] = hist[bin] + 1, variable index
+pkt.stats.len += 4    # nested struct field
+```
+
+A register's new value is visible only after the clock edge. This holds for `+=` as much
+as for plain assignment, and for writes to function parameters too: a callee's writes to its
+arguments never reach the caller's values.
+
+#### Boolean operators
+
+Python's `and` / `or` keywords work in hardware conditions.
+Each operand is normalised to `uint1_t` (non-zero → 1, zero → 0) before combining:
+
+```python
+if (x > 0) and (y < 100):   # both conditions must be true
+    ...
+
+if valid or overflow:         # either condition triggers the branch
+    ...
+```
+
+This is equivalent to `(x > 0) & (y < 100)` with each side coerced to 1 bit.
+The result type is always `uint1_t`.
+
+#### `for` / `while` → loop unrolling
+
+Loops are **fully unrolled at compile time**.
+The loop variable is a plain Python value (not a hardware signal) — an int is the common
+case, but anything Python can iterate works: a `tuple`/`list` (including one of tuples, with
+the target destructuring each element), `dict`, `str`, `enumerate(...)`, `zip(...)`, a
+generator expression. The compiler emits one copy of the body for each iteration.
+
+```python
+def sum_array(arr: uint32_t[4]) -> uint32_t:
+    total: uint32_t = 0
+    for i in range(4):        # unrolled 4 times; i is 0, 1, 2, 3 at elaboration time
+        total = total + arr[i]
+    return total
+
+def sum_scaled(arr: uint32_t[3]) -> uint32_t:
+    total: uint32_t = 0
+    for i, scale in [(0, 2), (1, 3), (2, 4)]:   # tuple target, tuple-valued iterable
+        total = total + arr[i] * scale
+    return total
+```
+
+`while` loops work the same way: the condition must be evaluable at compile time
+(i.e. it must only reference plain Python values, not hardware signals).
+
+The loop body may contain hardware expressions (reads from inputs, assignments to wires),
+but the loop *control* itself (the range, the condition, the counter variable(s)) is always
+pure Python ([#344](https://github.com/JulianKemmerer/PipelineC/discussions/344) discusses loops that run over several clock cycles). One
+exception: don't iterate a `set`/`frozenset` — its order isn't guaranteed
+across runs (`sorted(...)` it first if you need one).
+
+A `while` loop may unroll at most 65,536 iterations; exceeding the limit is treated as
+a non-terminating elaboration loop. Loop targets may be names or nested tuple/list
+patterns, but starred targets such as `for first, *rest in items` are not supported
+([#345](https://github.com/JulianKemmerer/PipelineC/discussions/345)).
+
+---
+
+## Calling Functions
+
+### Functions call functions
+
+Calling a hardware function from another hardware function **instantiates** it as a
+submodule.
+Each call site in the source corresponds to a distinct hardware instance.
+
+```python
+def add(a: uint32_t, b: uint32_t) -> uint32_t:
+    return a + b
+
+@MAIN
+def two_adders(x: uint32_t, y: uint32_t, z: uint32_t) -> uint32_t:
+    partial = add(x, y)     # one adder instance
+    return add(partial, z)  # a second, independent adder instance
+```
+
+Calls may use positional arguments, keyword arguments, or a positional prefix followed
+by keywords, with ordinary Python binding rules:
+
+```python
+add(x, y)
+add(a=x, b=y)
+add(x, b=y)
+```
+
+A call may also select a callable from a compile-time tuple or list. This is useful in
+an unrolled loop because the index is a Python constant for each elaborated iteration:
+
+```python
+ADDERS = (make_adder(1), make_adder(2), make_adder(4))
+for i in range(3):
+    values[i] = ADDERS[i](values[i])
+```
+
+A void function can be called as a bare statement. A non-void function may also be
+called this way when only its state or global-signal effects matter; its return value is
+discarded.
+
+### Feed-forward hierarchy
+
+Functions can call other functions to any depth.
+This is the primary way to build hierarchical designs — a top-level `@MAIN` calls
+sub-functions which call sub-sub-functions, forming a tree of combinational logic and
+registers.
+
+```python
+def compute_pixel(pos: vga_pos_t) -> rgb_t:
+    r: uint8_t = pos.x[7:0]
+    g: uint8_t = pos.y[7:0]
+    b: uint8_t = pos.x[7:0] ^ pos.y[7:0]
+    return rgb_t(r=r, g=g, b=b)
+
+def vga_scan(timing: vga_timing_signals_t) -> rgb_t:
+    px: rgb_t
+    if timing.active:
+        px = compute_pixel(timing.pos)
+    return px
+
+@MAIN(25.0)
+def top():
+    sig = vga_timing()
+    px  = vga_scan(sig)
+    video_out = px
+```
+
+Every build draws this tree in `diagram.html` in its output directory: one graph per
+function, from each `@MAIN` down through its calls
+([Viewing the design](README.md#viewing-the-design)).
+
+### Each call site is a separate instance
+
+Two calls to the same function produce two independent hardware instances.
+If the function contains registers, each instance has its own independent register state.
+
+```python
+@hw_func
+def accumulator(data: uint32_t) -> uint32_t:
+    acc: Reg[uint32_t]
+    acc = acc + data
+    return acc
+
+@MAIN
+def dual_accum(a: uint32_t, b: uint32_t) -> uint32_t:
+    sum_a = accumulator(a)   # instance 1 — its own flip-flop
+    sum_b = accumulator(b)   # instance 2 — independent flip-flop
+    return sum_a + sum_b
+```
+
+### Clock enable via `if` around a call
+
+Wrapping a function call in an `if` block automatically gates the **clock enable** of
+that instance's registers.
+The registers inside the called function only update when the condition is true.
+
+```python
+@MAIN
+def conditional_accum(update: uint1_t, data: uint32_t) -> uint32_t:
+    rv: uint32_t
+    if update:
+        rv = accumulator(data)   # accumulator's register only latches when update=1
+    return rv
+```
+
+When `update=0`, `accumulator`'s internal `acc` register holds its previous value
+unchanged — no explicit clock-enable wiring is needed.
+
+### Calling functions across files
+
+Large designs can be split across multiple `.py` files.
+Use a plain `import` at module level in the top file:
+
+```python
+# top.py
+import file_a
+import file_b
+```
+
+**Use `import file_a` and qualified attribute access (`file_a.func`).**
+`from file_a import func` and `from file_a import *` also work for functions, types and
+constants, but not for global wires: a `Wire[T]` has no Python value to import, so reach
+it as `file_a.w`.
+
+**Import aliases use the actual module name for hardware, not the alias.**
+`import file_a as fa` lets you write `fa.func()` in Python, but the generated VHDL
+wire and function names are prefixed with `file_a`, not `fa`.
+Two aliases pointing at the same file both refer to the same hardware wires.
+
+**Recursive (transitive) imports are followed automatically.**
+If `file_a.py` itself imports `file_b.py`, `file_b` is discovered and elaborated
+too — you don't need to also import it from the top file. Module-level `import module_name`
+and `from module_name import ...` statements are followed at each hop, including those
+inside a module-level `if`/`try` block that ran. An `import` inside a function body
+is not followed. So each file only needs to import what it directly uses, the same
+way plain Python code is organized.
+
+**Choosing modules at elaboration time.**
+A module-level `if` (or `try`/`except`) can select which file becomes hardware. The
+choice is usually a [build parameter](#build-parameters-param-and--d), set with
+`pypelinec top.py -D SHARE_MAC=1`:
+
+```python
+from pypeline import param
+
+if param("SHARE_MAC", False, help="one MAC shared by both directions"):
+    import mac_shared as mac     # one resource, shared by both directions
+else:
+    import mac_private as mac
+
+@MAIN
+def top(x: uint8_t) -> uint8_t:
+    return mac.compute(x)
+```
+
+Only the branch that ran becomes hardware. Its wires, functions and `@MAIN`s are
+included, and its names are prefixed with the chosen module's name (`mac_shared_...`),
+never the alias. The other module stays out even if something else already loaded it.
+Two rules:
+
+- **Import the module in the branch.** Hardware follows the module the branch
+  imported, through its binding. A conditional `from X import f` counts only if `f`
+  (and every other name it imports) is still bound to `X`'s object, so don't rebind it
+  later in the same file.
+- **A module that holds a `@MAIN` and other hardware must be imported at module
+  level.** If it is only imported inside a function (`def setup(): import mac_shared`),
+  Python still runs it, and native simulation would run its `@MAIN`, but the hardware
+  never sees that module's wires and functions. The hardware build stops with an error
+  naming that `@MAIN`. A `@MAIN` made from a factory in a module with no hardware of its
+  own needs no discovery, so it builds wherever it was made.
+
+Call hardware functions from imported files using attribute syntax:
+
+```python
+# top.py
+import my_lib
+
+@MAIN
+def top_level(x: uint32_t) -> uint32_t:
+    result = my_lib.accumulator(x)   # instantiates my_lib's accumulator
+    return result
+```
+
+Sub-files are always elaborated before the top file, so imported functions are always
+available when the top file calls them.
+
+Access or connect global wires declared in imported files using the same dotted notation:
+
+```python
+# top.py
+import file_a
+import file_b
+
+@MAIN
+def connector():
+    file_b.input_wire = file_a.output_wire   # write file_b's wire, read file_a's wire
+    file_a.input_wire = file_b.output_wire
+```
+
+The hardware wire names are automatically prefixed with the module name
+(`file_a_output_wire`, etc.) to avoid collisions.
+
+Nested field and array access on cross-module wires is also supported, to any depth:
+
+```python
+@MAIN
+def connector():
+    file_b.state.count = file_a.counters.total[0]
+```
+
+Module-level constants from sub-files work inside a hardware function body like any
+other Python name: as `my_lib.SHIFT_AMOUNT`, or bare after `from my_lib import
+SHIFT_AMOUNT`. A bare `SHIFT_AMOUNT` that this file never imported is an unknown name,
+as it would be in Python.
+
+### Tuple and list unpacking
+
+Compile-time values support nested tuple/list unpacking. Hardware expressions support a
+flat tuple or list on each side, including swaps; all right-hand expressions are evaluated
+before any target is written:
+
+```python
+a, b = b, a
+lo, hi = x[7:0], x[15:8]
+```
+
+For a hardware-valued right side, nested targets, starred targets, and unpacking a
+non-literal tuple/list expression are not supported ([#345](https://github.com/JulianKemmerer/PipelineC/discussions/345)). Assign fields or elements
+explicitly
+in those cases.
+
+---
+
+## Registers: `Reg[T]`
+
+```text
+        +----------+      +-----------------+      +-----------+
+current |          |      |                 |      |           | next
+--state>|  Reg[T]  |----->|  combinational  |----->| (assign   |---state
+        |  (flop)  |      |     logic       |      |  to Reg)  |
+        |          |      |                 |      |           |
+        +----------+      +-----------------+      +-----+-----+
+             ^                                            |
+             |                clock edge                  |
+             +--------------------------------------------+
+```
+
+A `Reg[T]` read returns the value latched at the *previous* clock edge; the value
+assigned by the end of the cycle is what latches at the *next* one.
+
+### Declaration
+
+Annotate a local variable with `Reg[T]` inside a hardware function to declare a register
+of type `T`.
+Its initial value is zero: its power-up value on an FPGA, and the value a
+[reset](#resets) gives it.
+
+```python
+from pypeline import Reg, uint32_t, uint1_t, hw_func
+
+@hw_func
+def counter(increment: uint1_t) -> uint32_t:
+    count: Reg[uint32_t]
+    if increment:
+        count = count + 1
+    return count
+```
+
+**`Reg[T]` may never use an `@interface`'s `.fwd_t`/`.fb_t` ([Bidirectional Ports: `@interface`](#bidirectional-ports-interface))** — a hard
+`ElaborationError`, not a style preference. `.fwd_t`/`.fb_t` signal "this value is one
+half of a genuine bidirectional port pairing"; a register is internal state, never a
+port, so it never needs (or should imply) that. Use `.stream_t` instead — the plain
+`{data, valid}` type with no pairing implication — and only wrap/unwrap via `.stream`
+at the point the register's value actually meets a real port field:
+
+```python
+# Wrong -- ElaborationError: Reg[T] cannot use an @interface's .fwd_t/.fb_t
+buf: Reg[chan_intrf.fwd_t]
+
+# Right
+buf: Reg[chan_intrf.stream_t]
+...
+o.stream_out_if.stream = buf   # wrap only where it meets the real port field
+```
+
+See [Where `.fwd_t`/`.fb_t` may appear — and where it may not](#where-fwd_tfb_t-may-appear--and-where-it-may-not) in the `@interface` section for the general rule (Reg[T] is one case of it).
+
+### Read / write semantics
+
+Registers use **blocking assignment** semantics, just like ordinary software variables.
+Reading a register before any assignment gives the value stored from the previous clock
+cycle.
+After you assign to a register, subsequent reads within the same function call see the
+new value.
+The final value assigned is what gets latched into the flip-flop at the next clock edge.
+
+```python
+# Example: read old, then write new, then read new
+acc: Reg[uint32_t]
+old = acc         # old = value from previous cycle
+acc = acc + 1     # register will latch acc+1 at next clock edge
+new = acc         # new = acc+1  (the value just written, not the old one)
+```
+
+To return the value *before* an update, capture it first:
+
+```python
+prev = acc
+acc  = acc + data
+return prev        # returns the pre-update value
+```
+
+### Non-zero initial values
+
+An optional initialiser sets the initial value (the power-up value, and the value a
+[reset](#resets) restores):
+
+```python
+cnt: Reg[uint32_t] = 10                  # scalar — starts at 10
+
+buf: Reg[uint8_t[4]] = [10, 20, 30, 40] # array — each element initialised
+
+pt:  Reg[point_t] = point_t(x=5, y=2)  # struct — NamedTuple constructor form
+```
+
+Without an initialiser the initial value is zero.
+
+A register does not have to be written. A read-only declaration is legal and behaves as
+a constant power-on value: zero without an initializer, or the declared initializer when
+the type supports one.
+
+### Counter example
+
+```python
+@hw_func
+def free_counter() -> uint32_t:
+    cnt: Reg[uint32_t]
+    cnt = cnt + 1       # increments every cycle
+    return cnt          # returns the incremented value (cnt+1)
+```
+
+[examples/pypeline/counter.py](../examples/pypeline/counter.py) is a complete counter
+`@MAIN`, with an extra `Output[T]` port for watching the register, and
+[blink.py](../examples/pypeline/blink.py) uses a counter to blink an LED.
+
+### Clock enable via `if`
+
+Placing a register write inside an `if` block gates the update with that condition —
+the register only changes when the condition is true.
+
+```python
+@hw_func
+def latch(load: uint1_t, data: uint8_t) -> uint8_t:
+    stored: Reg[uint8_t]
+    if load:
+        stored = data   # updates only when load=1
+    return stored
+```
+
+When `load=0`, `stored` keeps its previous value.
+
+### `@hw_func`
+
+Any non-`@MAIN` function that contains `Reg[T]` (or `Feedback[T]`) must be decorated
+with `@hw_func`.
+This is required for simulation (see [Simulation](#simulation)) and is good practice
+for documenting that the function has hardware-typed behaviour.
+Plain combinational helpers do not need it.
+
+---
+
+## Feedback Wires: `Feedback[T]`
+
+A `Feedback[T]` wire is a combinational signal whose **driver appears later in the
+function body than its first use**.
+This models reverse-propagating signals — a common pattern in hardware where a
+downstream signal feeds back to a computation upstream.
+
+```python
+from pypeline import Feedback, hw_func, uint1_t
+
+@hw_func
+def feedback_nand(a: uint1_t, b: uint1_t) -> uint1_t:
+    f: Feedback[uint1_t]   # declare before use
+    result: uint1_t = f | a  # read f — it hasn't been assigned yet in Python order
+    f = ~b                   # drive f here (appears after the read)
+    return result
+```
+
+In the generated VHDL, all signals are concurrent — "source order" is irrelevant.
+The compiler resolves the combinational loop correctly.
+
+Like `Reg[T]`, `Feedback[T]` may never use an `@interface`'s `.fwd_t`/`.fb_t` port-pairing
+type as `T` — see
+[Where `.fwd_t`/`.fb_t` may appear — and where it may not](#where-fwd_tfb_t-may-appear--and-where-it-may-not).
+
+**`Feedback[T]` vs `Reg[T]`:**
+
+| | `Reg[T]` | `Feedback[T]` |
+|---|---|---|
+| Storage | flip-flop (persists across cycles) | none (combinational only) |
+| Initial value | zero, or its initializer | none |
+| Clock edge | yes | no |
+
+Do not initialise a `Feedback[T]` wire at its declaration:
+
+```python
+f: Feedback[uint1_t] = x   # error
+```
+
+---
+
+## Bit Manipulation
+
+Hardware frequently needs sub-word access that Python integers do not support natively.
+pypeline adds the following syntax and built-in functions.
+
+### Single-bit select
+
+```python
+bit: uint1_t = x[15]      # extract bit 15 of x
+```
+
+### Bit-slice read
+
+```python
+lo: uint16_t = x[15:0]    # bits 15 down to 0  (high index first, like hardware)
+hi: uint4_t  = x[7:4]     # bits 7 down to 4
+```
+
+Slice bounds must be compile-time constants.
+
+### Bit-slice assignment
+
+```python
+x[7:0] = y    # overwrite bits [7:0] of x with y; other bits unchanged
+```
+
+### Bit concatenation — `concat()`
+
+`concat` packs multiple values end-to-end, **first argument in the most-significant
+position**:
+
+```python
+from pypeline import concat
+
+out: uint64_t = concat(hi_word, lo_word)   # uint32_t ++ uint32_t → uint64_t
+packed: uint24_t = concat(r, g, b)         # three uint8_t values → uint24_t
+```
+
+### Built-in bit helpers
+
+| Function | Description |
+|---|---|
+| `bit_dup(x, n)` | Replicate `x` exactly `n` times → `uintW*n_t` |
+| `rotl(x, n)` | Rotate left by `n` bits |
+| `rotr(x, n)` | Rotate right by `n` bits |
+| `bswap(x)` | Reverse byte order (width must be a multiple of 8) |
+| `bit_assign(base, val, offset)` | Overwrite bits `[offset+W-1:offset]` of `base` with `val` |
+| `array_to_uint_be(arr)` | Concatenate array elements, big-endian (arr[0] = MSB) |
+| `array_to_uint_le(arr)` | Concatenate array elements, little-endian (arr[0] = LSB) |
+| `uint_to_array_be(x, w)` | Split integer into `w`-bit elements, big-endian (element 0 = MSBs) |
+| `uint_to_array_le(x, w)` | Split integer into `w`-bit elements, little-endian (element 0 = LSBs) |
+
+All size/count arguments must be compile-time constants.
+
+**`make_clz` — count leading zeros.** `include/pypeline/bits.py`'s `make_clz(value_t)`
+builds a width-specialized leading-zero counter, used by the fixed/float libraries and by
+`dsp/cordic.py` and `dsp/log2_db.py` to normalize an operand before a shift. It is a
+`log2(n)`-level **binary search**, not an `n`-deep chain of dependent muxes — worth knowing
+because the obvious mux-chain form is quietly enormous: at 39 bits it measured as an entire
+CORDIC's critical path on its own.
+
+---
+
+## Basic Types
+
+Pypeline has three categories of type: **built-in/predefined** (the integer types
+below, `char_t`), **Python-defined structural** (`@struct`, `@enum` — you write the
+shape, Pypeline derives the hardware), and **parameterized/factory-generated**
+(built by calling a `make_*` function, covered in
+[Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions)
+and [Factory-Generated Types](#factory-generated-types) right after it — e.g.
+`float32_t`/`q4_12_t`). This section covers the first two categories.
+
+### Integer types
+
+pypeline provides fixed-width integer types matching C hardware-description convention.
+
+| Type | Width | Range |
+|---|---|---|
+| `uint1_t` … `uint64_t` | Every width from 1 through 64 bits | 0 … 2^N−1 |
+| `int1_t` … `int64_t` | Every width from 1 through 64 bits, signed | −2^(N−1) … 2^(N−1)−1 |
+
+Use `make_uint_t` / `make_int_t` for widths that are computed at module level:
+
+```python
+from pypeline import make_uint_t, make_int_t
+
+N = 24
+uint24_t = make_uint_t(N)
+int33_t  = make_int_t(N + 9)
+```
+
+Integer literals in hardware function bodies receive the smallest type that represents
+them. Non-negative literals are unsigned with at least one bit (`0` → `uint1_t`, `5` →
+`uint3_t`, `255` → `uint8_t`); negative literals are signed (`-1` → `int1_t`, `-2` →
+`int2_t`).
+
+At elaboration time, `len(T)` reports an integer type's bit width or an array's outer
+dimension. Scalar integer and `char_t` types also expose `T.width`; array types do not.
+
+#### Integer arithmetic result types
+
+Arithmetic grows to retain its mathematical result rather than silently truncating,
+except subtraction of two unsigned operands, which wraps:
+
+| Expression | Result width after operand promotion |
+|---|---|
+| `a + b`, signed `a - b` | `max(width(a), width(b)) + 1` |
+| `a - b`, both operands unsigned | `max(width(a), width(b))` (wraps) |
+| `a * b` | `width(a) + width(b)` |
+| Other integer binary operations | `max(width(a), width(b))` |
+| `-a` | `width(a) + 1`, signed |
+
+For mixed signed/unsigned arithmetic, if the unsigned operand is at least as wide as the
+signed operand, the signed side is first extended by one bit so every unsigned value and
+every signed value remain representable; the result is signed. Assigning that result to a
+narrower annotated destination performs the explicit truncation. Bitwise operations do not
+add a carry bit—their result uses the promoted maximum width—and comparisons produce
+`uint1_t`.
+
+An unsigned subtraction wraps before any wider destination sees it. With `uint8_t`
+operands, `d: int16_t = a - b` gives `254` for `3 - 5`, not `-2`. Cast one operand to a
+signed type first to keep the sign: `d: int16_t = int9_t(a) - b` gives `-2`.
+
+### Casting
+
+`T(x)` — a type called with exactly one positional argument and no keywords — is a cast.
+
+```python
+def widen(x: uint16_t) -> uint32_t:
+    return uint32_t(x)      # identical to: tmp: uint32_t = x; return tmp
+```
+
+For two scalar `u/intN_t` types, a cast behaves **exactly like an annotated assignment**
+— same truncation on narrowing, same sign-extension/zero-extension on widening — because
+it lowers to the same mechanism, not a separate one. `y = type2_t(x)` and
+`y: type2_t = x` always agree; there is no scenario where they diverge. Casting between
+two integer types of the *same* width and signedness (or casting a value to its own
+type) costs nothing extra — it's the same wire, not a new one.
+
+`char_t` is a scalar destination like the integer types: `char_t(x)` works the same way.
+Casting *to* an array type (`uint8_t[4](x)`) is rejected explicitly (an array's `[4]` looks
+like a bit width to the same machinery that computes one, so silently accepting it would
+risk masking to the wrong width). An `@enum` destination is not supported, because
+`state_t(2)` already has an unrelated meaning (`IntEnum` member lookup) that casting would
+silently shadow. Inside a hardware function, any `state_t(...)` call currently crashes
+with an internal `TypeError` instead of a clear error ([#362](https://github.com/JulianKemmerer/PipelineC/issues/362)); use the members (`state_t.RUN`)
+directly.
+
+For a compound (struct, or `@interface` half) destination, a cast dispatches to a
+**registered conversion function** — an ordinary hardware function of the form
+`def f(x: src_t) -> dst_t`, real logic if the conversion needs it (e.g. float↔float,
+float↔int):
+
+```python
+from pypeline import cast
+
+@cast
+def f(x: src_t) -> dst_t:
+    ...
+
+y = dst_t(some_src_t_value)   # dispatches to f
+```
+
+`register_cast(src_t, dst_t, func)` is the imperative form, for a factory that already
+built the function (`include/pypeline/floating_point.py`'s `make_float_converter`/
+`make_float_to_int`/`make_int_to_float` all self-register this way). Casting to a struct
+with no registered conversion from the argument's type is an `ElaborationError`, except
+for a struct with exactly one field, which falls back to filling that field directly
+(the same thing `T(x)` meant before casting existed).
+
+`register_lazy_cast(src_t, dst_t, build)` has the same result as `register_cast`, but
+defers the zero-argument `build()` factory until that exact conversion is first used. Use
+it when constructing the conversion function is expensive or mutually recursive with
+other library setup.
+
+`include/pypeline/stream/stream.py`'s `make_stream_interface` registers casts both ways
+between a stream interface's two halves and their plain payload types, so the common
+"give one field a name nobody needs to read" pattern collapses:
+
+```python
+axis_out_if = axis128_intrf.fb_t(some_ready_value)     # was fb_t(ready=some_ready_value)
+in_stream_if = axis128_intrf.fwd_t(some_stream_value)   # was fwd_t(stream=some_stream_value)
+```
+
+The keyword form (`fb_t(ready=x)`, `fwd_t(stream=x)`) still works everywhere — casting is
+purely additive syntax, never a replacement requirement.
+
+### Struct types
+
+Use `@struct` + `NamedTuple` to declare compound record types.
+
+```python
+from typing import NamedTuple
+from pypeline import struct, uint32_t
+
+@struct
+class point_t(NamedTuple):
+    x: uint32_t
+    y: uint32_t
+```
+
+The `@struct` decorator makes `point_t` usable as an array element type
+(`point_t[10]`) and enables field-wise wrapping during simulation.
+
+Access fields with the usual dot notation:
+
+```python
+def add_points(a: point_t, b: point_t) -> point_t:
+    return point_t(x=a.x + b.x, y=a.y + b.y)
+```
+
+### Enum types
+
+Use `@enum` on a Python `IntEnum` subclass to declare an integer-encoded enumeration type.
+The bit width is computed automatically from the largest member value.
+
+```python
+from enum import IntEnum
+from pypeline import enum, MAIN, Reg, uint1_t
+
+@enum
+class state_t(IntEnum):
+    IDLE    = 0
+    RUNNING = 1
+    DONE    = 2
+```
+
+The internal type key is `state_t_IDLE_RUNNING_DONE`: sequential `0..n-1` values
+are omitted there, while sparse enums retain explicit values. The VHDL type also
+identifies its source module and member values; in `controller.py` this example is
+`state_t_from_controller_IDLE_0_RUNNING_1_DONE_2`.
+
+Members are accessed with dot notation and compare with `==`:
+
+```python
+@MAIN
+def is_idle(s: state_t) -> uint1_t:
+    rv: uint1_t = 0
+    if s == state_t.IDLE:
+        rv = 1
+    return rv
+```
+
+Use `Reg[state_t]` for FSM state registers:
+
+```python
+@MAIN
+def simple_fsm(trigger: uint1_t) -> state_t:
+    st: Reg[state_t]
+    if st == state_t.IDLE and trigger:
+        st = state_t.RUNNING
+    elif st == state_t.RUNNING:
+        st = state_t.DONE
+    return st
+```
+
+[examples/pypeline/fsm.py](../examples/pypeline/fsm.py) is a complete state machine, with
+`@struct` outputs and an `Input[T]` port driven by a `@sim_input` function in simulation.
+
+The `@enum` decorator also accepts a plain class (auto-converted to `IntEnum`):
+
+```python
+@enum
+class direction_t:         # @enum detects int members and converts
+    NORTH = 0; EAST = 1; SOUTH = 2; WEST = 3
+```
+
+#### `auto()` values (0-based)
+
+PipelineC C enums start at 0. Use `auto()` so you don't have to write values
+manually — pypeline guarantees the first member is 0, not Python's default of 1.
+
+**Form 1 — plain class (no base class needed):**
+```python
+from enum import auto
+from pypeline import enum
+
+@enum
+class state_t:
+    IDLE    = auto()   # 0
+    RUNNING = auto()   # 1
+    DONE    = auto()   # 2
+```
+
+**Form 2 — `PypelineEnum` base class (IntEnum-subclass style):**
+```python
+from enum import auto
+from pypeline import enum, PypelineEnum
+
+@enum
+class state_t(PypelineEnum):
+    IDLE    = auto()   # 0
+    RUNNING = auto()   # 1
+    DONE    = auto()   # 2
+```
+
+Both forms produce identical enum types. You can also mix explicit int values with
+`auto()` — an explicit value resets the counter for subsequent `auto()` members:
+```python
+@enum
+class code_t:
+    ALPHA = 10
+    BETA  = auto()   # 11
+    GAMMA = auto()   # 12
+```
+
+#### Parameterizable enums
+
+Write a user factory that calls `enum(IntEnum(...))` — the same pattern as
+parameterizable structs:
+
+```python
+def make_traffic_t(include_yellow=True):
+    members = {"RED": 0, "GREEN": 2}
+    if include_yellow:
+        members["YELLOW"] = 1
+    return enum(IntEnum("traffic_t", members))
+
+traffic_t = make_traffic_t(include_yellow=True)
+```
+
+#### Introspection helpers
+
+```python
+from pypeline import enum_bit_width, enum_uint_type
+
+enum_bit_width(state_t)   # → 2  (minimum bits to represent 0..2)
+enum_uint_type(state_t)   # → uint2_t
+```
+
+Enum types can also be used as struct fields:
+
+```python
+@struct
+class packet_t(NamedTuple):
+    state: state_t
+    data:  uint8_t
+```
+
+### Char arrays (strings)
+
+`char_t` is a predefined 8-bit scalar type, exactly like `uint8_t` but with its own
+C-type-string (`"char"`). Combine it with `[N]` array syntax to get a fixed-size string
+type:
+
+```python
+from pypeline import char_t, strlen
+
+def greet() -> char_t[16]:
+    name: char_t[16] = "hello"    # Python string literal as a compile-time initializer
+    return name
+```
+
+A shorter literal is zero-padded on the right; a literal longer than the declared array
+raises an error at elaboration time. String literals also work as struct-field
+initializers, function return values, and directly as call arguments:
+
+```python
+@struct
+class packet_t(NamedTuple):
+    name: char_t[16]
+    value: uint32_t
+
+@hw_func
+def make_packet(v: uint32_t) -> packet_t:
+    p: packet_t
+    p.name = "sensor1"
+    p.value = v
+    return p
+
+@hw_func
+def log_event(tag: char_t[16]) -> uint32_t:
+    ...
+
+@MAIN
+def call_site() -> uint32_t:
+    return log_event("startup")   # string literal passed directly as an argument
+```
+
+`strlen(arr)` returns the array's **declared capacity**, not the length of whatever text
+happens to be stored in it — `strlen()` on the `name` field above always returns `16`,
+even when it holds `"sensor1"` (7 characters). This matches PipelineC's C-side `strlen()`
+exactly: it's a compile-time constant (the array size), not a runtime scan for a
+null terminator.
+
+A single scalar `char_t` holds a character code, not a string. Write `ord("A")` (C's
+`'A'`), not `"A"`. A Python builtin with constant arguments (`ord`, `min`, `len` of a
+constant list, ...) folds to a constant at elaboration, the same value native sim
+computes. Assigning a `str` to a scalar raises an error that points to `ord(...)`:
+
+```python
+c: char_t = ord("A")   # 65
+c = "A"                # error: a Python str is not an integer -- use ord('A')
+```
+
+In simulation, a `char_t[N]` value is a `CharArray` (a list of `SimVal`s that also behaves
+like the Python string it represents) — pass and compare plain Python `str` values
+directly, with no conversion helpers needed:
+
+```python
+r = sim_call(greet)
+assert r == "hello"
+
+p = sim_call(make_packet, v=42)
+assert p.name == "sensor1"
+
+r = sim_call(log_event, tag="customtag")
+```
+
+String literals containing an underscore produce invalid VHDL ([#356](https://github.com/JulianKemmerer/PipelineC/issues/356)): the shared constant
+decoder cuts the literal at the first `_`, dropping its closing quote. The build and
+native simulation still succeed; GHDL and synthesis tools reject the generated file. The C
+front end has the same bug. Use a spelling without underscores or a numeric `char_t[N]`
+initializer.
+
+Char arrays support ordinary per-element arithmetic like any other array — each element
+is just an 8-bit value:
+
+```python
+@MAIN
+def increment_chars(s: char_t[16]) -> char_t[16]:
+    out: char_t[16] = s
+    for i in range(16):
+        out[i] = s[i] + 1
+    return out
+```
+
+Known limitation: a `Reg[T]` whose leaf type is `char_t` cannot have an explicit
+initializer. This includes a scalar `Reg[char_t]` and `Reg[char_t[N]]` initialized from
+an integer, list, or string ([#357](https://github.com/JulianKemmerer/PipelineC/issues/357)). Zero-initialized char registers are supported.
+
+### Arrays
+
+Append `[N]` to any type to get a fixed-length array of that type:
+
+```python
+uint32_t[4]       # 4-element array of 32-bit values
+point_t[10]       # 10-element array of point_t structs
+uint8_t[4][2]     # 4-element outer array; each element is a 2-byte array (like C)
+```
+
+Arrays are meant to behave as they do in C. `T[A][B]` declares the same shape as C's
+`T x[A][B]`: `A` is the outer dimension and `B` the inner one, and `x[i][j]` selects
+outer element `i`, then inner element `j`. Python lists of lists index the same way, and
+native simulation stores the value as one: `uint8_t[4][2]` is a list of 4 lists of 2.
+The order is fixed no matter how many brackets you chain or how they are grouped.
+
+That has one consequence when types are built in steps. If `T` is already an array,
+`T[N]` keeps C order and adds `N` as the *innermost* dimension; it does not make N
+copies of `T`. `(uint8_t[4])[2]` is still `uint8_t[4][2]`, four rows of two. A factory
+that takes a caller's type and needs N values of it uses `make_array_t(T, N)`, which
+adds N as the outer dimension: `make_array_t(uint2_t[4], 5)` is `uint2_t[5][4]`, five
+`uint2_t[4]` elements. For a scalar or struct `T` it is the same as `T[N]`.
+
+Index arrays with a compile-time constant or with a hardware signal:
+
+```python
+def swap(arr: uint32_t[4], i: uint2_t, j: uint2_t) -> uint32_t[4]:
+    tmp     = arr[i]
+    arr[i]  = arr[j]
+    arr[j]  = tmp
+    return arr
+```
+
+Variable indexing (where `i` or `j` is a hardware signal) infers a multiplexer tree in
+hardware. This works the same way for reads and writes, including writes nested inside
+other control flow (`if arr[i] == 0: arr[j] = val`).
+Like any combinational logic, those mux trees can be auto-pipelined by PypelineC when a
+frequency constraint is set.
+
+Keep dynamic indices within the array's declared bounds. An out-of-range *constant* index is
+a compile-time error, but an out-of-range *hardware* index is not rejected -- hardware
+truncates it to the index's minimum bit width (modulo the next power of two at or above the
+array length), which can silently alias onto a real element instead of the intended one.
+Native simulation instead raises an `IndexError` for the same access, so an out-of-bounds
+dynamic index is one of the few cases where native sim and real hardware can disagree.
+
+### Compound initialisers
+
+A struct or array variable can be initialised from a constructor call or list literal
+in one go:
+
+```python
+def make_point(a: uint32_t, b: uint32_t) -> point_t:
+    p: point_t = point_t(x=a, y=b)   # NamedTuple constructor (preferred)
+    return p
+
+def zero_pair() -> uint32_t[2]:
+    v: uint32_t[2] = [0, 0]          # list literal
+    return v
+
+def make_point_dict(a: uint32_t, b: uint32_t) -> point_t:
+    p: point_t = {"x": a, "y": b}    # dict form (also supported)
+    return p
+```
+
+The NamedTuple form is preferred because it works in both hardware elaboration and
+simulation.
+
+Plain Python helper functions that return a `dict`, `list`, or NamedTuple instance
+at elaboration time can also serve as compound initialisers — the result must contain
+only compile-time integer values, not hardware wires:
+
+```python
+def zero_point():          # ordinary Python function
+    return point_t(x=0, y=0)
+
+def my_func(...) -> point_t:
+    p: point_t = zero_point()   # elaboration-time call → compound init
+    return p
+```
+
+### Struct/type ↔ bytes conversion
+
+`byte_length(t)`, `make_type_to_bytes(t, endian="little")`, and
+`make_type_from_bytes(t, endian="little")` give a generic, built-in way to pack any
+pypeline type — scalar, array, struct, or any nesting thereof — into a fixed
+`uint8_t[N]` array and back, instead of hand-writing per-type `concat()`/bit-slicing
+code:
+
+```python
+from pypeline import struct, uint8_t, uint16_t, uint32_t, byte_length, make_type_to_bytes, make_type_from_bytes
+from typing import NamedTuple
+
+@struct
+class header_t(NamedTuple):
+    version: uint8_t
+    length: uint16_t
+    flags: uint32_t
+
+header_to_bytes   = make_type_to_bytes(header_t)     # -> hardware function
+header_from_bytes = make_type_from_bytes(header_t)   # exact inverse
+
+def pack(h: header_t) -> uint8_t[byte_length(header_t)]:
+    return header_to_bytes(h)
+```
+
+`byte_length(t)` is the companion "sizeof" — a plain Python function (no hardware
+elaboration involved) that returns the byte size of `t`, for sizing the destination
+array before calling `..._from_bytes` or after calling `..._to_bytes`.
+
+The layout is a **packed, unpadded struct**, not C's natural alignment: each leaf
+scalar field is rounded up to a whole number of bytes (`ceil(width / 8)` — so a
+`uint3_t` field still takes 1 byte), and fields/array elements are packed back-to-back
+in declaration order with no other padding. `endian` (`"little"` by default, or
+`"big"`) controls the byte order within each multi-byte field.
+
+The returned functions are tagged `@wires` (see [Just-Wires Synthesis Hint: `@wires`](#just-wires-synthesis-hint-wires))
+since they are pure bit rewiring with no real combinational delay.
+
+Works for any combination of arrays and structs, e.g.
+`make_type_to_bytes(uint32_t[3])` or `make_type_to_bytes(my_struct_t[3])`.
+
+`@enum` fields work too — an enum leaf occupies `ceil(enum_bit_width / 8)` bytes, the
+same rule as any other scalar:
+
+```python
+@enum
+class mode_t(PypelineEnum):
+    OFF = auto(); ON = auto(); STANDBY = auto()
+
+@struct
+class record_t(NamedTuple):
+    mode: mode_t     # 2 bits -> 1 byte
+    seq:  uint16_t   # 2 bytes
+
+byte_length(record_t)   # 3
+```
+
+An *array of* enums (`mode_t[4]`) is not expressible in pypeline at all — `@struct`
+installs `__class_getitem__` but `@enum` does not, so the subscript is an `IntEnum`
+member lookup. Put the enum in a struct and make an array of that.
+
+### Software-side conversion: `type_to_bytes` / `T.to_bytes`
+
+The functions above generate *hardware*. Their plain-Python twins convert the same
+values in software, with no elaboration and no `sim_call`:
+
+```python
+from pypeline import type_to_bytes, type_from_bytes, byte_length
+
+raw = type_to_bytes(header_t, h)         # -> bytes, len == byte_length(header_t)
+write_stream(raw)
+
+h2 = type_from_bytes(header_t, read_stream(byte_length(header_t)))
+
+# equivalently, as classmethods on any @struct:
+raw = header_t.to_bytes(h)
+h2  = header_t.from_bytes(raw)
+```
+
+This is what makes a pypeline design usable from ordinary software: if you have
+`readStream`/`writeStream` functions that deal in byte arrays, these give you the
+structs on the other side, with no hand-maintained `struct.pack` format string to keep
+in sync. Both take an optional `endian` argument, defaulting to `"little"`.
+
+The software and hardware layouts cannot drift, because they are one layout: both walk
+the same leaf enumeration over the type. `type_bytes_sw_test.py` asserts it directly,
+comparing `type_to_bytes(...)` against what `make_type_to_bytes(...)` actually produces
+in simulation, for every fixture type and both endians.
+
+| `t` | `type_to_bytes` accepts | `type_from_bytes` returns |
+|---|---|---|
+| scalar | `int`, `bool`, `SimVal` | `SimVal` typed to `t` (signed leaves come back negative) |
+| `@enum` | an `IntEnum` member or an int | a `SimVal` of the enum's carrier uint — compare it against members directly (`rv.mode == mode_t.ON`), which is also what native sim holds |
+| array | `list`, `tuple`, `bytes`, `bytearray`, `CharArray` | `list` (a `CharArray` for `char_t[N]`, so `str(rv)` works) |
+| `@struct` | an instance of `t` | an instance of `t` |
+
+`type_from_bytes` builds its result exactly the way native simulation does, so the value
+it returns can be passed straight back into `sim_call()` as an argument. It raises
+`ValueError` if `len(data) != byte_length(t)`.
+
+
+---
+
+## Build Parameters: `param()` and `-D`
+
+Most designs have a few choices made per build: a clock goal, a data width, whether
+two blocks share one resource, a testbench mode. Declare each one with `param()`, and
+set it on the command line with `-D NAME=VALUE`:
+
+```python
+from pypeline import MAIN, make_uint_t, param
+
+WIDTH = param("WIDTH", 8, choices=(8, 16, 32), help="data path width in bits")
+CLK_MHZ = param("CLK_MHZ", 100.0, help="clock goal")
+
+data_t = make_uint_t(WIDTH)
+
+@MAIN(CLK_MHZ)
+def top(x: data_t) -> data_t:
+    return x + 1
+```
+
+```
+pypelinec top.py -D WIDTH=16 -D CLK_MHZ=125     # build
+pypelinec top.py --sim --comb -D WIDTH=16       # native simulation, same values
+python3 src/pypeline_sim.py top.py --run 100 -D WIDTH=16
+pypelinec top.py --list_params                  # what can be set, and to what
+```
+
+`param()` returns a plain Python value. Use it anywhere elaboration-time Python is
+allowed:
+- clock rates (`@MAIN(CLK_MHZ)`);
+- widths (`make_uint_t(WIDTH)`);
+- factory arguments;
+- array sizes;
+- which module to import (see [Choosing modules at elaboration time](#calling-functions-across-files));
+- `max_latency=` caps.
+
+Inside a hardware body, an `int` or `bool` parameter is a constant, like any other
+module-level constant.
+
+- **Where the value comes from.** In order: `-D NAME=VALUE`, then the `env=` variable
+  if you gave one and it is set, then the default. A name resolves once per build, so
+  every re-elaboration pass and every simulation import sees the same value.
+- **Types.** The default's type converts the `-D` text:
+  - `int` accepts `16` or `0x10`;
+  - `float` accepts `125`;
+  - `bool` accepts `1/0`, `true/false`, `yes/no` and `on/off`, and a bare `-D NAME` means `True`;
+  - a tuple default takes a comma list (`-D SIZES=16,64,256`).
+
+  For a parameter with no default (`param("DEPTH", type=int)`), `type=` converts the
+  text; `None` means "not given". Without a `type`, the text is read as a Python
+  literal, else kept as a string.
+- **`choices=`** lists the allowed values. Anything else stops the build with one line
+  naming the parameter, the value, where it came from and where it is declared:
+  ```
+  ERROR: Design parameter WIDTH: 12 is not one of (8, 16, 32) (from -D on the command line; declared at top.py:3)
+  ```
+- **Declare each parameter once.** Put shared parameters in one module and import the
+  values (`from config import WIDTH`, or `config.WIDTH`, which also works inside
+  hardware bodies). A second `param()` with the same name must match the first.
+- **Every build records its values.** The build prints the table after the design is
+  imported, and writes it to `<out_dir>/source_provenance.json` (`design_params`):
+  ```
+  Design parameters:
+    CLK_MHZ = 125.0 (-D)  top.py:4
+    WIDTH   = 16 (-D)  top.py:3
+  ```
+- **A misspelled `-D` name is an error**, not silently ignored (see below).
+- **`env=`.** Pass `env="VAR"` only if a build system can set nothing but the
+  environment. `-D` and the default are the normal paths.
+
+### Values read by name: injected globals
+
+A `-D NAME=VALUE` that no `param()` declares becomes a global name in every design
+module, like a C preprocessor macro. Its text is read as a Python literal (`3`, `2.5`,
+`(1, 2)`, `'x'`), else kept as a string:
+
+```python
+data_t = make_uint_t(WIDTH)      # built with: pypelinec top.py -D WIDTH=12
+
+@MAIN
+def top(x: data_t) -> data_t:
+    return x + INC               # ... -D INC=3
+```
+
+After the design is imported, the build checks every `-D` name and stops if:
+- **No design module reads the name and no `param()` declares it.** The message suggests close matches, so `-D WIDHT=16` fails with "Did you mean WIDTH?".
+- **A design module assigns the name at module level.** That module would silently ignore the command line.
+- **A module reads a `param()`-declared name as a bare global.** That only works while `-D` happens to give it.
+
+Prefer `param()` for anything with a sensible default. It documents itself in
+`--list_params`, and editors and type checkers can see it. Injected names suit
+required values without a default; add `# pyright: reportUndefinedVariable=none` to
+files that read them.
+
+### Top-down and bottom-up values
+
+Two kinds of build-time values flow through a design:
+
+| | Top-down (`param()`, `-D`) | Bottom-up (`.latency`) |
+|---|---|---|
+| Decided by | you, before elaboration | the build itself, during implementation |
+| Examples | clock goal, width, sharing choice, testbench mode | AUTO_PIPELINE depth, AUTO_MULTI_CYCLE cycle count, AUTO_FSM latency, auto-pipelined RAM plan |
+| Read with | `param()` (or an injected global) | the AUTO object's `.latency`, or a library factory's [sizing attributes](#passing-a-bottom-up-value-to-the-rest-of-the-design) |
+| Fixed when | before the first import, for the whole build | after re-elaboration: the build re-imports the design until every value read equals what was built |
+
+Keep the directions apart:
+- A parameter never depends on a bottom-up value.
+- A parameter can bound one. For example, `max_latency=param("MAX_LANES", 8) - 2`
+  caps a pipeline whose depth sets a lane count.
+
+The [`.latency` section](#latency-reading-back-the-discovered-pipeline-depth) shows how
+bottom-up values reach the rest of a design, and the report each build prints about them.
+
+---
+
+## Parametric Hardware with Factory Functions
+
+Because module-level Python code runs at elaboration time, you can generate specialised
+hardware functions and types using ordinary Python factories (closures).
+
+### Factory results and attributes
+
+An HDL factory returns one object: the function, struct, enum, or interface it
+creates. Related types and configuration are attributes of that object. A
+function's `.return_t` is its **complete return type**, matching its `->`
+annotation; use it in annotations, `Reg[...]`, `Feedback[...]`, or to construct
+a result value:
+
+```python
+pipeline = make_stream_auto_pipeline(compute, start_latency=4)
+
+@hw_func
+def stage(
+    stream_in_if: pipeline.in_fwd_t, stream_out_if: pipeline.out_fb_t
+) -> pipeline.return_t:
+    return pipeline(stream_in_if, stream_out_if)
+```
+
+A stream function's result contains both output data and input feedback.
+`.return_t` therefore differs from the output payload type. Directional
+attributes name the port's role at the returned function:
+
+| Attribute, when supported | Meaning |
+|---|---|
+| `.return_t` | Complete function result; `None` for an unannotated or void return |
+| `.in_intrf`, `.in_fwd_t`, `.in_fb_t` | Input interface, data received as an argument, and feedback returned to the producer |
+| `.out_intrf`, `.out_fwd_t`, `.out_fb_t` | Output interface, data returned to the consumer, and feedback received as an argument |
+| `.out_t` | Library-specific output type: a DSP payload type, or the complete result on RAM functions; see that factory's reference |
+
+Every `@hw_func` callable exposes `.return_t`, including functions produced by
+factories. Struct and enum factories return the type itself; they do not need a
+`.return_t`. Input parameter types remain available through `hw_arg_types(func)`.
+
+| Library factories | Other attributes on the returned object |
+|---|---|
+| Stream AUTO_PIPELINE, MCP, AUTO_FSM, and combinational-optimization wrappers | `.in_intrf`, `.out_intrf` and all four directional halves; AUTO_PIPELINE adds `.auto_pipeline`, `.max_in_flight`; automatic MCP adds `.mcp`; AUTO_FSM adds `.fsm` |
+| Stream FIFO and skid buffers, including probed variants | `.stream_intrf`, `.fwd_t`, `.fb_t`; FIFO sizing uses `.depth`, `.capacity_beats`; skid sizing uses `.n_slots`, `.mode`, `.latency`; probed variants add `.tap_name`, `.capacity_beats` |
+| AXIS width converters | Widening: `.narrow_in_intrf`, `.wide_out_intrf`; narrowing: `.wide_in_intrf`, `.narrow_out_intrf`; each interface exposes `.fwd_t` and `.fb_t` |
+| Raw and stream RAM | Element/address/port metadata and timing; raw `.p{i}_in_t`/`.p{i}_out_t`, stream `.p{i}_req_intrf`/`.p{i}_resp_intrf`; `.return_t` is the whole multi-port result |
+| DSP blocks | Payload, arithmetic, and timing metadata described in the DSP guide; `.out_t` is distinct from `.return_t`; FIR core additionally exposes `.accum_t` |
+| `make_fixed_t`, `make_float_t` | The numeric type, including `.as_const`; fixed-point types also expose `.int_bits`, `.frac_bits`, `.signed` |
+| `register_fixed_ops`, `register_float_ops` | One operations object with `.operand_t`, `.add`, `.subtract`, `.multiply`, plus fixed `.negate` or float `.divide`; each operation has its own `.return_t` |
+
+Only use attributes documented for the chosen factory. An AUTO_PIPELINE stream
+wrapper exposes core depth as `.auto_pipeline.latency`, rather than a fixed
+end-to-end `.latency`. Factories that produce several peer objects return a
+named bundle, with one attribute per object.
+
+### Generic functions
+
+```python
+from pypeline import hw_func, uint8_t, uint32_t
+
+def make_adder(T):
+    @hw_func
+    def add(a: T, b: T) -> T:
+        return a + b
+    return add
+
+add_u32 = make_adder(uint32_t)   # specialise for 32-bit
+add_u8  = make_adder(uint8_t)    # specialise for 8-bit
+
+@MAIN
+def top(x: uint32_t, y: uint8_t) -> uint32_t:
+    big  = add_u32(x, x)         # 32-bit adder instance
+    small = add_u8(y, y)         # 8-bit adder instance
+    return big + small
+```
+
+Each specialised result (`add_u32`, `add_u8`) produces a separate VHDL entity with the
+correct bit widths.
+Calling the same specialisation multiple times reuses the same entity definition but
+creates separate instances.
+
+Each specialization keeps its own type identity. The generated-output naming and lookup
+conventions are documented under [Generated files and reports](README.md#generated-files-and-reports).
+
+### Generic structs
+
+```python
+from typing import NamedTuple
+from pypeline import struct
+
+def make_pair_t(T):
+    @struct
+    class pair_t(NamedTuple):
+        a: T
+        b: T
+    return pair_t
+
+pair_u32_t = make_pair_t(uint32_t)
+pair_u8_t  = make_pair_t(uint8_t)
+```
+
+### Size-parametric example
+
+```python
+def make_sum_array(T, N):
+    @hw_func
+    def sum_array(arr: T[N]) -> T:
+        total: T = 0
+        for i in range(N):
+            total = total + arr[i]
+        return total
+    return sum_array
+
+sum4_u32 = make_sum_array(uint32_t, 4)
+sum8_u8  = make_sum_array(uint8_t, 8)
+```
+
+The factory body (`for i in range(N)`) is pure Python and runs at elaboration time.
+Only the inner function's body becomes hardware.
+
+### Naming factory-produced hardware: `name=`
+
+You don't have to name what a factory produces. Pypeline names it automatically from
+the factory and the arguments it was called with. `make_adder(uint32_t)` above becomes
+the entity `add_from_<module>_make_adder_T_uint32_t`, and every specialization gets a
+distinct name. Most designs never need anything else.
+
+When you want a shorter or more meaningful name, give one to the decorator inside the
+factory:
+
+```python
+def make_quarter_round(a, b, c, d):
+    @hw_func(name=f"quarter_round_{a}_{b}_{c}_{d}")
+    def quarter_round(s: state_t) -> state_t:
+        ...
+    return quarter_round
+
+def make_pair_t(T, n):
+    @struct(name=f"pair{n}_t")
+    class pair_t(NamedTuple):
+        a: T
+        b: T
+    return pair_t
+```
+
+`@enum(name=...)` works the same way.
+
+**The name is a prefix.** The VHDL entity or type is named exactly what you wrote,
+`quarter_round_0_4_8_12`. Internally the function's key is
+`quarter_round_0_4_8_12_s<digest>`, where the digest covers the specialization (the
+key it would have had without a name).
+
+- **Specializations stay distinct.** If two specializations end up with one name,
+  each VHDL name gets `_h<digest>` added, so they never merge.
+- **A collision is resolved, never an error.** The same `_h` suffix is added when a
+  name collides with another name, a `@MAIN` or a port.
+- **Pipelined entities are named the same way.** They still add the usual
+  `_<N>CLK_<hash>`.
+
+A name is used verbatim, so it must be a VHDL basic identifier:
+- a letter first, then letters, digits and single underscores, with no trailing `_`;
+- at most 64 characters;
+- not a VHDL reserved word;
+- not ending like a generated name (`_top`, `_NULL`, `_to_slv`, `_<n>CLK_<hex>`,
+  `_s<hex>`, `_h<hex>`).
+
+A bad name is an error, never silently changed.
+
+`name=` is for what factories produce. A top-level function's Python name already is
+its hardware name, so `@hw_func(name=...)` on one is an error. A `@MAIN`'s name is
+different: `@MAIN(name=...)` and `MAIN(fn, name=...)` name the MAIN itself, which is
+used exactly as written, with no `_s<digest>` (see
+[MAINs made in code](#mains-made-in-code-mainfn-name)). The generated VHDL keeps the
+automatic description in each entity's
+`-- Specialization:` comment, and `name_index.log` lists every name with the key it
+replaced (see [Generated files and reports](README.md#generated-files-and-reports)).
+
+AUTO_PIPELINE and AUTO_MULTI_CYCLE tags take a `name=` of their own. It names a
+latency group rather than an entity; see
+[Naming a latency group](#naming-a-latency-group-name).
+
+### Introspecting a function's types: `hw_arg_types` / `hw_return_type`
+
+Sometimes a factory wraps a function *supplied by the caller* rather than one it builds
+itself, and needs that function's parameter/return types to build the rest of its
+hardware (a stream type around the payload type, a result struct sized to match, etc.):
+
+```python
+def make_stream_multi_cycle(func, latency):
+    """func must already be @hw_func-decorated, with one annotated parameter and an
+    annotated return type, e.g.:
+        @hw_func
+        def divider(i: my_struct_t) -> uint32_t: ..."""
+    ...
+```
+
+There's no factory call site to ask for these types — `func` is just an ordinary
+annotated Python function. `hw_arg_types(func)` and `hw_return_type(func)` recover them:
+
+```python
+from pypeline import hw_arg_types, hw_return_type, is_hw_func
+
+(in_type,) = hw_arg_types(func)   # tuple of parameter types, in declaration order
+out_type = hw_return_type(func)   # the declared return type
+assert is_hw_func(func)            # True for @hw_func and @MAIN wrappers
+```
+
+Both work whether `func` is undecorated or already `@hw_func`-decorated — but for
+factories that go on to *call* `func` from inside their own hardware function body
+(rather than just introspecting its annotations), `func` itself must already be
+`@hw_func`-decorated: `AUTO_PIPELINE`, `make_stream_multi_cycle`, and
+`make_stream_auto_pipeline` all enforce this and raise `TypeError`
+otherwise (see [Automatic (HLS-like) Implementation](#automatic-hls-like-implementation) /
+[Multi-Cycle Paths: `MULTI_CYCLE[...]`](#multi-cycle-paths-multi_cycle)). `@hw_func`
+decoration does not propagate into plain functions called from inside that body — a
+factory that calls an undecorated `func` won't simulate `Reg[T]`/`Feedback[T]` or bare
+struct/array locals correctly under `sim_call`, which is why the check exists.
+
+Use `func.return_t` for the complete return type of a `@hw_func` callable.
+`hw_arg_types` and `hw_return_type` also support undecorated annotated functions
+and remain useful when introspecting caller-supplied functions. Avoid reaching
+into `func.__annotations__` directly or inventing a factory-specific alias for
+the complete return type. See `include/pypeline/stream/stream_multi_cycle.py`
+for the full `make_stream_multi_cycle` example.
+
+A port annotation may reach its type through any factory argument, even one the function
+body never mentions:
+
+```python
+def make_consumer(src):
+    @hw_func
+    def consumer(p: src.return_t) -> uint16_t:   # `src` appears only here
+        return p.a + p.b
+    return consumer
+```
+
+Python evaluates a parameter or return annotation once, when the `def` runs, and both
+simulation and hardware elaboration use that resolved type.
+
+---
+
+## Factory-Generated Types
+
+These are examples of the third category from the [Basic Types](#basic-types) roadmap above: `float32_t` isn't a builtin — it's `make_float_t(8, 23)`; `float64_t` is `make_float_t(11, 52)`. Fixed-point types work the same way, built by `make_fixed_t`.
+
+### Floating-point types
+
+`from floating_point import float32_t, float64_t` (an import or two, from the
+`include/pypeline/floating_point.py` library) gets you IEEE 754-like struct types
+with `sign` (1 bit), `exp` (E bits), and `man` (M bits) fields, matching IEEE 754
+layout for standard sizes — with `+`, `-`, `*`, `/` already overloaded, ready to use:
+
+```python
+from floating_point import float32_t, float64_t
+
+def bias_one(x: float32_t) -> float32_t:
+    one: float32_t = float32_t.as_const(1.0)   # Python float → hardware constant
+    return x + one                              # dispatches to the library's adder
+```
+
+`float32_t.as_const(value)` converts a Python `float` to a `float32_t` instance at
+elaboration time; `float(x)` (on any value returned from a `float32_t`/`float64_t`
+computation) converts back to a Python `float`, for printing/debugging/comparing
+against a reference implementation.
+
+A bare Python float literal is not a hardware value and cannot be used directly inside
+a hardware expression ([#345](https://github.com/JulianKemmerer/PipelineC/discussions/345)). Convert it at elaboration time with `float_t.as_const(...)`, as
+shown above, and capture the resulting constant.
+
+Need a non-standard precision, or just the building blocks? `make_float_t(E, M)`
+(also from `floating_point`) builds the struct type itself, and
+`register_float_ops(float_t)` builds and globally registers `+`/`-`/`*`/`/` for it
+— this is exactly how the library builds `float16_t`/`float32_t`/`float64_t`
+themselves. The individual factories (`make_float_adder`, `make_float_subtractor`,
+`make_float_multiplier`, `make_float_divider`) are available too if you want to
+register just one operator, or reuse an existing adder (`make_float_subtractor`'s
+`adder=` argument) instead of building a second copy.
+
+#### Converting between float precisions, or to/from an int
+
+`make_float_converter(src_t, dst_t)` builds a widening or narrowing conversion
+function between any two `make_float_t` types, and self-registers it as a
+[cast](#casting) — so once built, `dst_t(some_src_t_value)` works directly:
+
+```python
+from floating_point import float32_t, float64_t, make_float_converter
+
+float32_to_float64 = make_float_converter(float32_t, float64_t)
+float64_to_float32 = make_float_converter(float64_t, float32_t)
+y64: float64_t = float64_t(some_float32_value)   # same conversion, via the cast
+```
+
+The library already builds these two for you (`from floating_point import
+float32_to_float64, float64_to_float32`). For converting to/from a plain integer
+type, `make_float_to_int(float_t, int_t)` (truncating, toward zero, like C's
+`(int)f`) and `make_int_to_float(int_t, float_t)` (value-preserving) do the same
+job — self-registering as casts the same way — and the library also ships
+`float64_to_int32`/`int32_to_float64` pre-built. None of these handle subnormals,
+`inf`/`NaN`, or overflow specially — they match the common-case-only rigor of the
+adder they're built alongside.
+
+#### Converting to/from a raw bit pattern (e.g. `uint32_t`)
+
+A [cast](#casting) between two struct types is always a **value-preserving
+conversion** through a registered function, never an unchecked reinterpretation of
+the same bits — and no library conversion between `float32_t` and `uint32_t` is
+registered, since that pairing isn't a numeric conversion at all (a float's bit
+pattern is sign/exponent/mantissa, not the integer it names). To move a float
+value across a boundary declared as a plain unsigned integer — a top-level port, a
+stream payload, anything typed `uintN_t` — unpack/pack the struct fields by hand
+with bit-slicing and `concat()` instead:
+
+```python
+from pypeline import concat
+
+E_LEN = len(float32_t.typeof("exp"))   # 8  -- generic: works for any make_float_t result
+M_LEN = len(float32_t.typeof("man"))   # 23
+S_BIT = E_LEN + M_LEN                  # 31 -- sign is the top bit
+
+def uint32_to_float32(bits: uint32_t) -> float32_t:
+    return float32_t(
+        sign=bits[S_BIT],
+        exp=bits[S_BIT - 1 : M_LEN],
+        man=bits[M_LEN - 1 : 0],
+    )
+
+def float32_to_uint32(f: float32_t) -> uint32_t:
+    return concat(f.sign, f.exp, f.man)   # first arg = MSB, matching IEEE 754 layout
+```
+
+`T.typeof(field_name)` is available on any `@struct` type (not just floats) and
+returns the declared ctype of that field; `len(...)` on the result gives its bit
+width. Computing `E_LEN`/`M_LEN`/`S_BIT` this way — rather than hardcoding `8`/`23` —
+keeps the same unpack/pack code working unchanged for `float64_t = make_float_t(11,
+52)` or any other exponent/mantissa width.
+
+See `src/tests/pypeline_tests/inst/float32_add_test.py`'s `float_add_32_main` for a
+complete worked example: it receives two `uint32_t` ports, unpacks each into a
+`float32_t`, adds them, and repacks the `float32_t` result back into a `uint32_t`.
+
+### Fixed-point types
+
+`from fixed_point import make_fixed_t` (from `include/pypeline/fixed_point.py`) builds a
+struct type wrapping a single raw integer field — a fixed-point number is just an
+`intN_t`/`uintN_t` with an implied binary point `frac_bits` positions up from the LSB:
+
+```python
+from fixed_point import make_fixed_t, register_fixed_ops
+
+q4_12_t = make_fixed_t(4, 12)          # signed Q4.12: 4 integer bits, 12 fraction bits
+ops = register_fixed_ops(q4_12_t)   # registers +, -, *, unary - globally
+
+def bias_one(x: q4_12_t):
+    one: q4_12_t = q4_12_t.as_const(1.0)   # Python float -> hardware constant
+    return x + one                          # dispatches to the registered adder
+```
+
+`q4_12_t.as_const(value)` converts a Python `float` to a `q4_12_t` instance at elaboration
+time (round-half-even, matching Python's own `round()`); `float(x)` (on any `q4_12_t` value)
+converts back to a Python `float` for printing/debugging/comparing against a reference
+implementation. `t.int_bits`/`t.frac_bits`/`t.signed` are plain attributes on any type
+returned by `make_fixed_t`, for introspection by generic code (e.g. a FIR filter library
+choosing accumulator widths).
+
+#### `+`, `-`, `*` always grow — they never truncate
+
+Unlike native `intN_t`/`uintN_t` arithmetic (which you assign into an explicitly-sized
+local to narrow), `register_fixed_ops`/`make_fixed_adder`/`make_fixed_subtractor`/
+`make_fixed_multiplier` deliberately return a **wider** type than either operand, sized to
+hold the exact mathematical result with **zero bit truncation** — this is why `a + b` for
+two `q4_12_t` values does not itself produce a `q4_12_t` (it produces a 5-integer-bit
+result); bind it to its own type (or let Python infer it) rather than assuming the sum has
+the same type as its operands:
+
+```python
+from pypeline import hw_return_type
+
+sum_t = ops.add.return_t   # the actual (wider) result type: Q5.12
+```
+
+`hw_return_type` (see [Introspecting a function's types](#introspecting-a-functions-types-hw_arg_types--hw_return_type))
+reads the same declared return type as `.return_t`, so `sum_t` is the type
+returned by `ops.add`. The operation bundle's `.operand_t` remains `q4_12_t`.
+
+`+`/`-` require both operands to share the same `frac_bits` (mismatched `frac_bits` raises
+`TypeError` at the point you build the adder/subtractor — resize one operand first via
+`make_fixed_resize`, below); `*` has no such constraint and returns a full-precision, exact
+product (no rounding) with `frac_bits` equal to the sum of both operands' `frac_bits`.
+Growth accounts for **mismatched signedness** too: adding/multiplying a signed and an
+unsigned `fixed_t` grows the output 1 bit more than the naive `max(int_bits)+1` /
+`int_bits_a+int_bits_b` textbook formula would suggest, matching exactly the same
+sign-promotion rule Pypeline's native `intN_t`/`uintN_t` arithmetic already uses for any
+plain mismatched-signedness expression (`int8_t + uint10_t` promotes to `int12_t`, not
+`int11_t`) — this rule is literally the same shared code on both the native-simulation
+path and real hardware elaboration, so there's no risk of it behaving differently in
+`sim_call` versus synthesized hardware. **Narrowing is never an implicit side effect of
+arithmetic** — if you want a smaller result, resize explicitly (next section).
+
+Need the individual pieces instead of `register_fixed_ops`'s all-at-once self-pair
+registration? `make_fixed_adder(a_t, b_t)`/`make_fixed_subtractor(a_t, b_t)`/
+`make_fixed_multiplier(a_t, b_t)` build a single operator for any pair of `fixed_t` types
+(not just `a_t` with itself) — useful for e.g. an accumulator of one width absorbing
+products of another, without registering a global operator for every combination.
+`make_fixed_negate(a_t)` (requires `a_t.signed`) builds unary `-` at the same width as its
+input; like plain two's-complement negation elsewhere in this codebase, negating the
+most-negative representable value wraps back to itself rather than growing a bit.
+
+#### Resizing (rounding + saturation)
+
+`make_fixed_resize(src_t, dst_t, rounding="truncate", overflow="wrap")` is the explicit,
+opt-in narrowing/rounding operation — the only place bits are intentionally dropped. It
+changes `int_bits`/`frac_bits`/signedness between any two `fixed_t` types, vendor-FIR-IP
+"output precision control" style — e.g. rounding a wide accumulator down to a narrow
+output sample:
+
+```python
+from fixed_point import make_fixed_t, make_fixed_resize
+
+acc_t = make_fixed_t(12, 20)      # wide accumulator
+sample_t = make_fixed_t(4, 12)    # narrow output sample
+round_to_sample = make_fixed_resize(acc_t, sample_t, rounding="round_half_even", overflow="saturate")
+```
+
+`rounding` (only meaningful when narrowing the fraction, i.e. `src_t.frac_bits >
+dst_t.frac_bits` — a no-op when widening or unchanged):
+- `"truncate"` — drop the low bits (an arithmetic right shift, i.e. floor, not
+  round-toward-zero — `-1.5` truncates to `-2`, not `-1`).
+- `"round_half_up"` — ties always round toward `+∞`.
+- `"round_half_even"` — banker's/convergent rounding: ties round to whichever neighbor is
+  even.
+- `"round_half_away"` — symmetric rounding: ties round away from zero.
+
+`overflow` (applies regardless of whether the fraction narrowed): `"wrap"` (plain
+two's-complement truncation) or `"saturate"` (clamp to `dst_t`'s representable
+`[min, max]`, computed from `dst_t.int_bits`/`dst_t.signed`).
+
+`quantize_coeffs(taps, coeff_t, rounding="round_half_even")` is the plain-Python (no
+hardware) counterpart, for quantizing a list of floating-point filter taps into
+`coeff_t`'s raw integer representation ahead of time (e.g. baking FIR coefficients into
+`as_const`-initialized `Reg[T]`s) — each tap is quantized independently, with no
+symmetry-preservation logic.
+
+---
+
+## Custom Operators
+
+You can overload Python's binary and unary operators for specific pypeline types using
+the registration functions:
+
+```python
+from pypeline import register_operator, register_left_operator, register_unary_operator
+```
+
+| Function | Matches | Use case |
+|---|---|---|
+| `register_operator(op, lhs_t, rhs_t, impl)` | exact `(lhs, rhs)` pair | custom addition on a struct type |
+| `register_left_operator(op, lhs_t, impl)` | left type only | variable-width shift where rhs type is inferred |
+| `register_unary_operator(op, operand_t, impl)` | operand type | custom negation |
+
+`op` strings: `"PLUS"` (`+`), `"MINUS"` (`-`), `"INFERRED_MULT"` (`*` — not
+`"MULT"`/`"TIMES"`), `"DIV"` (`/` — not `"DIVIDE"`), `"SL"` (`<<`), `"SR"` (`>>`),
+`"NEGATE"` (unary `-`), `"GT"`/`"GTE"`/`"LT"`/`"LTE"` (`>`/`>=`/`<`/`<=`), `"EQ"`/`"NEQ"`
+(`==`/`!=`).
+
+`lhs_t`/`rhs_t`/`operand_t` can also be a **type matcher** — `any_uint_t`, `any_int_t`,
+`any_integer_t`, `uint_upto(n)`, `int_upto(n)` — instead of one concrete type, letting a
+single registration cover every width. In that case `impl` must be a **factory**
+`func(lhs_t[, rhs_t]) -> hw_func`, called once per concrete type (pair) actually used and
+memoized afterward:
+
+```python
+from pypeline import register_operator, any_integer_t
+
+register_operator("PLUS", any_integer_t, any_integer_t, make_soft_add)
+```
+
+A shipped library of such factories lives in `include/pypeline/operators/` — soft
+(bitwise-primitive) implementations for every integer operator that doesn't already have a
+built-in lowering, plus alternate flavors (ripple vs. carry-select add, shift-add vs.
+Karatsuba multiply, subtract vs. bitwise-magnitude compare):
+
+```python
+from operators.soft import register_soft_ops
+register_soft_ops()                  # whole design, soft all the way to bitwise leaves
+register_soft_ops(scope=my_func)     # only my_func's own body
+
+from operators.soft import register_soft_mult_karatsuba
+register_soft_mult_karatsuba()       # swap in a different flavor; last registration wins
+```
+
+Karatsuba has two leaf modes. Its default base case is soft shift-and-add below 16 bits,
+which keeps the multiplier all-fabric and is meant for ASIC-style builds. On an FPGA,
+the leaves can instead be ordinary inferred `*`, so the vendor tool can map each one to a
+DSP block. You opt into this mode explicitly; no default changes:
+
+```python
+from operators.soft import register_mult_karatsuba_inferred_leaves
+register_mult_karatsuba_inferred_leaves()   # every unsigned * above 34 bits
+
+# Or for one width only, as an exact-type registration or a direct call:
+from operators.soft_mult import make_mult_karatsuba_inferred_leaves
+mul130 = make_mult_karatsuba_inferred_leaves(uint130_t, uint130_t)   # threshold=34
+register_operator("INFERRED_MULT", uint130_t, uint130_t, mul130)
+```
+
+At threshold 34, a 130 × 130 product becomes nine 32–34-bit inferred leaves. A Karatsuba
+inside a DSP-block design of this shape (the FPGA-House-AG `mul_136_kar.vhd` ChaCha20-Poly1305
+multiplier) motivated this configuration. Measured DSP and LUT counts are in
+[`SYN_DESIGN.md`](SYN_DESIGN.md#karatsuba-with-inferred-leaves). The leaves are pinned to
+the built-in `*`, so no `*` registration, including the hybrid's own, can redispatch them.
+Pass any other multiplier factory as `make_soft_mult_karatsuba(l_t, r_t, threshold, leaf=...)`
+for a different leaf.
+
+Five operator families — int unary negate, int `>`/`>=`/`<`/`<=`, `/`, `%`, and
+variable-amount shift — are registered soft **by default** (before your design file is even
+imported), since they have no other inferred/raw-VHDL lowering. Register something more
+specific in your own design and it overrides the default, same as any other registration.
+
+The `floating_point` library (see [Factory-Generated Types: Floating-point types](#floating-point-types))
+already does this registration for you for its predefined types:
+
+```python
+from floating_point import float32_t   # +, -, *, / already registered
+
+@MAIN
+def fp_add(a: float32_t, b: float32_t) -> float32_t:
+    return a + b    # dispatches to the library's float32_add
+```
+
+Registering your own follows the same shape — `register_float_ops` (also in
+`floating_point`) is a convenience wrapper around exactly this pattern:
+
+```python
+from floating_point import make_float_t, make_float_adder, register_operator
+
+my_float_t = make_float_t(6, 9)             # a non-standard precision
+my_adder = make_float_adder(my_float_t)
+register_operator("PLUS", my_float_t, my_float_t, my_adder)
+```
+
+Registrations are global. To limit a registration to a single function's
+elaboration, use the `scope=` keyword:
+
+```python
+register_unary_operator("NEGATE", my_t, negate_my_t, scope=my_function)
+```
+
+Registered operators dispatch both during hardware elaboration and during plain
+Python/native simulation (`a + b` on two registered struct instances works the
+same whether or not you're inside `sim_call`) — `@struct` types get `__add__` /
+`__sub__` / `__mul__` / `__truediv__` / `__neg__` that consult these same
+registries, raising a clear `TypeError` if nothing is registered for the pair
+rather than falling through to `NamedTuple`'s default tuple concatenation/repeat.
+
+Matcher registrations (`any_integer_t` and friends) dispatch in sim too, but because
+one of them covers every integer op in every design at once, whether they *execute*
+is a policy. Set it in source with `set_sim_soft_ops(spec)` before simulating:
+
+| spelling | meaning |
+|---|---|
+| `None`, `all`, `1` | every registered op dispatches (**default**) |
+| `none`, `0` | matcher registrations do not dispatch; built-ins run |
+| `NEGATE,LT,LTE,GT,GTE` | only those op names |
+
+Both paths compute the same value, so this trades simulation speed against *structural*
+fidelity — running the same unrolled per-bit logic the hardware will, which is what you
+want when the thing under test is the operator implementation itself. It is not free:
+on uint16 operands a dispatched `DIV` costs ~42 ms against ~1.5 µs for the built-in, and
+a compare ~1.4 ms against ~0.5 µs. Turn it down for sim-heavy runs that only care about
+values. Concrete-type registrations ignore the policy — naming an exact type pair is
+taken as asking for that implementation specifically.
+
+> **Unary `-` widens.** `-x` on an integer produces `int<width+1>_t`, signed, in both
+> layers: `-uint24_t(5)` is `int25_t -5`, and negating a signed minimum widens rather
+> than wrapping. Annotate the destination accordingly. A registered `NEGATE`
+> implementation must return that type too, or registering it would change the type of
+> every negate in the design — see `make_soft_negate`.
+
+### Cheap and expensive ways to say the same thing
+
+Hardware-function bodies are elaborated, not executed, so an operator you write
+is an operator you get. Two things make an innocent-looking line expensive:
+
+- **A constant operand is still a port during leaf characterization.** Each
+  leaf is characterized standalone, with constants represented as ordinary inputs. So
+  `x * -1` is timed as a real NxM multiplier even where the vendor tool would
+  later fold it, and the auto-pipeliner plans its cuts against that number.
+- **A soft-registered operator is a whole submodule.** Under
+  `register_soft_ops()`, a stray `1 - bit` is not an inverter — `MINUS` resolves
+  to a ripple-borrow `soft_sub` instance.
+
+| Instead of | Write | Why |
+|---|---|---|
+| `-x` as `x * -1` | `wide: out_t = x` / `not_wide: out_t = ~wide` / `result: out_t = not_wide + 1` | An inverter row plus an increment, not a multiplier. The widen must be its own statement *before* the `~`, or the inversion happens at `x`'s width and a trailing annotation cannot recover the sign. |
+| `1 - bit` (a `uint1_t`) | `bit ^ 1` | One bitwise leaf instead of a subtract. `^ 1` also keeps the one-bit intent explicit in less strictly typed simulation. |
+| `k * x` for a Python-constant `k` | a Python `if` on `k`, or `operators/comb_opt.py`'s `make_constant_mult` | A branch on an elaboration-time constant costs nothing; only the taken arm is elaborated. |
+| `x / 2**n`, `x % 2**n` | `operators/comb_opt.py`'s `make_power_of_two` | A shift or a mask instead of a divider. |
+| widening by arithmetic | an annotated assignment (`wide: big_t = x`) | Pure wiring — zero-extend or sign-extend, no operator at all. |
+
+`include/pypeline/bits.py` (`make_clz`, `make_shifter_sl`, `make_shifter_sr`) and
+`include/pypeline/operators/comb_opt.py` hold the ready-made cheap primitives.
+
+---
+
+## Global Signals
+
+Global signals are module-level wires shared between `@MAIN` functions.
+They are declared at module scope (outside any function) using a type annotation.
+A build's `diagram.html` shows every `@MAIN` and the global wires between them, field
+by field and in the direction each field is driven
+([Viewing the design](README.md#viewing-the-design)).
+
+### `Wire[T]` — shared combinational signal
+
+```python
+main_a_in: Wire[uint1_t]  # input into main_a
+main_a_out: Wire[uint1_t]  # output from main_a
+@MAIN
+def main_a():
+    main_a_out = ~main_a_in
+
+main_b_in: Wire[uint1_t]  # input into main_b
+main_b_out: Wire[uint1_t]  # output from main_b
+@MAIN
+def main_b():
+    main_b_out = ~main_b_in
+
+# Connect output of A into B
+# and output of B into A
+# (nevermind this is bad combinatorial loop in synthesis)
+@MAIN
+def a_b_connect():
+    main_b_in = main_a_out
+    main_a_in = main_b_out
+```
+
+Rules:
+- Each `Wire[T]` must have at least one writer function, and each writer function has
+  exactly one instance in the design hierarchy. Several writer functions may split a
+  compound wire between them (see
+  [Splitting a compound wire](#splitting-a-compound-wire-across-multiple-writer-functions)).
+- Any number of functions may read it.
+- `Wire[T]` is **not** a register — it carries no value across clock cycles.
+- No `global` statement is needed. Inside the module that declares it, a wire's name
+  always *is* the wire: `w = ...` writes it and `w` reads it.
+- The name is therefore reserved in that module. You cannot also use it for a local:
+  a parameter, an annotated local (`w: uint8_t = ...`), a loop or comprehension
+  variable, and so on. The same goes for the name of an imported module that declares
+  wires. This is an error in both native sim (`GlobalWireNameError` at import) and
+  elaboration (`ElaborationError`). Rename the local.
+- Outside its declaring module, the bare name means nothing special. A helper function
+  in another file can have a local `w` without touching the wire; reach another
+  module's wire as `module.w`.
+- Unpacking assignment writes wires like any other assignment:
+  `w, count = x, count + 1`.
+
+### Reading and writing the same wire in its writer function
+
+A function may both read and write the same wire it drives — it behaves exactly like
+a normal local variable: writes and reads interleave in program order, and the value
+every *other* function sees that cycle is whatever this function's value is at the end
+of its body.
+
+```python
+w: Wire[uint8_t]
+
+@MAIN
+def writer():
+    w = 0
+    w += 1   # read-after-write: normal local semantics — w is now 1
+```
+
+Reading a leaf **before** this function has written it (even earlier in the very same
+statement list) returns **zero** — the implicit "driven with zeros" default every
+writer function starts with, the same default an undriven struct/array field gets
+(see below). It is not an elaboration error.
+
+```python
+point_out: Wire[point_t]   # point_t has fields .x, .y
+
+@MAIN
+def writer():
+    # point_out.x has not been written yet this function -- reads as 0.
+    point_out.x = point_out.x + 1   # writes 0 + 1 = 1
+```
+
+This applies to the leaves a function writes itself. Leaves of a split wire that
+another function writes read that function's live value (see
+[Splitting a compound wire](#splitting-a-compound-wire-across-multiple-writer-functions)).
+
+### Partially-driven compound wires read undriven fields as zero
+
+If a `Wire[T]`'s writer function only assigns some fields of a struct (or some
+elements of an array), the untouched fields/elements read as zero everywhere the wire
+is read — exactly as if the writer had first assigned the whole wire to a zero value,
+then overwritten the fields it actually drives.
+
+```python
+point_out: Wire[point_t]   # point_t has fields .x, .y
+
+@MAIN
+def writer():
+    point_out.x = 5   # .y is never assigned
+
+@MAIN
+def reader():
+    v = point_out   # v.x == 5, v.y == 0
+```
+
+### Splitting a compound wire across multiple writer functions
+
+A `Wire[T]`/`Output[T]` of compound type (struct or array, nested arbitrarily) may be
+driven by **more than one** writer function, as long as the set of scalar leaves each
+writer drives is disjoint from every other writer's. Conceptually the wire behaves
+**as if flattened into one independent global wire per scalar leaf**: each leaf is
+driven by whichever function writes it, leaves nobody drives read as zero, and every
+reader (including the writers themselves) sees each leaf's live value.
+
+```python
+main_ab_in:  Wire[uint1_t]   # input into main_a and into main_b
+main_ab_out: Wire[point_t]   # output .x from main_a and .y from main_b
+
+@MAIN
+def main_a():
+    main_ab_out.x = ~main_ab_in
+
+@MAIN
+def main_b():
+    main_ab_out.y = ~main_ab_in
+
+@MAIN
+def a_b_connect():
+    main_ab_in = main_ab_out.x ^ main_ab_out.y
+```
+
+What a writer may claim:
+- **Any static path**, at any nesting depth: a top-level field (`w.x = ...`), a nested
+  leaf (`w.a.x = ...`), a whole subtree (`w.a = some_point`), or a constant-indexed
+  array element (`w.arr[2] = ...`, including indices from unrolled `for i in range(...)`
+  loops — constant indices stay precise, so one writer covering `arr[0..1]` leaves
+  `arr[2..3]` free for another).
+- Writes may be **conditional** (`if en: w.x = v`): on cycles the write doesn't
+  execute, that leaf reads zero — the clock-enable idiom.
+- The writer may sit **anywhere in the hierarchy** — a helper function called (even
+  several levels deep) from a `@MAIN`, not just a `@MAIN` body itself.
+- A writer may also **read** the wire: leaves it drives itself follow normal
+  local-variable semantics (read-before-write is zero, write-then-read is the new
+  value), and leaves ANOTHER function drives read that function's live value.
+
+Restrictions:
+- Two writers claiming overlapping territory — the same leaf, or one claiming a
+  subtree enclosing another's claim, or one whole-wire write plus any other writer —
+  is an `ElaborationError` naming both functions and paths.
+- Writes through a **variable** (non-constant) array index are not supported when the
+  wire has more than one writer function ([#350](https://github.com/JulianKemmerer/PipelineC/discussions/350)).
+- Each writer function must still have exactly one instance in the design hierarchy.
+- Leaves no writer claims read as zero, exactly like the single-writer partial-write
+  case above.
+- Each leaf is on its own writer's clock. Its readers must be on that clock too, unless
+  the wire is an async wire; see
+  [Which clock a global wire is on](#which-clock-a-global-wire-is-on).
+
+### `Input[T]` / `Output[T]` — top-level FPGA ports
+
+`Input[T]` and `Output[T]` work like `Wire[T]` but also appear as ports in the generated
+VHDL entity, matching FPGA pin constraint files.
+
+```python
+from pypeline import Input, Output, uint1_t
+
+button: Input[uint1_t]    # physical FPGA input pin
+led:    Output[uint1_t]   # physical FPGA output pin
+
+@MAIN
+def blinker():
+    led = ~button          # invert the button to drive the LED
+```
+
+Port names match the pin names in your constraint (XDC/PCF) file exactly.
+
+In simulation, drive an `Input[T]`'s per-cycle value with `@sim_input` — see
+[Simulation](#simulation).
+
+### Wire declarations have no initialiser
+
+```python
+my_wire: Wire[uint32_t]       # correct
+my_wire: Wire[uint32_t] = 0  # error — initialisers are not allowed on Wire/Input/Output
+```
+
+### Global wires in pipelined code
+
+A function has pipeline stages when the compiler adds registers to it (see
+[Part II](#part-ii--temporal-behavior)). That covers an `AUTO_PIPELINE`-tagged
+function, a `@MAIN` the sweep pipelines, and a helper the sweep slices inside one of
+those. A [`@pipeline_latency`](#fixed-user-pipelines) function supplies its own
+registers and gets none added, so its body keeps ordinary same-cycle wire timing.
+Inside a function with pipeline stages, every global wire it touches behaves like an
+extra argument or return value of **that function**:
+
+- **Reads** are sampled together with the function's arguments, at its first stage.
+  Every read of a wire in the function sees that one sample, however late the
+  pipeline uses it; delay registers carry the value to its uses.
+- **Writes** are published together with its return value, at its last stage. A wire
+  computed early is held in delay registers until then. Several writes in the function
+  still follow program order, and other functions see the final value.
+- The input/output registers the sweep may add to a function hold its global reads
+  and writes too, so they stay lined up with its arguments and return value.
+
+A global wire is connected straight to the function that uses it, with no registers in
+between, and the alignment above concerns only that function's own stages. A function
+called inside a pipeline sits at some stage of it. Its global reads and writes line up
+with *its own* arguments and return value at that stage, not with the enclosing
+pipeline's inputs and outputs:
+
+```python
+g: Wire[uint16_t]
+
+@hw_func
+def read_g(x: uint16_t) -> uint16_t:
+    return x + g              # no stages of its own: reads g when it runs
+
+@hw_func
+def core(x: uint16_t) -> pair_t:
+    q: uint16_t = slow(x)     # say this fills core's 2 stages
+    early: uint16_t = read_g(x)   # at core's stage 0: g as x entered
+    late: uint16_t = read_g(q)    # at core's stage 2: g two cycles later
+    return pair_t(a=early, b=late)
+
+AP = AUTO_PIPELINE(core, latency=2)
+```
+
+`early` and `late` see `g` from different cycles. If `core` read `g` itself, both uses
+would see the sample taken with `x`. For a compound wire, the fields one function
+writes are published together. Another function writing other fields of the same wire
+keeps its own timing.
+
+#### `VOLATILE` wires
+
+Alignment costs delay registers when a wire is used far from a function's first or last
+stage. Some signals don't need to line up with the data, for example configuration and
+mode settings or status and debug outputs. Declare those `VOLATILE`:
+
+```python
+threshold: Input[uint32_t, VOLATILE]   # Wire[T, VOLATILE] and Output[T, VOLATILE] too
+status: Wire[status_t, VOLATILE]
+```
+
+Inside pipelined functions a `VOLATILE` wire is neither aligned nor registered:
+
+- Each operation that consumes it reads it at the stage where that operation runs, so
+  two reads in one function can see values from different cycles.
+- A write is driven as soon as its value is ready, wherever the pipeline's stages put
+  that. Different `VOLATILE` wires, and different writer functions, can change at
+  different times.
+- Limitation: the fields one function writes into one compound `VOLATILE` wire are
+  driven together, when the last of them is ready. Use separate wires (or separate
+  writer functions) for outputs that should appear independently.
+
+In code without pipeline stages, such as a stateful `@MAIN` or a `--comb` build,
+`VOLATILE` makes no difference.
+
+#### Limitations
+
+- **Arguments and return values are always aligned.** There is no `VOLATILE` argument
+  or return value yet. For an unaligned input, read a `VOLATILE` wire inside the
+  function instead of passing the value in.
+- **Native simulation models only some global wires in pipelines.** For a pipelined
+  `@MAIN` or an `AUTO_PIPELINE` call with latency, it evaluates the function's body at
+  the cycle the inputs enter. It publishes the writes with the delayed return value.
+  That is exact for non-`VOLATILE` wires used directly in that function's own body.
+
+  Two cases stop native simulation with `SimPipelineModelError`: a global wire used
+  by a function called inside the pipeline, and a `VOLATILE` wire used by the
+  pipelined function. Simulate the generated hardware instead (`--cocotb --ghdl`), or
+  move the access into the pipelined function and pass the value as an argument or
+  return value.
+
+  Code that runs without pipeline stages has no such limit. That covers stateful
+  `@MAIN`s and every `--comb` simulation apart from `AUTO_PIPELINE(..., latency=N)`
+  call sites.
+
+### `Inst[f]` — global instances
+
+A global instance is one instance of a hardware function placed at module level. Its ports
+become a global wire, so any function in the design can drive its inputs and read its
+outputs. The compiler adds the `@MAIN` that holds the instance:
+
+```python
+from pypeline import *                    # Inst included
+
+@hw_func
+def alu(a: uint8_t, b: uint8_t) -> uint8_t:
+    return a + b
+
+alu0: Inst[alu]                           # one alu, shared by the design
+
+@MAIN
+def decoder():
+    alu0.a = 3                            # drive its inputs
+    alu0.b = 4
+
+@MAIN
+def writeback():
+    result = alu0.out                     # read its output, in the same cycle
+```
+
+This replaces declaring a wire per input and output and writing a wiring `@MAIN` that calls
+the function (PipelineC's `GLOBAL_FUNC_INST` macros).
+
+**Ports.** Each port of `f` is a field of the instance:
+
+| Port of `f` | Field | Driven by |
+|---|---|---|
+| argument `a` | `alu0.a` | your functions |
+| the return value | `alu0.out` | the instance |
+| an [interface port](#bidirectional-ports-interface) `x_if`: a `.fwd_t` or `.fb_t` argument plus the return field of the same name | `alu0.x_if`, one field holding both halves (`.stream` and `.ready` for a stream) | an input port: your functions drive the feedforward half and the instance the reverse half (`.ready`); an output port the other way round |
+| a plain field of a returned port bundle, such as an `idle` flag next to stream ports | `alu0.idle` | the instance |
+
+A stream module is an instance with its stream ports as fields:
+
+```python
+sb: Inst[make_skid_buffer(cmd_t)]
+
+@MAIN
+def producer():
+    sb.stream_in_if.stream.data = next_cmd()
+    sb.stream_in_if.stream.valid = 1
+    if sb.stream_in_if.ready:             # accepted
+        ...
+
+@MAIN
+def consumer():
+    sb.stream_out_if.ready = 1
+    if sb.stream_out_if.stream.valid:
+        run(sb.stream_out_if.stream.data)
+```
+
+The compiler adds one `@MAIN` per instance, `<name>_INST` (`alu0_INST` for `alu0`,
+prefixed with the module's name for an instance declared in an imported module).
+Generated VHDL shows it under that name, and timing reports call it
+`global instance alu0 [top.py:7]`.
+
+Rules:
+
+- `f` is a `@hw_func`, including one made by a factory or written in raw VHDL, or an
+  `AUTO_PIPELINE(f)` tag. A `@MAIN` cannot be an instance.
+- Its ports follow the [`Wire[T]` rules](#wiret--shared-combinational-signal) leaf by
+  leaf: several functions may drive different inputs, each function with exactly one
+  instance in the hierarchy; any number of functions may read; an input that no function
+  drives reads zero.
+- Driving a field the instance drives is an error that names the instance and its inputs.
+- Writes into an input use constant indices or whole values. An instance's wire always has
+  several writers (your functions and the instance), and a variable-index write is not
+  supported on a wire with more than one writer function
+  ([Splitting a compound wire](#splitting-a-compound-wire-across-multiple-writer-functions)).
+- `Inst[f]` takes no initializer and is declared at module level only.
+- An argument named `out` next to a plain return value is an error, as is a return field
+  that has an argument's name without being the other half of its interface port. So is a
+  function named `<name>_INST`, which would clash with the instance's `@MAIN`.
+- In the generated VHDL a field whose name is a VHDL reserved word gets a suffix, as struct
+  fields do: `alu0.out` is the record field `out_v`.
+
+**Clock.** An instance runs on the clock of the functions that use it. Clock inference
+passes through it as through a wire: a bare `@MAIN` that uses an instance takes the rate of
+another `@MAIN` that uses it. Users on two different clocks are an error. A
+[global FIFO](#fifot--global-fifos) is the exception: inference does not pass through it.
+
+**Latency.** An instance adds no registers of its own, so its outputs follow its inputs
+like a function call's: in the same cycle, or after `f`'s own registers. The sweep never
+pipelines an instance's `@MAIN`. To pipeline an instance, make its hardware an
+`AUTO_PIPELINE` tag, `alu0: Inst[AUTO_PIPELINE(alu)]` (or `AUTO_PIPELINE(alu, latency=2)`
+for a fixed latency): its inputs are then sampled and its outputs driven
+[aligned with the pipeline](#global-wires-in-pipelined-code). A function that both drives
+and reads one interface port of an instance, as a producer driving `.stream` and reading
+`.ready` does, never gets pipeline stages: its handshake would break. `AUTO_PIPELINE` of
+such a function is an error that points to
+[`make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline).
+
+**Simulation.** Native simulation runs each instance as the same compiler-made `@MAIN`, with
+its own state: two instances of one stateful function keep separate registers.
+
+**Reset.** An instance resets with its clock's primary reset (`make_clock(..., reset=)`),
+every register in it, as if its `@MAIN` had `reset_registers="all"`; on a clock without
+one it is not reset. The declaration takes no reset keyword. See
+[Resets and global instances](#resets-and-global-instances).
+
+### `Fifo[T]` — global FIFOs
+
+A global FIFO is a buffer between a producer function and a consumer function anywhere in
+the design. It is declared at module level like a wire, with the FIFO hardware as its
+initializer:
+
+```python
+from pypeline import *                    # Fifo and global_fifo included
+
+cmds: Fifo[cmd_t] = global_fifo(16)       # holds at least 16 cmd_t words
+
+# Both MAINs run on the default clock, so this is a synchronous FIFO.
+@MAIN
+def parser():
+    n: Reg[uint8_t]
+    cmds.wr.stream.data = make_cmd(n)     # the write end
+    cmds.wr.stream.valid = 1
+    if cmds.wr.ready:                     # accepted: build the next command
+        n += 1
+
+@MAIN
+def executor():
+    slow: Reg[uint1_t]
+    cmds.rd.ready = slow                  # the read end: take a word every other cycle
+    if cmds.rd.stream.valid & slow:
+        run(cmds.rd.stream.data)
+    slow = ~slow
+```
+
+A global FIFO is always a valid/ready stream. `T` is the data type, and the FIFO supplies
+the handshake, so each end is a
+[valid/ready stream](#the-stream-interface-validready-handshaking) of `T`. The producer uses
+the write end `.wr`, and the consumer the read end `.rd`:
+
+| End | It is the FIFO's | The function using it drives | and reads |
+|---|---|---|---|
+| `cmds.wr` | input port | `.stream` (`.data` and `.valid`) | `.ready` |
+| `cmds.rd` | output port | `.ready` | `.stream` (`.data` and `.valid`) |
+
+An end's halves are the ones a stream module's ports carry: `.stream` is a
+`make_stream_t(T)` value and `.ready` a `uint1_t`. Connecting a stream module's output port
+to the write end therefore takes one assignment in each direction:
+
+```python
+cmd_intrf = make_stream_interface(cmd_t)
+
+@MAIN
+def cmd_source():                         # the producer, written with a stream module
+    r = parse(..., cmd_out_if=cmd_intrf.fb_t(ready=cmds.wr.ready))
+    cmds.wr.stream = r.cmd_out_if.stream
+```
+
+**The hardware.** `global_fifo(n)` builds the library FIFO,
+[`make_stream_fifo`](#fifos-make_stream_fifo). `global_sync_fifo(n)` builds the same
+FIFO and also states that both ends stay on one clock. Any other single-clock module with
+one valid/ready input port and one valid/ready output port of `T` can be the initializer
+instead, written in Pypeline or in raw VHDL: for example `make_stream_fifo(T, 256)` or
+`make_skid_buffer(T)`. Its ports must carry `make_stream_t(T)` with a `uint1_t` ready, as
+the stream modules built on `make_stream_interface(T)` do. The compiler checks them and
+names the module if they don't match.
+
+A global FIFO is a [global instance](#instf--global-instances) of its hardware whose two
+stream ports are the ends `.wr` and `.rd`, with the stricter rules below. The compiler adds
+one `@MAIN` per global FIFO, `<name>_FIFO` (`rx_FIFO` for `rx`, prefixed with the module's
+name for a FIFO declared in an imported module). It holds the FIFO hardware and runs on its
+ends' clock. Generated VHDL shows it under that name, and timing reports call it
+`global FIFO rx [top.py:14]`.
+
+**Across clocks.** The same `global_fifo(n)` becomes an async FIFO when its two ends are
+used on different clocks. `global_sync_fifo(n)` and `global_async_fifo(n)` say which one you
+expect. See [Clock-Crossing FIFOs](#clock-crossing-fifos).
+
+Rules:
+
+- Exactly one function uses each end, so a FIFO is point-to-point. Fan out through a
+  broadcast module, as for any interface ([Array ports](#array-ports-fan-out)). That
+  function may be a helper anywhere in the hierarchy, with exactly one instance.
+- Both ends must be used. An unused end is an error that names it.
+- Driving a half that the FIFO drives (`cmds.wr.ready`, `cmds.rd.stream`), or a whole end,
+  is an error that names the end.
+- Ends on two clocks make an async FIFO ([Clock-Crossing FIFOs](#clock-crossing-fifos)),
+  except for `global_sync_fifo(n)` and a single-clock module, where they are an error. Clock
+  inference does not pass through a FIFO, so a bare `@MAIN` does not take its clock from
+  the other end.
+- Writes into an end use constant indices or whole values. A FIFO's wire always has
+  several writers (the producer, the consumer and the FIFO), and a variable-index write
+  is not supported on a wire with more than one writer function
+  ([Splitting a compound wire](#splitting-a-compound-wire-across-multiple-writer-functions)).
+- `T` is a data type, never an interface: `Fifo[some_intrf]` is an error, since the FIFO
+  supplies valid and ready itself.
+- `n` is the minimum number of words. It is rounded up to a power of two, at least 2. The
+  output register holds one word more, as in `make_stream_fifo`.
+- Wider words are an array type: `Fifo[uint8_t[4]]`.
+- Unlike a `Wire[T]`, a `Fifo[T]` needs its initializer.
+- A function named `<name>_FIFO` would clash with the FIFO's `@MAIN` and is an error.
+- It replaces PipelineC's `GLOBAL_FIFO` and `GLOBAL_STREAM_FIFO` on one clock.
+
+**In pipelined code.** A function that both drives and reads one end, as a producer
+driving `.stream` and reading `.ready` does, never gets
+[pipeline stages](#global-wires-in-pipelined-code). With stages its reads would be sampled
+at the first stage and its writes published at the last, so the handshake would break. The
+sweep leaves such a function unpipelined, and `AUTO_PIPELINE` of it is an error. Keep the
+handshake outside the pipeline with
+[`make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline). A
+function that only drives an end, or only reads one, pipelines as usual. A global FIFO
+itself is never pipelined. A critical path inside a FIFO fails the build naming the FIFO,
+since auto-pipelining cannot cut it; a path from the FIFO into a function's logic belongs
+to that function's `@MAIN`.
+
+**Simulation.** Native simulation runs each global FIFO as the same compiler-made
+`@MAIN`, so the library FIFO runs through its
+[`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions), and any other
+initializer through its own simulation.
+
+**Reset.** A global FIFO on one clock resets with that clock's primary reset, like a
+global instance: it empties. A FIFO between two clocks is not reset. See
+[Resets and global instances](#resets-and-global-instances).
+
+---
+
+### Part II — Temporal behavior
+
+An ordinary call is same-cycle combinational (Part I). The sections below cover choices
+about time and resource use. First come resets, which put registers back to their initial
+values. Then comes `MULTI_CYCLE[...]`, a hand-written timing
+constraint that gives one slow register-to-register path `N` cycles to settle. Then come the
+**automatic** (HLS-like) constructs. `AUTO_PIPELINE` pipelines logic for throughput.
+`AUTO_MULTI_CYCLE` tunes a multi-cycle path's cycle count. `AUTO_COMB_AREA_OPT` reduces
+combinational resources without adding cycles; `AUTO_COMB_DELAY_OPT` trades area for
+shorter combinational delay. `AUTO_FSM` combines resource sharing
+with scheduling over multiple cycles.
+
+Each one has a valid/ready stream wrapper in Part III, so neighboring hardware doesn't need
+to know which one it's talking to: `make_stream_auto_pipeline`, `make_stream_multi_cycle` /
+`make_stream_auto_multi_cycle`, `make_stream_auto_comb_area_opt`,
+`make_stream_auto_comb_delay_opt`, and `make_stream_auto_fsm`.
+
+## Resets
+
+A register's initial value (`count: Reg[uint8_t] = 3`, or zero without one) is its
+power-up value on an FPGA. A **reset** puts registers back to those values while the
+design runs: while the reset signal is 1 at a rising clock edge, each register it resets
+takes its initial value instead of its next value. Pypeline resets are synchronous and
+active high.
+
+### Declaring a reset: `make_reset()`
+
+Bind `make_reset()` to a module-level `uint1_t` `Input` (a top-level pin) or `Wire`
+(driven by one `@MAIN`), on the line that declares it:
+
+```python
+from pypeline import *
+
+rst: Input[uint1_t] = make_reset()     # the top-level pin rst
+clk = make_clock(100.0, reset=rst)     # rst is clk's primary reset
+```
+
+`make_clock(..., reset=)` makes the reset the clock's **primary reset**: every `@MAIN` on
+that clock has it unless it names another, `@MAIN(100.0)` as much as `@MAIN(clk)`, since an
+unnamed `make_clock(100.0)` is the clock `@MAIN(100.0)` runs on. `clk.reset` reads it back.
+A bare `@MAIN` uses the primary reset of the clock it is given (see
+[Which clock a bare `@MAIN` gets](#which-clock-a-bare-main-gets)). The default clock, the
+one bare `@MAIN`s run on when no clock is named or inferred, has no `make_clock` and so no
+primary reset: its `@MAIN`s can name a reset with `MAIN(reset=)`, but its global
+instances and FIFOs cannot reset. Name the clock (`make_clock(rate, reset=rst)`) for that.
+
+### Which registers reset: `reset_registers=`
+
+A reset being available resets nothing by itself. Each `@MAIN` says which registers below
+it reset:
+
+```python
+@MAIN(clk, reset_registers="all")   # every register below dut resets with rst
+def dut():
+    count: Reg[uint8_t] = 3           # resets to 3
+    hist: Reg[uint8_t, NO_RESET]      # never resets
+
+@MAIN(clk)                            # the default, "requested"
+def ctrl():
+    pc: Reg[uint32_t, RESET]          # resets with clk.reset
+    last: Reg[uint8_t]                # does not reset
+```
+
+- `reset_registers="requested"` (the default) resets only `Reg[T, RESET]` registers.
+- `reset_registers="all"` resets every register below the `@MAIN` except
+  `Reg[T, NO_RESET]` ones: your own `Reg[T]`s, the state inside library blocks (FIFOs,
+  skid buffers, RAM requests in flight), and the registers the compiler adds (pipeline
+  stages of `AUTO_PIPELINE`, an `AUTO_FSM`'s state, I/O registers).
+- `MAIN(..., reset=other)` resets with another reset; `MAIN(..., reset=None)` has none.
+
+The markers go in any order with a `MULTI_CYCLE` role: `Reg[T, RESET, MC.start]`. A
+function called from two `@MAIN`s resets under each one's choice; it becomes two hardware
+modules when the choices differ.
+
+In hardware code the reset's name is an ordinary `uint1_t` signal: `if rst:` is plain
+logic, and a register you clear that way is not reset in the sense above.
+
+### What a reset does
+
+- Each register that resets takes its initial value: its `= value`, else zero (the first
+  member for an enum). The reset has priority over a [clock enable](#clock-enable-via-if-around-a-call):
+  a register resets in a cycle its call is skipped.
+- A FIFO (`make_stream_fifo`, a same-clock global `Fifo[T]`) empties: no word is valid in
+  the cycle after the reset, and its write side shows free space.
+- A RAM keeps its contents. Requests in flight are cancelled, and the write at the reset
+  edge does not happen. Only valid bits reset: `rd_data` keeps its last value, so read it
+  with its `valid`. No reset reaches the memory or the registers beside it, so the RAM
+  still maps to block RAM.
+- Global wires are combinational and are not reset. Where a reset design meets hardware
+  that is not reset (a top-level AXI-Stream port, say), gate `valid` and `ready`
+  yourself.
+- [Raw VHDL](#raw-vhdl-passthrough-vhdl) keeps its state unless it says
+  `vhdl(text, reset="sync")`, which lets the text use `RESET`.
+
+### Resets and global instances
+
+A global instance (`Inst[f]`) and a same-clock global FIFO run on one clock and reset with
+that clock's primary reset, under `"all"`. Their declarations take no reset keyword. A
+`reset_registers="all"` `@MAIN` that uses one must reset with the same reset; make it the
+clock's reset (`make_clock(..., reset=...)`). A global FIFO between two clocks is not
+reset, and a `reset_registers="all"` `@MAIN` at either end of one is an error.
+
+### Resets and clocks
+
+A reset is synchronous to the clock of each `@MAIN` it resets: a reset pin may reset
+`@MAIN`s on one clock only, and a reset `Wire` must be driven on the clock it resets.
+Bring an asynchronous source into a clock through two registers of that clock:
+
+```python
+BTN: Input[uint1_t, ASYNC]             # a button, synchronous to nothing
+cpu_rst: Wire[uint1_t] = make_reset()
+cpu_clk = make_clock(100.0, name="cpu", reset=cpu_rst)
+
+@MAIN(cpu_clk, reset=None)             # the synchronizer is not reset by its own output
+def btn_sync():
+    s0: Reg[uint1_t]
+    s1: Reg[uint1_t]
+    cpu_rst = s1
+    s1 = s0
+    s0 = BTN
+```
+
+A `@MAIN` cannot be reset by a reset that logic below it drives. An active-low reset is
+inverted the same way: `rst = ~rst_n` in the `@MAIN` that drives the reset `Wire`.
+
+### Resets in simulation
+
+Native simulation and the generated cocotb testbench drive a reset pin to 1 in cycle 0 and
+to 0 after it, so registers that reset start from their initial values. A reset pin that
+Python code drives (a `@sim_input`) gets no such pulse, and a reset `Wire` comes from its
+logic. `sim_call` runs with every reset inactive. Under a reset, `sim_print`,
+`sim_assert` and `@sim_output` keep running.
+
+### ASIC targets
+
+An ASIC has no register power-up values, so an initial value there holds only through a
+reset. When a design targets one (`PART("sky130")`, `--syn_tool device_models` or
+`--syn_tool pyrtl`), every register declared with `= value` must reset: its `@MAIN` has a
+reset and resets it (`reset_registers="all"`, or `Reg[T, RESET]`). Otherwise the build
+stops and names each such register. Registers without an initializer are not checked, nor
+is a build that names no part or tool.
+
+## Multi-Cycle Paths: `MULTI_CYCLE[...]`
+
+Combinational logic normally has to finish settling within a single clock period — that's
+what the synthesiser's timing analysis assumes by default. Sometimes that's overly
+strict: a slow operation (integer division, a deep arithmetic chain) sits between two
+registers, and you know it's fine for it to take several clock periods to settle because
+the surrounding logic only samples the result every `N` cycles anyway (e.g. inside a small
+FSM that only advances every `N` cycles). `MULTI_CYCLE[...]` tells the synthesiser to
+relax its setup-timing check between two specific registers by `N` cycles instead of one.
+The compiler places no pipeline registers in the untagged logic between
+`.start` and `.end`, even when the same helper is pipelined elsewhere.
+An explicit AUTO_PIPELINE call inside that logic still authorizes pipelining;
+its latency is not included in the multi-cycle count.
+
+```python
+from pypeline import Reg, MULTI_CYCLE
+
+def my_fsm(i: my_struct_t) -> my_struct_t:
+    o: my_struct_t
+    MC = MULTI_CYCLE[32]                      # allow up to 32 cycles between these two regs
+    data0: Reg[my_struct_t, MC.start]
+    data1: Reg[my_struct_t, MC.end]
+    o = data1
+    data1 = big_comb_multi_cycle_func(data0)  # slow combinational logic — gets up to 32 cycles
+    data0 = i
+    return o
+```
+
+`MULTI_CYCLE[ncycles]` produces a tag; `.start` and `.end` mark which of the two `Reg[T]`
+declarations is the source and which is the destination of the relaxed timing path —
+`.start` is where the path begins (the register whose output feeds the slow logic),
+`.end` is where it's captured (the register that's allowed to take longer to settle).
+Each tag must be used exactly twice: once as `.start`, once as `.end`, on two different
+`Reg[T]` declarations in the same function.
+
+This is purely a synthesis timing constraint — it has no effect on simulation, and no
+effect on what value ends up in the registers, only on how much time the tool is allowed
+to assume is available for the logic between them to settle.
+
+**Requires Vivado.** Like `PART()`, this only does something during real FPGA synthesis;
+without a `PART()` target it has no effect, and with another synthesis tool the build stops
+with an error (see [Limitations](#limitations--not-yet-supported); support for other tools
+is discussed in [#346](https://github.com/JulianKemmerer/PipelineC/discussions/346)). See
+[`stream_multi_cycle_test.py`](../src/tests/pypeline_tests/inst/stream_multi_cycle_test.py)
+and [`stream_auto_multi_cycle_test.py`](../src/tests/pypeline_tests/inst/stream_auto_multi_cycle_test.py)
+for complete examples including `PART(...)` targets.
+
+**Endpoint preservation.** Tagged launch/capture registers receive RTL
+`DONT_TOUCH` attributes so synthesis cannot silently pack those timing endpoints
+into DSP registers. The XDC reinforces preservation and emits setup `N` plus
+hold `N-1` on the launch-clock/capture-data pins. This leaves ordinary control
+paths single-cycle. Arithmetic can still use DSPs; separate AUTO_PIPELINE calls
+of the same helper keep their normal pipelining behavior. Preservation can use
+more fabric registers than unrestricted packing.
+
+An `MCP timing coverage error` identifies a reported path whose endpoints or
+requirement conflict with its MCP constraint. Repair preservation/coverage and
+regenerate affected synthesis artifacts; increasing an unrelated pipeline's
+latency will not repair the exception. See [constraints and diagnostics](AUTO_MULTI_CYCLE_DESIGN.md#2-constraints).
+
+**Automatically choosing `N`.** [`AUTO_MULTI_CYCLE(...)`](#auto_multi_cycle) is the
+timing-driven version of this tag. The chosen cycle count is exposed to source as
+`.latency`.
+
+### Wrapping a whole slow function
+
+The launch/capture pattern above is the right tool when a multi-cycle path sits between
+two registers you are already managing yourself inside a larger function. When the slow
+logic is instead a whole standalone function, `make_stream_multi_cycle` wraps it in exactly
+this FSM for you and presents the result as a valid/ready stream. Its ports are stream
+[interfaces](#bidirectional-ports-interface), so it is covered later alongside the
+other function-to-stream wrapper — see
+[`make_stream_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle).
+
+---
+
+## Automatic (HLS-like) Implementation
+
+Describe *what* to compute as an ordinary pure `@hw_func`; choose the
+implementation along two independent axes:
+
+| | 0 added cycles | N cycles |
+|---|---|---|
+| Parallel / unsharing | Original; [`AUTO_COMB_DELAY_OPT`](#auto_comb_area_opt--auto_comb_delay_opt-experimental) | [`AUTO_PIPELINE`](#auto_pipeline), [`AUTO_MULTI_CYCLE`](#auto_multi_cycle); optionally after AUTO_COMB_DELAY_OPT |
+| Sharing transformation | [`AUTO_COMB_AREA_OPT`](#auto_comb_area_opt--auto_comb_delay_opt-experimental) | [`AUTO_FSM`](#auto_fsm-experimental); AUTO_COMB_AREA_OPT followed by pipeline/MCP |
+
+Both pipelining and MCP divide computation **along the time axis**: pipelining
+inserts registers; MCP permits longer settling through timing constraints.
+Neither inherently shares the combinational resources. AUTO_COMB_AREA_OPT reduces resource
+use without adding cycles; FSMs divide computation in both time and space.
+The table describes the requested transformation, not ordinary synthesis CSE.
+
+| Feature | Trade-off | Core `.latency` | Stream wrapper |
+|---|---|---|---|
+| `AUTO_PIPELINE` | Extra registers for timing, II=1 | Inserted register slices | `make_stream_auto_pipeline` (`latency + 4` cycles, II=1) |
+| `AUTO_MULTI_CYCLE` | Longer settling interval, lower throughput | Allowed path cycles | `make_stream_auto_multi_cycle` (II=`latency + 1`) |
+| `AUTO_COMB_AREA_OPT` (Experimental) | Smaller estimated area, potentially longer combinational delay | Always 0 | `make_stream_auto_comb_area_opt` (two boundary cycles, II=1) |
+| `AUTO_COMB_DELAY_OPT` (Experimental) | Shorter estimated delay, potentially larger area | Always 0 | `make_stream_auto_comb_delay_opt` (two boundary cycles, II=1) |
+| `AUTO_FSM` (Experimental) | Share resources across states while meeting timing | Accepted input to result | `make_stream_auto_fsm` |
+
+AUTO_COMB_AREA_OPT ignores delay; AUTO_COMB_DELAY_OPT ignores area except to break delay ties. The temporal tools use the
+`@MAIN` clock goal; pipeline/MCP accept `latency=`, `start_latency=` and
+`max_latency=`, while FSM accepts `max_latency=`. Default FSM area search also
+considers AUTO_COMB_AREA_OPT's choices and delay-ranked AUTO_COMB_DELAY_OPT finalists, comparing complete FSM area.
+
+By default, the compiler measures logic needed for automatic pipelining and
+multi-cycle decisions, and estimates surrounding stateful functions. Opaque
+`vhdl()` text, such as a VHDL FIFO, starts with zero estimated delay; it is
+measured separately only if a failing path needs better timing data there.
+Whole-design synthesis checks timing and fit. No extra flag is needed.
+
+Rules shared by the AUTO tags:
+
+- **Construct the tag once, eagerly, as plain Python** (at module level or at a factory
+  function's top level) and capture it by closure in the `@hw_func` that uses it. That is
+  what lets the surrounding Python read `.latency`.
+- **`.latency` is an ordinary Python `int` at elaboration time**, so you can use it to size
+  FIFOs, counters and handshakes. A fixed value is visible immediately. An automatically
+  chosen value is zero (or its starting value, where supported) until timing-driven
+  implementation chooses it; the source is then elaborated again with the chosen value so
+  constants derived from `.latency` match the implemented hardware.
+  AUTO_COMB_AREA_OPT's latency is always zero and needs no latency feedback pass.
+- **Write handshakes that react to the chosen value**, not to a number you guessed. The tool is
+  free to change its mind when the clock goal or the design changes.
+- **An object is implemented for the clock goals of the `@MAIN`s that use it**, never for
+  another `@MAIN`'s. To use one function in several clock domains, construct one object per
+  domain: a separate `AUTO_PIPELINE(...)` / `AUTO_FSM(...)` or factory call each, in a loop
+  or not. See
+  [AUTO objects in several clock domains](#auto-objects-in-several-clock-domains).
+
+These were previously spelled `AUTOPIPELINE`, `AUTOMCP` and `AUTOFSM`. Their stream wrappers
+were `make_stream_pipeline`, `make_stream_interface_mcp`, `make_stream_interface_automcp` and
+`make_stream_autofsm`.
+
+### `AUTO_PIPELINE(...)`
+
+By default, a function called from inside a register or feedback context must complete
+**combinationally, in the same cycle** as its caller — the synthesiser is not free to
+split its logic across multiple clock cycles. That's normally what you want for a small
+state machine. But sometimes you want to call a large, otherwise-combinational pipeline
+stage (a multiplier, a divider, a deep arithmetic chain) from inside such a context, and
+you're fine with it taking several cycles internally — its result simply appears a fixed
+number of cycles later. This rule is per call site: pipelining one call does
+not add latency to untagged calls of the same function inside FSM or MCP
+logic. An untagged function containing a deeper AUTO_PIPELINE call keeps its
+own logic combinational; only that tagged call may gain latency.
+
+`AUTO_PIPELINE(func)` produces a callable tag object (the same all-caps factory style as
+`MULTI_CYCLE[...]`) that tells the synthesiser it's allowed to insert pipeline registers
+inside calls made through it, overriding the normal "must stay combinational here" rule —
+and, unlike a plain pragma, it exposes the **discovered stage count** back to your
+Python as `.latency`:
+
+The function does not need to be pre-divided into helpers that each happen to fit one
+clock. Primitive operations and their dependency wiring remain visible even when the
+body is one flat sequence. Legal cuts include operation boundaries and supported
+bit-internal splits for wide arithmetic, comparisons, and muxes. A `vhdl()`
+body is opaque: it can be pipelined only at boundaries declared by its fixed-latency
+contract. Helper boundaries are optional structure and a placement tie-break, not a
+prerequisite for auto-pipelining.
+
+The current built-in leaf split contract is:
+
+| Operation kind | Interior behavior when pipelined |
+|---|---|
+| `+`, `-`, comparisons, accumulator | Bit work can be divided across stages |
+| Built-in muxes | Packed output bits can be divided across stages, including compound values |
+| Bitwise operations, `~`, unary `-`, multiply | The operation remains whole; registers may be placed at its boundaries (at most two useful slices) |
+| Casts, constant shifts, constant references, pure bit rewiring | Zero-delay/atomic; no interior slice |
+| User `vhdl()` | Opaque; only its declared fixed latency and surrounding boundaries are visible |
+
+Division, remainder, and variable shifts use their registered soft implementations, so
+their internal source hierarchy may expose additional legal operation boundaries.
+
+```python
+MY_AP = AUTO_PIPELINE(some_func)           # tool picks how many registers
+
+@hw_func
+def my_pipeline(i: my_struct_t) -> my_struct_t:
+    return MY_AP(i)                       # some_func(i), auto-pipelined
+
+MY_AP.latency    # int: the number of registers (clocks of latency) built
+```
+
+An inserted register **slice** is not the same count as a combinational pipeline
+**stage**: zero slices is one stage, and `N` serial slices separate `N + 1` stages.
+The `latency` arguments below and `.latency` are the core's clock delay in inserted
+register slices, not the number of combinational regions. So `latency=2` separates
+three combinational regions and reports two clocks of core latency. Any explicit
+input/output registers around the call add their own cycles.
+
+`func` must already be `@hw_func`-decorated. In simulation, `MY_AP(x)` runs `func(x)`.
+It is delayed by `.latency` cycles when that is nonzero (see below), so while
+`.latency` is 0, `sim_call` behaves exactly as it would without the tag.
+
+#### Controlling the latency: `latency=`, `start_latency=`, `max_latency=`
+
+By default timing-driven implementation decides how many registers a call site gets,
+starting from none. Three optional keyword arguments change that:
+
+```python
+AUTO_PIPELINE(some_func, latency=3)                       # fixed: exactly 3 registers, always
+AUTO_PIPELINE(some_func, start_latency=2)                 # a starting guess
+AUTO_PIPELINE(some_func, max_latency=5)                   # a hard limit
+AUTO_PIPELINE(some_func, start_latency=2, max_latency=5)  # guess and limit together
+```
+
+- **`latency=N` sets a fixed latency.** The call site always gets exactly `N`
+  registers. `.latency` reads `N` from the moment the object is constructed, and
+  native simulation delays the call by `N` cycles.
+  Use it when surrounding logic depends on an exact latency. If `N` registers cannot
+  meet the clock goal, implementation fails rather than violating the fixed source
+  contract. `latency=` can't be combined with the other two arguments.
+- **`start_latency=S` is a starting guess.** Timing-driven implementation starts with
+  `S` registers, may add more when timing fails, and may remove unnecessary registers
+  after timing is met. Past the first iteration the search is the same as for an
+  AUTO_PIPELINE without a hint, including the measured mini-sweep of a repeated helper inside
+  it, or of the tagged function itself, so a hint can save iterations but never changes
+  where the search can go. Its bootstrap elaboration reads `.latency == S`; plain source
+  simulation and non-automatic elaboration read 0 until an implemented latency is
+  supplied.
+- **`max_latency=M` is a limit.** Automatic implementation never builds more than `M`
+  registers at the call site. If that limit prevents the clock goal, implementation
+  fails rather than exceeding the source constraint.
+
+The rules for these arguments:
+- Values are ints of at least 0, and `start_latency` can't exceed `max_latency`.
+- On a function declared `@pipeline_latency(k)`, the values must agree with `k`.
+- A constrained call site's function can't itself contain another AUTO_PIPELINE call
+  site.
+- The old `depth=` argument is now `latency=`.
+- Library wrappers built around one internal AUTO_PIPELINE accept the same three
+  keyword arguments and pass them to that core:
+  - [`make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline),
+    which also passes on `name=`;
+  - the DSP factories (`make_fir`, `make_fir_decim`, `make_fir_interp`,
+    `make_dc_block`, `make_moving_avg`, `make_magnitude`).
+
+With a clock goal, a function that can be pipelined and contains no further
+AUTO_PIPELINE calls gets its register positions planned from its own logic.
+Surrounding stateful control logic does not set those positions. A starting hint
+changes the first register count while keeping that same placement behavior.
+
+#### Naming a latency group: `name=`
+
+Each AUTO_PIPELINE has a key that identifies its *latency group*: every call site in the
+group is planned to one register count, the one `.latency` reports. By default the key
+is the wrapped function's own identity, plus `_latency_N` / `_start_latency_S` /
+`_max_latency_M` for a constraint. `name=` replaces it with a name of your choosing:
+
+```python
+body_encrypt = AUTO_PIPELINE(poly1305_body, name="poly1305_body_encrypt")
+body_decrypt = AUTO_PIPELINE(poly1305_body, name="poly1305_body_decrypt")
+```
+
+- **Two names on one function are two groups.** Each gets its own latency, even when
+  the two need different depths. Without names, two unconstrained tags on one function
+  would be one group, and differing depths would be an error.
+- **The key is the name.** A `latency=` or `max_latency=` constraint adds its usual
+  suffix (`poly1305_body_encrypt_max_latency_6`). `start_latency=` is not part of a
+  named key, so changing a starting guess renames nothing.
+- **Reports and hints use the name.** It appears in sweep reports
+  (`AUTO_PIPELINE poly1305_body_encrypt: 3 clks`), in latency hints and the
+  [latency memory](#starting-latencies-the-latency-memory-and---latency_hints), and in
+  `name_index.log`. It never changes the call's VHDL instance label or the emitted
+  hierarchy, so the sweep attributes timing paths exactly as for an unnamed tag. The
+  wrapped function's own entity keeps its own name.
+- **A name is one group.** Tags that share a name must wrap the same function with the
+  same `latency=` / `start_latency=` / `max_latency=`. A conflict is an error that names
+  both construction sites. Identical tags are fine: they are one group, like two unnamed
+  tags on one function.
+
+Name a tag when you want a stable handle for it: a latency hint you commit, a report you
+parse, or a second, independent group over a function. Unnamed tags work everywhere
+else.
+
+#### Starting latencies: the latency memory and `--latency_hints`
+
+A synthesizing build remembers what it verified, so later builds need fewer synthesis
+runs. It remembers it in pieces, so a later build can reuse every piece that still
+matches even after you edit part of the design or change a clock goal:
+
+- **AUTO_PIPELINE depths and AUTO_MULTI_CYCLE counts**, per tag;
+- **mini-sweep locks**: how a depth was reached, for example "`poly1305_body` locked at
+  8 stages by a mini-sweep", not just the number 8;
+- **whole `@MAIN` implementations**: every register placement the build kept.
+
+**What is recorded.**
+- Every synthesizing build writes `<out_dir>/latency_profile.json`: what it built for
+  each tag and whether the `@MAIN`s using it met timing.
+- A piece is remembered in `<out_dir>/latency_memory.json` when every `@MAIN` using it
+  met timing. A `@MAIN` that misses keeps its earlier pieces, and the others still
+  record theirs.
+- An AUTO_PIPELINE region whose own measured delay could not meet the clock at the
+  depth it was built is not remembered, even though its `@MAIN` met timing, and neither
+  is a whole `@MAIN` containing it. Synthesis never timed such a region, usually because
+  a testbench's constant stimulus let it remove the logic; the build warns about it.
+- With `--syn_cache DIR`, pieces also go into the store. The store isn't tied to an
+  output directory, so a 60 MHz build directory can start an 85 MHz one.
+
+**What a later build reuses.** A piece is reused only for unchanged hardware: the same
+part and tool, and the same pre-pipelining VHDL for its function and everything that
+function calls. Then:
+- **At the same clock goal**, depths, counts and locks are restored. When every `@MAIN`
+  is unchanged, the whole implementation is replayed with one confirmation synthesis,
+  usually a store hit, and the pin-and-confirm re-elaboration is skipped.
+- **At a higher goal**, results from the highest lower goal are the starting point. A
+  depth or count starts there and never goes below it; a lock starts its mini-sweep at
+  the old depth, without waiting for the sweep to blame that function again.
+- **At a lower goal**, results from higher goals are never used: they would build more
+  registers than the lower goal needs. Leaf delays and synthesis-store hits don't
+  depend on the goal, so those are still reused.
+
+**Stale pieces cost time, never correctness.** A piece whose hardware changed is
+ignored and the build says so, before any synthesis. Everything reused is confirmed by
+synthesis, and a build with no usable memory runs the normal sweep. Deleting
+`latency_memory.json` or the store is always safe. Two kinds of builds don't replay
+whole `@MAIN`s but still reuse the other pieces: designs whose RAM plan search or
+AUTO_FSM passes re-elaborate them, and `--coarse` builds. A fixed `latency=` is never
+seeded.
+
+`--latency_hints FILE` supplies starting latencies from a file you keep, for builds
+with no memory yet (a fresh clone, a new machine). The file is a
+`latency_profile.json` copied from an earlier build, or a hand-written one:
+
+```json
+{"AUTO_PIPELINE": {"chacha20": 17, "poly1305_body_encrypt": 3},
+ "AUTO_MULTI_CYCLE": {"poly1305_prologue_shared": 6}}
+```
+
+- **Keys are tag keys.** A named tag's key is its name, which is what makes a committed
+  hints file readable and robust to refactoring.
+- **A hint is a start, exactly like `start_latency=`.** A hinted tag needs no
+  `start_latency=` of its own.
+- **Precedence.** The flag is repeatable, and a later file wins. A piece remembered at
+  this clock goal wins over a hint. A piece remembered at a lower goal is only a floor
+  here: a deeper hint starts above it, a shallower one starts at the floor. Hints win
+  over `start_latency=`.
+- **What the build reports.** One line per starting latency it used, naming its source
+  and recorded goal; locks also show their depth. One note names every hint no tag
+  took: a renamed or removed tag, or one that isn't part of this configuration (one
+  file can cover several).
+- **Turning the memory off.** `--no_latency_memory` neither reads nor writes remembered
+  pieces; the profile is still written and hints still apply.
+
+How pieces are identified and matched is in
+[SWEEP_DESIGN.md](SWEEP_DESIGN.md#5-latency-memory).
+
+#### `.latency`: reading back the discovered pipeline depth
+
+`.latency` is an ordinary Python `int` you can use for elaboration-time sizing. It is
+most useful for sizing FIFOs and counters that sit next to the free-running pipeline;
+this is exactly how `make_stream_auto_pipeline` sizes its output FIFO automatically (see
+[Pipelined Stream Wrappers: `make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline)).
+A fixed `latency=N` always reads `N`. Otherwise `.latency` reads 0 when no completed
+timing-driven implementation has supplied a value, except that an active automatic
+implementation bootstraps `start_latency=S` at S. During implementation the source is
+re-elaborated until the value consumed by surrounding Python equals the actual inserted
+register count. Native simulation supplied with that implemented configuration emulates
+the same N-cycle delay. The commands and build modes that do or do not perform this
+feedback are listed under [Automatic implementation and sweeps](README.md#automatic-implementation-and-sweeps).
+
+**Construction timing matters**: construct `AUTO_PIPELINE(...)` once, eagerly, as plain
+Python — typically at a factory function's own top level — and capture the object by
+closure into whatever `@hw_func` body calls it. That's what makes `.latency` readable
+by the surrounding Python. Constructing it inline inside a `@hw_func` body still
+pipelines correctly, but nothing outside that body can read its `.latency`.
+
+#### Passing a bottom-up value to the rest of the design
+
+Read the value where the producing block is built, then pass the plain `int` into the
+factory of whatever it sizes. Don't send it through a module-level variable that some
+other file reads later:
+
+```python
+core = make_stream_auto_pipeline(round_func)
+# Storage that must cover everything the core can have in flight
+fifo = make_stream_fifo(data_t, 4 * core.max_in_flight + 8)
+```
+
+The library documents the bottom-up values its factories expose. These attributes are
+regenerated by every re-elaboration pass:
+
+| Factory | Attribute | Value |
+|---|---|---|
+| `make_stream_auto_pipeline` | `.auto_pipeline` | the core `AUTO_PIPELINE`; `.auto_pipeline.latency` is its depth L, excluding the two boundary registers |
+| | `.max_in_flight` | the credit limit, L+5 |
+| `make_stream_auto_multi_cycle` | `.mcp` | the `AUTO_MULTI_CYCLE` tag; `.mcp.latency` is the cycle count (the fixed `make_stream_multi_cycle` takes its count as an argument) |
+| `make_stream_fifo` | `.depth` | the requested depth |
+| | `.capacity_beats` | words it can hold: the power-of-two memory plus the FWFT output register |
+| `make_skid_buffer`, `make_stream_ram`, `make_stream_auto_fsm` | `.latency` | their fixed latency |
+
+A stream wrapper around an AUTO_PIPELINE has no `.latency` of its own, because a
+valid/ready handshake is not a fixed latency. Read its `.auto_pipeline` and
+`.max_in_flight` instead.
+
+Three rules keep the re-elaboration loop short:
+- **Size storage and counters outside AUTO_PIPELINE'd functions.** A value captured by
+  an AUTO_PIPELINE'd function's closure is part of that function's identity, and the
+  set of AUTO_PIPELINE call sites must not change between passes.
+- **Every value that reshapes logic can cost a pass.** A chain like depth → lane count →
+  multi-cycle count → FIFO depth may need one pass per link. The build stops after
+  three passes that don't settle.
+- **Cap a depth that sizes compute.** When a depth sets how much compute you build (for
+  example interleaved lanes = depth + 2), cap it with `max_latency=`, often a
+  [build parameter](#build-parameters-param-and--d), so that a faster clock goal cannot
+  silently grow the design past the device.
+
+#### The pass report
+
+After each implementation pass whose elaboration read a bottom-up value, the build
+prints what was read, what the build then made, and where in the source it was read:
+
+```
+Bottom-up values read during pass 1 elaboration (read -> built):
+  AUTO_PIPELINE func_core_start_latency_1: 1 -> 5  <- differs
+      read at include/pypeline/stream/stream_auto_pipeline.py:111 (via top.py:20)
+      read at top.py:21
+  => re-elaborate with the built values (pass 2)
+Bottom-up values read during pass 2 elaboration (read -> built):
+  AUTO_PIPELINE func_core_start_latency_1: 5 -> 5
+      ...
+  => converged: every read matches what was built
+```
+
+A read inside a library factory names the library line and the design line that called
+the factory. A read inside a hardware body, such as the multi-cycle wrapper comparing
+its counter against `.latency`, names that body's line. The same records are written
+to `sweep_history.json` as
+`latency_passes`. A `start_latency=` that matches what gets built avoids the extra
+pass entirely.
+
+#### Example
+
+This mirrors the shape of `examples/autopipelined_submodules.c`: a free-running
+combinational pipeline stage, instantiated from inside a function that also has a
+register (so without `AUTO_PIPELINE`, the call would have to be a single-cycle
+combinational instance):
+
+```python
+@hw_func
+def pipeline_stage(x: uint32_t) -> uint32_t:
+    return x / ~x   # some deep/slow, multi-cycle-worthy combinational logic
+
+PIPELINE_STAGE_AP = AUTO_PIPELINE(pipeline_stage)
+
+@hw_func
+def wrapper(pipeline_in: uint32_t) -> uint32_t:
+    # `phase` is just some placeholder state — a stand-in for any small FSM
+    # running alongside the pipeline. It is what makes this a register/feedback
+    # context, so that without AUTO_PIPELINE the `pipeline_stage` call would be
+    # forced to complete combinationally within this same cycle.
+    phase: Reg[uint2_t]
+    phase = phase + 1
+
+    # AUTO_PIPELINE overrides that: the synthesiser may slice pipeline_stage's
+    # logic across multiple cycles.
+    return PIPELINE_STAGE_AP(pipeline_in)
+```
+
+`Reg[T]` and bare struct/array locals (like `rv` above) only simulate correctly under
+`sim_call` when their own function carries `@hw_func` (or `@MAIN`) — see
+[Registers: `Reg[T]`](#registers-regt) / [Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions).
+
+See `src/tests/pypeline_tests/inst/auto_pipeline_test.py` for the full example.
+
+#### Boundary registers around an AUTO_PIPELINE'd call
+
+To register the pipeline's inputs/outputs at its boundary rather than leaving them
+combinational, wrap the call with plain unconditional `Reg[T]`s (the same pattern
+`make_stream_auto_pipeline` uses internally):
+
+```python
+@hw_func
+def pipeline_stage_registered(x: uint32_t) -> uint32_t:
+    in_reg: Reg[uint32_t]
+    out_reg: Reg[uint32_t]
+    rv: uint32_t = out_reg
+    out_reg = PIPELINE_STAGE_AP(in_reg)
+    in_reg = x
+    return rv
+```
+
+Note `.latency` reports the AUTO_PIPELINE'd core's own depth only — boundary registers
+you add around the call are yours to count (e.g. total latency here is
+`1 + PIPELINE_STAGE_AP.latency + 1`).
+
+#### AUTO_PIPELINE_RAM
+
+`make_auto_pipeline_ram` provides synchronous block RAM whose input/output registers
+and depth banks can be selected automatically. `make_stream_auto_pipeline_ram` adds
+independent valid/ready request and response interfaces with enough response buffering
+to tolerate downstream backpressure.
+
+```python
+from pypeline import hw_func, uint1_t, uint32_t
+from ram import make_auto_pipeline_ram
+from stream.stream_ram import make_stream_auto_pipeline_ram
+
+ram = make_auto_pipeline_ram(
+    uint32_t, 65536, ports=("w", "r"), max_latency=9
+)
+stream_ram = make_stream_auto_pipeline_ram(
+    uint32_t, 65536, ports=("w", "r"), max_latency=9
+)
+```
+
+Both factories have this signature:
+
+```python
+factory(elem_t, size, ports=("rw",), init=None, byte_write_enables=False,
+        *, latency=None, start_latency=None, max_latency=None)
+```
+
+The raw factory is called once per enabled clock with one request per port. Its
+response `.valid` and data describe the request from `.latency` enabled clocks ago:
+
+```python
+addr_t = ram.addr_t
+write_t = ram.p0_in_t
+read_t = ram.p1_in_t
+
+@hw_func
+def access_ram(write_addr: addr_t, write_data: uint32_t,
+               read_addr: addr_t, do_write: uint1_t) -> ram.return_t:
+    write: write_t
+    write.addr = write_addr
+    write.valid = do_write
+    write.wr_en = 1
+    write.wr_data = write_data
+
+    read: read_t
+    read.addr = read_addr
+    read.valid = 1
+
+    return ram(write, read)  # caller uses .p1.valid and .p1.rd_data
+```
+
+The stream factory takes the request-forward and response-feedback halves for every
+port. A request transfers on `request.stream.valid & result.*_req_if.ready`; a response
+transfers on `result.*_resp_if.stream.valid & response_ready`:
+
+```python
+write_req_if_t = stream_ram.p0_req_intrf.fwd_t
+write_resp_fb_t = stream_ram.p0_resp_intrf.fb_t
+read_req_if_t = stream_ram.p1_req_intrf.fwd_t
+read_resp_fb_t = stream_ram.p1_resp_intrf.fb_t
+
+@hw_func
+def access_stream_ram(write_req: write_req_if_t, write_response_ready: uint1_t,
+                      read_req: read_req_if_t, read_response_ready: uint1_t
+                      ) -> stream_ram.return_t:
+    return stream_ram(
+        write_req,
+        write_resp_fb_t(ready=write_response_ready),
+        read_req,
+        read_resp_fb_t(ready=read_response_ready),
+    )
+```
+
+The port request/response fields, initialization values, byte-write-enable types, and
+clock-enable behavior match [`make_ram`](#rams-make_ram--make_stream_ram). Each factory
+instance owns independent storage. `latency`, `start_latency`, and `max_latency` count
+the **total** request-to-response latency, including the mandatory one-cycle synchronous
+memory read, so every supplied value must be an integer of at least one. A fixed
+`latency` cannot be combined with the other two. Fixed latency is exact in simulation
+and hardware. Without a selected automatic plan or fixed value, the RAM uses its
+one-cycle synchronous baseline; `start_latency` is the automatic-plan bootstrap guess
+and may later be trimmed, while `max_latency` is a hard ceiling. There is no reset or
+flush port.
+
+The returned RAM function exposes:
+
+- `.latency`: total response latency shared by all ports.
+- `.plan`: the selected input/output register and bank-tree layout.
+- `.read_after_write_gap`: enabled-clock separation required between an accepted write
+  and a dependent read of the same address.
+- The same `.pN_in_t`, `.pN_out_t`, `.in_ts`, `.out_ts`, `.addr_t`, `.we_t`, and
+  configuration attributes as the manual RAM factory.
+
+Waiting `.read_after_write_gap` enabled clocks, or waiting for the corresponding stream
+write response, guarantees that a dependent read observes the write. Disabled clocks do
+not count. Same-address read/write collision data, ordering between overlapping
+simultaneous writes, and `rd_data` returned by an `"rw"` write are unspecified. Disjoint
+byte writes are not overlapping. Invalid requests never write memory.
+Native and generated-HDL simulation assertions diagnose an early dependent read and
+simultaneous writes to overlapping bits; do not rely on either unspecified result.
+
+Non-power-of-two memories retain the manual RAM convention: native simulation wraps an
+address modulo `size`, while an out-of-range hardware address has undefined behavior.
+One writer with any number of readers is supported by read-memory replication. Two
+writable ports are supported when they fit the two physical RAM ports; more than two
+writers, or extra independent readers alongside two writers, are rejected.
+
+An unsplit RAM can place registers before and/or after its synchronous read:
+
+```text
+request --> [optional input register] --> [BRAM read: 1 cycle]
+        --> [optional local output register] --> response
+```
+
+For a deep memory, splitting uses high address bits to choose contiguous banks and
+pipelines two-way request and response trees. The valid bit travels with each branch,
+avoiding one high-fanout global bank selector:
+
+```text
+                         REQUEST TREE       MEMORY LEAVES       RETURN TREE
+                         /--[R]-------> [BRAM 0] -->[O]--\
+              /--[R]----<                               [M]--\
+request->[I]<           \--[R]-------> [BRAM 1] -->[O]--/     [M]-->response
+             \           /--[R]-------> [BRAM 2] -->[O]--\     /
+              \--[R]----<                               [M]--/
+                         \--[R]-------> [BRAM 3] -->[O]--/
+
+[I] input register  [R] request-routing register
+[O] per-bank output register  [M] registered response selection
+```
+
+The stream wrapper reserves one response FIFO and credit counter per port. It admits a
+request only after reserving response space; once admitted, a request advances through
+the RAM exactly once even if the consumer stalls. Credits return when responses are
+consumed. It exposes the core `.latency` and `.min_response_latency == .latency + 2`.
+After filling, it can sustain one accepted request per enabled clock (II=1) while the
+consumer remains ready.
+
+Automatic RAM plan selection supports Vivado and the ECP5 open-source synthesis
+flow. The resolved target determines BRAM depth/width geometry before plans are
+finalized, including fixed-latency builds. Two-writer memories use shared storage
+with a separate clocked process per port; GHDL simulation requires `-frelaxed`
+(supplied automatically by `--cocotb --ghdl`). ROMs and single-writer memories
+retain signal-based storage. Backend availability and RAM-plan reports are documented under [Automatic
+implementation and sweeps](README.md#automatic-implementation-and-sweeps).
+
+<a id="auto_multi_cycle"></a>
+
+### `AUTO_MULTI_CYCLE(...)`
+
+Picking `N` by hand means guessing how slow the logic really is. Too small, and the build
+fails timing; too large, and throughput is wasted. `AUTO_MULTI_CYCLE(...)` is the tool-tuned
+version of `MULTI_CYCLE[N]`, in the same spirit as `AUTO_PIPELINE(...)`: timing-driven
+implementation chooses the cycle count.
+
+```python
+from pypeline import Reg, AUTO_MULTI_CYCLE, uint8_t
+
+MC = AUTO_MULTI_CYCLE(start_latency=3)                # selection starts at 3 cycles
+# MC = AUTO_MULTI_CYCLE(start_latency=3, max_latency=8)   ...and never goes past 8
+# MC = AUTO_MULTI_CYCLE(latency=4)                         fixed: exactly 4 cycles
+
+@hw_func
+def my_fsm(i: my_struct_t) -> my_struct_t:
+    o: my_struct_t
+    data0: Reg[my_struct_t, MC.start]
+    data1: Reg[my_struct_t, MC.end]
+    count: Reg[uint8_t]
+    if count == MC.latency + 1:              # the handshake follows the chosen count
+        ...
+    data1 = big_comb_multi_cycle_func(data0)
+    ...
+```
+
+- **`.latency` is the cycle count.** Before timing-driven implementation it reads
+  `latency=`, else `start_latency=`, else 1. Native simulation uses the same source-visible
+  value it is supplied.
+- **Automatic selection only raises it.** The count never drops below
+  `start_latency=` (or 1) and never exceeds `max_latency=`. A cap that prevents the
+  clock goal is a hard failure. A starting count from the
+  [latency memory or a hints file](#starting-latencies-the-latency-memory-and---latency_hints)
+  is provisional: it may also be confirmed down to what the build measures.
+- **`name=` gives the tag a stable key.** Without one, the key is the source line that
+  constructs the tag, plus a construction ordinal. A
+  [`make_stream_auto_multi_cycle`](#tool-chosen-cycle-count-make_stream_auto_multi_cycle)
+  tag's key is instead the function it wraps, like an AUTO_PIPELINE's. With a name, the key
+  is the name, so hints, the latency memory and reports find it however the code around
+  it changes.
+- **A key is one group with one count.** Tags sharing a name, or stream wrappers of one
+  function with the same constraints, are one group, the way two calls of one factory
+  give one hardware definition with separate state. Tags sharing a name must have the
+  same `latency=` / `start_latency=` / `max_latency=` (and wrap the same function); a
+  conflict is an error that names both construction sites. Give tags different names for
+  independent counts. See [Naming a latency group](#naming-a-latency-group-name).
+- **The source is re-elaborated with the final count.** Like `AUTO_PIPELINE.latency`, this
+  keeps every counter, buffer, and handshake derived from `.latency` consistent with the
+  implemented constraint.
+- **Your logic must read `.latency`.** An `AUTO_MULTI_CYCLE` whose `.latency` nothing reads can't
+  follow the sweep, so a synthesizing build refuses it. For a hand-timed path, use
+  `MULTI_CYCLE[N]` or `AUTO_MULTI_CYCLE(latency=N)`.
+- **Construct it once, outside any `@hw_func` body**, and capture it by closure, e.g. at
+  a factory's top level. Constructing it inside a body is an error.
+- **Vivado only**, like `MULTI_CYCLE[...]`; see [Synthesis backends and target
+  selection](README.md#synthesis-backends-and-target-selection).
+
+For the common case of one slow function behind a valid/ready handshake, use
+[`make_stream_auto_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle),
+which does all of this for you.
+
+<a id="auto_comb_area_opt--auto_comb_delay_opt-experimental"></a>
+
+### `AUTO_COMB_AREA_OPT(...)` / `AUTO_COMB_DELAY_OPT(...)` (Experimental)
+
+`AUTO_COMB_AREA_OPT(func)` returns a combinational callable with the same input and
+output types and bit-exact behavior. It searches for lower resource use without
+a delay constraint: operand selection and longer logic chains are allowed, but
+registers and extra cycles are not.
+
+```python
+from pypeline import AUTO_COMB_AREA_OPT, AUTO_PIPELINE, hw_func, uint1_t, uint8_t, uint16_t
+
+@hw_func
+def selected_product(a: uint8_t, b: uint8_t, c: uint8_t, d: uint8_t,
+                     select: uint1_t) -> uint16_t:
+    x: uint16_t = a * b
+    y: uint16_t = c * d
+    return x if select else y
+
+AREA_OPT = AUTO_COMB_AREA_OPT(selected_product)  # may mux operands into one multiplier
+AP = AUTO_PIPELINE(AREA_OPT)                      # pipeline the reduced combinational graph
+```
+
+Construct the tag once at module/factory level. `.func` is the original function
+and `.latency` is always zero. Multiple arguments are supported; stream wrappers
+require a single argument, so bundle their inputs into a struct.
+
+Beyond output-mux-to-input-mux sharing, the search considers typed common
+expressions across helpers, mux/Boolean factoring, unsigned modular arithmetic
+factoring, constant multiply/divide/remainder implementations, demanded/known-bit
+narrowing, and soft-operator decomposition. Every consumer and intermediate cast
+must retain its meaning. Sharing cannot turn two simultaneously needed results
+into one serial use of a unit without storage.
+
+**Experimental and bounded.** The original is retained unless a candidate has
+strictly lower estimated area. This is not a global-minimum or mapped-area
+guarantee. The search is bounded to 4,096 graph nodes, 96 candidates, eight rounds,
+a beam width of four, and 8,192 Boolean-proof nodes. Stateful
+functions, temporal calls and raw VHDL fail the purity check; unsupported decoded
+operations and scoped operator implementations conservatively retain the original.
+Floating-point reassociation and unsafe signed arithmetic transformations are
+not performed.
+
+Plain native simulation calls the original function without running the optimizer.
+To meet timing after sharing, use `AUTO_PIPELINE(AREA_OPT)`, put `AREA_OPT(...)` between MCP
+registers, or pass it to the existing pipeline/MCP stream factory. For an
+area-reduced core with registered valid/ready ports and II=1, see
+[`make_stream_auto_comb_area_opt`](#combinational-optimization-stream-wrappers-make_stream_auto_comb_area_opt--make_stream_auto_comb_delay_opt-experimental).
+Default `AUTO_FSM(original_func)` already considers the shared optimization
+choices; explicitly wrapping it in AUTO_COMB_AREA_OPT is not required.
+
+`AUTO_COMB_DELAY_OPT(func)` chooses the opposite trade-off: reduce estimated
+combinational critical-path delay, allowing area growth without an area budget.
+It has the same signature and zero-cycle contract. The original stays unless
+an emitted candidate has strictly lower estimated delay; area breaks ties
+between improving candidates. It does not stop at the clock goal.
+
+```python
+from pypeline import AUTO_COMB_DELAY_OPT
+
+DELAY_OPT = AUTO_COMB_DELAY_OPT(my_comb_func)
+AP = AUTO_PIPELINE(DELAY_OPT)  # pipeline the selected combinational implementation
+```
+
+Choices include correlated mux speculation (compute both results before selecting),
+unsigned/Boolean distributive expansion, balanced reductions, carry-save sums,
+carry-select adders, prefix comparators and alternative multipliers. Shared
+constant/width optimizations and helper decomposition are available too.
+Unsafe speculation of division, variable shifts or arbitrary calls, signed/float
+reassociation and pure fanout-only cloning are excluded.
+
+Selection uses dependency-path estimates and cached timing, with **no extra
+candidate synthesis jobs**. Search work is bounded;
+there is no global-optimum or post-route-speed guarantee. Native calls still
+forward to the original. `AUTO_COMB_DELAY_OPT(AUTO_COMB_AREA_OPT(f))` applies inside
+out; the wrappers do not cancel. Repeating either same wrapper is idempotent.
+
+For registered valid/ready ports use
+`from stream.stream_auto_comb_delay_opt import make_stream_auto_comb_delay_opt`.
+Its contract matches the area wrapper below (latency 2, II=1), with `.comb_opt`
+exposing the underlying tag. Pipeline, MCP and FSM factories also accept AUTO_COMB_DELAY_OPT.
+Default AUTO_FSM compares new candidates by total scheduled area, not by delay
+alone. AUTO_PIPELINE does not implicitly invoke AUTO_COMB_DELAY_OPT.
+
+<a id="auto_fsm-experimental"></a>
+
+### `AUTO_FSM(...)` (Experimental)
+
+> **Experimental.** `AUTO_FSM`'s scheduler and minimum-area search may still change.
+> It has no `ready` backpressure of its own; for a
+> real valid/ready port use
+> [`make_stream_auto_fsm`](#stream-wrapper-for-auto_fsm-make_stream_auto_fsm-experimental).
+
+`AUTO_PIPELINE` spends area to get throughput: one full copy of your function's
+hardware, sliced into stages, accepting a new input every cycle. `AUTO_FSM` spends
+time to get area: shared units reused across several cycles. Its default search
+also considers the combinational rewrites available to `AUTO_COMB_AREA_OPT`, choosing
+by full scheduled area (including muxes, registers and control), not simply by
+the smallest combinational graph.
+
+```python
+@hw_func
+def next_state(s: state_t) -> state_t:    # pure: no Reg, no Feedback, no globals
+    ...
+
+UPDATE = AUTO_FSM(next_state)              # tool picks how many states
+
+@MAIN(40.0)
+def top() -> state_t:
+    state: Reg[state_t]
+    req: UPDATE.in_stream_t               # auto-generated {data, valid} struct
+    req.data = state
+    req.valid = start_pulse
+    resp = UPDATE(req)                    # resp: {data, valid}
+    if resp.valid:
+        state = resp.data
+    return state
+
+UPDATE.latency                            # fixed in→out cycle count; 0 until known
+```
+
+Twelve identical adds in `next_state` — whether written as a Python loop that
+elaborates unrolled, or as twelve separate lines — can become one adder reused in
+twelve different states. The implementation schedules operations against the clock
+goal and chooses which compatible operations share a unit.
+It can also share pipelined arithmetic and balance selections controlled by
+distinct constant indices. These choices are automatic: you still set only the
+clock goal and, optionally, a latency cap.
+
+This is the right tool when a computation has a lot of *slack* — something that
+runs once per video frame, or once per packet, while a million cycles go by.
+Parallel combinational logic for such a thing is hardware sitting idle almost
+all of the time.
+
+**The contract**
+
+- `func` must be `@hw_func`, **pure** (no `Reg`/`Feedback`/global wires anywhere
+  in its call subtree), and take exactly **one** annotated argument with an
+  annotated return type. Bundle several inputs into an `@struct` — the same rule
+  `make_stream_auto_pipeline` and `make_stream_multi_cycle` follow.
+- The argument is a `{data, valid}` struct: use `MY_FSM.in_stream_t`, or any
+  structurally identical type (`make_stream_t(in_t)` works).
+- An input is accepted **only while the FSM is idle**. A `valid` pulse asserted
+  while it is busy is IGNORED — there is no `ready` signal in this version.
+  Space requests at least `.latency` cycles apart; that is what `.latency` is
+  for. For a real valid/ready stream port that does this bookkeeping for you
+  — including holding a result across a stalled consumer instead of dropping
+  it — see [Stream Wrapper for AUTO_FSM: `make_stream_auto_fsm` (Experimental)](#stream-wrapper-for-auto_fsm-make_stream_auto_fsm-experimental).
+- The result arrives with a one-cycle `valid` pulse exactly `.latency` cycles
+  after the accepted input. `.data` holds the last result in between. Initiation
+  interval == `.latency`.
+- Construct `AUTO_FSM(...)` once, eagerly, at module or factory level and capture
+  it by closure — same rule and same reason as `AUTO_PIPELINE`.
+- Its function may be sized from an `AUTO_PIPELINE` `.latency`, for example compute
+  lanes = depth + 2 from a factory. When the build changes that depth, it schedules
+  the resized function before confirming timing.
+- Hardware array indices are supported, including reads of struct and array elements.
+
+**Write the caller to react to `valid`, not to count cycles.** Before an implemented
+schedule is supplied, `.latency` is 0 and the call is a combinational passthrough.
+Code that waits for `resp.valid` is correct both then and with a multi-cycle schedule,
+and stays correct when the state count changes:
+
+```python
+busy: Reg[uint1_t]
+req.valid = 0
+if busy == 0:
+    req.valid = 1
+    busy = 1
+resp = MY_FSM(req)
+if resp.valid:
+    result = resp.data
+    busy = 0
+```
+
+An operation must have an implementation that can meet the clock. The tool can
+try a pipelined unit or decompose supported arithmetic. An opaque operation with
+neither option must meet the clock on its own; adding states cannot speed it up.
+
+**Capping the latency.** `AUTO_FSM(func, max_latency=N)` says the result must
+arrive within N cycles. Sharing everything onto one unit of each kind can force
+too many states, so meeting a cap may require additional copies of the units
+causing the delay:
+
+```python
+UPDATE = AUTO_FSM(next_state, max_latency=8)
+```
+
+It is a hard constraint. The tool compares additional unit copies, pipelined
+arithmetic and different sharing choices. If the considered implementations
+cannot fit N, the build fails and reports the latency found by scheduling.
+
+The area search prefers the smallest schedule within the cap, so it often uses
+most of the cap. For an FSM that serves one request at a time, latency is
+throughput, so the build log reports the trade it saw: an `area vs states` line
+lists estimated area at each state count, for example
+`45 states 28715, 50 states 26100, 64 states 23388`. Picking a cap from it
+needs no synthesis. The list holds only the points the search visited, so it is
+not exhaustive.
+
+Sharing is not free: every shared unit needs a multiplexer picking its operands
+per state, and more states means more registers holding values in between. For
+an expensive unit — a multiplier, a wide adder — sharing wins easily. For a
+cheap one, the multiplexer can cost more than a second copy of the unit would,
+and the search will decline to share it. It also goes the other way, breaking an
+operation down into smaller pieces when several different operations turn out to
+be built from the same ones and can then share those instead. If soft-operator
+implementations are available (`include/pypeline/operators/`) it can follow that
+all the way down to logic gates — and will normally decide, correctly, that
+gates are far too small a thing to share.
+
+The search never returns something its model calls bigger than plain
+share-everything. It may spend unused timing margin, but never beyond the
+per-state clock budget.
+
+**How much the search can do depends on your clock goal**, and not in the
+direction people expect. A high goal FORCES decomposition — an operation that
+cannot fit one state is split whether or not that saves area — but leaves the
+pieces shared. A LOW goal is what gives the search room to decompose *by
+choice*: with a budget big enough for the whole operation, keeping it atomic is
+the starting point and opening it up is a decision made on area grounds. So if
+you want the smallest design and do not care about speed, ask for a low clock
+and let the search work; asking for a high one takes the choice away from it.
+Built-in unsigned integer operators can often be decomposed through their soft
+implementations; signed multiplication and floating-point operations remain atomic.
+
+The mux cost is based on **distinct values per port**, not simply the number of
+operations using the unit. If twenty states all feed the same coefficient or
+the same allocated register into one port, that port is a wire; if they use two
+values, it is a 2-row mux. State-to-row selectors are shared between ports with
+the same mapping. Under sky130, non-overlapping same-type values from different
+units may also share a register when the real FF saving exceeds the writeback
+mux cost and the mux still fits the clock budget.
+
+`AUTO_FSM(func, max_latency=N, register_output=False)` omits the default result
+register bank. The result and one-cycle valid pulse are then driven directly from the
+final execution state, so `.latency` equals the execution-state count. The default
+`register_output=True` keeps `.data` stable between valid pulses. Most source should use
+the default; `make_stream_auto_fsm` selects `False` because its own backpressure holding
+register already supplies that boundary. The minimum scheduled latency is two cycles
+with the default registered output and one cycle with `register_output=False`;
+`max_latency` smaller than the corresponding minimum is rejected at construction.
+
+Working examples: `examples/pypeline/auto_fsm_donut_update.py` (per-frame
+rotation math) and `examples/pypeline/float_sine_auto_fsm.py` (a float64
+polynomial onto one multiplier). Build controls and reports are documented under
+[Automatic implementation and sweeps](README.md#automatic-implementation-and-sweeps).
+
+---
+
+### Part III — Ports and streams
+
+The next six sections build a single layered stack, each one on top of the last:
+`kept_data_bus_t` (a lane of data plus a per-lane "keep" bit) underlies
+`ndarray_fragment_t` (a partially-filled N-dimensional chunk), which underlies
+`stream_t` (the generic `{data, valid}` payload type), which underlies `@interface`
+(a full bidirectional valid/ready port pairing), which AXI-Stream specializes into an
+industry-standard bus, with FIFOs and the two stream wrappers as the connective tissue
+between them. As `include/pypeline/axi/axis.py`'s own docstring puts it, AXI-Stream
+"composes the three layers above into a single factory."
+
+## Keep-Tagged Lanes: `kept_data_bus_t`
+
+A common streaming pattern is N parallel lanes of data, each with its own "is this lane
+actually valid this transfer" bit — AXI-Stream's `tdata`/`tkeep` is the best-known example,
+but the same shape shows up any time you transport a partially-filled chunk of a larger
+array one beat at a time. `kept_data_bus_t`, from `include/pypeline/kept_data_bus.py`,
+captures exactly that shape, generic over both the lane count and the element type:
+
+```python
+from pypeline import uint8_t
+from kept_data_bus import make_kept_data_bus_t
+
+bus4_t = make_kept_data_bus_t(uint8_t, 4)   # 4 lanes of uint8_t + a 4-bit keep mask
+
+def make_lane(b: bus4_t, i: int) -> uint8_t:
+    return b.data[i] if b.keep[i] else 0
+```
+
+`make_kept_data_bus_t(data_t, n)` returns a struct with two fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `.data` | `data_t[n]` | the N lanes of payload |
+| `.keep` | `uint1_t[n]` | per-lane "this lane is valid" flag |
+
+`data_t` doesn't have to be a byte — it can be any pypeline type, including a struct. The
+result is only literally AXI-Stream-shaped when `data_t` is `uint8_t`; with another element
+type it's the same per-lane keep-masking generalized to a stream of structs (see
+[AXI-Stream](#axi-stream-axis_t)).
+
+This layer has no `valid` bit and no end-of-transfer flag (`eod`/`tlast`) of its
+own — those are added by the layers above it.
+
+---
+
+## N-Dimensional Stream Fragments: `ndarray_fragment_t`
+
+AXI-Stream's `tlast` marks the end of one dimension — the end of a packet. Many real
+streams have more than one nested boundary: a video stream has an end-of-line *and* an
+end-of-frame, for instance. `ndarray_fragment_t`, from `include/pypeline/ndarray.py`,
+generalizes a single `tlast` bit into one end-of-dimension flag per dimension of whatever
+N-dimensional array the stream is serializing:
+
+```python
+from pixel import pixel_t   # whatever your pixel struct is
+from ndarray import make_ndarray_fragment_t
+
+video_frag_t = make_ndarray_fragment_t(pixel_t, 2)   # eod[0]=end of row, eod[1]=end of frame
+
+def track_position(frag: video_frag_t, x: uint16_t, y: uint16_t) -> ...:
+    next_x: uint16_t = x + 1
+    next_y: uint16_t = y
+    if frag.eod[0]:           # end of row
+        next_x = 0
+        next_y = y + 1
+    if frag.eod[1]:           # end of frame
+        next_y = 0
+    ...
+```
+
+`make_ndarray_fragment_t(frag_t, ndims)` returns a struct with two fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `.frag` | `frag_t` | the payload for this one transfer |
+| `.eod` | `uint1_t[ndims]` | per-dimension "end of dimension k" flags; `eod[0]` is the innermost dimension (AXIS `tlast`'s direct equivalent) |
+
+The field is named `.frag` rather than `.data` specifically so that nesting
+`ndarray_fragment_t` inside [`kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t)
+(which already has a `.data` array field) and inside
+[`stream_t`](#streams-stream_t) (which already has a `.data` payload field)
+doesn't produce an ambiguous `.data.data.data` chain.
+
+`frag_t` can be anything — a single struct (one whole element per transfer, as above) or a
+[`kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t) (multiple byte/element lanes per
+transfer, the AXI-Stream case — see [AXI-Stream: `axis_t`](#axi-stream-axis_t)).
+
+---
+
+## Streams: `stream_t`
+
+A stream carries a payload forward, one beat per clock, tagged with a **valid** bit that says
+whether this cycle's payload is really there. `stream_t`, from
+`include/pypeline/stream/stream.py`, is exactly that pair — data flowing **forward only**, with
+nothing travelling back:
+
+```text
+   upstream                                   downstream
+      |----data, valid (forward)------------------>|
+      |<---ready (reverse, from @interface)---------|
+
+   A transfer happens on any cycle where valid=1 AND ready=1 (once paired
+   with a ready signal via @interface -- stream_t alone carries no ready).
+```
+
+```python
+from stream.stream import make_stream_t
+
+uint32_stream_t = make_stream_t(uint32_t)
+
+@hw_func
+def scale_by_two(s: uint32_stream_t) -> uint32_stream_t:
+    o: uint32_stream_t
+    o.data = s.data * 2
+    o.valid = s.valid      # a valid input this cycle produces a valid output
+    return o
+```
+
+`make_stream_t(data_t)` returns a `@struct` with two fields — so `make_stream_t(uint32_t)` is
+the struct `{data: uint32_t, valid: uint1_t}`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `.data` | `data_t` | the payload |
+| `.valid` | `uint1_t` | whether `.data` is valid this cycle |
+
+`data_t` is typically an [`ndarray_fragment_t`](#n-dimensional-stream-fragments-ndarray_fragment_t)
+(giving end-of-dimension flags) or a [`kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t)
+(giving per-lane keep flags), but it can be any type — `make_stream_t(uint32_t)` above is a
+plain stream of integers with no `eod`/`keep` layer at all.
+
+Use `stream_t` on its own wherever data only flows forward: a free-running pipeline stage, or a
+value built and passed along whose consumer can always accept it. When a consumer must instead
+be able to say "not this cycle" — apply **backpressure** — the payload needs a companion signal
+travelling the *opposite* way. A signal flowing the other direction does not belong in the same
+struct as the data, so the next section introduces the general way pypeline bundles
+opposite-direction signals into one port — the **`@interface`** — out of which the valid/ready
+stream falls as the feedforward `stream_t` plus a reverse `ready`.
+
+**See also:** [Bidirectional Ports: `@interface`](#bidirectional-ports-interface) ·
+[Keep-Tagged Lanes: `kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t) ·
+[N-Dimensional Stream Fragments: `ndarray_fragment_t`](#n-dimensional-stream-fragments-ndarray_fragment_t) ·
+[FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo)
+
+---
+
+## Bidirectional Ports: `@interface`
+
+Real interfaces are rarely one-directional. A valid/ready stream sends `data`/`valid`
+downstream but takes `ready` back; a credit-based bus sends a payload and receives credits; a
+request/acknowledge pair goes both ways. An **`@interface`** bundles the signals of one port
+that travel together, *regardless of direction*: plain fields are **feedforward** (out along the
+port), and fields wrapped in `Feedback[T]` are **reverse** (back along it). Nothing about the
+mechanism is stream-specific — the reverse channel can be any number of fields of any type:
+
+```python
+from interface.interface import interface
+
+@interface
+class bus_intrf(NamedTuple):
+    payload: uint32_t
+    go:      uint1_t
+    credit:  Feedback[uint4_t]   # reverse — any width, not just a ready bit
+    halt:    Feedback[uint1_t]
+```
+
+```text
+   upstream                                     downstream
+      |----- payload, go (forward, .fwd_t) --------->|
+      |<---- credit, halt (reverse, .fb_t) -----------|
+```
+
+### The two halves
+
+An interface is not itself a hardware type — a hardware function never takes a whole `bus_intrf` as
+a port. Instead, `@interface` attaches two (or three) ordinary `@struct`s directly onto the class:
+
+```python
+bus_intrf.fwd_t     # feedforward half: {payload, go}
+bus_intrf.fb_t      # reverse half:     {credit, halt}
+bus_intrf.stream_t  # the plain {data, valid} half nested at .fwd_t.stream,
+                     # only for stream-shaped interfaces (None otherwise -- see below)
+```
+
+- `.fwd_t` gathers the plain fields into the **feedforward** struct.
+- `.fb_t` gathers the `Feedback[T]` fields — *unwrapped* to their inner type (`Feedback[uint4_t]`
+  → `uint4_t`) — into the **reverse** struct.
+
+There is no separate `make_interface_type`/`make_interface_feedback_type` to call, and no local
+alias to invent either: always write `bus_intrf.fwd_t` (etc.) directly at each use site rather than
+binding it to a shorter name first. A bound alias (`bus_t = bus_intrf.fwd_t`) throws away exactly
+the information `.fwd_t`/`.fb_t` exist to preserve — both a reader and elaboration of a
+factory closure can no longer distinguish a paired port half from a standalone struct.
+This is also why the interface-holding variable
+itself gets a distinct suffix, so the two kinds of name are never visually interchangeable:
+
+- **`_intrf`**: a variable holding the `@interface` class itself (`bus_intrf`) — always accessed
+  directly (`bus_intrf.fwd_t`), never re-aliased.
+- **`_if`**: an argument/field name holding an *instance* of one port half (see the naming
+  convention below) — unrelated to `_intrf`, and never confused with it since the suffixes differ.
+
+### Port types vs ordinary signal types
+
+Two related but separate questions come up constantly with interfaces: *what kind of value
+is this* (plain value, stream, or interface half), and *what kind of place is this value
+stored* (local, register, feedback, global wire). Neither tree implies the other — any
+storage kind on the right can hold any value kind on the left, **except** that `.fwd_t`/
+`.fb_t` may only ever sit at a real port boundary (see
+[Where `.fwd_t`/`.fb_t` may appear — and where it may not](#where-fwd_tfb_t-may-appear--and-where-it-may-not)
+below):
+
+```text
+value kind:                          storage kind:
+
+ordinary value (T)                   T
+    |                                 ├── local variable
+    ├── stream_t                      ├── Reg[T]
+    |     {data, valid}               ├── Feedback[T]
+    |                                 ├── Wire[T]
+    └── interface (@interface)        ├── Input[T]
+          ├── .fwd_t  (forward half)  └── Output[T]
+          └── .fb_t   (reverse half)
+```
+
+`.stream_t` is a plain value like any other — it can sit in a local, a `Reg[T]`, a global
+`Wire[T]`, anywhere. `.fwd_t`/`.fb_t` are the exception: they mark "this value is one half
+of a real port pairing", so they're restricted to exactly the places a real port boundary
+can occur.
+
+### Ports: two halves under one name
+
+Because the two halves travel opposite ways, a module carries a port as **both** halves — one as
+an argument, one as a return field — paired only by sharing the **same name**. There is no
+required naming convention (no `ready_for_`/`_ready`/`_rdy` affix); the port name is whatever you
+choose. Direction follows from which side holds the feedforward half:
+
+- an **input** port takes the feedforward half as an argument and returns the reverse half;
+- an **output** port does the opposite.
+
+**Convention (enforced by a lint): suffix the port variable with `_if`.** A lint warns if a
+paired port name doesn't end in `_if`. This is not a hard error, but every port name
+in this codebase follows it. Because one name legitimately means two
+different types depending on which side you're reading (an argument of the feedforward type, a
+return field of the reverse type — or vice versa for an output port), a bare port name like
+`axis_in` or `poly_key_out` reads as if it were two different same-named signals instead of one
+bidirectional port. Suffixing the *variable* with `_if` (`axis_in_if`, `key_if`, `to_pipeline_if`)
+marks it as one port, and — since it's a different suffix from the `_intrf` on the `@interface`
+*type* itself — the two never collide. When a module has two same-shaped ports going opposite
+ways, name them accordingly: `data_in_if`/`data_out_if`, `axis_in_if`/`axis_out_if`.
+
+```python
+@struct
+class x_to_y_t(NamedTuple):
+    x_if: bus_fb_t   # input port x_if: its reverse half (credit/halt) travels out
+    y_if: bus_t      # output port y_if: its feedforward half (payload/go) travels out
+
+@hw_func
+def x_to_y(x_if: bus_t, y_if: bus_fb_t) -> x_to_y_t:
+    o: x_to_y_t
+    o.y_if = x_if    # feedforward: pass x_if's payload/go out on y_if
+    o.x_if = y_if    # feedback:    pass y_if's credit/halt back on x_if
+    return o
+```
+
+### The stream interface: valid/ready handshaking
+
+A valid/ready stream is the most common interface, and the one the whole streaming library is
+built on. Its forward field **nests** a plain `make_stream_t(data_t)` rather than re-declaring
+`data`/`valid` itself, so the with-ready interface's forward half and a standalone valid-only
+stream are never two independently-shaped twins requiring a field-by-field conversion — the
+with-ready side's data+valid *is* a `make_stream_t(data_t)` value, reached through `.stream`:
+
+```python
+from stream.stream import make_stream_interface, make_stream_t
+
+# make_stream_interface(uint32_t) is literally this interface:
+@interface
+class uint32_stream_intrf(NamedTuple):
+    stream: make_stream_t(uint32_t)   # nested plain {data, valid} struct
+    ready:  Feedback[uint1_t]         # the one reverse field
+```
+
+so its halves are, always accessed directly off `uint32_stream_intrf` (never re-aliased):
+
+```python
+uint32_stream_intrf = make_stream_interface(uint32_t)
+uint32_stream_intrf.fwd_t     # {stream: {data, valid}}
+uint32_stream_intrf.fb_t      # {ready}
+uint32_stream_intrf.stream_t  # the plain {data, valid} nested at .fwd_t.stream
+```
+
+A standalone `make_stream_t(uint32_t)` ([Streams: `stream_t`](#streams-stream_t)) is a plain `{data, valid}` struct with no `@interface`
+involved at all — it never needed one to define itself. `uint32_stream_intrf.stream_t` is exactly
+that type (replacing the older `<fwd_t>.typeof("stream")` idiom — the shortcut belongs on the
+interface, not on a forward-half value), so crossing between "a valid-only value" and "the
+data+valid half of a real backpressured port" is a single `.stream` field access/assignment, never
+a per-field copy:
+
+```python
+plain: make_stream_t(uint32_t) = uint32_stream_intrf.stream_t(data=5, valid=1)
+port_val: uint32_stream_intrf.fwd_t = uint32_stream_intrf.fwd_t(stream=plain)  # wrap into a port value
+plain_again = port_val.stream                                                  # unwrap back out
+```
+
+A module gives a stream port the same two-halves-one-name treatment as any interface — an
+**input** stream returns its `ready`, an **output** stream takes one. Field access on a real port
+goes through `.stream`; `.ready` is unaffected (the reverse half was never nested):
+
+```python
+@struct
+class relay_t(NamedTuple):
+    stream_in_if:  uint32_stream_intrf.fb_t   # input port: ready travels back out
+    stream_out_if: uint32_stream_intrf.fwd_t  # output port: data+valid travel out
+
+@hw_func
+def relay(
+    stream_in_if: uint32_stream_intrf.fwd_t, stream_out_if: uint32_stream_intrf.fb_t
+) -> relay_t:
+    o: relay_t
+    o.stream_out_if = stream_in_if               # forward the data+valid downstream
+    o.stream_in_if.ready = stream_out_if.ready   # forward the backpressure upstream
+    return o
+
+@hw_func
+def show_fields(stream_in_if: uint32_stream_intrf.fwd_t) -> uint1_t:
+    return stream_in_if.stream.valid   # .stream. reaches the nested data+valid
+```
+
+**Naming convention.** Two distinct suffixes, never interchangeable:
+
+| Suffix | Is | Accessed as | Example |
+|---|---|---|---|
+| `_intrf` | the whole interface, both directions | `some_intrf.fwd_t`/`.fb_t`/`.stream_t`, always direct | `uint32_stream_intrf` |
+| `_if` | an argument/field holding *one instance* of a port half | the value itself, typed `some_intrf.fwd_t`/`.fb_t` | `stream_in_if`, `stream_out_if` |
+
+`.fwd_t`, `.fb_t`, and `.stream_t` are attributes on the `_intrf` — there is no third kind of
+bound-alias name (`uint32_stream_t`, `uint32_stream_fb_t`, ...) to introduce; write the attribute
+access out at each use site instead, even where it repeats.
+
+A genuinely valid-only stream (no `@interface`, no reverse half at all) is built directly with
+`make_stream_t(T)`/`axi.make_axis_t(...)` — see [Streams: `stream_t`](#streams-stream_t) — not by taking the `.fwd_t` half of a
+with-ready interface and ignoring its `.fb_t`; the latter still declares a real reverse half that
+the def-site check (`InterfacePortError`) will demand a caller pair.
+
+The reverse channel is not limited to a one-bit `ready`: `make_stream_interface(data_t,
+feedback_t=...)` widens it to a credit count or a struct of flags, just as `bus_intrf` above
+carries `credit`/`halt`. Every streaming building block that follows —
+[AXI-Stream](#axi-stream-axis_t), [FIFOs](#fifos-make_stream_fifo),
+[pipelined wrappers](#pipelined-stream-wrappers-make_stream_auto_pipeline), and the
+[DSP blocks](#dsp-filters--signal-conditioning) — declares its ports as these two interface halves.
+
+### Interface functions: write feedforward, get the reverse wired
+
+Wiring handshake modules together normally means hand-threading the reverse signal back
+through a `Feedback[T]` while the forward data flows on. A function whose annotations use a
+whole `@interface` is an **interface function**: you write only the feedforward connections
+and the reverse direction is generated. No decorator is needed — a whole interface is not a
+valid hardware type, so annotating with one is unambiguous.
+
+```python
+from interface.interface_func import make_hw_func_from_interface_func
+
+def two_in_series(stream_in: chan) -> chan:
+    a = inc2(stream_in)
+    b = inc5(a.stream_out)
+    return b.stream_out
+
+two_series = make_hw_func_from_interface_func(two_in_series)
+```
+
+Instantiation stays explicit, so the boundary where real hardware enters a design is always
+visible. The generated callable has a `.return_t` result struct, identical in shape to what a
+hand-written module declares — which is why the two compose freely in either direction.
+
+```text
+hand-written module          two_series (interface func)
++----------------+           +--------------------------+
+| calls          |--fwd_t--->| a = inc2(stream_in)       |
+| two_series(x)  |<--fb_t----| b = inc5(a.stream_out)    |  <-- reverse (ready)
+|                |           | return b.stream_out       |     wired back for you
++----------------+           +--------------------------+
+```
+
+**The wiring rule, in full:** calls are emitted in source order, and an edge gets a
+`Feedback[T]` whenever the value's source is emitted *after* the destination that consumes
+it. This is direction-agnostic. It inserts a feedback on a reverse edge (ordinary
+backpressure) and equally on a *feedforward* edge — which is what lets an FSM consume a value
+produced by a pipeline called after it:
+
+```python
+def merge(axis_in: chan) -> chan:
+    f = fsm(axis_in, p.stream_out)   # consumes a value produced by a later call
+    p = pipe(f.to_pipe)
+    return f.axis_out
+```
+
+That loop is the shape of an FSM+datapath merge (see wireguard's `chacha20_instance`), and it
+generates both feedbacks — one carrying the feedforward value backward, one the reverse value.
+
+**Plain values pass through.** Non-interface args and return fields (config, keys, flags) are
+ordinary feedforward wires: they appear verbatim with no reverse companion. Statements that
+touch no interface value are copied through as-is, so plain computation between calls is fine —
+including reading a *non-interface* field off a call result (a status flag, a count). Unlike an
+interface, a plain value may fan out freely.
+
+**Multiple ports.** Return an `@interface` bundle whose fields are interfaces to expose more
+than one output port; a bare interface return becomes a single port named `out_port`. Bundles
+may mix interface fields and plain fields; every field must be assigned in the return.
+
+**Limitations.** An interface function body is straight-line wiring only. `if`/`for`/`while`
+and conditional expressions are rejected — steer interfaces with an explicit mux/demux module
+instead. Each interface is point-to-point: fan-out of one interface is rejected (use an explicit
+duplicator — see array ports below), as is a dangling output or passing an input straight
+through to an output. Modules whose reverse signal is *computed* from state (a FIFO's ready
+from occupancy, an FSM's from state) are written by hand as ordinary `@hw_func`s — the sugar
+wires such modules together, it does not replace them.
+
+### Crossing between the two styles
+
+Designs mix the two: hand-written modules for anything stateful, generated wiring between them.
+Both directions of that boundary are ordinary, and neither reinvents a naming convention.
+
+**Manual → implied: a hand-written `@hw_func` (or a `@MAIN`) instantiates an interface function.**
+No name matching is involved at all — the generated callable has an ordinary `.return_t` result struct,
+so you call it like any module: reverse halves go in as arguments, and come back out as named
+return fields. The shape follows from the interface function's own signature:
+
+| | contents | order |
+|---|---|---|
+| **args** | plain params verbatim; interface params as their feedforward half; then one feedback-half arg per **output** port | declaration order, then return-bundle order |
+| **return fields** | feedforward half per **output** port; then plain return-bundle fields; then feedback half per **input** port | bundle order, then param order |
+
+Every port keeps the name you gave it, and a half is omitted when that direction is empty.
+Reverse halves are whole structs — construct them inline, directly in the call arguments, at
+the exact point they cross into the real port (never as their own local variable first; see
+[Registers: `Reg[T]`](#registers-regt)'s `.fwd_t`/`.fb_t` restriction):
+
+```python
+@MAIN(80.0)
+def encrypt_dataflow():
+    r = encrypt_dataflow_core(
+        axis_in_if=axis128_intrf.fwd_t(stream=ports.axis_in),  # forward half, inline
+        key=ports.key, nonce=ports.nonce, aad=ports.aad, aad_len=ports.aad_len,
+        axis_out_if=axis128_intrf.fb_t(ready=ports.axis_out_ready),  # reverse half, inline
+    )
+    ports.axis_in_ready = r.axis_in_if.ready      # implied feedback -> explicit
+    ports.axis_out = r.axis_out_if.stream         # ports.axis_out is a plain Wire[.stream_t]
+```
+
+**Implied → manual: an interface function instantiates a hand-written module.** Here names *do*
+matter, in one narrow structural sense: **the two halves of a port share the port's name**, one
+on the argument side and one on the return side. The name itself is yours (by convention,
+suffixed `_if`); there is no `_ready` or `ready_for_` affix anywhere in the mechanism. Direction
+comes from whichever side holds the feedforward half. Declaring only one half is a hard error
+*when such a module is instantiated by an interface function*, naming the port and the missing
+side, since an undetected single half would mis-wire silently. `@hw_func` also raises `InterfacePortError` at
+decoration time whenever a signature declares one half of a port without the other, so the
+mistake surfaces even for a module no interface function has composed yet. The one legitimate
+lone half is an intentional [valid-only stream](#streams-stream_t) (data + valid,
+no backpressure) — build it with `make_stream_t`/`axi.make_axis_t` (genuinely no reverse half,
+so the check never applies), not by taking the `.fwd_t` of a with-ready interface and ignoring
+its `.fb_t`:
+
+```python
+@struct
+class gate_t(NamedTuple):
+    stream_in_if: chan_intrf.fb_t      # input port's reverse half travels out
+    stream_out_if: chan_intrf.fwd_t    # output port's feedforward half travels out
+    passed: uint8_t                    # plain status, no reverse companion
+
+@hw_func
+def gate(
+    stream_in_if: chan_intrf.fwd_t, limit: uint8_t, stream_out_if: chan_intrf.fb_t
+) -> gate_t:
+    o: gate_t
+    count: Reg[uint8_t]
+    open_: uint1_t = count < limit          # backpressure computed from state
+    o.stream_in_if.ready = stream_out_if.ready & open_
+    ...
+```
+
+That is the *only* change a stateful module needs to become callable from an interface function —
+its body keeps using `.ready` explicitly. `src/tests/pypeline_tests/inst/interface_boundary_test.py`
+exercises both crossings against a hand-written twin, plain signals included.
+
+### Where `.fwd_t`/`.fb_t` may appear — and where it may not
+
+> **Not supported:** Nothing except a hw_func signature arg/return-struct field, or an
+> inline constructor-call *expression* at the exact point a value crosses into a real
+> port, may ever hold an `@interface`'s `.fwd_t`/`.fb_t` type.
+
+That means not a plain local variable (even one built up over several statements, or
+assigned via a bare `x = intrf.fwd_t(...)` with no type annotation at all), not
+`Feedback[T]`, not `Reg[T]` (see [Registers: `Reg[T]`](#registers-regt)), and not a
+global `Wire[T]`/`Input[T]`/`Output[T]`. None of these are themselves a port — a local
+is scratch space, `Feedback[T]` is a same-cycle forward reference to a value that meets
+a port *elsewhere*, `Reg[T]` is internal state, and a global `Wire`/`Input`/`Output` is
+plain wiring between `@MAIN`s or a flattened top-level chip signal — so none of them
+ever need (or should imply) the `.fwd_t`/`.fb_t` pairing signal. Use `.stream_t` (or a
+bare `uint1_t` for a lone ready/valid signal) everywhere one of these needs to carry the
+value, and construct `.fwd_t`/`.fb_t` inline only at the point it meets a real port:
+
+```python
+# Wrong -- ElaborationError: a local variable cannot be declared with .fwd_t/.fb_t
+dwidth_conv_data_in: axis128_intrf.fwd_t = axis128_null()
+...
+in_to_block = axis128_to_axis512(narrow_in_if=dwidth_conv_data_in, wide_out_if=...)
+
+# Also wrong -- same error, just without the type annotation
+dwidth_conv_data_in = axis128_intrf.fwd_t(stream=axis128_stream_null())
+
+# Also wrong -- Feedback[T] and global Wire[T] are restricted the same way
+block_in_ready: Feedback[axis512_intrf.fb_t]
+encrypt_pipeline_in: Wire[chacha20_loop_body_stream_intrf.fwd_t]
+
+# Right -- build up the plain .stream_t/uint1_t locally, wrap only at the call site
+dwidth_conv_data_in: axis128_intrf.stream_t = axis128_stream_null()
+block_in_ready: Feedback[uint1_t]
+encrypt_pipeline_in: Wire[chacha20_loop_body_stream_intrf.stream_t]
+...
+in_to_block = axis128_to_axis512(
+    narrow_in_if=axis128_intrf.fwd_t(stream=dwidth_conv_data_in),
+    wide_out_if=axis512_intrf.fb_t(ready=block_in_ready),
+)
+```
+
+**A global stream+ready pair doesn't need to be two separate Wires at all** —
+`Wire[SomeInterface]` (the bare `@interface` class, not `.fwd_t`/`.fb_t`/`.stream_t`) is
+sugar for one compound Wire holding both halves, with `.stream` and `.ready`
+independently driven/read from different functions exactly like any other flattened
+multi-writer struct Wire:
+
+```python
+# Also fine, and usually clearer than two separate Wires -- one compound Wire
+# instead of an independently-named stream Wire + ready Wire for the same port
+encrypt_pipeline_in_if: Wire[chacha20_loop_body_stream_intrf]
+
+@hw_func
+def drive_in():
+    encrypt_pipeline_in_if.stream = ...   # written by one function
+
+@hw_func
+def drive_ready():
+    encrypt_pipeline_in_if.ready = ...    # written by another
+
+...
+x = encrypt_pipeline_in_if.stream.data    # read by a third
+```
+
+`Wire[SomeInterface.fwd_t]`/`Wire[SomeInterface.fb_t]` remain banned exactly as above —
+only the bare interface class gets this sugar.
+
+An `intrf.fwd_t(...)`/`intrf.fb_t(...)` constructor call is also valid directly as a call
+argument (not just as a whole assignment's right-hand side) — no local variable is
+needed at all when there's nothing to build up over multiple statements:
+
+```python
+r = gated(chan_intrf.fwd_t(data=in_data, valid=in_valid), limit, chan_intrf.fb_t(ready=downstream_ready))
+```
+
+**A plain (non-hw_func) Python function may not return a `.fwd_t`/`.fb_t` value either**
+— that just hides the same construction behind a call boundary instead of at a real port
+crossing, indistinguishable from any of the banned patterns above once the caller uses
+the result:
+
+```python
+# Wrong -- ElaborationError: a plain function cannot return .fwd_t/.fb_t
+def axis128_null():
+    return axis128_intrf.fwd_t(stream=axis128_stream_null())
+
+# Right -- return the plain stream_t; wrap inline at each call site that needs it
+def axis128_stream_null():
+    return axis128_intrf.stream_t(data=axis128_frag_null(), valid=0)
+...
+o.axis_out_if.stream = axis128_stream_null()  # port field already fwd_t-typed
+```
+
+### Array ports: fan-out
+
+An interface is point-to-point, so forking a stream needs a module that owns the fork. Its output
+is an **array port**: `axis_out_if: axis_intrf.fwd_t[n]` on the return side paired with `axis_out_if: axis_intrf.fb_t[n]`
+on the argument side. Each element is an independent interface with its own backpressure, so
+handing `bcast.axis_out_if[i]` to each sink is the whole wiring — the reverse array is assembled and
+fed back for you. `make_axis_broadcast_interlock` ([AXI-Stream: `axis_t`](#axi-stream-axis_t)) is the ready-made one:
+
+```python
+def fork_wiring(axis_in_if: axis_intrf) -> fork_ports:
+    d = bcast(axis_in_if)                    # no sink_ready array to build by hand
+    f = hold_fast(d.axis_out_if[0])
+    s = hold_slow(d.axis_out_if[1])
+    return fork_ports(fast_if=f.axis_out_if, slow_if=s.axis_out_if)
+```
+
+Array ports are an output-side feature; an array *input* port is rejected with a clear error.
+
+### Common patterns
+
+Short answers to the interface questions that come up most often — each is a direct
+application of the rules above, collected here as a quick reference:
+
+**Store a stream value in a register.** Use `.stream_t`, never `.fwd_t`:
+```python
+buf: Reg[chan_intrf.stream_t]
+```
+
+**Delay a ready (reverse) signal by a cycle.** A bare `uint1_t` register — `.fb_t`'s
+unwrapped field type, not `.fb_t` itself:
+```python
+ready_d1: Reg[uint1_t]
+ready_d1 = downstream_if.ready
+```
+
+**Route an interface through a local variable.** Build up the plain `.stream_t`/`uint1_t`
+locally, and wrap into `.fwd_t`/`.fb_t` only at the call site that needs it:
+```python
+data_in: chan_intrf.stream_t = chan_stream_null()
+...
+r = gated(chan_intrf.fwd_t(stream=data_in), limit)
+```
+
+**Fan out one interface to several sinks.** Use an array port (see
+[Array ports: fan-out](#array-ports-fan-out) above) — never hand the same interface to
+two different call sites directly, which would be two independent point-to-point ports
+silently sharing one name.
+
+**Convert between a port half and a plain stream.** `.stream_t` is the standalone type;
+`.fwd_t.stream` is the same shape nested inside a port half. Moving between them is a
+single field access/assignment, never a per-field copy:
+```python
+o.axis_out_if.stream = my_stream_value      # plain -> port half
+my_stream_value = axis_in_if.stream         # port half -> plain
+```
+
+**See also:** [Streams: `stream_t`](#streams-stream_t) ·
+[AXI-Stream: `axis_t`](#axi-stream-axis_t) ·
+[Registers: `Reg[T]`](#registers-regt) ·
+[Feedback Wires: `Feedback[T]`](#feedback-wires-feedbackt)
+
+---
+
+## AXI-Stream: `axis_t`
+
+`include/pypeline/axi/axis.py` composes the three layers above into a single factory for
+the common case — a complete AXI-Stream-equivalent type:
+
+```python
+from pypeline import uint8_t, sim_call
+from kept_data_bus import make_kept_data_bus_t
+from axi.axis import make_axis_t, make_keep_count, make_count_to_keep
+
+axis32_t = make_axis_t(4)   # 4 lanes of uint8_t: stream(ndarray_fragment(1, kept_data_bus(uint8_t, 4)))
+
+def axis32_passthrough(x: axis32_t) -> axis32_t:
+    return x
+```
+
+`make_axis_t(n, elem_t=uint8_t, ndims=1)` is exactly:
+
+```python
+bus_t = make_kept_data_bus_t(elem_t, n)
+fragment_t = make_ndarray_fragment_t(bus_t, ndims)
+return make_stream_t(fragment_t)
+```
+
+i.e. a genuinely one-directional, plain `{data, valid}` struct — no `@interface`, no reverse half,
+ever ([Streams: `stream_t`](#streams-stream_t)). A module that needs backpressure takes both halves of the *with-ready* interface as
+ports instead, built from `make_axis_interface(n, elem_t=uint8_t, ndims=1)` — the same three
+layers, stopping at the interface:
+
+```python
+from axi.axis import make_axis_interface
+
+axis32_intrf = make_axis_interface(4)
+axis32_intrf.fwd_t     # {stream: {data, valid}} -- real port, needs .stream.
+axis32_intrf.fb_t      # {ready}
+axis32_intrf.stream_t  # the plain {data, valid} nested at .fwd_t.stream
+```
+
+`axis32_intrf.fwd_t` here is *not* the same type as the standalone `make_axis_t(4)` above: one is a
+real with-ready port (`.stream.data`/`.stream.valid`, must pair with `axis32_intrf.fb_t`), the other
+is a plain valid-only value (`.data`/`.valid` directly, never paired) — see the naming table in [Bidirectional Ports: `@interface`](#bidirectional-ports-interface).
+
+`make_axis_broadcast_interlock(axis_intrf, n)`, `make_dwidth_widen` and `make_dwidth_narrow` all
+declare their ports this way — see [Crossing between the two
+styles](#crossing-between-the-two-styles).
+
+> ⚠ **`tlast` is only meaningful under `tvalid`, and a broadcast leg can break that at a
+> top-level port.** `make_axis_broadcast_interlock` copies the source beat to every leg and
+> then zeroes `valid` on a leg whose sibling is not ready yet — so a stalled leg can present
+> `eod = 1` with `valid = 0`. That is legal *inside* the library, since AXI leaves `tlast`
+> don't-care while `tvalid` is low, but a top-level master must not emit it. Qualify it with
+> that leg's own valid at the pin:
+> ```python
+> leg0_valid: uint1_t = b.axis_out_if[0].stream.valid & out_en
+> m_axis_tlast  = b.axis_out_if[0].stream.data.eod[0] & leg0_valid   # not eod alone
+> m_axis_tvalid = leg0_valid
+> ```
+> The same defect is recorded against the old C library as `axis.h:539`. A testbench that
+> checks this on every port rather than trusting the producer is what catches it.
+
+so for an `axis32_t` value `x`:
+
+| Old AXIS field | pypeline equivalent |
+|---|---|
+| `tdata[i]` | `x.data.frag.data[i]` |
+| `tkeep[i]` | `x.data.frag.keep[i]` |
+| `tlast` | `x.data.eod[0]` |
+| `valid` | `x.valid` |
+
+`elem_t` only needs to be `uint8_t` (the default) for this to be literally AXI-Stream —
+with any other `elem_t`, `make_axis_t` produces the same `tdata`/`tkeep`-shaped struct
+generalized to a stream of per-lane elements instead of bytes. `ndims` only needs to be `1`
+(the default, a single `tlast`-equivalent flag) — pass a larger value for streams with
+nested end-of-dimension boundaries, the same way
+[`ndarray_fragment_t`](#n-dimensional-stream-fragments-ndarray_fragment_t) does on its
+own.
+
+Two small helpers cover the `tkeep`↔lane-count conversions that AXIS-handling logic
+typically needs:
+
+```python
+bus4_t = make_kept_data_bus_t(uint8_t, 4)
+keep_count_4 = make_keep_count(bus4_t, 4)        # .keep[4] -> count of asserted lanes
+count_to_keep_4 = make_count_to_keep(4)          # count -> thermometer-coded .keep[4]
+
+assert sim_call(count_to_keep_4, 3) == [1, 1, 1, 0]
+assert sim_call(keep_count_4, bus4_t(data=[0, 0, 0, 0], keep=[1, 1, 1, 0])) == 3
+```
+
+`make_keep_count(bus_t, n)` returns a hardware function summing `.keep` over `n` lanes
+(a popcount). `make_count_to_keep(n)` returns the inverse: given a lane count, produces a
+thermometer-coded `.keep[n]` array with lanes `[0, count)` asserted. Both fully unroll
+their internal `for i in range(n)` loop at elaboration time (see
+[for/while → loop unrolling](#your-first-hardware-function)), so there's no need for
+the per-width duplication older, non-generic AXIS implementations require.
+
+See `src/tests/pypeline_tests/inst/axis_test.py` for a complete source example.
+
+### Testbench byte-stream generator/checker
+
+Every hand-written axis testbench ends up rebuilding the same shape: a fixed-width byte
+buffer + "bytes remaining" counter, `keep[i] = remaining > i` per lane, `eod` set on the
+last beat, and — once a transfer actually fires (`stream.valid & <reverse ready>`) —
+shifting the buffer down by the lane width (generating) or appending the kept lanes into
+an accumulating buffer (checking). `make_axis_byte_source`/`make_axis_byte_sink` factor
+that out into reusable, synthesizable `@hw_func`s:
+
+```python
+from axi.axis import make_axis_interface, make_axis_byte_source, make_axis_byte_sink
+
+axis128_intrf = make_axis_interface(16)
+byte_source = make_axis_byte_source(axis128_intrf, 16, MAX_FRAME_BYTES)
+byte_sink = make_axis_byte_sink(axis128_intrf, 16, MAX_FRAME_BYTES)
+
+# byte_source(load, load_data, load_len, stream_out_if) -> byte_source_t
+#   .stream_out_if (fwd_t) - the generated stream; .idle - safe to `load` a new frame
+# byte_sink(stream_in_if) -> byte_sink_t
+#   .stream_in_if (fb_t) - reverse half; .frame_valid/.frame_data/.frame_len - one
+#   pulse per completed frame, ready for a single sim_assert/compare
+```
+
+Neither factory generates or checks backpressure — both drive their own
+`ready`/consume-every-beat behavior unconditionally, the same as every hand-written
+testbench in this codebase. A caller wanting stalls drives the interface's reverse half
+itself.
+
+`make_axis_byte_source(..., use_keep_mask=True)` adds a `load_keep_mask` input
+overriding the default `keep[i] = remaining > i` derivation with an explicit per-byte
+mask — needed whenever a frame is really *multiple concatenated sub-messages* with a
+hard beat boundary between them (e.g. a protocol where a fixed-size trailer must always
+start on a fresh beat, so a non-block-aligned leading segment needs its last beat padded
+with not-kept bytes rather than letting the trailer merge into the leftover lanes).
+`AxisSimSource.send(frame, keep_mask=...)` is the same idea for native sim.
+
+For native testbenches driven via `@sim_input`/`@sim_output`,
+`include/pypeline/axi/axis_sim.py`'s `AxisSimSource`/`AxisSimSink` cover the same ground in
+plain Python — API-inspired by cocotb's `cocotbext-axi` (queue-backed `send()`/`recv()`, a
+`set_pause_generator()` backpressure hook) but not that library itself: Pypeline's native
+sim is a synchronous, non-async, delta-cycle-converging function-call model, incompatible
+with cocotbext-axi's `async def`/cocotb-scheduler-based classes.
+
+> **Backpressure is asymmetric, and this is a real coverage gap to be aware of.**
+> `AxisSimSource` has `set_pause_generator()`, so a *producer* can stall however you like.
+> `AxisSimSink` has no equivalent — it presents `ready = 1` to its caller and records every
+> valid beat it is shown, so **stalling a consumer is the testbench's own job**, driven by
+> hand onto the DUT's `tready`. Every testbench in this repo does that with a fixed period
+> (`0 if (n % 5) == 0 else 1` and friends, on mutually prime periods so the stalls drift
+> against each other), which exercises backpressure but is not the same as a randomized
+> ready pattern — **no design here has been tested against randomized output flow control.**
+> `dsp/fir_tb.py`/`dsp/dsp_tb.py`'s `ready_pattern="random"` is the exception, and it only
+> covers the single-stream blocks those testbench libraries drive.
+
+```python
+from axi.axis_sim import AxisSimSource, AxisSimSink
+
+src = AxisSimSource(axis128_intrf, 16)
+snk = AxisSimSink(axis128_intrf, 16)
+src.send(b"...")                       # queue a frame
+
+@sim_input
+def drive_in_word():
+    return src.step(some_ports.axis_in_ready)
+
+@sim_output
+def check_out():
+    snk.step(some_ports.axis_out)
+    frame = snk.recv_nowait()          # None until a full frame has arrived
+    if frame is not None:
+        ...
+```
+
+`axis_sim.py` also has `Scoreboard` — not AXIS-specific, just factored out because every
+testbench in this codebase reinvented the same "dict of expected packets + a manually-
+incremented index" bookkeeping around its own checker. `expect(value, **meta)` queues an
+expected value plus arbitrary caller metadata (packet index, a tamper flag, whatever);
+`check(got)` pops the oldest expectation and compares, returning
+`{"passed": bool, "expected": ..., "got": ..., **meta}`. `AxisSimSink` takes one directly
+(`AxisSimSink(axis_intrf, n, scoreboard=sb)`), so `check_nowait()` combines "pop a
+completed frame" and "check it" in one call:
+
+```python
+from axi.axis_sim import AxisSimSource, AxisSimSink, Scoreboard
+
+sb = Scoreboard()
+src = AxisSimSource(axis128_intrf, 16)
+snk = AxisSimSink(axis128_intrf, 16, scoreboard=sb)
+
+@sim_input
+def drive_in_word():
+    if src.idle():
+        frame, meta = generate_next_frame()   # whatever's genuinely testbench-specific
+        sb.expect(frame, **meta)
+        src.send(frame)
+    return src.step(some_ports.axis_in_ready)
+
+@sim_output
+def check_out():
+    snk.step(some_ports.axis_out)
+    result = snk.check_nowait()            # None until a full frame has arrived
+    if result is not None and not result["passed"]:
+        sim_print(f"ERROR: mismatch, packet {result['idx']}")
+```
+
+See `src/tests/pypeline_tests/inst/axis_byte_stream_test.py` for a complete worked
+example of both, including a partial-final-beat (non-multiple-of-lane-width) frame length
+and `set_pause_generator`.
+
+**See also:** [Bidirectional Ports: `@interface`](#bidirectional-ports-interface) ·
+[Keep-Tagged Lanes: `kept_data_bus_t`](#keep-tagged-lanes-kept_data_bus_t) ·
+[FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo)
+
+---
+
+## Byte-Stream Serialization: `make_serializer` / `make_deserializer`
+
+`include/pypeline/stream/serializer.py` and `stream/deserializer.py` move a value across
+a narrower (or wider) bus, one keep-tagged beat at a time, with valid/ready handshaking
+on both sides. They are the pypeline replacements for old PipelineC's
+`serializer_in_to_out`/`deserializer_in_to_out`.
+
+```python
+from stream.serializer import make_serializer
+from stream.deserializer import make_deserializer
+
+ser = make_serializer(uint8_t, 13, 4)    # 13-element value -> 4-lane beats
+deser = make_deserializer(uint8_t, 4, 13)  # the inverse
+```
+
+Both take the usual paired ports and return a callable with its complete result type at `.return_t`:
+
+```python
+@MAIN
+def top(stream_in_if: ser.in_intrf.fwd_t, stream_out_if: ser.out_fb_t) -> ser.return_t:
+    return ser(stream_in_if, stream_out_if)
+```
+
+**Padding lives in `keep`, never in the data.** A value whose length is not a multiple of
+the bus width simply ends in a partial beat whose `keep` gives the real count — so 13
+elements on a 4-lane bus is three full beats plus one carrying a single element. (The old
+C macros deadlocked outright on any non-divisible size, silently and with no diagnostic.)
+
+| Option | Values | Meaning |
+|---|---|---|
+| `align` | `"beat"` (default), `"packed"` | Whether each value starts on a fresh beat boundary, or values run back-to-back through the stream |
+| `padding` | `"pad"` (default), `"exact"` | `"exact"` demands divisibility and raises `ValueError` at factory-call time if it does not hold, naming both sizes |
+| `on_eod` *(deserializer)* | `"discard"` (default), `"zero_pad"`, `"ignore"` | What a partial value does when the stream ends: drop and resync (pulsing `.runt`), emit it zero-filled (also pulsing `.runt`), or carry the residue forward |
+| `registered_ready` *(deserializer)* | `False` (default) | Break the combinational `ready` path, at the cost of one bubble cycle per value |
+
+Both modules are **bubble-free** by default: an output drains and an input beat is
+accepted in the same cycle. That is worth knowing because the old deserializer was not —
+its `ready` was gated on the output register being empty, costing a cycle per value,
+which *halves* throughput whenever a value is one beat wide. `registered_ready=True`
+restores the old behaviour if a design needs that combinational path broken.
+
+Note that `registered_ready` is a **deserializer-only** knob. On the serializer
+(`make_type_to_axis`) the downstream `ready` is combinational on purpose and there is no
+option to break it — and that path is deeper than it looks, since it feeds the variable
+index of the buffer write. If a design needs it cut (logic that must force `ready` to
+drain the serializer, say), put a `mode="full"`
+[skid buffer](#skid-buffers-make_skid_buffer) downstream and drive the OR onto the
+slice's registered ready instead.
+
+**See also:** [Streams: `stream_t`](#streams-stream_t) ·
+[Struct ↔ AXI-Stream](#struct--axi-stream-make_axis_to_type--make_type_to_axis) ·
+[the library-local guide](../include/pypeline/stream/pypeline_stream_guide.md)
+
+---
+
+## Struct ↔ AXI-Stream: `make_axis_to_type` / `make_type_to_axis`
+
+`include/pypeline/axi/type_axis.py` puts a `@struct` on an AXI-Stream and takes it off
+again — the pypeline replacement for old PipelineC's `axis_packet_to_type`,
+`axis_to_type` and `type_to_axis`. Under the hood it is
+`stream/type_byte_stream.py` (the byte-layout functions plus a serializer) with framing
+policy on top.
+
+```python
+from axi.type_axis import make_axis_to_type, make_type_to_axis
+
+rx = make_axis_to_type(hdr_t, 4)   # AXIS frames -> hdr_t values
+tx = make_type_to_axis(hdr_t, 4)   # hdr_t values -> AXIS frames
+
+@MAIN
+def rx_top(axis_in_if: rx.axis_intrf.fwd_t, stream_out_if: rx.out_fb_t) -> rx.return_t:
+    return rx(axis_in_if, stream_out_if)
+```
+
+The bytes on the wire are exactly `type_to_bytes(hdr_t, value)` — so a host program can
+build and parse frames with nothing but
+[the software helpers above](#software-side-conversion-type_to_bytes--tto_bytes).
+
+### Framing modes
+
+`frame="one_per_packet"` (default) gives each value its own frame, with `tlast` on its
+final beat and a **length limiter** that drops anything a frame carries beyond
+`byte_length(t)`. That limiter is not optional decoration: Ethernet pads frames to a
+60-byte minimum, so without it a struct smaller than the minimum frame leaves trailing
+pad bytes in the deserializer and desyncs every value after it.
+
+`frame="many_per_packet"` packs values back-to-back inside one frame, with `tlast` only
+at the end. End a frame either by driving `stream_in_if.stream.data.eod[0]` on the last
+value, or by passing `structs_per_packet=k` to have an internal counter do it. Value
+boundaries may straddle beats freely; `byte_length(t)` need not divide the bus width.
+
+### Short frames
+
+`on_runt` controls what happens when a frame ends mid-value — `"discard"` (default,
+resync and pulse `.runt`), `"zero_pad"` (emit it zero-filled, also pulsing `.runt`), or
+`"ignore"`. The old code did none of these: one runt frame permanently desynced the
+value boundary for every frame after it, silently. `"ignore"` exists only to reproduce
+that behaviour for comparison.
+
+### `tkeep`
+
+Consumed on receive and produced on transmit, in both directions, as a contiguous
+prefix (Xilinx-style: full keep on every beat but the last). A 7-byte struct on a 4-byte
+bus transmits as two beats, the second with `keep == [1, 1, 1, 0]`. The old code
+hardcoded `tkeep` all-ones on transmit and ignored it entirely on receive.
+
+**See also:** [AXI-Stream: `axis_t`](#axi-stream-axis_t) ·
+[Byte-Stream Serialization](#byte-stream-serialization-make_serializer--make_deserializer) ·
+[Struct/type ↔ bytes conversion](#structtype--bytes-conversion) ·
+[the library-local guide](../include/pypeline/stream/pypeline_stream_guide.md)
+
+---
+
+## Host Type Export Declarations
+
+The sections above put a struct on a wire. Something on the other end has to parse it —
+usually a program on a host machine, written in plain Python, with no Pypeline checkout.
+[`type_to_bytes`](#software-side-conversion-type_to_bytes--tto_bytes) covers that only
+while Pypeline is importable, which on a target board it generally is not.
+
+Pypeline source records the types and constants that a host needs. Types used by
+`make_type_to_bytes` or `make_type_from_bytes` register themselves automatically because
+the AXI and byte-stream converters all pass through those factories.
+
+Any type the hardware serializes registers itself, because
+`make_type_to_bytes` / `make_type_from_bytes` is the choke point that
+[`make_type_to_axis`](#struct--axi-stream-make_axis_to_type--make_type_to_axis),
+`make_axis_to_type`, `make_type_to_byte_stream` and `make_byte_stream_to_type` all go
+through. A design that already streams its structs needs no change at all.
+
+`host_export` covers the rest — types the design never streams, and the named constants a
+host would otherwise transcribe by hand:
+
+```python
+from pypeline import host_export
+
+host_export(some_t,                       # a type never put on a wire
+            CTRL_DEFAULTS=CTRL_DEFAULTS,  # a real @struct value
+            CTRL_FLAG_LOOPBACK_EN=1,      # a plain constant
+            RECORD_T=valid_pdw_t)         # a friendlier alias for a type
+```
+
+The exported representation uses the same leaf order, widths, signedness, and total byte
+size as the hardware conversion functions, so no separate packing schema is required.
+How to generate and consume the standalone host module is documented under
+[Generated files and reports](README.md#generated-files-and-reports).
+
+**See also:**
+[Struct/type ↔ bytes conversion](#structtype--bytes-conversion) ·
+[Struct ↔ AXI-Stream](#struct--axi-stream-make_axis_to_type--make_type_to_axis) ·
+`src/pypeline_host.py`
+
+---
+
+## FIFOs: `make_stream_fifo`
+
+`include/pypeline/stream/stream_fifo.py`'s `make_stream_fifo` wraps a single-clock-domain FIFO
+in pypeline's standard valid/ready
+[stream interface](#the-stream-interface-validready-handshaking), so you
+don't have to unpack/repack `.data`/`.valid` by hand. (It's a thin layer over
+`include/pypeline/fifo.py`'s lower-level `make_fifo` — most users should just use
+`make_stream_fifo` directly and never need to touch `make_fifo` itself.)
+
+To put a FIFO between two functions anywhere in the design, declare a global FIFO
+instead: [`Fifo[T]`](#fifot--global-fifos), on one clock or across two.
+
+```python
+from pypeline import uint32_t, MAIN
+from stream.stream_fifo import make_stream_fifo
+
+stream_fifo = make_stream_fifo(uint32_t, 256)   # 256-deep FIFO of uint32_t
+
+@MAIN
+def buffered(in_stream_if: stream_fifo.fwd_t, out_stream_if: stream_fifo.fb_t) -> stream_fifo.return_t:
+    return stream_fifo(in_stream_if, out_stream_if)
+```
+
+`make_stream_fifo(data_t, depth, mode="fwft")` returns `stream_fifo_func`, with its complete return type at `stream_fifo_func.return_t`. It
+has one input port `in_stream_if` and one output port `out_stream_if`, each declared as the two
+halves of the same [interface](#bidirectional-ports-interface):
+
+| | Type | Meaning |
+|---|---|---|
+| `stream_fifo_func(in_stream_if, out_stream_if)` | `(fwd_t, fb_t) -> stream_fifo.return_t` | one FIFO instance |
+| `stream_fifo.return_t.out_stream_if` | `fwd_t` | the FIFO's output: `.stream.data`/`.stream.valid` |
+| `stream_fifo.return_t.in_stream_if` | `fb_t` | backpressure for `in_stream_if` — `.ready` high while the FIFO has room |
+
+The interface and both halves hang off the returned function as `.stream_intrf` / `.fwd_t` /
+`.fb_t`, with `.depth` and `.capacity_beats` for sizing, so callers don't rebuild them. Because the ports are interfaces, an
+[interface function](#interface-functions-write-feedforward-get-the-reverse-wired) can drop a
+FIFO into a chain with `f = stream_fifo(upstream.out_stream)` and no ready wiring at all.
+
+`make_fifo` itself is deliberately **not** migrated: its `data_in`/`data_in_valid`/
+`data_in_ready` signals are literally the wrapped VHDL entity's ports, and `make_stream_fifo`
+is its interface face.
+
+`depth` must be `>= 2`. `mode` only accepts `"fwft"` (first-word-fall-through) for now — the
+only underlying FIFO implementation currently available.
+
+**Simulates via a functional model.** Even though the FIFO is a raw VHDL entity under the
+hood, `make_fifo` attaches a `collections.deque`-based FWFT [`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions)
+to it, so `stream_fifo_func` works under both single-function and complete-design native
+simulation — same data,
+same valid/ready handshake, and the same rounded-up-to-a-power-of-two capacity as real
+hardware, just not cycle-accurate internally. The model is first-word-fall-through,
+rounds capacity up to a power of two, accepts a push only while ready, presents the
+oldest word while valid, and pops it when the consumer asserts ready.
+
+**There is no flush, no occupancy count and no rollback.** `make_fifo` is a black-box
+wrapper over `src/vhdl/pipelinec_fifo_fwft.vhd` that exposes push and pop and nothing
+else — no write-pointer rewind, no "how full is it", no clear input. A buffer that needs
+any of those is built on [`make_ram`](#rams-make_ram--make_stream_ram) instead. With
+`make_fifo` itself, two consequences are worth designing around:
+
+* **A reset empties a FIFO** under a `@MAIN` with `reset_registers="all"` and a reset
+  (see [Resets](#resets)): in one cycle, whatever its depth. Under the default
+  `"requested"` policy a FIFO is not reset, and the only way to empty it is to clock its
+  contents out.
+* **"Drop this packet" is built from two FIFOs plus a counter, not from a rewind.** A
+  store-and-forward design that needs to discard a partially-written packet keeps the
+  payload in one FIFO and one descriptor per completed packet in a second, then pops a
+  descriptor and moves exactly that many beats — downstream if accepted, into the bit
+  bucket if not. Observably identical to a rollback, at the cost of spending read
+  bandwidth to discard. `examples/pypeline/dsp/pdw/pulse_extract.py`'s `packet_store`
+  is a worked example.
+
+**See also:** [Streams: `stream_t`](#streams-stream_t) ·
+[Skid Buffers: `make_skid_buffer`](#skid-buffers-make_skid_buffer) ·
+[Pipelined Stream Wrappers: `make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline) ·
+[Multi-Cycle Stream Wrapper: `make_stream_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle)
+
+---
+
+## RAMs: `make_ram` / `make_stream_ram`
+
+`include/pypeline/ram.py`'s `make_ram` builds a RAM or ROM of any element type. It can have
+any mix of read+write, read-only and write-only ports, a combinational or block-RAM read,
+and extra input and output register stages. `include/pypeline/stream/stream_ram.py`'s
+`make_stream_ram` puts the same memory behind valid/ready streams. Together they replace
+old PipelineC's `include/ram.h` macros and its built-in `_RAM_SP_RF_N`/`_RAM_DP_RF_N`
+functions.
+
+```python
+from pypeline import uint32_t, MAIN
+from ram import make_ram
+
+ram = make_ram(uint32_t, 1024, ports=("w", "r"), read_latency=1)
+ram_wr_t = ram.p0_in_t
+ram_rd_t = ram.p1_in_t
+
+@MAIN
+def memory(wr: ram_wr_t, rd: ram_rd_t) -> ram.return_t:
+    return ram(wr, rd)
+```
+
+Inside a design, pass one struct per port and read the output struct per port:
+
+```python
+o = ram(ram.p0_in_t(addr=wa, wr_data=wd, wr_en=we, valid=1),
+        ram.p1_in_t(addr=ra, valid=1))
+x = o.p1.rd_data      # answers the request made ram.latency clocks earlier
+```
+
+### Ports
+
+`make_ram(elem_t, size, ports=("rw",), read_latency=1, in_regs=0, out_regs=0, init=None,
+byte_write_enables=False)` returns `ram`, with its complete return type at `ram.return_t`. `ram` takes one struct argument per
+entry of `ports` (`p0`, `p1`, ...) and returns `ram_out_t`, which has one field per port.
+
+| Port kind | Input: `ram.p{i}_in_t` | Output: `ram_out_t.p{i}` (`ram.p{i}_out_t`) |
+|---|---|---|
+| `"rw"` | `addr`, `wr_data`, `wr_en`, `valid` | `addr`, `wr_data`, `wr_en`, `valid`, `rd_data` |
+| `"w"` | `addr`, `wr_data`, `wr_en`, `valid` | `addr`, `wr_data`, `wr_en`, `valid` |
+| `"r"` | `addr`, `valid` | `addr`, `valid`, `rd_data` |
+
+Every `ram.h` shape is a port list: `("rw",)` is a single-port RAM, `("w", "r")` a simple
+dual-port RAM, `("rw", "rw")` a true dual-port RAM, `("r", "r", "w")` a register file.
+
+- `addr` is `ram.addr_t`, a `uintN_t` just wide enough for `size`.
+- A write happens when `wr_en & valid`.
+- Every output field except `rd_data` is the request's input, **piped through the RAM**, so
+  it arrives on the same clock as that request's `rd_data`. Use these instead of delaying
+  your own copies. Fields you don't use cost nothing after synthesis.
+- Constructing a port struct needs every field, as for any `@struct`. If you build one field
+  by field instead (`req: ram.p0_in_t`, then `req.addr = ...`), set `valid`: an unassigned
+  field is zero, so that port would neither write nor mark its output valid.
+
+### Latency: `read_latency`, `in_regs`, `out_regs`
+
+| Argument | Clocks added | Hardware |
+|---|---|---|
+| `read_latency=0` | 0 | combinational read (distributed / LUT RAM) |
+| `read_latency=1` | 1 | registered read (block RAM) |
+| `in_regs=N` | N | input registers before the memory; writes are delayed too |
+| `out_regs=N` | N | output registers after the read, e.g. a block RAM's optional output register |
+
+`ram.latency = in_regs + read_latency + out_regs`. It is the same for every port, and the
+function is declared [`@pipeline_latency(ram.latency)`](#fixed-user-pipelines). What that
+means for your code:
+
+- **Pure caller** (no `Reg`/`Feedback`): the compiler delays your other signals to meet the
+  RAM's outputs. `ram(...).p0.rd_data + x` adds the `x` from `ram.latency` clocks ago.
+- **Stateful caller**: you get the RAM's physical outputs in the current clock. `rd_data`
+  answers the request made `ram.latency` clocks earlier, and the piped-through `addr`/`valid`
+  fields tell you which request that was.
+
+The caller's clock enable gates the whole RAM, writes included: `if en:` around the call
+holds it. There is no per-port read enable. For a port that must stall on its own, use
+`make_stream_ram`.
+
+### Memory semantics
+
+- **Read-first.** A read sees the memory as it was at the start of the cycle. A write and a
+  read of the same address on the same edge, from one port or two, read the old value.
+- **Write collisions.** When several ports write the same address in one cycle, the
+  highest-numbered port wins (bit by bit, with byte write enables). Vendor block RAM leaves
+  this undefined, so don't rely on it in hardware.
+- **Out-of-range addresses.** If `size` is not a power of two, an `addr` value can exceed
+  `size - 1`. Simulation wraps it modulo `size`. Hardware behaviour is undefined.
+- **Byte write enables.** `byte_write_enables=True` makes `wr_en` a `uint1_t[N // 8]` for a
+  `uintN_t`/`intN_t` `elem_t` whose N is a multiple of 8. Bit `j` writes byte `j`, like
+  `DECL_4BYTE_RAM_SP_RF_1`.
+- **Reset.** Under a `@MAIN` with `reset_registers="all"` (see [Resets](#resets)) a reset
+  cancels every request in flight and the write at the reset edge, and clears the read
+  registers. The memory keeps its contents.
+
+### Initial contents: `init=`
+
+Pass plain Python values; `make_ram` generates the VHDL initializer.
+
+```python
+@struct
+class limit_t(NamedTuple):
+    mode: mode_t      # an @enum
+    level: uint4_t
+
+squares = make_ram(uint16_t, 256, ports=("r",), init=[i * i for i in range(256)])
+limits = make_ram(limit_t, 4, init={0: limit_t(mode=mode_t.RUN, level=9), 3: {"level": 2}})
+names = make_ram(char_t[8], 3, ports=("r",), init=["boot", "run", "halt"])
+```
+
+- `init` is `None` (all zeros), a sequence of up to `size` values (the rest are zero), or a
+  dict `{index: value}`.
+- Each value is anything native simulation accepts for `elem_t`:
+  - ints, including numpy integers, and enum members;
+  - for an `@struct`, an instance, a dict of fields (missing fields are zero), or a
+    positional tuple;
+  - for an array, a nested list, or a string for `char_t[N]`.
+- Integers wider than `elem_t` are masked like any typed assignment. A value of the wrong
+  shape raises at the `make_ram` call.
+- A RAM with only `"r"` ports and an `init` is a ROM.
+
+RAMs with different contents become different hardware entities automatically. Calling
+`make_ram` again with identical arguments returns the same function.
+
+### Stream RAM: `make_stream_ram`
+
+```python
+from stream.stream_ram import make_stream_ram
+
+sram = make_stream_ram(uint32_t, 1024, ports=("w", "r"), read_latency=1)
+
+@MAIN
+def memory(p0_req_if: sram.p0_req_intrf.fwd_t, p0_resp_if: sram.p0_resp_intrf.fb_t,
+           p1_req_if: sram.p1_req_intrf.fwd_t, p1_resp_if: sram.p1_resp_intrf.fb_t) -> sram.return_t:
+    return sram(p0_req_if, p0_resp_if, p1_req_if, p1_resp_if)
+```
+
+`make_stream_ram` takes the same arguments and has the same memory semantics as `make_ram`.
+Each port `i` gets a request stream `p{i}_req_if` and a response stream `p{i}_resp_if`:
+
+| Stream | Payload type | Fields |
+|---|---|---|
+| request | `sram.p{i}_req_t` | `addr`, plus `wr_data` and `wr_en` for writable ports |
+| response | `sram.p{i}_resp_t` | the request's fields, plus `rd_data` for readable ports |
+
+Backpressure uses **ready as a clock enable**, the scheme of the old
+`DECL_STREAM_RAM_DP_W_R_1`, not a skid FIFO:
+
+- A port's whole pipeline advances when its response is taken or its last stage is empty:
+  `req_ready = resp_ready | ~last_valid`.
+- While a response waits, every stage of that port holds, including the block RAM's own read
+  register, so the response's `rd_data` stays stable.
+- With `ready` held high, a port answers one request per cycle, `sram.latency` clocks after
+  it. A bubble in the last stage is filled on the next edge.
+- A write happens exactly once, when its request advances through the RAM stage. A stalled
+  request doesn't write until it moves, and a refused request never writes.
+- Ports stall independently.
+- With `read_latency=0` and `out_regs=0`, `rd_data` is a live combinational read: another
+  port's write to that address during a stall shows through. Any registered configuration
+  holds it.
+
+`make_stream_ram` is **not** `@pipeline_latency`: its latency depends on backpressure, so like
+a FIFO it is a stateful block. `sram.latency` is its latency when nothing stalls, and
+`sram.core` is the raw handshake function underneath.
+
+### Simulation
+
+`make_ram` and `make_stream_ram` share one cycle-exact Python simulation model, so they work
+under `sim_call()` and complete-design native simulation. The model shares its memory
+across evaluations, so a large RAM does not copy its contents every simulated cycle.
+
+Because `make_ram` is a fixed pipeline, two things follow for simulation:
+
+- A design that reaches a RAM with `latency > 0` from an untagged function loads the compiler
+  at simulation start, to align its callers (see [Fixed User Pipelines](#fixed-user-pipelines)).
+- An `AUTO_PIPELINE(f, latency=N)` region that reaches such a RAM must be simulated with
+  a complete-design configuration that knows the fixed pipeline boundaries.
+
+Tests: `src/tests/pypeline_tests/inst/ram_test.py`, `stream_ram_test.py`,
+`self_check_ram_test.py`, `ram_sim_model_test.py`.
+
+**See also:** [FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo) ·
+[Skid Buffers: `make_skid_buffer`](#skid-buffers-make_skid_buffer) ·
+[Fixed User Pipelines](#fixed-user-pipelines) ·
+[Raw VHDL Passthrough: `vhdl()`](#raw-vhdl-passthrough-vhdl)
+
+---
+
+## Skid Buffers: `make_skid_buffer`
+
+`include/pypeline/stream/skid_buffer.py`'s `make_skid_buffer` is a **register slice** for a
+valid/ready stream: it breaks combinational paths through a stream port without dropping a
+whole [FIFO](#fifos-make_stream_fifo) into the design. It's the pypeline answer to old
+PipelineC's `SKID_BUF` macro (`include/stream/stream.h`).
+
+Reach for it when timing fails on a long `ready` path (a consumer whose `ready` fans back
+through several blocks), or on a long data path between two modules that each met timing
+alone. A FIFO would also work, but costs a BRAM/LUTRAM and several cycles of latency for a
+problem that needs one or two registers.
+
+```python
+from pypeline import uint32_t, MAIN
+from stream.skid_buffer import make_skid_buffer
+
+skid = make_skid_buffer(uint32_t)          # mode="full" by default
+
+@MAIN
+def buffered(
+    stream_in_if: skid.fwd_t, stream_out_if: skid.fb_t
+) -> skid.return_t:
+    return skid(stream_in_if, stream_out_if)
+```
+
+`make_skid_buffer(data_t_or_intrf, mode="full")` returns `skid_buffer`, with its complete return type at `skid_buffer.return_t`, with
+one input port `stream_in_if` and one output port `stream_out_if` declared as the two halves
+of the same [interface](#bidirectional-ports-interface). The first argument is either a plain
+payload type (the interface is built for you) **or** an already-built `@interface` — pass the
+interface when you already have one, since interface ports are matched by Python identity, not
+just by name.
+
+### Choosing a mode
+
+`mode` names which combinational paths get cut, using the same vocabulary as Xilinx's AXI
+Register Slice `REG_CONFIG`:
+
+| `mode` | Slots | Latency | Throughput | Cuts |
+|---|---|---|---|---|
+| `"full"` (default) | 2 | 1 | 100% | data/valid **and** `ready` |
+| `"forward"` | 1 | 1 | 100% | data/valid only |
+| `"reverse"` | 1 | 0 | 100% steady, 1 bubble to recover from a stall | `ready` only |
+| `"bypass"` | 0 | 0 | 100% | nothing (pure wires) |
+
+Full throughput with *both* directions cut needs two slots, and that is the whole reason a skid
+buffer is not just a register: one slot presents a beat downstream while the other catches the
+beat already accepted upstream when the consumer stalls. The one-slot modes each leave one path
+combinational — with a single slot, `ready` can only be a pure function of registers if the
+buffer refuses input while draining, which costs the recovery bubble.
+
+`"bypass"` exists so a design can parameterize the slice away entirely (a sweep over
+`mode`, or a slice that a particular instantiation doesn't need) without an `if` at every
+call site.
+
+`n_slots` and `latency` hang off the returned function, alongside `.stream_intrf` / `.fwd_t` /
+`.fb_t` / `.data_t` / `.mode`, so a caller sizing a surrounding pipeline never re-derives them.
+
+**`"full"` is also what makes a downstream `ready` safe to override.** Logic that drains
+a block whose only exit is `ready` (a serializer, say) writes `ready | drain`. Doing that
+straight onto a top-level pin puts a LUT in the path feeding that block's own ready logic,
+which can be far deeper than it looks: a serializer's ready feeds the variable index of
+its buffer write. Putting a `mode="full"` slice in between moves the OR onto the slice's
+registered output ready instead, and costs one cycle. A [reset](#resets) needs no such
+drain: it empties the blocks it resets.
+
+### On AXI-Stream
+
+Because [`make_axis_interface`](#axi-stream-axis_t) composes down to a stream interface, an
+AXIS stream needs no separate implementation — `axi/axis.py`'s `make_axis_skid_buffer` is a
+one-line face over this module that takes the interface you already built:
+
+```python
+from axi.axis import make_axis_interface, make_axis_skid_buffer
+
+axis_intrf = make_axis_interface(4)
+axis_skid = make_axis_skid_buffer(axis_intrf, mode="reverse")
+```
+
+`tdata`/`tkeep`/`tlast` are carried through opaquely: whole beats are stored and replayed, never
+inspected or re-derived, so a Xilinx-style-compliant stream in is byte-identically the same
+compliant stream out a cycle or more later.
+
+Several interface widths can coexist in one design. Passing each original interface
+preserves the identity used by [interface functions](#interface-functions-write-feedforward-get-the-reverse-wired)
+for port pairing, and the generated specialization names retain the payload widths.
+
+### What it is not
+
+`axi/axis.py`'s `dwidth_widen`/`dwidth_narrow` are also two-register, full-throughput elastic
+buffers, but they clear their registers *before* deriving `ready`, so the downstream `ready`
+still reaches the upstream `ready` combinationally. They buffer; they do not slice. `"full"`
+here deliberately derives both outputs from registers only, before any clear or write — that
+ordering is the entire difference, and
+`src/tests/pypeline_tests/inst/skid_buffer_test.py` tests it directly by probing whether
+each output actually moves when the opposite side's input changes.
+
+**See also:** [Streams: `stream_t`](#streams-stream_t) ·
+[FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo) ·
+[AXI-Stream: `axis_t`](#axi-stream-axis_t) ·
+[Bidirectional Ports: `@interface`](#bidirectional-ports-interface)
+
+---
+
+## Pipelined Stream Wrappers: `make_stream_auto_pipeline`
+
+```text
+in_if -->|Reg|--> [ AUTO_PIPELINE'd func ] -->|Reg|--> [ output FIFO ] --> out_if
+        (input reg)   (free-running,             (output reg)   (L+4 words,
+                        L-stage pipeline)                        sized from .latency)
+```
+
+`include/pypeline/stream/stream_auto_pipeline.py`'s `make_stream_auto_pipeline` wraps a single
+combinational hardware function in a free-running, fully-pipelined
+[stream interface](#the-stream-interface-validready-handshaking): an
+[AUTO_PIPELINE'd](#auto_pipeline) instance (with registered
+input/output) feeding a [`make_fifo`](#fifos-make_stream_fifo)-backed output FIFO.
+The FIFO and in-flight counter are **sized automatically** from the AUTO_PIPELINE
+instance's `.latency` — the tool-discovered pipeline depth — so there is no
+`MAX_IN_FLIGHT` parameter to guess and hand-tune against synthesis results. It's the
+pypeline equivalent of PipelineC's `GLOBAL_VALID_READY_PIPELINE_INST` macro — minus the
+global wires, since this is one locally-instantiated function rather than two `MAIN`s
+joined by `Wire[T]`s.
+
+```python
+from pypeline import hw_func, uint8_t, MAIN
+from stream.stream_auto_pipeline import make_stream_auto_pipeline
+
+@hw_func
+def div_inv(x: uint8_t) -> uint8_t:
+    return x / ~x
+
+stream_auto_pipeline = make_stream_auto_pipeline(div_inv)
+
+@MAIN(50.0)
+def buffered_div_inv(
+    stream_in_if: stream_auto_pipeline.in_fwd_t, stream_out_if: stream_auto_pipeline.out_fb_t
+) -> stream_auto_pipeline.return_t:
+    return stream_auto_pipeline(stream_in_if, stream_out_if)
+```
+
+`make_stream_auto_pipeline(func, *, latency=None, start_latency=None, max_latency=None, name=None)`
+returns `stream_auto_pipeline_func`, with its complete return type at `stream_auto_pipeline_func.return_t`:
+
+| | Type | Meaning |
+|---|---|---|
+| `stream_auto_pipeline_func(stream_in_if, stream_out_if)` | `(in_fwd_t, out_fb_t) -> stream_auto_pipeline.return_t` | one pipelined instance of `func`; ports are the two halves of a stream `@interface` |
+| `stream_auto_pipeline.return_t.stream_out_if.stream` | `stream_t(out_type)` | `func`'s result, after AUTO_PIPELINE retiming and the output FIFO |
+| `stream_auto_pipeline.return_t.stream_in_if.ready` | `uint1_t` | high while the pipeline can accept a new `stream_in_if` word (registered; high while fewer than L+5 words are in flight) |
+
+The returned function also carries `.in_intrf`/`.out_intrf` and their halves
+`.in_fwd_t`, `.in_fb_t`, `.out_fwd_t`, `.out_fb_t` for declaring matching ports.
+
+**Throughput: one word per cycle.** With core latency L, the wrapper admits up to
+L+5 words that have not yet been read out of the FIFO. That is exactly how many cycles
+each admitted word holds a place: the input register, L core registers, the output
+register, the FIFO's two cycles from push to output, and the registered `ready`.
+So while the consumer keeps `ready` high, the wrapper accepts a new word every cycle
+(II=1), and a word accepted on cycle t comes out on cycle t+L+4. `ready` is low on
+the first cycle after reset.
+
+If the consumer stalls, the pipeline keeps running into the FIFO. The FIFO's L+4
+words of memory plus its output register hold all L+5 admitted words, so nothing is
+lost; `ready` drops once L+5 words are waiting and rises as the consumer reads them.
+
+L comes from the core's `.latency`. Native simulation and `--comb` builds use L=0
+unless `latency=N` fixes it. A synthesizing build re-elaborates with the implemented
+`.latency`, which resizes the FIFO and the in-flight limit to the real pipeline depth.
+
+**Core latency constraints.** The keyword-only `latency=`, `start_latency=` and
+`max_latency=` are passed unchanged to the wrapper's single internal
+[`AUTO_PIPELINE`](#auto_pipeline). They count core registers only, not the two boundary
+registers. The returned stream function has no `.latency` of its own, because a
+valid/ready handshake is not a fixed latency.
+- **`start_latency=S`** is a starting guess for a synthesizing build, which saves sweep
+  iterations when the core's depth is already known (e.g. from a previous build).
+  - The bootstrap elaboration sizes the FIFO from S.
+  - The sweep's first iteration builds S core registers. It grows from there if timing
+    fails (by the same search as an untagged core), and its post-met trim may still go
+    below S.
+  - When the build lands exactly on S, the pin-and-confirm re-elaboration is skipped.
+- **`max_latency=M`** caps the core.
+- **`latency=N`** fixes the core at N registers in every build and in native simulation.
+
+Native simulation and `--comb`/`--no_synth`/`--yosys_json` builds ignore `start_latency`
+and `max_latency`, so the core stays a zero-latency passthrough there:
+
+```python
+# Seed the sweep from a previously confirmed core depth of 4
+chacha_pipeline = make_stream_auto_pipeline(chacha_loop_body, start_latency=4)
+```
+
+A synthesizing build also starts the core from the depth earlier builds of the same
+output directory verified (the
+[latency memory](#starting-latencies-the-latency-memory-and---latency_hints)), so a
+`start_latency=` copied from a previous build is rarely needed.
+
+**Naming the core.** `name=` names the core's AUTO_PIPELINE latency group (see
+[Naming a latency group](#naming-a-latency-group-name)):
+
+```python
+chacha_pipeline = make_stream_auto_pipeline(chacha_loop_body, name="chacha20")
+```
+
+Hints and reports then find the core as `chacha20`, and the wrapper's generated names
+include `name_chacha20`. Two wrappers over one `func` with different names get
+independently sized cores.
+
+`in_type`/`out_type` are inferred from `func`'s own annotations via `hw_arg_types`/
+`hw_return_type`, the same way
+[`make_stream_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle) does (see
+[Parametric Hardware with Factory Functions](#parametric-hardware-with-factory-functions)). **`func` must already be
+`@hw_func`-decorated** — `make_stream_auto_pipeline` calls `is_hw_func(func)` and raises
+`TypeError` immediately if it isn't, since `func` is called from inside an internal
+AUTO_PIPELINE'd wrapper and needs its own decoration for any `Reg[T]`/bare struct-array
+locals in its body to simulate correctly (see [Automatic (HLS-like) Implementation](#automatic-hls-like-implementation)).
+
+**Simulates end-to-end.** Since `make_fifo`'s internal FIFO now carries a
+[`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions), the whole
+pipeline — AUTO_PIPELINE retiming plus the output FIFO — simulates through the Pypeline
+simulation APIs, including realistic backpressure when the consumer stalls. See
+`src/tests/pypeline_tests/inst/stream_auto_pipeline_test.py`, and
+`stream_ii1_throughput_test.py` next to it for the one-word-per-cycle checks.
+
+[examples/pypeline/stream_pipeline.py](../examples/pypeline/stream_pipeline.py) connects
+one to a producer and a consumer `@MAIN` through [global `Wire[T]`s](#global-signals), the
+pattern PipelineC's `GLOBAL_VALID_READY_PIPELINE_INST` macro provided.
+
+**See also:** [Automatic (HLS-like) Implementation](#automatic-hls-like-implementation) ·
+[FIFOs: `make_stream_fifo`](#fifos-make_stream_fifo) ·
+[Multi-Cycle Stream Wrapper: `make_stream_multi_cycle`](#multi-cycle-stream-wrapper-make_stream_multi_cycle) ·
+[Stream Wrapper for AUTO_FSM: `make_stream_auto_fsm` (Experimental)](#stream-wrapper-for-auto_fsm-make_stream_auto_fsm-experimental)
+
+---
+
+## Multi-Cycle Stream Wrapper: `make_stream_multi_cycle`
+
+[`make_stream_auto_pipeline`](#pipelined-stream-wrappers-make_stream_auto_pipeline) above trades
+area for throughput: a free-running pipeline that accepts a new word every cycle.
+`make_stream_multi_cycle`, from `include/pypeline/stream/stream_multi_cycle.py`, is the other
+function-to-stream wrapper. It takes a single slow combinational function and gives it a
+[`MULTI_CYCLE[...]`](#multi-cycle-paths-multi_cycle) launch/capture FSM, presenting the
+result as a valid/ready [stream interface](#the-stream-interface-validready-handshaking) — one
+result every `latency + 1` cycles rather than one per cycle. It is the pypeline equivalent of
+PipelineC's `DECL_VALID_READY_MCP_FUNC` macro:
+
+```python
+from pypeline import hw_func, MAIN
+from stream.stream_multi_cycle import make_stream_multi_cycle
+
+@hw_func
+def divider(i: my_struct_t) -> uint32_t:
+    return i.x / i.y
+
+divider_mcp = make_stream_multi_cycle(divider, 16)   # 16-cycle MCP
+
+@MAIN(100.0)
+def top(stream_in_if: divider_mcp.in_fwd_t, stream_out_if: divider_mcp.out_fb_t) -> divider_mcp.return_t:
+    return divider_mcp(stream_in_if, stream_out_if)
+```
+
+`make_stream_multi_cycle(func, latency)` infers `in_type`/`out_type` from `func`'s own
+parameter/return type annotations (unlike the C macro, which takes them as separate
+arguments) and returns `func_mcp`, with its complete return type at `func_mcp.return_t`. Its ports are the two halves of a stream
+`@interface`, exactly like `make_stream_auto_pipeline`'s:
+
+| | Type | Meaning |
+|---|---|---|
+| `func_mcp(stream_in_if, stream_out_if)` | `(in_fwd_t, out_fb_t) -> func_mcp.return_t` | one MCP-wrapped instance of `func` |
+| `func_mcp.return_t.stream_out_if.stream` | `stream_t(out_type)` | `func`'s result, valid `latency + 1` cycles after launch |
+| `func_mcp.return_t.stream_in_if.ready` | `uint1_t` | high while the FSM is idle and ready to accept a new `stream_in` |
+
+Internally it is the same `MULTI_CYCLE[latency]` / `Reg[T, MC.start]` / `Reg[T, MC.end]`
+pattern from [Multi-Cycle Paths: `MULTI_CYCLE[...]`](#multi-cycle-paths-multi_cycle), with `launch`/`capture` registers and a
+`cycles_since_launch` counter driving the handshake. Like `MULTI_CYCLE[...]` itself, the
+relaxed timing only matters during real FPGA synthesis (requires `PART()` + Vivado; see
+[#346](https://github.com/JulianKemmerer/PipelineC/discussions/346) for other tools);
+simulation always sees `func`'s result settle the same cycle it is computed. See
+`src/tests/pypeline_tests/inst/stream_multi_cycle_test.py` (translated from
+`examples/mcp/mcp_divider.c`) for the full example.
+
+### Tool-chosen cycle count: `make_stream_auto_multi_cycle`
+
+`make_stream_auto_multi_cycle` is the same wrapper with an
+[`AUTO_MULTI_CYCLE(...)`](#auto_multi_cycle) tag in place of the fixed
+`MULTI_CYCLE[latency]`, so timing-driven implementation selects the cycle count:
+
+```python
+from stream.stream_multi_cycle import make_stream_auto_multi_cycle
+
+divider_mcp = make_stream_auto_multi_cycle(divider)                   # sweep starts at 1
+divider_mcp = make_stream_auto_multi_cycle(divider, start_latency=5)  # known-good start
+divider_mcp = make_stream_auto_multi_cycle(divider, start_latency=5, max_latency=8)
+divider_mcp = make_stream_auto_multi_cycle(divider, latency=5)        # fixed
+divider_mcp = make_stream_auto_multi_cycle(divider, name="divider")    # a stable key
+
+divider_mcp.mcp.latency    # the cycle count (results are valid latency + 1 cycles after launch)
+```
+
+The ports and `func_mcp.return_t` are identical to `make_stream_multi_cycle`'s. The handshake
+is written in terms of `func_mcp.mcp.latency`, so it always waits exactly as many cycles
+as the path is constrained for. A correct `start_latency=` can already match the final
+value; otherwise source re-elaboration updates the handshake automatically.
+
+Calls over one function with the same constraints share a key: one cycle count and one
+hardware definition, each instance with its own state. A factory can therefore build its
+wrapper once per caller, with no caching or `name=` needed. Give the calls different
+`name=`s for counts of their own, for example one per clock domain.
+
+---
+
+## Combinational Optimization Stream Wrappers: `make_stream_auto_comb_area_opt` / `make_stream_auto_comb_delay_opt` (Experimental)
+
+For a reduced combinational core between registered valid/ready ports:
+
+```python
+from stream.stream_auto_comb_area_opt import make_stream_auto_comb_area_opt
+
+opt = make_stream_auto_comb_area_opt(my_comb_func)  # or an AUTO_COMB_AREA_OPT tag
+
+@MAIN(20.0)
+def top(stream_in_if: opt.in_fwd_t, stream_out_if: opt.out_fb_t) -> opt.return_t:
+    return opt(stream_in_if, stream_out_if)
+```
+
+`my_comb_func` must be a pure `@hw_func` with one annotated input and an annotated
+return type. The factory returns `stream_function`, with its complete return type at `stream_function.return_t`. Results have
+`stream_in_if.ready` and `stream_out_if.stream.{data,valid}` fields. The function
+exposes `.in_intrf`, `.out_intrf`, their `.in_fwd_t`/`.in_fb_t`/`.out_fwd_t`/
+`.out_fb_t` halves, and the underlying tag as `.comb_opt`.
+
+Both the input and output data/valid are elastic registers. Unstalled latency
+is **two cycles**, reported by `opt.latency`; initiation interval is **one**.
+Backpressure holds output data/valid stable and propagates through small
+combinational occupancy logic. The large core is absent from the input-to-output
+combinational port path. No FIFO or user-managed counter is required.
+
+This wrapper does not pipeline the optimized computation internally. If it cannot
+meet the target clock, pass `AUTO_COMB_AREA_OPT(my_comb_func)` to
+`make_stream_auto_pipeline` or `make_stream_auto_multi_cycle` instead.
+
+The delay-oriented sibling is `make_stream_auto_comb_delay_opt` from
+`stream.stream_auto_comb_delay_opt`. It uses the same two-bank elastic shell,
+accepts a pure function or AUTO_COMB_DELAY_OPT tag, and exposes it as `.comb_opt`. All interface, latency,
+II and stall behavior above is identical; only the combinational optimization
+objective differs.
+
+---
+
+## Stream Wrapper for AUTO_FSM: `make_stream_auto_fsm` (Experimental)
+
+[`AUTO_FSM(func)`](#auto_fsm-experimental) has no backpressure of
+its own: an input is accepted only while the FSM is idle, a `valid` pulse asserted while it's
+busy is ignored, and the result itself is only a **one-cycle `valid` pulse** — every raw
+AUTO_FSM call site (`self_check_auto_fsm_test.py`, the donut/sine examples) hand-rolls a `busy`
+register and manually spaces requests at least `.latency` cycles apart.
+`make_stream_auto_fsm`, from `include/pypeline/stream/stream_auto_fsm.py`, does that bookkeeping
+once and presents a real valid/ready [stream interface](#the-stream-interface-validready-handshaking)
+instead — the AUTO_FSM sibling of `make_stream_auto_pipeline` (AUTO_PIPELINE) and
+`make_stream_multi_cycle` (`MULTI_CYCLE[...]`) above:
+
+```python
+from pypeline import hw_func, MAIN
+from stream.stream_auto_fsm import make_stream_auto_fsm
+
+@hw_func
+def blob(x: blob_in_t) -> int16_t:
+    ...
+
+blob_fsm = make_stream_auto_fsm(blob)   # tool picks the state count
+
+@MAIN(25.0)
+def top(stream_in_if: blob_fsm.in_fwd_t, stream_out_if: blob_fsm.out_fb_t) -> blob_fsm.return_t:
+    return blob_fsm(stream_in_if, stream_out_if)
+```
+
+`make_stream_auto_fsm(func, max_latency=None)` infers `in_type`/`out_type` from `func`'s own
+parameter/return type annotations, constructs an
+`AUTO_FSM(func, max_latency=max_latency, register_output=False)` instance
+internally, and returns `func_auto_fsm`, with its complete return type at `func_auto_fsm.return_t`. Disabling the raw
+result bank avoids duplicating the wrapper's own backpressure holding register.
+Its ports are the two
+halves of a stream `@interface`, exactly like `make_stream_auto_pipeline`'s and
+`make_stream_multi_cycle`'s:
+
+| | Type | Meaning |
+|---|---|---|
+| `func_auto_fsm(stream_in_if, stream_out_if)` | `(in_intrf.fwd_t, out_intrf.fb_t) -> func_auto_fsm.return_t` | one AUTO_FSM-backed instance of `func` |
+| `func_auto_fsm.return_t.stream_out_if` | `out_intrf.fwd_t` | `func`'s result, held valid until the consumer takes it |
+| `func_auto_fsm.return_t.stream_in_if` | `in_intrf.fb_t` | `.ready` high while the FSM is idle **and** the output slot is free |
+| `func_auto_fsm.fsm` | `AUTO_FSM` | the underlying tag object — `func_auto_fsm.fsm.latency` reads the raw FSM's cycle count |
+| `func_auto_fsm.latency` | `int` | the wrapper's own latency, `fsm.latency + 1` |
+
+**Internally, exactly one registered output.** A holding register latches the
+FSM's combinational final-state pulse and a `busy` register tracks whether the
+FSM itself is occupied; raw AUTO_FSM's own optional result bank is disabled, so
+the same payload is not registered twice. `stream_in_if.ready` is asserted only
+when both are free. This means the wrapper's latency and initiation interval are both
+`FSM.latency + 1` — one cycle more than the raw AUTO_FSM contract, spent latching the pulse — but
+in exchange a stalled consumer (`stream_out_if.ready` low) never loses a result: it stays valid,
+with stable data, until taken. Back-to-back requests still pack tightly: when the consumer is
+always ready, the slot frees combinationally within the same cycle the result appears, so a new
+input can be accepted that same cycle.
+
+**The handshake body never reads `.latency`.** Unlike the raw AUTO_FSM call site's manual
+spacing (which reads `.latency` to know how far apart to place requests), `make_stream_auto_fsm`'s
+generated hardware is identical whether `fsm.latency` is 0 or a real scheduled value — only
+the register-transfer *timing* differs, not the source structure. This avoids making the
+wrapper's hardware identity depend on a schedule that is not known during initial elaboration.
+
+**Simulates end-to-end**, in the same sense `make_stream_auto_pipeline` does: plain native sim never
+installs a schedule, so `fsm.latency` stays 0 and the wrapper degrades to a correct
+1-cycle-latency, 1-cycle-II stream. When native simulation is supplied an implemented
+schedule, it uses that schedule's actual latency instead.
+
+## Stream Performance Measurement: Probes & Bottlenecks
+
+The stream performance library measures a valid/ready design in native simulation:
+throughput versus packet size, per-packet latency and, through probes placed inside the
+design's own hardware functions, which block is the bottleneck and why.
+
+It has four parts:
+- the probes (`hs`, `stream_hs`, `state`, `occupancy`, `arb`) and the probed buffers
+  (`make_probed_stream_fifo`, `make_probed_skid_buffer`);
+- a phase-plan testbench runner (`PhaseRunner`, `StreamMeter`);
+- block-graph bottleneck attribution (`stream_bottleneck`);
+- report helpers (cycles → Gb/s, CSV, markdown).
+
+The probes are `@sim_output` calls, so they add no hardware. See
+[`include/pypeline/stream/pypeline_stream_perf_guide.md`](../include/pypeline/stream/pypeline_stream_perf_guide.md),
+next to the library source, for the full reference and a complete testbench.
+
+---
+
+### Part IV — Multiple clock domains
+
+Every `@MAIN` is a clock domain: it and every function it calls run on one clock. A
+single-clock design never names its clock. A bare `@MAIN` runs on the default clock, whose
+top-level port is `clk_None`. `@MAIN(100.0)` runs on the clock of that rate, port
+`clk_100p0`. [`make_clock`](#declaring-a-clock-make_clock) makes a clock with a name, a
+synthesis target or a pin. Features planned for later, such as related clocks and
+simulating several clocks, are listed in
+[Limitations / Not Yet Supported](#limitations--not-yet-supported).
+
+Any two different clocks are unrelated: asynchronous to each other, with the paths between
+them untimed. Data moves between clocks in one of two ways:
+
+- an [async wire](#async-wires-wiret-async), `Wire[T, ASYNC]`, which adds no logic. It
+  suits flags and slowly changing values that the reader synchronizes itself.
+- a [global FIFO](#clock-crossing-fifos), `Fifo[T]`, for a stream of values that must
+  arrive whole and in order.
+
+Reading a value written on another clock in any other way is an elaboration error.
+
+One design using all of it:
+
+```python
+from pypeline import *                           # Fifo, ASYNC and global_fifo included
+
+eth_clk = make_clock(125.0, name="eth_rx")       # the clock clk_125p0_eth_rx
+ETH_RX_CLK: Input[uint1_t] = eth_clk             # arrives on this pin, named to match the board
+ETH_RXD: Input[uint8_t]                          # read only on eth_clk: synchronous to it
+ETH_RXDV: Input[uint1_t]
+
+rx: Fifo[uint8_t] = global_fifo(64)              # async here: its ends are on two clocks
+link_up: Wire[uint1_t, ASYNC]                    # a flag between clocks, unsynchronized
+
+@MAIN(eth_clk)
+def eth_rx():
+    seen: Reg[uint1_t]
+    rx.wr.stream.data = ETH_RXD                  # the write end
+    rx.wr.stream.valid = ETH_RXDV
+    link_up = seen
+    seen = seen | ETH_RXDV
+
+@MAIN(100.0)                                     # a clock with only a rate: clk_100p0
+def app():
+    sync: Reg[uint1_t[2]]                        # two ordinary registers synchronize link_up
+    up = sync[1]
+    sync[1] = sync[0]
+    sync[0] = link_up
+    rx.rd.ready = up                             # the read end
+    if up & rx.rd.stream.valid:
+        handle_byte(rx.rd.stream.data)           # some hardware function of yours
+```
+
+## Clock Domains
+
+How clocks are told apart:
+
+- **The default clock.** A bare `@MAIN` that is not placed on another clock (see
+  [Which clock a bare `@MAIN` gets](#which-clock-a-bare-main-gets)) runs on the default
+  clock. Its port is `clk_None`, and the tool uses 1000 MHz for it only in its own timing
+  measurements. The default clock is a clock of its own: `@MAIN(1000.0)` is a different
+  clock, `clk_1000p0`.
+- **A clock with only a rate** is named after it: `@MAIN(100.0)` runs on `clk_100p0`.
+  Every unnamed clock of one rate is the same clock.
+- **A name tells apart two clocks of one rate.** Clocks are identified by rate first and
+  then by name. Two clocks of one rate with different names are different clocks, and so
+  are two clocks of different rates, whatever their names. Most designs need only rates.
+
+### Declaring a clock: `make_clock`
+
+`make_clock(mhz, name=..., syn_mhz=...)` returns a clock, and `@MAIN(clk)` runs a function
+on it:
+
+```python
+rx_clk = make_clock(25.0, name="eth_rx")       # the clock clk_25p0_eth_rx
+tx_clk = make_clock(25.0, name="eth_tx")       # the same rate, a different clock
+dsp_clk = make_clock(125.0, syn_mhz=147.0)     # clk_125p0, with a synthesis-only target
+
+@MAIN(rx_clk)
+def eth_rx(): ...
+
+@MAIN(clock=tx_clk)                            # keyword form
+def eth_tx(): ...
+
+@MAIN(125.0)                                   # the same clock as dsp_clk: rate 125, no name
+def filt(): ...
+
+lanes = [MAIN(make_lane(i), clock=rx_clk, name=f"lane{i}") for i in range(4)]
+```
+
+- The name becomes part of the clock's name, and of its port unless a pin is bound to it:
+  `clk_25p0_eth_rx`.
+- `syn_mhz=` asks for margin above the real rate. Tools that only synthesize aim at
+  `syn_mhz`, and tools that place and route aim at `mhz` (PipelineC's `MAIN_SYN_MHZ`).
+  A clock has one `syn_mhz`, however many `@MAIN`s use it: `filt` above aims at 147 MHz
+  too, and two different `syn_mhz` for one clock are an error.
+- `@MAIN(100.0)` and `@MAIN(mhz=100.0)` are shorthand for the unnamed clock of that rate.
+  Name the clock once: a rate or a clock, not both.
+- [`@MAIN`s made in code](#mains-made-in-code-mainfn-name) take `clock=` the same way: `MAIN(fn, clock=clk, name=...)`.
+- A name is letters, digits and single underscores between them. Two names of one rate
+  that differ only in case are an error, since VHDL would read them as one.
+- A clock is an ordinary Python value. It can be imported from another module or built
+  from a [build parameter](#build-parameters-param-and--d):
+  `make_clock(param("ETH_MHZ", 125.0))`.
+- One clock object replaces PipelineC's `MAIN_MHZ`, `MAIN_GROUP`, `MAIN_SYN_MHZ`,
+  `CLK_MHZ` and `CLK_MHZ_GROUP` pragmas.
+
+### Clock pins and board clocks
+
+A clock arrives on a pin when an `Input[uint1_t]` is bound to it:
+
+```python
+eth_clk = make_clock(125.0, name="eth_rx")
+ETH_RX_CLK: Input[uint1_t] = eth_clk           # eth_clk's port is the pin ETH_RX_CLK
+```
+
+`pll_clk: Input[uint1_t] = make_clock(85.0)` binds the unnamed 85 MHz clock, the one
+`@MAIN(85.0)` runs on. A clock bound to a pin must be some `@MAIN`'s clock, and a clock has
+one pin: two clocks of one rate on two pins need names.
+
+Board modules under [include/pypeline/board](../include/pypeline/board) export their
+clocks bound to the board's pin names. A design then names the board's clock instead of
+repeating its rate. Importing such a module binds its pin, so some `@MAIN` must run on its
+clock:
+
+```python
+# include/pypeline/board/arty/clocks.py
+from pypeline import Input, make_clock, uint1_t
+clk100 = make_clock(100.0)
+CLK100MHZ: Input[uint1_t] = clk100             # the pin name in the Arty constraints file
+
+# a design for the Arty
+import board.arty.clocks as arty_clocks
+
+@MAIN(arty_clocks.clk100)
+def top(): ...
+```
+
+### Clocks made by logic
+
+A clock can be driven by logic. Bind it to a `Wire[uint1_t]` and write that wire from a
+`@MAIN` on another clock (PipelineC's [internal_clocks.c](../examples/internal_clocks.c)):
+
+```python
+slow_clk = make_clock(1.0)
+slow_clk_wire: Wire[uint1_t] = slow_clk        # the clock net, driven by logic
+
+@MAIN(100.0)
+def clk_gen():
+    count: Reg[uint8_t]
+    toggle: Reg[uint1_t]
+    slow_clk_wire = toggle
+    if count == 49:
+        count = 0
+        toggle = ~toggle
+    else:
+        count += 1
+
+@MAIN(slow_clk)
+def slow_logic(): ...
+```
+
+Like any two clocks, `slow_clk` and `clk_100p0` are asynchronous, so data between them goes
+through an async wire or a global FIFO. Where you can, use a clock enable instead
+([an `if` around a call](#clock-enable-via-if-around-a-call)): it keeps one clock and needs
+no crossings. A clock made by logic is for when a clock enable is not possible, for example
+when the slow clock also drives a pin.
+
+### Which clock a bare `@MAIN` gets
+
+A bare `@MAIN` takes the clock of the functions it shares plain global wires with: every
+function that writes or reads any part of the wire. A board port module such as
+[`vga_pmod_ja_jb.py`](../include/pypeline/board/arty/vga_pmod_ja_jb.py) runs on the clock of
+the `@MAIN` that writes its wires. `@MAIN`s connected by plain wires therefore need one
+clock named among them, or none at all.
+
+- Inference follows plain wires, pins and [global instances](#instf--global-instances):
+  an instance runs on the clock of the functions that use it. It never follows async wires
+  or global FIFOs.
+- A pin or wire with a stated clock (`Input[T, clk]`, `Wire[T, clk]`) places the bare
+  `@MAIN`s that use it on that clock.
+- A bare `@MAIN` that inference does not reach runs on the default clock, `clk_None`. If it
+  shares async wires or global FIFOs with functions on other clocks, a warning names those
+  clocks, in case it was meant to run on one of them.
+- A bare `@MAIN` that plain wires connect to two different clocks is an error that names
+  both paths, wire by wire with source lines. Through a global instance, the error names
+  the instance.
+- The build log says which clock each bare `@MAIN` got, and how: `Clock of bare @MAIN
+  'vga_to_pmod8': clk_25p175, from @MAIN 'app' -> wire 'vga_pmod' ...`.
+
+**Helper functions need nothing new.** A function that is not a `@MAIN` runs on its
+caller's clock, and a helper called from `@MAIN`s on two clocks becomes two instances, one
+on each. A function that writes a global wire has exactly one instance, so it is on exactly
+one clock.
+
+### Which clock a global wire is on
+
+Each leaf of a global wire belongs to the clock of the function that drives it. A compound
+wire already behaves as one independent wire per scalar leaf, each with its own writer
+([Splitting a compound wire](#splitting-a-compound-wire-across-multiple-writer-functions)),
+so different leaves of one wire can be written on different clocks. Reading a leaf written
+on another clock is allowed only when the wire is an
+[async wire](#async-wires-wiret-async). A global FIFO crosses clocks inside its own
+hardware, and each of its two ends is used on one clock.
+
+Any other read across clocks stops elaboration, naming both ends:
+
+```
+ElaborationError: wire 'status.eth_up' crosses clocks without a crossing.
+  driven on clock eth_clk (clk_125p0_eth_rx) by eth() at top.py:41
+  read on clock clk_100p0 by csr() at top.py:58
+Declare it an async wire, and synchronize it in the reader:
+  status: Wire[status_t, ASYNC]
+or move the values through a global FIFO:
+  status_q: Fifo[status_t] = global_fifo(4)
+```
+
+A pin read on two clocks is an error too, unless it says so
+([Pins with a stated clock](#pins-with-a-stated-clock)).
+
+A wire can also state the clock its writer must be on. The marker documents the wire, and
+the compiler checks it:
+
+```python
+eth_status: Wire[status_t, eth_clk]            # written on eth_clk, or an error
+eth_debug: Wire[debug_t, eth_clk, VOLATILE]    # with VOLATILE too
+```
+
+After the type, a `Wire`, `Input` or `Output` takes at most one of `ASYNC` or a clock, and
+`VOLATILE` alone or with a clock. `ASYNC` already behaves as `VOLATILE`, so the two
+together are an error. `Inst[f]` and `Fifo[T]` take no markers.
+
+---
+
+### AUTO objects in several clock domains
+
+Each AUTO object is implemented for the clock goals of the `@MAIN`s that use it. A faster
+`@MAIN` elsewhere does not change it: an AUTO_FSM under a 50 MHz `@MAIN` is scheduled for
+50 MHz even when another `@MAIN` runs at 200 MHz.
+
+To use one function in two clock domains, make one object per domain. No `name=` is
+needed, and each object's `.latency` is its own domain's value:
+
+```python
+def make_lane(f):
+    AP = AUTO_PIPELINE(f)
+    fifo = make_fifo(word_t, AP.latency + 4)  # sized for this object's domain
+    ...
+
+SLOW = make_lane(work)   # used by the 50 MHz @MAIN
+FAST = make_lane(work)   # used by the 100 MHz @MAIN
+LANES = [make_lane(work) for _ in range(4)]   # objects from a loop work the same way
+```
+
+Objects used at the same clock goal share their hardware. A goal is the clock's rate, or
+its `syn_mhz` on a synthesis-only tool.
+
+One object used by `@MAIN`s at different goals keeps a single implementation:
+
+| | One object used at several clock goals |
+|---|---|
+| `AUTO_PIPELINE` | Each instance is pipelined for its own `@MAIN`'s goal. Reading its `.latency` is an error, since no one value matches; make one object per domain instead |
+| `AUTO_FSM` | One schedule, built for the fastest goal, with a note saying so |
+| `AUTO_MULTI_CYCLE` | One cycle count, enough for the fastest goal |
+| Auto-pipelined RAM | One plan per configuration, meeting every clock |
+
+Native simulation runs one clock, so a testbench simulating hardware built at several goals
+sees the objects' values at its own clock's goal.
+
+## Async Wires: `Wire[T, ASYNC]`
+
+An async wire carries its writer's value to readers on other clocks unchanged, with no
+added logic. It is declared like a [`VOLATILE`](#volatile-wires) wire, with a marker next to
+the type:
+
+```python
+from pypeline import *                         # ASYNC included
+
+cam_ready: Wire[uint1_t, ASYNC]                # read on clocks other than its writer's
+```
+
+The paths from the writer to readers on other clocks are untimed, like every path between
+two clocks. This is PipelineC's `#pragma ASYNC_WIRE` on a shared global.
+
+- Every leaf still has one writer, and
+  [the writer's clock](#which-clock-a-global-wire-is-on) is still the leaf's clock. `ASYNC`
+  only allows reads on other clocks.
+- An `ASYNC` wire that no function reads on another clock gets a warning. There the marker
+  does nothing, and its paths stay timed.
+- `Output[T, ASYNC]` works the same way for a pin that functions on other clocks also read.
+
+### Synchronizing in the reader
+
+A reader that needs a stable value synchronizes it itself, with ordinary registers on its
+own clock (PipelineC's `CDC2`):
+
+```python
+cam_ready: Wire[uint1_t, ASYNC]
+
+@MAIN(100.0)
+def app():
+    sync: Reg[uint1_t[2]]
+    ready = sync[1]                    # cam_ready, two clk_100p0 cycles later
+    sync[1] = sync[0]
+    sync[0] = cam_ready
+    ...
+```
+
+Leaves written on different clocks can share one struct, and the reader synchronizes it
+like any other value:
+
+```python
+@struct
+class status_t(NamedTuple):
+    eth_up: uint1_t
+    pcie_up: uint1_t
+
+status: Wire[status_t, ASYNC]          # leaves written on two clocks, read on a third
+
+@MAIN(eth_clk)
+def eth():
+    up: Reg[uint1_t]
+    status.eth_up = up                 # this leaf is on eth_clk
+    up = phy_link_up()
+
+@MAIN(pcie_clk)
+def pcie():
+    up: Reg[uint1_t]
+    status.pcie_up = up                # this one on pcie_clk
+    up = pcie_link_up()
+
+@MAIN(100.0)
+def csr():
+    s1: Reg[status_t]                  # the reader's two synchronizer registers
+    s2: Reg[status_t]
+    s = s2
+    s2 = s1
+    s1 = status
+    ...
+```
+
+For a vendor synchronizer cell, wrap it in a one-clock
+[`vhdl()`](#raw-vhdl-passthrough-vhdl) function. For example, wrap `xpm_cdc_single`, as
+PipelineC's `xil_cdc2_bit` does.
+
+### What an async wire does not guarantee
+
+Nothing makes the bits of one multi-bit value, or leaves written on different clocks,
+arrive at a reader in the same cycle:
+
+- A multi-bit value read while it changes can mix bits from two different cycles.
+- Logic between the writer's registers and the wire can glitch, and a reader's register
+  can capture the glitch.
+
+Flags written straight from a register are safe, as are values that change only while the
+reader ignores them. A value that must arrive whole, such as a count, an address or a
+message, goes through a [global FIFO](#clock-crossing-fifos). The two flags in
+`status` above are independent, so reading them separately is fine.
+
+### Pins with a stated clock
+
+A pin read by functions on one clock is synchronous to that clock. A pin
+synchronous to some other clock, or to none, says so:
+
+```python
+rmii_clk = make_clock(50.0, name="rmii")
+RMII_RXD: Input[uint2_t, rmii_clk]             # synchronous to the RMII clock
+BTN: Input[uint4_t, ASYNC]                     # synchronous to no clock
+```
+
+`Input[T, clk]` puts the pin on that clock. Functions on `clk` read it directly, a read
+on any other clock is an error, and a bare `@MAIN` that reads it runs on `clk`. `Input[T, ASYNC]` is an async wire whose writer is
+the pin. Any clock may read it, and the reader synchronizes it (PipelineC's
+`DECL_INPUT_REG` plus `CDC2`).
+
+### Async wires in pipelined code
+
+Inside a function with [pipeline stages](#global-wires-in-pipelined-code), an async wire
+behaves as `VOLATILE`. Each operation reads it at the stage where that operation runs, and
+a write is driven as soon as its value is ready. A value from another clock has no cycle to
+line up with, so alignment registers would only add delay.
+
+---
+
+## Clock-Crossing FIFOs
+
+A [global FIFO](#fifot--global-fifos) whose write end is used on one clock and
+its read end on another is an async FIFO. The FIFO hardware itself crosses the clocks, and
+both ends keep their valid/ready handshakes: a global FIFO is always a valid/ready stream,
+on one clock or across two. The declaration and the ends are the same as on one clock:
+
+```python
+# eth_clk, ETH_RXD and ETH_RXDV as in the Part IV example
+rx: Fifo[uint8_t] = global_async_fifo(64)
+
+@MAIN(eth_clk)
+def eth_rx():                                  # the producer uses the write end
+    drops: Reg[uint32_t]
+    rx.wr.stream.data = ETH_RXD
+    rx.wr.stream.valid = ETH_RXDV
+    if ETH_RXDV & ~rx.wr.ready:                # full: this byte is lost
+        drops += 1
+
+@MAIN(100.0)
+def app():                                     # the consumer uses the read end
+    rx.rd.ready = 1
+    if rx.rd.stream.valid:
+        handle_byte(rx.rd.stream.data)
+```
+
+### `global_fifo`, `global_sync_fifo` and `global_async_fifo`
+
+The initializer says which clocks the ends may be on:
+
+| Initializer | Ends used on one clock | Ends used on two clocks |
+|---|---|---|
+| `global_fifo(n)` | a synchronous FIFO | an async FIFO |
+| `global_sync_fifo(n)` | a synchronous FIFO | an error: declared to stay on one clock |
+| `global_async_fifo(n)` | an error: declared to cross clocks | an async FIFO |
+| a single-clock module such as `make_stream_fifo(T, n)` | that module | an error: a single-clock module cannot cross |
+
+`global_sync_fifo` and `global_async_fifo` state what the design expects. A change that
+moves a `@MAIN` to another clock, or two `@MAIN`s onto one, is then caught at the
+declaration. `global_fifo` is for code that works either way, such as a FIFO between a UART
+and whatever clock its user runs on, like PipelineC's `GLOBAL_FIFO`. On one clock,
+`global_fifo` and `global_sync_fifo` both build the library FIFO.
+
+Across clocks the compiler builds the FIFO as two `@MAIN`s, `rx_FIFO_wr` on the write clock
+and `rx_FIFO_rd` on the read clock, around one two-clock FIFO instance, `rx_FIFO`, at the top
+level; those are the names timing reports and the generated VHDL show. An async FIFO's
+name may not contain `_READ` or `_WRITE`.
+
+### The async FIFO hardware: `impl=`
+
+An async FIFO is one entity with two clocks, which a Pypeline function, with its one clock,
+cannot describe. The FIFO comes from the back end, as in PipelineC:
+
+| Synthesis tool | Async FIFO |
+|---|---|
+| Vivado | Xilinx's `xpm_fifo_async` macro |
+| every other tool | the built-in `pipelinec_async_fifo_fwft` |
+
+`impl="builtin"` forces the built-in FIFO on every tool, for example so that a VHDL
+simulator without the Xilinx libraries can run it. `impl=param("FIFO_IMPL", None)` makes
+the choice a [build parameter](#build-parameters-param-and--d). `global_fifo` and
+`global_async_fifo` take `impl=`; `global_sync_fifo` has no async FIFO to choose. With no
+synthesis tool selected, the built-in FIFO is built.
+
+### Depth and latency across clocks
+
+`n` is the minimum number of words. It is rounded up to a power of two and raised to the
+implementation's minimum: 4 for the built-in async FIFO and 16 for `xpm_fifo_async`. The
+built-in FIFO holds one word more in its output register. The
+[crossing report](#the-crossing-report) shows the depth each FIFO got.
+
+Crossing adds latency, because the FIFO's pointers pass through two synchronizer registers
+on each side. In the built-in async FIFO, a word written appears at the read end on the
+third read-clock edge after the write. After a pop, the writer sees room again on the
+second write-clock edge.
+
+---
+
+## Building and Simulating Multi-Clock Designs
+
+### Timing constraints
+
+Declared clocks reach the constraints the way `@MAIN` rates do today:
+
+- a `create_clock` for each clock, on its port, its pin or the wire that carries it;
+- every pair of different clocks declared asynchronous.
+
+Every path between clocks, through an async wire or inside an async FIFO, is therefore
+untimed. `xpm_fifo_async` adds Xilinx's own constraints for its synchronizers. Not every
+synthesis tool writes multi-clock constraints yet; see
+[Limitations](#limitations--not-yet-supported).
+
+### The crossing report
+
+Every build lists its crossings in `clock_crossings.log`, and in `clock_crossings.json`
+for scripts, next to the other [generated reports](README.md#generated-files-and-reports):
+one row per async wire leaf and reading clock, and one per global FIFO, on one clock or
+two. Clocks are called by their Python names where they have one:
+
+```
+crossing        clocks                 kind               hardware          depth  source
+link_up         eth_clk -> clk_100p0   ASYNC wire         none                     top.py:12
+status.eth_up   eth_clk -> clk_100p0   ASYNC wire         none                     top.py:13
+status.pcie_up  pcie_clk -> clk_100p0  ASYNC wire         none                     top.py:13
+rx              eth_clk -> clk_100p0   global_async_fifo  built-in async    64     top.py:14
+cmds            clk_None               global_sync_fifo   make_stream_fifo  16     top.py:15
+```
+
+An `Input[T, ASYNC]` pin's rows read `pin -> clk_100p0`.
+
+### Pipelining and the sweep
+
+- Each `@MAIN` is judged against its own clock. Paths between clocks are
+  untimed, so they never reach the sweep.
+- A critical path that starts and ends inside a global FIFO, synchronous or asynchronous,
+  is reported as that FIFO's, with its source line. The sweep does not blame a `@MAIN` for
+  it or add pipeline stages for it, and if it misses its clock's goal the build ends
+  `TIMING NOT MET: global FIFO rx [top.py:14] ...`. A path from a FIFO's output into a
+  `@MAIN`'s logic still belongs to that `@MAIN`.
+- An async wire is `VOLATILE` in pipelined code
+  ([Async wires in pipelined code](#async-wires-in-pipelined-code)). A function with
+  pipeline stages cannot use both halves of one FIFO end, and a global FIFO is never
+  pipelined ([`Fifo[T]`](#fifot--global-fifos)).
+
+### Simulation across clocks
+
+Native simulation runs one clock. A design whose `@MAIN`s name more than one clock, two
+rates or two named clocks of one rate, is refused with a message that names the clocks and
+their `@MAIN`s. A bare `@MAIN` names no clock and simulates with the others; the build, not
+native simulation, says when it would put such a `@MAIN` on the default clock. Single-clock
+designs with global FIFOs simulate natively, through the library FIFO's
+[`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions). Simulating
+several clocks, natively or with a generated VHDL testbench, is listed under
+[Limitations](#limitations--not-yet-supported).
+
+---
+
+### Part V — Escape hatches
+
+When Pypeline's normal abstraction isn't enough, these hatches let you drop to a
+lower level without leaving the language: `vhdl()` for literal VHDL text,
+`@pipeline_latency` for an existing user pipeline, and `@wires` for telling the
+synthesiser a function is pure bit-rewiring with no real logic delay.
+(`kept_data_bus_t`/`ndarray_fragment_t` from Part III are not escape hatches — they're
+ordinary structured types.)
+
+## Raw VHDL Passthrough: `vhdl()`
+
+Sometimes you need an escape hatch — a primitive your target FPGA vendor provides, a
+trick that's awkward to express in pypeline, or an existing VHDL block you want to drop
+in unchanged. `vhdl(text)` replaces a function's entire body with literal VHDL text,
+spliced directly into the generated entity's architecture. It's the pypeline equivalent
+of C's `__vhdl__("...")`.
+
+```python
+from pypeline import vhdl, uint64_t
+
+@MAIN
+def main(x: uint64_t, y: uint64_t) -> uint64_t:
+    vhdl(f"""
+        begin
+        return_output <= x + y;
+    """)
+```
+
+> **Required:** `vhdl(...)` must be the **only statement** in the function body (an
+> optional leading docstring is fine). The function's signature is still used to
+> generate the entity's ports exactly as normal — `x` and `y` become `in` ports, the
+> return value becomes the `return_output` `out` port — but nothing inside the body is
+> elaborated; the text is inserted as-is into the architecture, which already supplies
+> `architecture arch of <name> is ... end arch;` around it. Your text should *not*
+> include its own `end;` — only the declarative part (optional), `begin`, and the
+> statements.
+
+Inside the text, reference ports by their literal VHDL signal names: the function's
+parameter names, `return_output` for the return value, and `CLOCK_ENABLE`/`clk` if your
+logic needs them. (Parameter names with leading/trailing/double underscores, or that
+collide with a VHDL reserved word, get sanitised into a different port name — keep
+parameter names simple to avoid surprises.)
+
+The argument to `vhdl(...)` can be **any compile-time-computed Python string** — an
+f-string, concatenation, or a call to a plain Python helper function — as long as it only
+references plain Python/elaboration-time values. It cannot reference hardware wire
+values (there's no way to "interpolate" a signal's runtime value into VHDL text; if you
+need to refer to a port, write its VHDL name literally in the string, as in the example
+above).
+
+```python
+def make_adder_vhdl(width):
+    return f"""
+        begin
+        return_output <= std_logic_vector(unsigned(x) + unsigned(y))({width-1} downto 0);
+    """
+
+@MAIN
+def sized_add(x: uint32_t, y: uint32_t) -> uint32_t:
+    vhdl(make_adder_vhdl(32))
+```
+
+**No timing information.** The compiler has no idea what's inside a `vhdl(...)` block,
+so it's always treated as an opaque, zero-cycle-delay black box — same as C's
+`__vhdl__`. If your raw VHDL needs registers, manage them yourself within the text. If
+those registers form a fixed pipeline, declare it with
+[`@pipeline_latency(N)`](#fixed-user-pipelines) so callers align around it.
+
+**Resets.** `vhdl(text, reset="sync")` lets the text use `RESET`, a `std_logic` that is
+1 while a [reset](#resets) is active, synchronous to `clk`:
+
+```python
+@hw_func
+def held(x: uint8_t) -> uint8_t:
+    vhdl("""
+signal r : unsigned(7 downto 0) := (others => '0');
+begin
+process(clk) begin
+  if rising_edge(clk) then
+    r <= x;
+    if RESET = '1' then r <= (others => '0'); end if;
+  end if;
+end process;
+return_output <= r;
+""", reset="sync")
+```
+
+Under a `@MAIN` with `reset_registers="all"` and a reset, `RESET` is that reset;
+elsewhere it is a constant `'0'`. Text without `reset=` keeps its state through a reset,
+and a note says so. A `vhdl()` function cannot have an argument named `reset`, which VHDL
+would read as the same name. A sim model of a `vhdl()` function without `reset=` keeps its
+state too; one with it is recreated, or has its `on_reset()` method called.
+
+**Simulating raw VHDL requires a model.** There is no general way to simulate arbitrary
+user-supplied VHDL text in Python, so calling a `vhdl(...)`-bodied function in simulation
+— directly or via `sim_call()` — raises `NotImplementedError`
+unless you attach a Python simulation model to it with `@sim_model(target)` (see
+[`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions)): either a
+synthesizable `@hw_func` written in pypeline, or an arbitrary Python class with
+`__init__`-held state and a `__call__` matching the function's signature.
+
+---
+
+## Fixed User Pipelines
+
+Use `@pipeline_latency(N)` when you have already implemented a function with an
+unchangeable latency of N clocks. It is equivalent to PipelineC's
+`#pragma FUNC_LATENCY function N` and implies `@hw_func`:
+
+```python
+from pypeline import Reg, hw_func, pipeline_latency, sim_call, sim_reset, uint16_t
+
+@pipeline_latency(1)
+def delay_one(x: uint16_t) -> uint16_t:
+    saved: Reg[uint16_t]
+    result: uint16_t = saved
+    saved = x
+    return result
+
+@hw_func
+def aligned_add(x: uint16_t) -> uint16_t:
+    return delay_one(x) + x
+
+sim_reset()
+assert sim_call(aligned_add, 3) == 0
+assert sim_call(aligned_add, 8) == 6
+assert sim_call(aligned_add, 17) == 16
+```
+
+The register in `delay_one` supplies the clock of latency. The compiler treats the
+function as a fixed building block and aligns the caller's other operands with
+it. Larger callers may receive additional automatic pipeline stages; the tagged
+function's implementation stays fixed. Use the declaration for a pipeline whose
+data and valid signals obey the stated latency under the normal clock-enable
+semantics. It does not describe a variable-latency transaction or add handshaking.
+
+N must be a nonnegative integer; zero is supported. The declaration is trusted:
+it does not insert registers or check that the body implements N cycles.
+It works on factory-produced functions and stacks with `@MAIN` in either order.
+An AUTO_PIPELINE request inside the tagged implementation is an error. AUTO_PIPELINE
+latency arguments on the tagged function itself must agree with N (`latency=N`,
+`start_latency=N`, `max_latency` of at least N).
+
+The body may also be a [`vhdl()`](#raw-vhdl-passthrough-vhdl) passthrough. The text then
+supplies the registers, and an attached `@sim_model` must produce the same N-cycle delay,
+because native simulation never adds one.
+[`make_ram`](#rams-make_ram--make_stream_ram) is built this way.
+
+AUTO_PIPELINE asks the tool to implement pipelining. `pipeline_latency` describes
+pipelining supplied by the user. MULTI_CYCLE constrains setup timing between
+registers and does not declare a function's pipeline latency.
+
+Native simulation aligns callers around fixed user pipelines using the declared
+latency. During warm-up, pipeline registers contain typed zeros; register state inside
+each stage still advances with the stage's enabled input. Ordinary registers and AUTO
+tags do not turn an undeclared raw-VHDL pipeline into a fixed user pipeline.
+
+## Just-Wires Synthesis Hint: `@wires`
+
+Some functions don't synthesise to any real logic — they just rearrange bits: packing a
+struct into a byte array, splitting an integer into its individual bits and wiring them
+out to separate ports, casting one same-width type to another. There's no gate delay to
+estimate for logic like that. A function with no registers whose body uses no operators
+at all (only casts, bit slices, concatenation, constant shifts or constants) is
+recognized as wires automatically. `@wires` states it explicitly for any function —
+equivalent to PipelineC's `#pragma FUNC_WIRES <func_name>` — so the synthesiser never
+spends time measuring or estimating a path delay through it, and elaboration checks
+the claim.
+
+```python
+from pypeline import wires, struct, uint8_t
+from typing import NamedTuple
+
+@struct
+class pair_t(NamedTuple):
+    a: uint8_t
+    b: uint8_t
+
+@wires
+def pair_to_bytes(p: pair_t) -> uint8_t[2]:
+    return [p.a, p.b]
+```
+
+**`@wires` implies `@hw_func`** — you don't need to add `@hw_func` separately. That means
+a `@wires` function can be called directly with `sim_call()` (or from inside another
+`@hw_func`/`@MAIN` body) just like any other hardware helper:
+
+```python
+assert sim_call(pair_to_bytes, pair_t(a=1, b=2)) == [1, 2]
+```
+
+It also stacks with `@MAIN` in either order, for the case where an entire top-level entry
+point is just wires — mirroring `include/leds/leds_port.c`, which independently tags its
+`leds_module` function with both `#pragma MAIN` and `#pragma FUNC_WIRES`:
+
+```python
+@MAIN
+@wires
+def leds_module(): ...
+```
+
+**It is a synthesis-time hint** — it has no effect on simulation behaviour (the function
+still runs as ordinary Python/hardware logic). Because the compiler then never times a
+`@wires` function, elaboration checks that it really is just wires: nothing anywhere in
+its hierarchy may hold a register (`Reg`) or compute anything (arithmetic, comparisons,
+`if`/ternary muxes, variable array indexing, inversion). These are fine:
+
+- struct/array rewiring, constant indexing, bit slices, concatenation, constant shifts;
+- casts;
+- `Wire`/`Input`/`Output` connections and `Feedback` wires;
+- other `@wires` functions;
+- `sim_print`/`sim_assert`/`sim_finish`. Logic that only feeds them, like the condition
+  of `if done: sim_finish()`, never reaches synthesis.
+
+Anything else is an `ElaborationError` that names the register or operator and its source
+line. A `vhdl()` body can't be inspected, so a `@wires` function written in raw VHDL is
+trusted as-is, registers included. Calling an *untagged* `vhdl()` function from `@wires`
+is an error.
+
+**A function that wraps real hardware is not `@wires`**, even if its own body looks like
+wiring — a synthesizable testbench `@MAIN` that drives a design with counters and checks
+its output, for example. Leave it untagged and it is timed like any other function. No
+separate "wrapper" tag is needed: every operator is already its own submodule, so a
+function's delay is always derived from what it instantiates.
+
+See `src/tests/pypeline_tests/inst/func_wires_test.py` for the full example.
+
+See `src/tests/pypeline_tests/inst/vhdl_text_test.py` for a complete example.
+
+---
+
+### Part VI — Reference
+
+## Simulation Reference
+
+The rest of the simulation feature set, beyond the [Simulation](#simulation) basics in
+Part I: side-effect hooks, console output and simulation control, start/end-of-run hooks,
+the native-vs-VHDL debug probes, and Python simulation models for hand-written VHDL.
+
+### `@sim_output` — side effects once per cycle
+
+Functions decorated with `@sim_output` are called normally in simulation's final pass
+but are skipped during intermediate convergence iterations.
+Use this for `print`, plotting, file writes, etc.
+
+```python
+from pypeline import sim_output
+
+@sim_output
+def display_result(data):
+    print(f"output: {data}")
+```
+
+`@sim_output` calls inside `@MAIN` bodies are **invisible to the hardware compiler** —
+they produce no gates or wires in the synthesised design. This holds no matter where in
+the design the call happens — a top-level `@MAIN` body or a nested non-MAIN helper.
+
+A `@sim_output` function's body can also read a `Wire[T]`/`Input[T]`/`Output[T]` directly
+by bare name, instead of only receiving values as passed-in arguments:
+
+```python
+out0: Wire[uint32_t]
+
+@sim_output
+def check_out():
+    print(int(out0))   # direct read, not passed in as an argument
+```
+
+### `@sim_input` — driving simulation inputs
+
+`@sim_input` is the reverse of `@sim_output`: it runs once near the *start* of each
+simulated clock cycle (before everything else needs a stable value) instead of the end,
+and is used to drive `Input[T]` wires rather than observe outputs. Two forms:
+
+```python
+from pypeline import sim_input
+
+in0: Input[uint32_t]
+
+@sim_input
+def in_global():
+    in0 = python_stuff()          # direct-write form: body drives the wire itself
+
+@sim_input
+def in_return() -> uint32_t:
+    return python_stuff()          # return-value form: caller assigns the return value
+
+in1: Input[uint32_t]
+
+@MAIN
+def tb_inputs():
+    in_global()
+    in1 = in_return()
+```
+
+Like `@sim_output`, `@sim_input` calls are invisible to the hardware compiler no matter
+where they appear. The real body runs at most once per simulated cycle — a per-cycle
+result cache, not a fixed call location, is what guarantees this — so a non-idempotent
+driving value (a counter, a random sample, a queue pop) advances exactly once per cycle
+even though a `@MAIN` body actually runs at least twice per cycle internally.
+
+A return-value call must be the whole right-hand side, and its target a module-level
+`Wire[T]`/`Input[T]`/`Output[T]` (or a field/element of one, also `module.wire.field`).
+Storing it in a local (`x = in_return()`) or using it inside an expression
+(`in_return() + 1`) is an error, in native sim at import and in elaboration (see
+[Limitations](#limitations--not-yet-supported)). The value only exists in simulation, so
+hardware has nothing to build from it. An `Input[T]` becomes
+a real top-level port instead, which is what lets the same top elaborate (a pipelined
+`--sim` run elaborates it first). Elaboration also never runs a `@sim_input` body.
+
+That cache is keyed by the function alone, not by its arguments. Calling one `@sim_input`
+function twice in a cycle with different arguments currently returns the first call's
+value both times ([#355](https://github.com/JulianKemmerer/PipelineC/issues/355)). Use a separate function for each value.
+
+### `sim_print` — printf-style console output
+
+`sim_print(...)` looks like `@sim_output` (fires once per cycle, in the final pass) but is
+**not** invisible to the hardware compiler — it also elaborates to a real VHDL console
+`write(output, ...)` statement, PipelineC's equivalent of C's `printf(...)`.
+
+```python
+from pypeline import sim_print
+
+n: Reg[uint8_t]
+sim_print(f"n={n} hex={hex(n)}")
+```
+
+Write it like ordinary Python `print()`-style code: an f-string (or a plain string with no
+interpolation), one argument, no separate `%`-style format-string-plus-args form. A trailing
+newline is appended automatically, like real `print()`. Bare `{expr}` interpolation works for
+plain integers (decimal, sign-aware) and for `char_t[N]` arrays (`%s`); `hex(expr)` gives hex.
+A single `char_t` still needs `chr(expr)` — a bare `{ch}` is ambiguous between a number and a
+character, so it's a compile error instead of a silent mismatch:
+
+```python
+from pypeline import char_t, strlen
+
+def print_name(name: char_t[16]):
+    sim_print(f"name={name} len={strlen(name)}")
+```
+
+### `sim_assert` / `sim_finish` — simulation control
+
+Two more `sim_print`-style builtins for controlling simulation itself. Like `sim_print`,
+they are represented in generated simulation VHDL rather than skipped by elaboration:
+
+```python
+from pypeline import sim_assert, sim_finish
+
+n: Reg[uint8_t]
+sim_assert(n < 100, f"n grew too large: {n}")   # msg is optional
+sim_assert(n != 0)                               # bare condition -> default message
+
+if n >= 3:
+    sim_finish()
+```
+
+`sim_assert(cond, msg=None)` checks `cond` every cycle it executes while enabled — a failing
+condition raises `AssertionError` in native Python simulation and elaborates to a VHDL `assert
+... report ... severity failure;` that halts a real GHDL simulation immediately. `msg` follows
+the same f-string interpolation rules as `sim_print`'s argument.
+
+`sim_finish()` takes no arguments and signals "stop simulating now": it raises a
+`SimFinish` exception in native simulation and elaborates to VHDL's
+`std.env.finish;`, halting a VHDL simulation.
+
+A `sim_print` that runs on the same cycle as `sim_finish()` appears in native simulation
+but is missing from VHDL simulation output ([#361](https://github.com/JulianKemmerer/PipelineC/issues/361)). Print one cycle before finishing.
+
+### `@initial` / `@final` — start/end-of-run hooks
+
+`@initial` and `@final` mark plain Python functions the tools run **once** at the start or
+end of a simulation and/or a synthesis (hardware build) run. They replace the "first
+cycle?" flags and "all done?" checks a testbench would otherwise hand-roll inside its
+per-cycle `@sim_input`/`@sim_output` functions:
+
+```python
+from pypeline import final, initial, sim_finish, sim_output, sim_print
+
+state = {"errors": 0, "checked": 0}      # mutate in place, see below
+
+@initial(sim=True)
+def start():
+    scoreboard.fill(expected_packets)    # once, before the first clock
+    sim_print(f"=== my_tb: {len(expected_packets)} packets ===")
+
+@sim_output
+def check_done():
+    if state["checked"] == len(expected_packets):
+        sim_finish()                     # the per-cycle "when to stop" test stays here
+
+@final(sim=True)
+def finish_checks():                     # once, after the last cycle, however it ended
+    assert state["errors"] == 0, f"{state['errors']} mismatches"
+    assert state["checked"] == len(expected_packets), "simulation ended early"
+    sim_print("my_tb: all packets PASSED")
+```
+
+| Form | Runs for |
+|---|---|
+| `@initial` / `@final` | both simulation and synthesis |
+| `@initial(sim=True)` / `@final(sim=True)` | simulation only |
+| `@initial(syn=True)` / `@final(syn=True)` | synthesis only |
+
+**When they run:**
+
+- **Sim `@initial`** — once, after the design is loaded and reset, before the first clock
+  cycle (so before any `@sim_input`). This holds for every simulator: native (`--comb` or
+  pipelined) and cocotb+GHDL/Verilator/CXXRTL, where it runs just before the simulator is
+  launched.
+- **Sim `@final`** — once, after the last cycle's `@sim_output` calls, **however the
+  simulation ended**: `sim_finish()`, `--run N` reaching N, or an error (a failed assert,
+  the `--run all` safety cap). After an error, the original error is still the one reported
+  (a `@final` hook's own error is printed but does not replace it), so a `@final` check is
+  the natural place for "did the run actually finish?" — a run cut short fails there
+  instead of exiting 0 with the end-of-run checks never reached. For an external
+  simulator it runs after the simulator exits.
+- **Syn `@initial`** — once per `pypelinec` run, right after the design file is imported
+  and before it is elaborated.
+- **Syn `@final`** — once, right after the final VHDL is written and before any bitstream
+  generation (`--pins`) or simulation of the built design. A plain native
+  `--sim --comb` run builds nothing, so it runs no syn hooks.
+
+A design may have any number of hooks; they run in no particular order. A `--sim` build
+that is not `--comb` runs both: the syn hooks around its build, then the sim hooks around
+its simulation.
+
+**Rules:**
+
+- A hook is host Python, never hardware: its body is not elaborated (it can open files,
+  use numpy, run a script), it takes no arguments, and calling one from hardware code is
+  a compile error.
+- In an external simulator (cocotb+GHDL, ...) hooks run in the `pypelinec` process, not
+  inside the simulation, so they cannot read the design's `Reg`/`Wire` values — only Python
+  state your `@sim_input`/`@sim_output` functions keep (which also only exist in native sim).
+  Hardware-side end-of-run checks still belong in `sim_assert`s.
+- Calling `sim_finish()` inside a hook is an error — it only means something inside a
+  simulated cycle.
+- Share state with `@sim_input`/`@sim_output` functions through a mutable object mutated
+  in place (a dict, a list, a scoreboard), not by rebinding a module-level name: those
+  functions run against a detached copy of the module's globals.
+- A build re-imports the design several times. Syn `@final` hooks run from the same import
+  as the syn `@initial` hooks, and sim `@final` hooks from the same import as the sim
+  `@initial` hooks, so state each pair shares survives. Syn and sim hooks may see
+  **different** imports of the design, though — don't share state between them.
+- **A syn `@final` hook reading `.latency` gets stale values after a re-elaboration.** The
+  syn hooks run from the **first** import, so a `.latency` the hook reads (directly or
+  through a variable from that import) returns the bootstrap value: 0, or
+  `start_latency`. It does not see what the build re-elaborated with. Size hardware from
+  `.latency` in elaboration code, which every pass re-runs. For what was built, read
+  `sweep_history.json` (`latency_passes`, and each MAIN's `final` record) after the build.
+
+### `sim_print(..., debug=True)` — tagged prints
+
+`sim_print(s, debug=True)` behaves identically to plain `sim_print(s)`, except the printed
+message is prefixed with a `[SIM DEBUG PRINT: <abs path>:<N>]` tag identifying the call site.
+`debug` must be a compile-time-constant `True`/`False` literal. The tag uses an absolute path
+(not just a filename), formatted as `path:line` — most terminals and editors recognize that
+shape and let you click straight to the call site:
+
+```python
+from pypeline import sim_print, hex
+
+n: Reg[uint8_t]
+sim_print(f"n={n} hex={hex(n)}", debug=True)
+# prints: [SIM DEBUG PRINT: /home/me/proj/my_design.py:42]: n=3 hex=03
+```
+
+Use `debug=True` for prints that should be compared cycle-by-cycle between native and
+VHDL simulation. Plain `sim_print(...)` (`debug=False`, the default) is not a comparison
+probe. For a pipelined comparison, valid-gate every probe, place it in stateful code
+outside the pipelined combinational region. Native delay lines warm up with typed zeros
+while VHDL pipeline registers may be unknown; those two source rules avoid false cycle
+mismatches.
+
+`hex(...)`/`chr(...)`/plain `{expr}` interpolation rules are unaffected by `debug`; using
+`from pypeline import hex` (not Python's builtin) matters here more than usual, since only
+Pypeline's `hex()` is guaranteed to render identically in both native and VHDL sim (see its
+docstring in `pypeline.py`).
+
+Any hardware function that pairs a hand-written [`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions)
+with raw `vhdl(...)` text (rather than letting the elaborator derive both from one
+description) is exactly where native sim and real VHDL can silently diverge in cycle
+timing — the two implementations are maintained independently, and nothing checks they
+agree. `debug=True` marks the probes used to find and localize that
+class of bug: add debug prints at successive points along a suspect data path (bisecting
+the hierarchy, narrowest first at the two ends of a call, then walking inward) and re-run;
+the first cycle where native and VHDL disagree pinpoints the boundary responsible.
+See [Native-vs-VHDL cycle diff](README.md#pypeline_sim_debugpy--native-vs-vhdl-cycle-diff-tool)
+for tool invocation and output files.
+
+### `@sim_model` — Python simulation models for hardware functions
+
+`sim_model(target)` attaches a Python model to any `@hw_func`/`@MAIN` function: whenever
+`target` is called in simulation, the model runs instead of the function's own body.
+Hardware elaboration is completely unaffected — models are invisible to the compiler.
+This is how raw-VHDL functions become simulable (see
+[Raw VHDL Passthrough: `vhdl()`](#raw-vhdl-passthrough-vhdl)), and it can equally swap a slow bit-accurate
+function for a fast high-level model.
+
+The model can take **either** of two forms — attach exactly one per target (a second
+`@sim_model(target)` raises `ValueError`):
+
+**Form 1 — a synthesizable `@hw_func` delegate** with the same signature:
+
+```python
+from pypeline import hw_func, sim_model, vhdl, Reg, uint32_t
+
+@hw_func
+def accum(din: uint32_t) -> uint32_t:   # the hardware: raw VHDL
+    vhdl(ACCUM_VHDL_TEXT)
+
+@sim_model(accum)
+@hw_func
+def accum_model(din: uint32_t) -> uint32_t:
+    total: Reg[uint32_t]
+    total = total + din
+    return total
+```
+
+**Form 2 — an arbitrary Python class** (sim-only, never synthesizable): `__init__` holds
+any state you like — numpy arrays, deques, open files — and `__call__` takes the target's
+arguments and returns its output:
+
+```python
+import numpy as np
+
+@sim_model(accum)
+class AccumModel:
+    def __init__(self):
+        self.samples = np.array([], dtype=np.uint64)
+    def __call__(self, din):
+        self.samples = np.append(self.samples, int(din))
+        return int(self.samples.sum())
+```
+
+One class instance is created lazily **per hardware instance** — per call site, the same
+keying as `Reg[T]` state — so two call sites of `accum` accumulate independently.
+`sim_reset()` discards the instances (fresh power-on state), and model outputs are cast
+to the target's declared return type at the boundary like any other hw_func result.
+
+State timing is Reg-like: each evaluation runs on a `copy.deepcopy` of the instance
+committed at the last clock edge, and the mutated copy commits at the edge. Outputs are
+therefore a pure function of (cycle-start state, current inputs), so under
+complete-design simulation can safely re-evaluate a model during wire convergence — even with
+a combinational input→output path through it — and its state still advances exactly once
+per cycle. Because `__call__` may run several times per cycle during convergence, keep
+model bodies side-effect-free (or gate side effects the way `@sim_output` does). For
+heavy state you can opt out of the deepcopy with `@sim_model(accum, copy_state=False)`:
+the instance is then created once and mutated in place — faster, but only sound when
+inputs are already final the first time the model runs each cycle (e.g. plain
+single-call `sim_call()` use).
+
+---
+
+The DSP library reference and the categorized list of known limitations close out the
+guide.
+
+## DSP: Filters & Signal Conditioning
+
+The DSP library (`make_fir`, `make_fir_decim`/`make_fir_interp`, `make_magnitude`,
+`make_dc_block`, `make_moving_avg`, `make_cordic_atan2`/`make_cordic_rotate`,
+`make_lut_nco`, `make_log2_db`, and their testbench helpers) has moved to
+[`include/pypeline/dsp/pypeline_dsp_guide.md`](../include/pypeline/dsp/pypeline_dsp_guide.md),
+next to the library source it documents. See that file for the full reference.
+
+---
+
+## Source Naming Rules
+
+Python names used for locals, parameters, functions, struct fields, global `Wire`s,
+and instances are converted to legal VHDL basic identifiers. Leading/trailing
+underscores are normalized, repeated underscores collapse, and reserved words gain a
+suffix. Because VHDL names are case-insensitive, two source names in the same scope
+that differ only by case, or that normalize to the same identifier, are rejected.
+
+`Input[T]` and `Output[T]` are different: their bare source names become top-level
+ports exactly, without a module prefix or silent normalization, so they must already be
+legal, globally unique VHDL identifiers. Imported `Wire[T]` names are module-prefixed;
+import aliases do not change that prefix. Enum member names are also emitted verbatim
+and therefore must not be VHDL reserved words ([#358](https://github.com/JulianKemmerer/PipelineC/issues/358)). Struct field names are normalized.
+
+These source rules are the stable contract. Generated entity/type names and timing
+suffixes are implementation artifacts; use the lookup files described under
+[Generated files and reports](README.md#generated-files-and-reports) instead of parsing
+their spelling.
+
+## Limitations / Not Yet Supported
+
+The table below lists known limitations, unsupported features and known bugs, grouped by
+category so unrelated kinds of restriction don't read as equivalent — a language
+restriction you must design around is a different kind of fact than "this hasn't been
+built yet," and both differ from a bug. A status that names a failure, such as *Invalid
+VHDL* or *Wrong in native simulation*, marks a known bug; its notes give the workaround.
+The last column links the GitHub issue (a bug) or discussion (a feature idea) that
+tracks the row.
+
+| Category | Feature | Status | Notes | Tracked in |
+|---|---|---|---|---|
+| Language | **Multiple/early `return` statements** | Not supported | A function may have at most one `return`, and it must be the function's final top-level statement; assign to a variable inside `if`/`else` branches and return it once at the end (see [Control flow](#your-first-hardware-function)) | [#343](https://github.com/JulianKemmerer/PipelineC/discussions/343) |
+| Language | **`break` or `continue` inside a loop** | Not supported | Restructure the loop body (e.g. an early-exit flag checked each iteration) instead | [#343](https://github.com/JulianKemmerer/PipelineC/discussions/343) |
+| Language | **Hardware signals as loop conditions** | Not supported | `for`/`while` loop bounds must be compile-time Python integers (fully unrollable) | [#344](https://github.com/JulianKemmerer/PipelineC/discussions/344) |
+| Language | **More than 65,536 `while` iterations** | Not supported | The elaborator stops at the safety limit rather than hanging on a non-terminating loop | — |
+| Language | **Starred unpack targets** | Not supported | Nested unpacking is supported for compile-time values; hardware-valued unpacking must be flat and use a literal tuple/list RHS | [#345](https://github.com/JulianKemmerer/PipelineC/discussions/345) |
+| Language | **Iterating a `set`/`frozenset` in a `for` loop** | Not supported | Iteration order is `PYTHONHASHSEED`-dependent, not a deterministic function of the design source; `sorted(...)` it first — tuple/list/dict/str/`enumerate`/`zip`/generator iteration, and a nested-tuple loop target (`for kind, a, b in ops:`), are all fine | — |
+| Language | **Bit index from a hardware signal (`x[i]`)** | Not supported | Bit positions must be compile-time constants. A hardware index currently crashes the elaborator with `ValueError: substring not found` instead of a clear error. Split the value into bits first, `bits: uint1_t[32] = uint_to_array_le(x, 1)`, then index `bits[i]` (see [Built-in bit helpers](#built-in-bit-helpers)) | [#362](https://github.com/JulianKemmerer/PipelineC/issues/362), [#323](https://github.com/JulianKemmerer/PipelineC/discussions/323) |
+| Language | **Casting to an `@enum` or an array type** | Not supported | Scalar int/uint and `char_t` casting, and compound (struct/`@interface`-half) casting via `@cast`/`register_cast`, are supported (see [Casting](#casting)). An array destination is rejected with a clear error. Any `state_t(...)` call inside a hardware function currently crashes with an internal `TypeError`; use the members (`state_t.RUN`) directly | [#362](https://github.com/JulianKemmerer/PipelineC/issues/362) |
+| Language | **Assigning or returning an array of a different length** | Invalid VHDL | A `uint2_t[4]` value assigned to a `uint2_t[16]` local, or returned from a function declared `-> uint2_t[16]`, is accepted. Native simulation passes the 4-element value through, and GHDL rejects the generated VHDL. Keep array lengths equal | [#359](https://github.com/JulianKemmerer/PipelineC/issues/359) |
+| Language | **Arrays of `@enum` (`some_enum_t[N]`)** | Not supported | `@struct` installs `__class_getitem__`, `@enum` does not, so the subscript is an `IntEnum` member lookup and raises `KeyError`. Wrap the enum in a `@struct` and make an array of that — an enum inside a struct inside an array is fine | [#362](https://github.com/JulianKemmerer/PipelineC/issues/362) |
+| Language | **`@enum` member names that are VHDL reserved words** | Invalid VHDL | Member names are emitted verbatim into the generated VHDL enumeration type and are *not* sanitized (unlike locals and struct fields, which `_sanitize_vhdl_name` mangles), so a member called `ON`, `OPEN`, `OUT`, `BUS`, `RELEASE`, `REGISTER`, `RANGE`, `NEXT`, `REM` or `SIGNAL` produces uncompilable VHDL. Native simulation cannot see this — only a `synth_*`-category or GHDL run can, which is why every enum-bearing design wants one | [#358](https://github.com/JulianKemmerer/PipelineC/issues/358) |
+| Language | **Underscores in string literals** | Invalid VHDL | The literal is cut at the first `_` and loses its closing quote. The build and native simulation succeed; GHDL and synthesis tools reject the file. Use a string without `_`, or initialize the `char_t[N]` data numerically | [#356](https://github.com/JulianKemmerer/PipelineC/issues/356) |
+| Language | **An initializer on a `Reg[T]` whose element type is `char_t`** | Not supported | Rejected with a clear error; a zero-initialized char register works (see [Char arrays](#char-arrays-strings)) | [#357](https://github.com/JulianKemmerer/PipelineC/issues/357) |
+| Language | **Float literals as hardware values** | Not supported | Use `float_t.as_const(value)` at elaboration time | [#345](https://github.com/JulianKemmerer/PipelineC/discussions/345) |
+| Language | **Global wires through `from module import ...`** | Not supported | `from module import *` and `from module import name` work for functions, types and constants. A `Wire[T]` has no Python value to import, so use `import module` and `module.w` (see [Calling functions across files](#calling-functions-across-files)) | — |
+| Language | **Initializers on `Wire[T]` / `Input[T]` / `Output[T]`** | Not allowed | Assign inside `@MAIN` instead | — |
+| Language | **Control flow inside an interface function** | Rejected | `if`/`for`/`while` and conditional expressions in an interface-function body raise an `InterfaceError`; route conditional steering through an explicit handshake mux/demux module instead (see [`@interface`](#bidirectional-ports-interface)). Interfaces are also point-to-point: fan-out of a single interface, dangling outputs and input-to-output bypass are rejected — fan out through a module with an [array port](#array-ports-fan-out) instead. Array *input* ports are not supported. Compile-time `for`/`while` unrolling in ordinary `@hw_func`s is unaffected | — |
+| Source model | **Multiple clock domains** | Supported | `@MAIN`s on several clocks, named clocks from `make_clock`, clock pins, async wires and global FIFOs across clocks; see [Part IV](#part-iv--multiple-clock-domains). Every pair of different clocks is asynchronous. The rows below list what is not built yet | [#342](https://github.com/JulianKemmerer/PipelineC/discussions/342) |
+| Source model | **Related clocks** | Not supported | Clocks from one source with an integer ratio, whose paths between them would be timed. Until then every pair of different clocks is asynchronous, with untimed paths | [#342](https://github.com/JulianKemmerer/PipelineC/discussions/342) |
+| Source model | **Crossings between related clocks** | Not supported | Free-flowing integer-ratio crossings like PipelineC's `volatile` crossings. Use an async wire or a global FIFO | [#342](https://github.com/JulianKemmerer/PipelineC/discussions/342) |
+| Source model | **Resets** | Supported | Synchronous, active-high resets from a pin or a `Wire`, per clock and per `@MAIN`, with per-register markers; see [Resets](#resets). The rows below list what is not built yet | — |
+| Source model | **Asynchronous or active-low resets** | Not supported | `make_reset(kind="async")` and `make_reset(active="low")` raise `NotImplementedError`. Synchronize an asynchronous source with two registers and drive a reset `Wire`; invert an active-low one there | — |
+| Source model | **Resetting a global FIFO between clocks** | Not supported | An async `Fifo[T]` is not reset, and a `reset_registers="all"` `@MAIN` at either end of one is an error. Reset the ends with `Reg[T, RESET]` under `"requested"` | — |
+| Source model | **Another reset for a global instance** | Not supported | `Inst[f]` and a same-clock `Fifo[T]` always take their clock's primary reset | — |
+| Source model | **A reset for the default clock** | Not supported | Bare `@MAIN`s on the default clock (no clock named or inferred) have no `make_clock` to carry a primary reset, so global instances and FIFOs there do not reset | Name the clock: `make_clock(rate, reset=rst)` |
+| Source model | **A reset value other than the initial value** | Not supported | A register resets to its initializer, which is also its power-up value; there is no separate `reset_to=`, and a struct or array register resets whole | — |
+| Source model | **Reset scopes and inferred reset pins** | Not supported | No `with` blocks of reset settings and no implied `reset_<clock>` ports: declare each reset with `make_reset()` | — |
+| Source model | **Synchronizers made for resets** | Not supported | The compiler inserts no reset synchronizer and does not check one; write the two registers yourself (see [Resets and clocks](#resets-and-clocks)) | — |
+| Source model | **Resets in simulation side effects and `sim_call`** | Not supported | `sim_print`, `sim_assert` and `@sim_output` run during a reset; `sim_call` runs with every reset inactive and has no reset procedure | — |
+| Source model | **Reset driving in other HDL simulators** | Not supported | Only native simulation and the generated cocotb testbench drive the cycle-0 reset pulse; the Verilator, CXXRTL, ModelSim and EDAPlay flows leave a reset pin to the user | — |
+| Source model | **ASIC checks beyond explicit initializers** | Not supported | On an ASIC target only registers with an explicit `= value` must reset. Registers without one, compiler-made initial values (an `AUTO_FSM`'s one-hot state gets a warning), raw VHDL signal initializers, RAM contents and builds with no target are not checked | — |
+| Source model | **Synchronizer crossings** | Not supported | Bit, pulse, Gray-code and handshake synchronizers as kinds of crossing. Use an async wire with registers in the reader, or a global FIFO | [#342](https://github.com/JulianKemmerer/PipelineC/discussions/342) |
+| Source model | **Synchronizer register markers** | Not supported | Registers cannot be tagged for vendor synchronizer attributes such as `ASYNC_REG`. Wrap a vendor cell such as `xpm_cdc_single` in a [`vhdl()`](#raw-vhdl-passthrough-vhdl) function | — |
+| Source model | **Crossings written in Pypeline** | Not supported | A crossing cannot be written as a sender function on one clock plus a receiver on another; crossings are async wires and global FIFOs | — |
+| Source model | **Constraints on individual crossings** | Not supported | No `set_max_delay -datapath_only` or `set_bus_skew` on crossing paths; paths between clocks are untimed | — |
+| Source model | **Multi-clock constraints on every synthesis tool** | Not supported | Quartus ignores its clock groups when a design has three or more clocks, and Gowin, Efinity, PyRTL and DEVICE_MODELS stop on designs with more than one clock | — |
+| Source model | **Arrays of interface ports on a global instance** | Not supported | `Inst[f]` rejects an argument or return field that is an array of interface port halves, such as a fan-out port. Wrap `f` in a `@hw_func` with one port per element, or declare the wires and a wiring `@MAIN` | — |
+| Source model | **Other wrappers as a global instance's hardware** | Not supported | `Inst[f]` takes a `@hw_func` or an `AUTO_PIPELINE(f)` tag. For `AUTO_FSM(f)` or `MULTI_CYCLE[...]`, call it in a `@hw_func` and make that the instance | — |
+| Source model | **One AUTO object implemented separately per clock domain** | Not supported | One AUTO object used by `@MAIN`s at different clock goals keeps a single implementation ([AUTO objects in several clock domains](#auto-objects-in-several-clock-domains)); so do identical auto-pipelined RAM configurations. Make one object per domain: a separate constructor or factory call each | — |
+| Source model | **A global instance on a stated clock** | Not supported | An instance runs on the clock of the functions that use it ([`Inst[f]`](#instf--global-instances)) | — |
+| Source model | **Global FIFOs and instances made by library code** | Not supported | A `Fifo[T]` or `Inst[f]` is a module-level declaration, so a factory cannot create one | — |
+| Source model | **Global FIFO chains with skid buffers** | Not supported | No `chain(skid, global_fifo(64), skid)` initializer; put a skid buffer inside the producer or consumer function | — |
+| Source model | **Global FIFO sizes in Python** | Not supported | No `rx.depth`, `rx.capacity_beats` or crossing latencies (`rx.write_to_valid`, `rx.pop_to_ready`) on a global FIFO for sizing credits and timeouts; the crossing report lists each FIFO's depth | — |
+| Source model | **Connecting two wires through a FIFO** | Not supported | No `CONNECT(a, b, global_fifo(64))` between two stream wires; declare a `Fifo[T]` | — |
+| Source model | **RAMs, ROMs and stream RAMs** | Supported | [`make_ram` / `make_stream_ram`](#rams-make_ram--make_stream_ram) provide the portable source shapes; vendor-specific memory IP still needs `vhdl()` | — |
+| Source model | **Multi-cycle paths with a synthesis tool other than Vivado** | Not supported | Constraints for `MULTI_CYCLE[...]`, `AUTO_MULTI_CYCLE` and `make_stream_multi_cycle` are written only for Vivado. Other tools stop with "Multi cycle paths have only been tested with Vivado!" | [#346](https://github.com/JulianKemmerer/PipelineC/discussions/346) |
+| Source model | **`AUTO_PIPELINE(...).latency` before implementation** | Usually reads `0` | `latency=N` reads N immediately; an active automatic implementation bootstraps `start_latency=S` at S. The selected value becomes visible when source is re-elaborated with the implemented plan | — |
+| Simulation | **Simulation of `vhdl()`** | Needs a model | `vhdl()`-based functions raise `NotImplementedError` in simulation unless a [`@sim_model`](#sim_model--python-simulation-models-for-hardware-functions) is attached (as `make_fifo`, `make_ram` and `make_stream_ram` do, covering `make_stream_fifo`/`make_stream_auto_pipeline` too) | — |
+| Simulation | **Two calls to one stateful function on the same source line** | Wrong in native simulation | Native simulation keys register state by source line, so `acc(a) + acc(b)` shares one register there but has two in hardware. Put each call on its own line (see [Registers in simulation](#registers-in-simulation--multiple-instances)) | [#353](https://github.com/JulianKemmerer/PipelineC/issues/353) |
+| Simulation | **More than one clock** | Not supported | Native simulation and generated cocotb testbenches run one clock. Native simulation refuses a design whose `@MAIN`s name more than one clock, two rates or two named clocks of one rate, naming the clocks and the `@MAIN`s on each; bare `@MAIN`s name no clock and do not count (see [Simulation across clocks](#simulation-across-clocks)). Build with `--comb --no_synth` and drive `top` from a VHDL testbench of your own | [#354](https://github.com/JulianKemmerer/PipelineC/issues/354), [#342](https://github.com/JulianKemmerer/PipelineC/discussions/342) |
+| Simulation | **`@sim_input` called with different arguments in one cycle** | Wrong in native simulation | The once-per-cycle cache ignores arguments, so every call in a cycle returns the first call's value. Use one function per value | [#355](https://github.com/JulianKemmerer/PipelineC/issues/355) |
+| Simulation | **A `@sim_input` result stored in a local, or used inside an expression** | Rejected | `x = stim()` and `stim() + 1` raise a clear error in native sim (at import) and in elaboration. Declare a module-level `Input[T]` and assign the call to it as its own statement (`in0 = stim()`); it becomes a real top-level port (see [`@sim_input`](#sim_input--driving-simulation-inputs)). A future version could accept a local by turning it into an implicit `Input[T]` port of the function's return type | — |
+| Simulation | **`sim_print` of a `uint32_t` value ≥ 2³¹** | Fails in VHDL only | `sim_print` lowers to `integer'image(to_integer(x))`, and VHDL's `integer` is 32-bit *signed*, so GHDL raises `overflow detected` at runtime. Native simulation prints it happily, so this only ever appears in a cocotb/GHDL run — mask or narrow the value before probing it | [#360](https://github.com/JulianKemmerer/PipelineC/issues/360) |
+| Simulation | **`sim_print` on the `sim_finish()` cycle** | Missing in VHDL simulation | Native simulation prints the line; in GHDL the run ends before it is written. Print one cycle before finishing | [#361](https://github.com/JulianKemmerer/PipelineC/issues/361) |
+| Simulation | **`@initial`/`@final` under `sim_call`** | Not run | Hooks run in clocked simulation runs (`pypelinec --sim`, `pypeline_sim.py`) and `pypelinec` builds. A plain Python script that drives `sim_call` itself has no run start/end for the tools to hook — call its setup/teardown code directly | — |
+
+Native simulation cannot detect restrictions that appear only after emitting VHDL, such
+as a reserved enum member, an underscore in a string literal, an array-length mismatch or
+VHDL integer display overflow. Give every reusable source
+block a small synthesizable `@MAIN` wrapper with representative `Input[T]`/`Output[T]`
+ports, then exercise that wrapper using the flows described in
+[Simulation](README.md#simulation) under Tools & CLI.
+
+Coming from PipelineC? See also [docs/pipelinec_to_pypeline.md](pipelinec_to_pypeline.md)
+for a pattern-by-pattern translation reference.

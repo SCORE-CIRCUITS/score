@@ -1,0 +1,72 @@
+/*
+ *
+ *                   _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *                  _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *                 _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *                _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *               _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *             ***********************************************
+ *                              PandA Project 
+ *                     URL: http://panda.dei.polimi.it
+ *                       Politecnico di Milano - DEIB
+ *                        System Architectures Group
+ *             ***********************************************
+ *              Copyright (c) 2023-2026 Politecnico di Milano
+ *
+ *   This file is part of the PandA framework.
+ *
+ *   The PandA framework is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+*/
+/*!
+  \page install_docker Build PandA framework in container environment
+  The repository ships container recipes that can be used to build and test PandA in a reproducible Linux environment.
+  This page intentionally stays at a high level: container layouts, image tags, and helper scripts evolve more often than the Doxygen pages.
+
+  \section install_docker_req Prerequisites
+  Install a recent Docker engine on the host system and make sure the current user can run container commands.
+
+  \section install_docker_overview Container files in the repository
+  Container-related assets live in the repository itself:
+  - \c .devcontainer/Dockerfile
+  - \c .devcontainer/Dockerfile.yosys
+  - helper scripts under \c .devcontainer/library-scripts/
+
+  These files are the authoritative source for the container environment. When in doubt, prefer the checked-in Dockerfiles and scripts over older prose documentation.
+
+  \section install_docker_usage Recommended workflow
+  A conservative container workflow is:
+  - build the image from the Dockerfile that matches your use case;
+  - mount the repository into the container;
+  - run the normal project build from inside the container, preferring the CMake flow documented for the repository;
+  - install the built tree before invoking \c bambu, so the executable uses the matching installed plugins and libraries.
+
+  This approach avoids coupling the documentation to a specific wrapper command or compose file.
+
+  \section install_docker_notes Notes
+  The container environment is mainly useful to:
+  - reproduce builds on a known Linux userspace;
+  - isolate host-specific package differences;
+  - prepare AppImage or toolchain-oriented build setups without polluting the host machine.
+
+  If you need to customize the environment, edit the Dockerfiles or helper scripts under \c .devcontainer/ and keep any command examples aligned with those files.
+
+  
+  \section install_docker_next Next steps
+  - \ref bambu101_page
+  - \ref dev_page
+
+
+*/

@@ -1,0 +1,9 @@
+--configuration-name=arf arf/module.c --top-fname=arf --generate-tb=BENCHMARKS_ROOT/arf/test.xml 
+
+--configuration-name=CHStone_dfadd CHStone/CHStone/dfadd/dfadd.c --top-fname=main -fwhole-program -fno-delete-null-pointer-checks --experimental-setup=BAMBU-PERFORMANCE-MP -s --benchmark-name=sdc --device-name=xc7z020,-1,clg484 --clock-period=15 
+
+--configuration-name=sha256 sha-256/sha-256.c --top-fname=calc_sha_256 --generate-tb=BENCHMARKS_ROOT/sha-256/test.xml --speculative-sdc-scheduling
+
+--configuration-name=aes MachSuite/MachSuite/aes/aes/aes.c --top-fname=aes256_encrypt_ecb -fno-tree-vectorize -fno-unroll-loops --experimental-setup=BAMBU-PERFORMANCE-MP -s --generate-interface=INFER -IBENCHMARKS_ROOT/MachSuite/MachSuite/common --benchmark-name=aes --generate-tb=BENCHMARKS_ROOT/MachSuite/MachSuite/aes/aes/local_support.c --generate-tb=BENCHMARKS_ROOT/MachSuite/MachSuite/common/harness.c --generate-tb=BENCHMARKS_ROOT/MachSuite/MachSuite/common/support.c --tb-arg=BENCHMARKS_ROOT/MachSuite/MachSuite/aes/aes/input.data --tb-arg=BENCHMARKS_ROOT/MachSuite/MachSuite/aes/aes/check.data
+
+--configuration-name=VGA VGA/delay.c VGA/vgatest.c --top-fname=plot_test --clock-period=20 -O3 --target-file=BENCHMARKS_ROOT/VGA/DE1-characterization-file.xml --backend-script-extensions=BENCHMARKS_ROOT/VGA/DE1_pin_assignments.qsf --backend-sdc-extensions=BENCHMARKS_ROOT/VGA/DE1_design.sdc VGA/constraints_STD.xml VGA/PLOT_IPs.xml --C-no-parse=BENCHMARKS_ROOT/VGA/plot.c,BENCHMARKS_ROOT/VGA/leds_ctrl.c -DC_SIMULATION --file-input-data=BENCHMARKS_ROOT/VGA/leds_ctrl.v,BENCHMARKS_ROOT/VGA/plot.v --enable-function-proxy

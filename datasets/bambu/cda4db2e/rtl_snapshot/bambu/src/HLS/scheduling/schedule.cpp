@@ -1,0 +1,1144 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/**
+ * @file schedule.cpp
+ * @brief Class implementation of the schedule data structure.
+ *
+ *
+ * @author Fabrizio Ferrandi <fabrizio.ferrandi@polimi.it>
+ * @author Marco Lattuada <marco.lattuada@polimi.it>
+ *
+ */
+#include "schedule.hpp"
+
+#include "FSMInfo.hpp"
+#include "Parameter.hpp"
+#include "allocation_information.hpp"
+#include "behavioral_helper.hpp"
+#include "dbgPrintHelper.hpp"
+#include "fu_binding.hpp"
+#include "function_behavior.hpp"
+#include "function_frontend_flow_step.hpp"
+#include "hls.hpp"
+#include "hls_constraints.hpp"
+#include "hls_device.hpp"
+#include "hls_manager.hpp"
+#include "ir_basic_block.hpp"
+#include "ir_helper.hpp"
+#include "ir_manager.hpp"
+#include "ir_manipulation.hpp"
+#include "ir_node.hpp"
+#include "op_graph.hpp"
+#include "string_manipulation.hpp"
+#include "technology_manager.hpp"
+
+#include <filesystem>
+#include <ostream>
+#include <set>
+
+AbsControlStep::AbsControlStep() : std::pair<unsigned int, unsigned int>(0, AbsControlStep::UNKNOWN)
+{
+}
+
+AbsControlStep::AbsControlStep(const unsigned int basic_block_index, const unsigned int control_step)
+    : std::pair<unsigned int, unsigned int>(basic_block_index, control_step)
+{
+}
+
+bool AbsControlStep::operator<(const AbsControlStep& other) const
+{
+   if(this->second != other.second)
+   {
+      return this->second < other.second;
+   }
+   return this->first < other.first;
+}
+
+Schedule::Schedule(const HLS_managerConstRef _hls_manager, const unsigned int _function_index,
+                   const ParameterConstRef _parameters)
+    : hls_manager(_hls_manager),
+      TM(_hls_manager->get_ir_manager()),
+      ir_man(new ir_manipulation(TM, _parameters, application_managerRef())),
+      allocation_information(_hls_manager->get_HLS(_function_index)->allocation_information),
+      function_index(_function_index),
+      tot_csteps(0),
+      op_graph(hls_manager.lock()->CGetFunctionBehavior(_function_index)->GetOpGraph(FunctionBehavior::FLSAODG)),
+      parameters(_parameters),
+      debug_level(_parameters->get_class_debug_level(GET_CLASS(*this)))
+{
+}
+
+void Schedule::print(fu_bindingRef Rfu) const
+{
+   std::map<AbsControlStep, OpVertexSet> csteps_partitions;
+   for(const auto v : op_graph.vertices())
+   {
+      const auto control_step = get_cstep(v);
+      if(csteps_partitions.find(control_step) == csteps_partitions.end())
+      {
+         csteps_partitions.insert(std::make_pair(control_step, OpVertexSet(&op_graph.GetGraphsCollection())));
+      }
+      auto& control_step_ops = csteps_partitions.at(control_step);
+      control_step_ops.insert(v);
+   }
+   for(const auto& control_step : csteps_partitions)
+   {
+      for(const auto op : control_step.second)
+      {
+         const auto& node_info = op_graph.CGetNodeInfo(op);
+         INDENT_OUT_MEX(0, 0,
+                        "---Operation " + node_info.vertex_name + "(" + node_info.GetOperation() + ")" +
+                            " scheduled at control step (" + STR(get_cstep(op).second) + "-" +
+                            STR(get_cstep_end(op).second) + ") " +
+                            (Rfu ? ("on functional unit " + Rfu->get_fu_name(op)) : ""));
+      }
+   }
+}
+
+class ScheduleWriter : public GraphWriter<OpGraph>
+{
+ private:
+   /// The schedule to be printed
+   const ScheduleConstRef sch;
+   const OpVertexSet* opSet;
+
+ public:
+   /**
+    * Constructor
+    * @param op_graph is the operation graph to be printed
+    * @param _sch is the schedule
+    */
+   ScheduleWriter(const OpGraph& op_graph, const ScheduleConstRef _sch, const OpVertexSet* _opSet = nullptr)
+       : GraphWriter<OpGraph>(op_graph, 0), sch(_sch), opSet(_opSet)
+   {
+   }
+
+   /**
+    * Redefinition of operator()
+    */
+   void operator()(std::ostream& os) const override
+   {
+      os << "//Scheduling solution\n";
+      os << "splines=ortho;\n";
+      std::map<unsigned int, UnorderedSetStdStable<OpGraph::vertex_descriptor>> inverse_relation;
+      for(const auto v : printing_graph.vertices())
+      {
+         if(!opSet || opSet->find(v) != opSet->end())
+         {
+            inverse_relation[sch->get_cstep(v).second].insert(v);
+         }
+      }
+      for(auto level = 0u; level < sch->get_csteps(); ++level)
+      {
+         os << "//Control Step: " << level << std::endl;
+         os << "CS" << level << " [style=plaintext]\n{rank=same; CS" << level << " ";
+         for(const auto operation : inverse_relation[level])
+         {
+            os << boost::get(boost::vertex_index_t(), printing_graph)[operation] << " ";
+         }
+         os << " ;}\n";
+      }
+      for(auto level = 1u; level < sch->get_csteps(); ++level)
+      {
+         os << "CS" << level - 1u << " -> CS" << level << ";\n";
+      }
+      for(auto level = 0u; level < sch->get_csteps(); ++level)
+      {
+         if(!inverse_relation[level].empty())
+         {
+            os << "CS" << level << " -> "
+               << boost::get(boost::vertex_index_t(), printing_graph)[*inverse_relation[level].begin()]
+               << " [style=invis weight=1000 color=dimgrey];\n";
+         }
+      }
+   }
+};
+
+void Schedule::writeDot(const std::filesystem::path& file_name) const
+{
+   OpVertexWriter op_label_writer(op_graph, 0);
+   OpEdgeWriter op_edge_property_writer(op_graph);
+   ScheduleWriter graph_writer(op_graph, ScheduleConstRef(this, null_deleter()));
+   op_graph.graph::writeDot(file_name, op_label_writer, op_edge_property_writer, graph_writer);
+}
+
+void Schedule::writeDot(const std::filesystem::path& file_name, const OpGraph& subgraph, const OpVertexSet& opSet) const
+{
+   OpVertexWriter op_label_writer(subgraph, 0);
+   OpEdgeWriter op_edge_property_writer(subgraph);
+   ScheduleWriter graph_writer(subgraph, ScheduleConstRef(this, null_deleter()), &opSet);
+   subgraph.graph::writeDot(file_name, op_label_writer, op_edge_property_writer, graph_writer);
+}
+
+void Schedule::set_execution(OpGraph::vertex_descriptor op, unsigned int c_step)
+{
+   const auto operation_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   if(op_starting_cycle.find(operation_index) == op_starting_cycle.end())
+   {
+      op_starting_cycle.emplace(operation_index, c_step);
+   }
+   else
+   {
+      op_starting_cycle.at(operation_index) = c_step;
+   }
+   starting_cycles_to_ops[c_step].insert(operation_index);
+}
+
+void Schedule::set_execution_end(OpGraph::vertex_descriptor op, unsigned int c_step_end)
+{
+   const auto operation_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   if(op_ending_cycle.find(operation_index) == op_ending_cycle.end())
+   {
+      op_ending_cycle.emplace(operation_index, c_step_end);
+   }
+   else
+   {
+      op_ending_cycle.at(operation_index) = c_step_end;
+   }
+}
+
+bool Schedule::is_scheduled(OpGraph::vertex_descriptor op) const
+{
+   const auto statement_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   return is_scheduled(statement_index);
+}
+
+bool Schedule::is_scheduled(const unsigned int statement_index) const
+{
+   return op_starting_cycle.find(statement_index) != op_starting_cycle.end();
+}
+
+AbsControlStep Schedule::get_cstep(OpGraph::vertex_descriptor op) const
+{
+   const auto operation_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   THROW_ASSERT(is_scheduled(op), "Operation " + op_graph.CGetNodeInfo(op).vertex_name + " has not been scheduled");
+   if(operation_index == ENTRY_ID)
+   {
+      return AbsControlStep(BB_ENTRY, op_starting_cycle.at(operation_index));
+   }
+   if(operation_index == EXIT_ID)
+   {
+      return AbsControlStep(BB_EXIT, op_starting_cycle.at(operation_index));
+   }
+   return AbsControlStep(GetPointer<const node_stmt>(TM->GetIRNode(operation_index))->bb_index,
+                         op_starting_cycle.at(operation_index));
+}
+
+AbsControlStep Schedule::get_cstep(const unsigned int operation_index) const
+{
+   THROW_ASSERT(op_starting_cycle.find(operation_index) != op_starting_cycle.end(),
+                "Operation " + STR(operation_index) + " has not been scheduled");
+   if(operation_index == ENTRY_ID)
+   {
+      return AbsControlStep(BB_ENTRY, op_starting_cycle.at(operation_index));
+   }
+   if(operation_index == EXIT_ID)
+   {
+      return AbsControlStep(BB_EXIT, op_starting_cycle.at(operation_index));
+   }
+   return AbsControlStep(GetPointer<const node_stmt>(TM->GetIRNode(operation_index))->bb_index,
+                         op_starting_cycle.at(operation_index));
+}
+
+AbsControlStep Schedule::get_cstep_end(OpGraph::vertex_descriptor op) const
+{
+   const auto statement_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   return get_cstep_end(statement_index);
+}
+
+AbsControlStep Schedule::get_cstep_end(const unsigned int statement_index) const
+{
+   THROW_ASSERT(is_scheduled(statement_index), "Operation " + STR(statement_index) + " has not been scheduled");
+   THROW_ASSERT(op_ending_cycle.find(statement_index) != op_ending_cycle.end(), "Ending step not stored");
+   if(statement_index == ENTRY_ID)
+   {
+      return AbsControlStep(BB_ENTRY, op_ending_cycle.at(statement_index));
+   }
+   if(statement_index == EXIT_ID)
+   {
+      return AbsControlStep(BB_EXIT, op_ending_cycle.at(statement_index));
+   }
+   return AbsControlStep(GetPointer<const node_stmt>(TM->GetIRNode(statement_index))->bb_index,
+                         op_ending_cycle.at(statement_index));
+}
+
+unsigned int Schedule::num_scheduled() const
+{
+   return static_cast<unsigned int>(op_starting_cycle.size());
+}
+
+void Schedule::clear()
+{
+   tot_csteps = 0u;
+   op_starting_cycle.clear();
+   starting_cycles_to_ops.clear();
+   loopPipelinedMap.clear();
+}
+
+void Schedule::remove_sched(OpGraph::vertex_descriptor op)
+{
+   const auto operation_index = op_graph.CGetNodeInfo(op).GetNodeId();
+   remove_sched(operation_index);
+}
+void Schedule::remove_sched(const unsigned int operation_index)
+{
+   if(op_starting_cycle.find(operation_index) == op_starting_cycle.end())
+   {
+      return;
+   }
+   auto cstep = op_starting_cycle.at(operation_index);
+   starting_cycles_to_ops.at(cstep).erase(operation_index);
+   op_starting_cycle.erase(operation_index);
+}
+
+void Schedule::UpdateTime(const unsigned int operation_index, bool update_cs)
+{
+   if(operation_index == ENTRY_ID or operation_index == EXIT_ID)
+   {
+      return;
+   }
+
+   const auto current_starting_time = starting_times[operation_index];
+   const auto current_ending_time = starting_times[operation_index];
+
+   CustomOrderedSet<const ssa_node*> rhs_ssa_uses;
+   const auto tn = TM->GetIRNode(operation_index);
+   const auto gn = GetPointer<const node_stmt>(tn);
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                  "-->Computing ending time of new statement " + STR(gn->index) + ": " + gn->ToString());
+   const auto hls = hls_manager.lock()->get_HLS(function_index);
+   const auto clock_period = hls->HLS_C->get_clock_period() * hls->HLS_C->get_clock_period_resource_fraction();
+   const auto margin = allocation_information->GetClockPeriodMargin();
+   const auto curr_bb_index = gn->bb_index;
+   THROW_ASSERT(curr_bb_index, "Basic block of " + gn->ToString() + " not set");
+   auto starting_time = 0.0;
+
+   /// The starting control step
+   auto starting_cs = 0u;
+   if(!update_cs)
+   {
+      starting_time = clock_period * double(op_starting_cycle.at(operation_index));
+   }
+   if(gn->get_kind() == assign_stmt_K)
+   {
+      ir_helper::compute_ssa_uses_rec_ptr(GetPointer<const assign_stmt>(tn)->op1, rhs_ssa_uses);
+   }
+   else if(gn->get_kind() == multi_way_if_stmt_K)
+   {
+      const auto gmwi = GetPointer<const multi_way_if_stmt>(tn);
+      for(const auto& cond : gmwi->list_of_cond)
+      {
+         if(cond.first)
+         {
+            ir_helper::compute_ssa_uses_rec_ptr(cond.first, rhs_ssa_uses);
+         }
+      }
+   }
+   else if(gn->get_kind() == phi_stmt_K or gn->get_kind() == nop_stmt_K)
+   {
+   }
+   else if(gn->get_kind() == return_stmt_K)
+   {
+      const auto gr = GetPointer<const return_stmt>(tn);
+      if(gr->op)
+      {
+         ir_helper::compute_ssa_uses_rec_ptr(gr->op, rhs_ssa_uses);
+      }
+   }
+   else if(gn->get_kind() == call_stmt_K)
+   {
+      ir_helper::compute_ssa_uses_rec_ptr(tn, rhs_ssa_uses);
+   }
+   else
+   {
+      THROW_UNREACHABLE("Compute new ending time of " + gn->ToString() + " (" + gn->get_kind_text() + ")");
+   }
+   for(const auto ssa_use : rhs_ssa_uses)
+   {
+      if(ssa_use->virtual_flag)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Virtual SSAs are not considered");
+         continue;
+      }
+      const auto def = ssa_use->GetDefStmt();
+      const auto def_gn = GetPointer<const node_stmt>(def);
+      if(def_gn->get_kind() == nop_stmt_K)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Parameter");
+         continue;
+      }
+      THROW_ASSERT(def_gn->bb_index,
+                   "Basic block of " + def_gn->ToString() + " which defines " + ssa_use->ToString() + " not set");
+      if(def_gn->bb_index != curr_bb_index)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "---Definition " + STR(def->index) + " - " + def->ToString() + " is in BB" +
+                            STR(curr_bb_index));
+         continue;
+      }
+      if(!allocation_information->is_operation_bounded(def->index))
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Defined by an unbounded statement");
+         continue;
+      }
+      THROW_ASSERT(ending_times.find(def_gn->index) != ending_times.end(), "Not possible because ending time of " +
+                                                                               def_gn->ToString() + " (which defines " +
+                                                                               ssa_use->ToString() + ") is unknown");
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Definition " + STR(def->index) + " - " + def->ToString() + " ends at " +
+                         STR(ending_times.at(def_gn->index)));
+
+      /// Compute the control step
+      if(get_cstep_end(def_gn->index).second > starting_cs)
+      {
+         starting_cs = get_cstep_end(def_gn->index).second;
+      }
+
+      /// Compute the remaining time
+      const auto ending_time = ending_times.at(def_gn->index);
+      const auto connection_time = allocation_information->GetConnectionTime(def_gn->index, operation_index);
+      if(ending_time + connection_time >= starting_time)
+      {
+         starting_time = ending_time + connection_time;
+      }
+   }
+   starting_times[operation_index] = starting_time;
+   const auto cycles = allocation_information->GetCycleLatency(gn->index);
+   if(cycles > 1)
+   {
+      /// Check if the first stage is across states; if so move a the beginning of the next state
+      const auto first_stage_latency =
+          allocation_information->is_operation_PI_registered(gn->index) ?
+              0.0 :
+              allocation_information->GetTimeLatency(gn->index, fu_binding::UNKNOWN).second;
+      auto first_stage_ending = starting_time + first_stage_latency;
+      if(first_stage_ending != 0.0 and
+         (floor((first_stage_ending + margin) / clock_period) != floor((starting_time) / clock_period)))
+      {
+         first_stage_ending = ((ceil((first_stage_ending + margin) / clock_period) + 1) * clock_period);
+      }
+      else
+      {
+         first_stage_ending = ((ceil((first_stage_ending + margin) / clock_period) * clock_period));
+      }
+      const auto other_cycles_latency =
+          (cycles - 2) * clock_period +
+          allocation_information->GetTimeLatency(gn->index, fu_binding::UNKNOWN, cycles - 1).second;
+      ending_times[operation_index] = first_stage_ending + other_cycles_latency;
+   }
+   else
+   {
+      const auto latency = allocation_information->GetTimeLatency(gn->index, fu_binding::UNKNOWN).first;
+      ending_times[operation_index] = starting_time + latency;
+      /// Checking if we are crossing a state
+      if(floor(
+             (ending_times[operation_index] + allocation_information->GetConnectionTime(operation_index, 0) + margin) /
+             clock_period) != floor(starting_times[operation_index] / clock_period))
+      {
+         starting_times[operation_index] = ceil(starting_times[operation_index] / clock_period) * clock_period;
+         ending_times[operation_index] = starting_times[operation_index] + latency;
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "---Fixed ending time is " + STR(ending_times[operation_index]));
+      }
+   }
+
+   /// True if the execution time of this operation has been updated
+   const bool updated_time = starting_times[operation_index] != current_starting_time or
+                             starting_times[operation_index] != current_ending_time;
+   if(updated_time)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Execution time updated from [" + STR(current_starting_time) + "---" +
+                         STR(current_ending_time) + "] to [" + STR(starting_times[operation_index]) + "---" +
+                         STR(ending_times[operation_index]) + "]");
+   }
+
+   if(update_cs)
+   {
+      /// Remove the old scheduling
+      if(is_scheduled(operation_index))
+      {
+         starting_cycles_to_ops[op_starting_cycle.at(operation_index)].erase(operation_index);
+      }
+      auto valS = static_cast<unsigned int>(floor(starting_times[operation_index] / clock_period));
+      if(op_starting_cycle.find(operation_index) == op_starting_cycle.end())
+      {
+         op_starting_cycle.emplace(operation_index, valS);
+      }
+      else
+      {
+         op_starting_cycle.at(operation_index) = valS;
+      }
+      auto valE = static_cast<unsigned int>(floor(ending_times[operation_index] / clock_period));
+      if(op_ending_cycle.find(operation_index) == op_ending_cycle.end())
+      {
+         op_ending_cycle.emplace(operation_index, valE);
+      }
+      else
+      {
+         op_ending_cycle.at(operation_index) = valE;
+      }
+   }
+   if(allocation_information->IsVariableExecutionTime(operation_index) and updated_time)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "-->Checking if simultaneous operations have to be rescheduled");
+      const auto reschedule = [&]() -> bool {
+         if(not is_scheduled(operation_index))
+         {
+            return false;
+         }
+         for(const auto simultaneous_operation : starting_cycles_to_ops[op_starting_cycle.at(operation_index)])
+         {
+            if(allocation_information->IsVariableExecutionTime(simultaneous_operation))
+            {
+               return true;
+            }
+         }
+         return false;
+      }();
+      /// Reschedule operation according the order of control flow graph; in this way we are sure that topological order
+      /// is followed; Skip operations prevoius to this control step since they have not to be rescheduled
+      if(reschedule)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Operations have to be rescheduled");
+         const auto current_cs = op_starting_cycle.at(operation_index);
+         const auto fd = GetPointer<const function_val_node>(TM->GetIRNode(function_index));
+         const auto sl = GetPointer<const statement_list_node>(fd->body);
+         for(const auto& stmt : sl->list_of_bloc.at(gn->bb_index)->CGetStmtList())
+         {
+            if(op_starting_cycle.at(stmt->index) >= current_cs and stmt->index != operation_index and
+               starting_times.find(stmt->index) != starting_times.end())
+            {
+               UpdateTime(stmt->index, true);
+            }
+         }
+      }
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "<--Checked if simultaneous operations have to be rescheduled");
+   }
+   /// Performed in this point to avoid check in the previous cycle
+   starting_cycles_to_ops[op_starting_cycle.at(operation_index)].insert(operation_index);
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                  "<--Scheduling is " + STR(starting_times.at(operation_index)) + "-" +
+                      STR(ending_times.at(operation_index)) + " Control steps: " +
+                      STR(op_starting_cycle.at(operation_index)) + "-" + STR(op_ending_cycle.at(operation_index)));
+}
+
+FunctionFrontendFlowStep_Movable Schedule::CanBeMoved(const unsigned int statement_index,
+                                                      const unsigned int basic_block_index) const
+{
+   const auto tn = TM->GetIRNode(statement_index);
+   THROW_ASSERT(basic_block_index, "Trying to move " + tn->ToString() + " to BB0");
+   const auto hls = hls_manager.lock()->get_HLS(function_index);
+   const FunctionBehaviorConstRef FB = hls_manager.lock()->CGetFunctionBehavior(hls->functionId);
+   const auto behavioral_helper = FB->CGetBehavioralHelper();
+   if(not behavioral_helper->CanBeMoved(statement_index))
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "<--No because it is artificial and cannot be moved by default");
+      return FunctionFrontendFlowStep_Movable::UNMOVABLE;
+   }
+   const auto clock_period = hls->HLS_C->get_clock_period() * hls->HLS_C->get_clock_period_resource_fraction();
+   const auto clock_period_margin = allocation_information->GetClockPeriodMargin();
+   double bb_ending_time = GetBBEndingTime(basic_block_index);
+   const auto ga = GetPointer<const assign_stmt>(tn);
+   const auto gc = GetPointer<const call_stmt>(tn);
+   THROW_ASSERT(ga || gc, "Asking if " + tn->ToString() + " can be moved");
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "-->Checking if " + tn->ToString() + " can be moved");
+   if(gc && gc->fn->get_kind() == addr_node_K)
+   {
+      const auto ae = GetPointerS<const addr_node>(gc->fn);
+      if(ae->op->get_kind() == function_val_node_K)
+      {
+         const auto fu_name = ir_helper::GetFunctionName(ae->op);
+         if(fu_name == "abort" || fu_name == "exit")
+         {
+            INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--No because it is a terminating call");
+            return FunctionFrontendFlowStep_Movable::UNMOVABLE;
+         }
+      }
+   }
+   if(behavioral_helper->IsLoad(statement_index))
+   {
+      bool loadCanBePredicated = false;
+      const auto is_predicable_load_base = [&](const ir_nodeRef& node) {
+         auto var = ir_helper::GetBaseVariable(node);
+         if(!var)
+         {
+            return false;
+         }
+         const auto vd = GetPointer<const variable_val_node>(var);
+         return vd && (vd->static_flag || (vd->parent && vd->parent->get_kind() != module_unit_node_K));
+      };
+      if(ga)
+      {
+         if(is_predicable_load_base(ga->op1))
+         {
+            loadCanBePredicated = true;
+         }
+      }
+      else
+      {
+         for(const auto& arg : gc->args)
+         {
+            if(is_predicable_load_base(arg))
+            {
+               loadCanBePredicated = true;
+               break;
+            }
+         }
+      }
+      if(loadCanBePredicated)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---LOAD can be predicated");
+      }
+      if(!loadCanBePredicated)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--No because it is a load");
+         return FunctionFrontendFlowStep_Movable::UNMOVABLE;
+      }
+   }
+
+   const bool unbounded_operation = not allocation_information->is_operation_bounded(statement_index);
+   if(unbounded_operation)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--No because it is unbounded");
+      return FunctionFrontendFlowStep_Movable::UNMOVABLE;
+   }
+   const auto cycles = allocation_information->GetCycleLatency(statement_index);
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Cycles: " + STR(cycles));
+   if(cycles > 1)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--No because it is multi-cycle");
+      return FunctionFrontendFlowStep_Movable::UNMOVABLE;
+   }
+   const auto latency = allocation_information->GetTimeLatency(statement_index, fu_binding::UNKNOWN).first;
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Latency: " + STR(latency));
+
+   double new_ending_time = 0.0;
+   CustomOrderedSet<const ssa_node*> rhs_ssa_uses;
+   if(ga)
+   {
+      ir_helper::compute_ssa_uses_rec_ptr(ga->op1, rhs_ssa_uses);
+   }
+   else
+   {
+      ir_helper::compute_ssa_uses_rec_ptr(gc->fn, rhs_ssa_uses);
+      for(const auto& arg : gc->args)
+      {
+         ir_helper::compute_ssa_uses_rec_ptr(arg, rhs_ssa_uses);
+      }
+   }
+   for(const auto ssa_use : rhs_ssa_uses)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Considering used ssa " + STR(ssa_use->index) + " - " + ssa_use->ToString());
+      const auto def = ssa_use->GetDefStmt();
+      const auto gn = GetPointer<const node_stmt>(def);
+      if(gn->bb_index != basic_block_index)
+      {
+         /// Moved in a basic block after the definition - there cannot be problem of chaining
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "---Defined in a different basic block from the current (BB" + STR(gn->bb_index) + " BB" +
+                            STR(basic_block_index) + ")");
+         continue;
+      }
+      THROW_ASSERT(ending_times.find(gn->index) != ending_times.end(),
+                   "Ending time of " + gn->ToString() + " is not available");
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Definition " + STR(def->index) + " - " + def->ToString() + " ends at " +
+                         STR(ending_times.at(gn->index)));
+      if(!allocation_information->is_operation_bounded(def->index))
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Defined by an unbounded statement");
+         continue;
+      }
+      /// Compute the remaining time
+      const auto ending_time =
+          ending_times.at(gn->index) + allocation_information->GetConnectionTime(gn->index, statement_index);
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Ending time + connection delay of predecessor is " + STR(ending_time));
+      const auto operation_margin =
+          (ceil(ending_time / clock_period) * clock_period) - ending_time - clock_period_margin;
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Connection time to phi is " +
+                         STR(allocation_information->GetConnectionTime(statement_index, 0)));
+      if(operation_margin > latency + allocation_information->GetConnectionTime(statement_index, 0))
+      {
+         if(ending_time + latency > new_ending_time)
+         {
+            new_ending_time = ending_time + latency;
+         }
+         continue;
+      }
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Ending time of this operation: " + STR((ceil(ending_time / clock_period) * clock_period)) +
+                         " + " + STR(latency) + " + " + STR(clock_period) + " = " +
+                         STR((ceil(ending_time / clock_period) * clock_period) + latency + clock_period_margin));
+      /// Operation is scheduled at the beginning of the next control step
+      if(((ceil(ending_time / clock_period) * clock_period) + latency + clock_period_margin) > new_ending_time)
+      {
+         new_ending_time = ((ceil(ending_time / clock_period) * clock_period) + latency);
+      }
+      /// Check if this operation ends not in the last control step
+      if(ceil(bb_ending_time / clock_period) * clock_period < (ceil(new_ending_time / clock_period) * clock_period))
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "<--No because it can increase the latency of a previous BB: " + STR(bb_ending_time) + " vs. " +
+                            STR(new_ending_time));
+         return FunctionFrontendFlowStep_Movable::TIMING;
+      }
+   }
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                  "<--Yes because of chaining - New ending time is " + STR(new_ending_time));
+   return FunctionFrontendFlowStep_Movable::MOVABLE;
+}
+
+bool Schedule::EvaluateCondsMerging(const unsigned statement_index, const unsigned int first_condition,
+                                    const unsigned second_condition, unsigned int function_decl_nid) const
+{
+   if(not first_condition or not second_condition)
+   {
+      return true;
+   }
+   if(TM->GetIRNode(first_condition)->get_kind() == constant_int_val_node_K or
+      TM->GetIRNode(second_condition)->get_kind() == constant_int_val_node_K)
+   {
+      return true;
+   }
+   const auto statement = GetPointer<const node_stmt>(TM->GetIRNode(statement_index));
+   const auto or_result = ir_man->CreateOrExpr(TM->GetIRNode(first_condition), TM->GetIRNode(second_condition),
+                                               blocRef(), function_decl_nid);
+   const auto or_ending_time =
+       std::max(GetReadyTime(first_condition, statement->bb_index),
+                GetReadyTime(second_condition, statement->bb_index)) +
+       allocation_information
+           ->GetTimeLatency(GetPointer<const ssa_node>(or_result)->GetDefStmt()->index, fu_binding::UNKNOWN)
+           .first;
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                  "---Checking if merging of conditions can be put at then end BB" + STR(statement->bb_index) +
+                      " (ending with " + statement->ToString());
+   return or_ending_time < GetBBEndingTime(statement->bb_index);
+}
+
+bool Schedule::EvaluateMultiWayIfsMerging(const unsigned int first_statement_index,
+                                          const unsigned int second_statement_index,
+                                          unsigned int function_decl_nid) const
+{
+   const auto hls = hls_manager.lock()->get_HLS(function_index);
+   const auto list_of_block =
+       GetPointer<statement_list_node>(GetPointer<const function_val_node>(TM->GetIRNode(function_index))->body)
+           ->list_of_bloc;
+   const auto first_statement = TM->GetIRNode(first_statement_index);
+   const auto second_statement = TM->GetIRNode(second_statement_index);
+   const auto first_basic_block = GetPointer<const node_stmt>(first_statement)->bb_index;
+   const auto first_block = list_of_block.at(first_basic_block);
+   const auto second_basic_block = GetPointer<const node_stmt>(second_statement)->bb_index;
+   /// Note that we compute ending times only for the longest newly created condition; existing condition can be worse
+   const auto new_ending_time = [=, this]() -> double {
+      if(first_statement->get_kind() == multi_way_if_stmt_K and second_statement->get_kind() == multi_way_if_stmt_K)
+      {
+         const auto first_gmwi = GetPointer<const multi_way_if_stmt>(first_statement);
+         const auto second_gmwi = GetPointer<const multi_way_if_stmt>(second_statement);
+
+         const auto default_basic_block = first_gmwi->list_of_cond.back().second;
+         if(default_basic_block != second_basic_block)
+         {
+            for(const auto& first_cond : first_gmwi->list_of_cond)
+            {
+               if(first_cond.second == second_basic_block)
+               {
+                  auto current_condition = first_cond.first;
+                  auto current_ending_time = GetReadyTime(first_cond.first->index, first_basic_block);
+                  for(const auto& second_cond : second_gmwi->list_of_cond)
+                  {
+                     if(second_cond.first)
+                     {
+                        const auto not_operation =
+                            ir_man->CreateNotExpr(second_cond.first, blocRef(), function_decl_nid);
+                        const auto cond_delay = GetReadyTime(second_cond.first->index, first_basic_block);
+                        const auto not_ending_time =
+                            cond_delay +
+                            allocation_information->GetTimeLatency(not_operation->index, fu_binding::UNKNOWN).first;
+                        const auto and_operation = ir_man->CreateAndExpr(
+                            GetPointer<const assign_stmt>(current_condition)->op0,
+                            GetPointer<const assign_stmt>(not_operation)->op0, blocRef(), function_decl_nid);
+                        current_condition = and_operation;
+                        current_ending_time =
+                            std::max(not_ending_time, current_ending_time) +
+                            allocation_information->GetTimeLatency(and_operation->index, fu_binding::UNKNOWN).first;
+                     }
+                  }
+                  return current_ending_time;
+               }
+            }
+            THROW_UNREACHABLE("");
+         }
+         else
+         {
+            auto current_condition = ir_nodeRef();
+            auto current_ending_time = 0.0;
+            for(const auto& cond : first_gmwi->list_of_cond)
+            {
+               if(cond.first)
+               {
+                  const auto not_operation = ir_man->CreateNotExpr(cond.first, blocRef(), function_decl_nid);
+                  const auto not_ending_time = GetReadyTime(cond.first->index, first_basic_block);
+                  const auto and_operation =
+                      current_condition ? ir_man->CreateAndExpr(GetPointer<const assign_stmt>(current_condition)->op0,
+                                                                cond.first, blocRef(), function_decl_nid) :
+                                          not_operation;
+                  const auto and_ending_time =
+                      current_condition ?
+                          std::max(not_ending_time, current_ending_time) +
+                              allocation_information->GetTimeLatency(and_operation->index, fu_binding::UNKNOWN).first :
+                          not_ending_time;
+                  current_condition = and_operation;
+                  current_ending_time = and_ending_time;
+               }
+            }
+            for(const auto& cond : second_gmwi->list_of_cond)
+            {
+               if(cond.first)
+               {
+                  const auto and_operation = ir_man->CreateAndExpr(
+                      GetPointer<const assign_stmt>(current_condition)->op0, cond.first, blocRef(), function_decl_nid);
+                  const auto and_ending_time =
+                      std::max(current_ending_time, GetReadyTime(cond.first->index, first_basic_block)) +
+                      allocation_information->GetTimeLatency(and_operation->index, fu_binding::UNKNOWN).first;
+                  current_ending_time = std::max(and_ending_time, current_ending_time);
+               }
+            }
+            return current_ending_time;
+         }
+      }
+      else
+      {
+         THROW_UNREACHABLE("");
+         return 0.0;
+      }
+      THROW_UNREACHABLE("");
+      return 0.0;
+   }();
+   return new_ending_time < GetBBEndingTime(first_basic_block) ? true : false;
+}
+
+double Schedule::GetReadyTime(const unsigned int ir_node_index, const unsigned int basic_block_index) const
+{
+   const auto sn = GetPointer<const ssa_node>(TM->GetIRNode(ir_node_index));
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "-->Computing ready time of " + sn->ToString());
+   const auto def = GetPointer<node_stmt>(sn->GetDefStmt());
+   if(def->get_kind() == phi_stmt_K)
+   {
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--0.0");
+      return 0.0;
+   }
+   if(def->get_kind() == assign_stmt_K)
+   {
+      if(def->bb_index != basic_block_index)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--0.0");
+         return 0.0;
+      }
+      THROW_ASSERT(ending_times.find(def->index) != ending_times.end(),
+                   "Ending time of " + def->ToString() + " not found");
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--" + STR(ending_times.at(def->index)));
+      return ending_times.at(def->index);
+   }
+   THROW_UNREACHABLE("");
+   return 0.0;
+}
+
+double Schedule::GetBBEndingTime(const unsigned int basic_block_index) const
+{
+   const auto hls = hls_manager.lock()->get_HLS(function_index);
+   const auto clock_period = hls->HLS_C->get_clock_period() * hls->HLS_C->get_clock_period_resource_fraction();
+   const auto margin = allocation_information->GetClockPeriodMargin();
+   const auto tn = TM->GetIRNode(function_index);
+   const auto fd = GetPointer<const function_val_node>(tn);
+   THROW_ASSERT(GetPointer<statement_list_node>(fd->body)->list_of_bloc.find(basic_block_index) !=
+                    GetPointer<statement_list_node>(fd->body)->list_of_bloc.end(),
+                "BB" + STR(basic_block_index) + " not found");
+   const auto block = GetPointer<statement_list_node>(fd->body)->list_of_bloc.at(basic_block_index);
+   const auto stmt_list = block->CGetStmtList();
+   if(stmt_list.size() == 0)
+   {
+      return 0.0;
+   }
+   const auto ending_time =
+       std::max_element(stmt_list.begin(), stmt_list.end(), [=, this](const ir_nodeRef first, const ir_nodeRef second) {
+          if(ending_times.find(first->index) != ending_times.end() &&
+             ending_times.find(second->index) != ending_times.end())
+          {
+             return ending_times.at(first->index) < ending_times.at(second->index);
+          }
+          else
+          {
+             if(ending_times.find(first->index) == ending_times.end() &&
+                ending_times.find(second->index) == ending_times.end())
+             {
+                return first->index < second->index;
+             }
+             else
+             {
+                return ending_times.find(first->index) == ending_times.end();
+             }
+          }
+       });
+   THROW_ASSERT(ending_time != stmt_list.end(), "");
+   return ceil((ending_times.at((*ending_time)->index) + margin) / clock_period) * clock_period;
+}
+
+double Schedule::GetEndingTime(const unsigned int operation_index) const
+{
+   if(operation_index == ENTRY_ID or operation_index == EXIT_ID)
+   {
+      return 0.0;
+   }
+   THROW_ASSERT(ending_times.find(operation_index) != ending_times.end(),
+                "Ending time of operation " + STR(TM->GetIRNode(operation_index)) + " not found");
+   return ending_times.at(operation_index);
+}
+
+double Schedule::GetStartingTime(const unsigned int operation_index) const
+{
+   if(operation_index == ENTRY_ID or operation_index == EXIT_ID)
+   {
+      return 0.0;
+   }
+   THROW_ASSERT(starting_times.find(operation_index) != starting_times.end(),
+                "Starting time of operation " + STR(operation_index) + " not found");
+   return starting_times.at(operation_index);
+}
+
+double Schedule::get_fo_correction(unsigned int first_operation, unsigned int second_operation) const
+{
+   return allocation_information->GetConnectionTime(first_operation, second_operation, false);
+}
+
+const std::string Schedule::PrintTimingInformation(const unsigned int statement_index) const
+{
+   return "[" + NumberToString(GetStartingTime(statement_index), 2, 7) + "---" +
+          NumberToString(GetEndingTime(statement_index), 2, 7) + "(" +
+          NumberToString(GetEndingTime(statement_index) - GetStartingTime(statement_index), 2, 7) + ")" + "]";
+}
+
+class StartingTimeSorter
+{
+ protected:
+   /// The starting time
+   const CustomMap<unsigned int, double>& starting_times;
+
+ public:
+   /**
+    * The constructor
+    * @param starting_time is the starting time of each operation
+    */
+   explicit StartingTimeSorter(const CustomMap<unsigned int, double>& _starting_times) : starting_times(_starting_times)
+   {
+   }
+
+   /**
+    * Compare position of two operations
+    * @param x is the index of the first operation
+    * @param y is the index of the second operation
+    * @return true if starting time of x is before starting time of y
+    */
+   bool operator()(const unsigned int x, const unsigned int y) const
+   {
+      if(starting_times.at(x) == starting_times.at(y))
+      {
+         return x < y;
+      }
+      else
+      {
+         return starting_times.at(x) < starting_times.at(y);
+      }
+   }
+};
+
+template <>
+CustomSet<unsigned int> Schedule::ComputeCriticalPath<FSMInfo::stateData>(const FSMInfo::stateData& state_info) const
+{
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "-->Considering operations of state " + state_info.name);
+
+   /// The set of operations which are in the critical path of the current basic block
+   CustomSet<unsigned int> critical_paths;
+   /// Computing ending time of state
+   double ending_state_time = 0;
+   for(const auto starting_operation : state_info.startingOperations)
+   {
+      const auto node_id = op_graph.CGetNodeInfo(starting_operation).GetNodeId();
+      if(node_id == ENTRY_ID or node_id == EXIT_ID)
+      {
+         continue;
+      }
+      const auto stmt = TM->GetIRNode(node_id);
+      if(stmt->get_kind() == phi_stmt_K)
+      {
+         continue;
+      }
+      const bool found = std::find(state_info.endingOperations.begin(), state_info.endingOperations.end(),
+                                   starting_operation) != state_info.endingOperations.end();
+      const auto ending_time =
+          found ? ending_times.at(stmt->index) :
+                  starting_times.at(stmt->index) +
+                      (allocation_information->is_operation_PI_registered(stmt->index) ?
+                           0.0 :
+                           allocation_information->GetTimeLatency(stmt->index, fu_binding::UNKNOWN).second);
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Ending time of " + stmt->ToString() + " is " + STR(ending_time));
+      if(ending_time > ending_state_time)
+      {
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "---Updating ending time to " + STR(ending_time) + " because of " + stmt->ToString());
+         ending_state_time = ending_time;
+      }
+   }
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Ending time of state is " + STR(ending_state_time));
+
+   std::set<unsigned int, StartingTimeSorter> to_be_processed =
+       std::set<unsigned int, StartingTimeSorter>(StartingTimeSorter(starting_times));
+   for(const auto starting_operation : state_info.startingOperations)
+   {
+      const auto node_id = op_graph.CGetNodeInfo(starting_operation).GetNodeId();
+      if(node_id == ENTRY_ID or node_id == EXIT_ID)
+      {
+         continue;
+      }
+      const auto stmt = TM->GetIRNode(node_id);
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                     "---Stmt " + stmt->ToString() + " ends at " + STR(ending_times.at(stmt->index)));
+      const bool found = std::find(state_info.endingOperations.begin(), state_info.endingOperations.end(),
+                                   starting_operation) != state_info.endingOperations.end();
+      const auto ending_time =
+          found ? ending_times.at(stmt->index) :
+                  starting_times.at(stmt->index) +
+                      (allocation_information->is_operation_PI_registered(stmt->index) ?
+                           0.0 :
+                           allocation_information->GetTimeLatency(stmt->index, fu_binding::UNKNOWN).second);
+      if(ending_time == ending_state_time)
+      {
+         to_be_processed.insert(stmt->index);
+         critical_paths.insert(stmt->index);
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Adding " + stmt->ToString() + " to critical path");
+      }
+   }
+   while(to_be_processed.size())
+   {
+      const auto last = *(to_be_processed.rbegin());
+      const auto starting_time = starting_times.at(last);
+      to_be_processed.erase(last);
+      const auto stmt_tn = TM->GetIRNode(last);
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "-->Processing " + stmt_tn->ToString());
+      const auto gn = GetPointer<const node_stmt>(stmt_tn);
+      CustomOrderedSet<const ssa_node*> rhs_ssa_uses;
+      if(gn->get_kind() == assign_stmt_K)
+      {
+         ir_helper::compute_ssa_uses_rec_ptr(GetPointer<const assign_stmt>(stmt_tn)->op1, rhs_ssa_uses);
+      }
+      else if(gn->get_kind() == multi_way_if_stmt_K)
+      {
+         const auto gmwi = GetPointer<const multi_way_if_stmt>(stmt_tn);
+         for(const auto& cond : gmwi->list_of_cond)
+         {
+            if(cond.first)
+            {
+               ir_helper::compute_ssa_uses_rec_ptr(cond.first, rhs_ssa_uses);
+            }
+         }
+      }
+      else if(gn->get_kind() == phi_stmt_K or gn->get_kind() == nop_stmt_K)
+      {
+      }
+      else if(gn->get_kind() == return_stmt_K)
+      {
+         const auto gr = GetPointer<const return_stmt>(stmt_tn);
+         if(gr->op)
+         {
+            ir_helper::compute_ssa_uses_rec_ptr(gr->op, rhs_ssa_uses);
+         }
+      }
+      else if(gn->get_kind() == call_stmt_K)
+      {
+         ir_helper::compute_ssa_uses_rec_ptr(stmt_tn, rhs_ssa_uses);
+      }
+      else
+      {
+         THROW_UNREACHABLE("Computing critical path analyzing " + gn->ToString() + " (" + gn->get_kind_text() + ")");
+      }
+      for(const auto ssa_use : rhs_ssa_uses)
+      {
+         if(ssa_use->virtual_flag)
+         {
+            INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Virtual SSAs are not considered");
+            continue;
+         }
+         const auto def = ssa_use->GetDefStmt();
+         const auto def_gn = GetPointer<const node_stmt>(def);
+         if(def_gn->get_kind() == nop_stmt_K)
+         {
+            INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "---Parameter");
+            continue;
+         }
+         THROW_ASSERT(def_gn->bb_index,
+                      "Basic block of " + def_gn->ToString() + " which defines " + ssa_use->ToString() + " not set");
+         if(state_info.bbId != def_gn->bb_index)
+         {
+            INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                           "---Definition " + STR(def->index) + " - " + def->ToString() + " is in other state");
+            continue;
+         }
+         THROW_ASSERT(ending_times.find(def_gn->index) != ending_times.end(),
+                      "Not possible because ending time of " + def_gn->ToString() + " (which defines " +
+                          ssa_use->ToString() + ") is unknown");
+         INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                        "---Definition " + STR(def->index) + " - " + def->ToString() + " ends at " +
+                            STR(ending_times.at(def_gn->index)));
+         /// Compute the remaining time
+         const auto ending_time = ending_times.at(def_gn->index);
+         if(ending_time + allocation_information->GetConnectionTime(def_gn->index, last) == starting_time)
+         {
+            to_be_processed.insert(def_gn->index);
+            critical_paths.insert(def_gn->index);
+            INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level,
+                           "---Adding " + def_gn->ToString() + " to critical path");
+         }
+      }
+      INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--Processed " + stmt_tn->ToString());
+   }
+   INDENT_DBG_MEX(DEBUG_LEVEL_VERY_PEDANTIC, debug_level, "<--Computed critical path in state " + state_info.name);
+   return critical_paths;
+}
+
+void Schedule::Initialize()
+{
+   TM = hls_manager.lock()->get_ir_manager();
+   allocation_information = hls_manager.lock()->get_HLS(function_index)->allocation_information;
+   tot_csteps = 0;
+   op_starting_cycle.clear();
+   op_ending_cycle.clear();
+   starting_times.clear();
+   ending_times.clear();
+   op_slack.clear();
+   loopPipelinedMap.clear();
+}

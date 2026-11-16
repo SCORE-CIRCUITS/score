@@ -1,104 +1,157 @@
-#!/bin/bash
-# Add all optional RTL generation tools as submodules
-# This script adds repositories from the "RTL Generation Tools (Optional Integration)" section
-
-set -e  # Exit on error
+#!/usr/bin/env bash
+#
+# Add or initialize optional RTL generation and HLS tools as submodules
+# Repositories cover HLS frameworks, Meta-HDLs, and specialized register generators.
+#
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
 # shellcheck source=scripts/common_logging.sh
 source "$SCRIPT_DIR/common_logging.sh"
 init_script_logging add-optional-tools
 
-# List of repositories to add as submodules
-# Format: "repo-name git-url local-path"
-
-REPOSITORIES=(
+# List of optional RTL generation tools:
+# Format: "name primary_url fallback_url local_path category"
+TOOLS_REGISTRY=(
     # High-Level Synthesis (HLS) Tools
-    "xls git@github.com:google/xls.git tools/xls"
-    "aha git@github.com:StanfordAHA/aha.git tools/aha"
-    "bambu git@github.com:ferrandi/PandA-bambu.git tools/bambu"
-    "pipelinec git@github.com:JulianKemmerer/PipelineC.git tools/pipelinec"
+    "xls https://github.com/SCORE-CIRCUITS/xls.git https://github.com/google/xls.git tools/xls HLS"
+    "aha https://github.com/SCORE-CIRCUITS/aha.git https://github.com/StanfordAHA/aha.git tools/aha HLS"
+    "bambu https://github.com/SCORE-CIRCUITS/PandA-bambu.git https://github.com/ferrandi/PandA-bambu.git tools/bambu HLS"
+    "pipelinec https://github.com/SCORE-CIRCUITS/PipelineC.git https://github.com/JulianKemmerer/PipelineC.git tools/pipelinec HLS"
 
     # Hardware Construction Languages (Meta-HDLs)
-    "amaranth git@github.com:amaranth-lang/amaranth.git tools/amaranth"
-    "chisel git@github.com:chipsalliance/chisel.git tools/chisel"
-    "spinalhdl git@github.com:SpinalHDL/SpinalHDL.git tools/spinalhdl"
-    "myhdl git@github.com:myhdl/myhdl.git tools/myhdl"
-    "pymtl3 git@github.com:pymtl/pymtl3.git tools/pymtl3"
-
-    # Hardware Intermediate Representations
+    "amaranth https://github.com/SCORE-CIRCUITS/amaranth.git https://github.com/amaranth-lang/amaranth.git tools/amaranth Meta-HDL"
+    "chisel https://github.com/SCORE-CIRCUITS/chisel.git https://github.com/chipsalliance/chisel.git tools/chisel Meta-HDL"
+    "spinalhdl https://github.com/SCORE-CIRCUITS/SpinalHDL.git https://github.com/SpinalHDL/SpinalHDL.git tools/spinalhdl Meta-HDL"
+    "myhdl https://github.com/SCORE-CIRCUITS/myhdl.git https://github.com/myhdl/myhdl.git tools/myhdl Meta-HDL"
+    "pymtl3 https://github.com/SCORE-CIRCUITS/pymtl3.git https://github.com/pymtl/pymtl3.git tools/pymtl3 Meta-HDL"
 
     # Specialized RTL Generators
-    "peakrdl git@github.com:SystemRDL/PeakRDL.git tools/peakrdl"
-    "rggen git@github.com:rggen/rggen.git tools/rggen"
+    "peakrdl https://github.com/SCORE-CIRCUITS/PeakRDL.git https://github.com/SystemRDL/PeakRDL.git tools/peakrdl Generator"
+    "rggen https://github.com/SCORE-CIRCUITS/rggen.git https://github.com/rggen/rggen.git tools/rggen Generator"
 )
 
-echo "🚀 Starting to add optional RTL generation tools as submodules..."
-echo "📦 Total repositories to add: ${#REPOSITORIES[@]}"
-echo ""
+SHALLOW=true
+STATUS_ONLY=false
+SELECTED_TARGETS=()
 
-# Track success/failure
-SUCCESS_COUNT=0
-FAILURE_COUNT=0
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [tool1 tool2 ...]
 
-for repo_info in "${REPOSITORIES[@]}"; do
-    # Parse repo info (name url path)
-    IFS=' ' read -r REPO_NAME GIT_URL LOCAL_PATH <<< "$repo_info"
+Manages and initializes optional RTL generation, HLS, and Meta-HDL tools.
 
-    echo "➕ Adding $REPO_NAME..."
-    echo "   📦 Repository: $GIT_URL"
-    echo "   📂 Path: $LOCAL_PATH"
-    echo ""
+Supported tools:
+  HLS:          xls, aha, bambu, pipelinec
+  Meta-HDLs:    amaranth, chisel, spinalhdl, myhdl, pymtl3
+  Generators:   peakrdl, rggen
 
-    # Check if path already exists
-    if [ -e "$LOCAL_PATH" ]; then
-        echo "⚠️  Warning: Path '$LOCAL_PATH' already exists, skipping..."
-        echo ""
-        continue
-    fi
+Options:
+  -h, --help       Show this help message
+  --no-shallow     Perform full git history clone instead of shallow (--depth 1)
+  --status         Only display current checkout status of optional tools
 
-    # Check if already a submodule
-    if git submodule status "$LOCAL_PATH" 2>/dev/null | grep -q "$LOCAL_PATH"; then
-        echo "⚠️  Warning: '$LOCAL_PATH' is already configured as a submodule, skipping..."
-        echo ""
-        continue
-    fi
+Examples:
+  $(basename "$0")                     # Add/init all optional tools (shallow)
+  $(basename "$0") amaranth pipelinec  # Add/init only specific tools
+  $(basename "$0") --status            # Show checkout status table
+EOF
+}
 
-    # Add the submodule
-    echo "🔄 Adding submodule..."
-    if git submodule add "$GIT_URL" "$LOCAL_PATH"; then
-        echo "✅ Successfully added $REPO_NAME"
-        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-    else
-        echo "❌ Failed to add $REPO_NAME"
-        FAILURE_COUNT=$((FAILURE_COUNT + 1))
-    fi
-    echo ""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --no-shallow) SHALLOW=false; shift ;;
+        --status) STATUS_ONLY=true; shift ;;
+        -*) log_error "Unknown option: $1"; usage; exit 1 ;;
+        *) SELECTED_TARGETS+=("$1"); shift ;;
+    esac
 done
 
-echo "📊 Summary:"
-echo "   ✅ Successfully added: $SUCCESS_COUNT repositories"
-echo "   ❌ Failed to add: $FAILURE_COUNT repositories"
-echo ""
-
-if [ $FAILURE_COUNT -eq 0 ]; then
-    echo "🎉 All repositories added successfully!"
-    echo ""
-    echo "📝 Next steps:"
-    echo "   1. Initialize submodules: git submodule update --init --recursive"
-    echo "   2. Commit the changes: git add .gitmodules && git commit -m 'Add optional RTL generation tools as submodules'"
-    echo "   3. The repositories are now available in the tools/ directory"
-else
-    echo "⚠️  Some repositories failed to add. Please check the errors above."
-    echo "   You may need to:"
-    echo "   - Check your internet connection"
-    echo "   - Verify the repository URLs are correct"
-    echo "   - Check if you have sufficient permissions"
+if [[ "$STATUS_ONLY" == "true" ]]; then
+    echo "=========================================================================================="
+    printf "%-12s %-10s %-18s %-45s\n" "TOOL" "CATEGORY" "STATUS" "COMMIT / PATH"
+    echo "=========================================================================================="
+    for entry in "${TOOLS_REGISTRY[@]}"; do
+        read -r NAME PRIMARY_URL FALLBACK_URL LOCAL_PATH CATEGORY <<< "$entry"
+        ABS_PATH="$PROJECT_ROOT/$LOCAL_PATH"
+        if [[ -d "$ABS_PATH" && -e "$ABS_PATH/.git" ]]; then
+            COMMIT="$(git -C "$ABS_PATH" rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+            printf "%-12s %-10s \033[0;32m%-18s\033[0m %-45s\n" "$NAME" "$CATEGORY" "Initialized" "[$COMMIT] $LOCAL_PATH"
+        elif [[ -d "$ABS_PATH" ]]; then
+            printf "%-12s %-10s \033[0;33m%-18s\033[0m %-45s\n" "$NAME" "$CATEGORY" "Dir exists (no git)" "$LOCAL_PATH"
+        else
+            printf "%-12s %-10s \033[0;90m%-18s\033[0m %-45s\n" "$NAME" "$CATEGORY" "Not checked out" "$LOCAL_PATH"
+        fi
+    done
+    echo "=========================================================================================="
+    exit 0
 fi
 
-echo ""
-echo "📋 Added repositories:"
-for repo_info in "${REPOSITORIES[@]}"; do
-    IFS=' ' read -r REPO_NAME GIT_URL LOCAL_PATH <<< "$repo_info"
-    echo "   • $REPO_NAME -> $LOCAL_PATH"
+is_selected() {
+    local target="$1"
+    if [[ ${#SELECTED_TARGETS[@]} -eq 0 ]]; then
+        return 0
+    fi
+    for s in "${SELECTED_TARGETS[@]}"; do
+        if [[ "$s" == "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+log_info "Evaluating optional RTL generation tools..."
+
+SUCCESS_COUNT=0
+SKIPPED_COUNT=0
+FAILURE_COUNT=0
+
+for entry in "${TOOLS_REGISTRY[@]}"; do
+    read -r NAME PRIMARY_URL FALLBACK_URL LOCAL_PATH CATEGORY <<< "$entry"
+
+    if ! is_selected "$NAME"; then
+        continue
+    fi
+
+    ABS_PATH="$PROJECT_ROOT/$LOCAL_PATH"
+
+    if [[ -d "$ABS_PATH" && -e "$ABS_PATH/.git" ]]; then
+        COMMIT="$(git -C "$ABS_PATH" rev-parse --short HEAD 2>/dev/null || echo 'HEAD')"
+        log_success "[$CATEGORY] $NAME is already initialized at $LOCAL_PATH ($COMMIT)"
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        continue
+    fi
+
+    log_info "[$CATEGORY] Adding submodule for $NAME -> $LOCAL_PATH"
+
+    CLONE_OPTS=("-f")
+    if [[ "$SHALLOW" == "true" ]]; then
+        CLONE_OPTS+=("--depth" "1")
+    fi
+
+    # Try primary SCORE-CIRCUITS URL, fallback to upstream if unreachable
+    ADD_OK=false
+    if git -C "$PROJECT_ROOT" submodule add "${CLONE_OPTS[@]}" "$PRIMARY_URL" "$LOCAL_PATH"; then
+        ADD_OK=true
+    else
+        log_warning "Primary URL failed; attempting upstream fallback: $FALLBACK_URL"
+        if git -C "$PROJECT_ROOT" submodule add "${CLONE_OPTS[@]}" "$FALLBACK_URL" "$LOCAL_PATH"; then
+            ADD_OK=true
+        fi
+    fi
+
+    if [[ "$ADD_OK" == "true" ]]; then
+        COMMIT="$(git -C "$ABS_PATH" rev-parse --short HEAD 2>/dev/null || echo 'HEAD')"
+        log_success "[$CATEGORY] Successfully added $NAME ($COMMIT)"
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        log_error "[$CATEGORY] Failed to add $NAME"
+        FAILURE_COUNT=$((FAILURE_COUNT + 1))
+    fi
 done
+
+echo ""
+log_info "Optional Tools Summary: $SUCCESS_COUNT added, $SKIPPED_COUNT already present, $FAILURE_COUNT failed."

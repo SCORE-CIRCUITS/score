@@ -52,8 +52,6 @@ module carfield_top_verilator import cheshire_pkg::*; import carfield_pkg::*; #(
 
   `include "cheshire/typedef.svh"
 
-  import cheshire_addrmap_pkg::*;
-
   function automatic cheshire_cfg_t gen_dut_cfg();
     cheshire_cfg_t ret = carfield_pkg::CheshireCfg;
     if (RtcFreq != 0) ret.RtcFreq = RtcFreq;
@@ -83,8 +81,8 @@ module carfield_top_verilator import cheshire_pkg::*; import carfield_pkg::*; #(
     output int unsigned     dbg_idcode,
     output int unsigned     rtc_freq
   );
-    scratch_base     = REGS_SCRATCH_BASE_ADDR(0);
-    llc_spm_cfg_addr = LLC_BASE_ADDR + axi_llc_reg_pkg::AXI_LLC_CFG_SPM_LOW_OFFSET;
+    scratch_base     = 64'h0300_0000;
+    llc_spm_cfg_addr = 64'h0300_1000;
     llc_not_bypass   = 8'(DutCfg.LlcNotBypass);
     dram_base        = DutCfg.LlcOutRegionStart;
     dram_end         = DutCfg.LlcOutRegionEnd;

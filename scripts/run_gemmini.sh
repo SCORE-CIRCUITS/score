@@ -172,7 +172,10 @@ else
     warn "Skipped install step."
 fi
 
-if [[ -f "$PROJECT_ROOT/setup_gemmini_env.sh" ]]; then
+if [[ -f "$PROJECT_ROOT/scripts/setup_gemmini_env.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$PROJECT_ROOT/scripts/setup_gemmini_env.sh"
+elif [[ -f "$PROJECT_ROOT/setup_gemmini_env.sh" ]]; then
     # shellcheck source=/dev/null
     source "$PROJECT_ROOT/setup_gemmini_env.sh"
 fi

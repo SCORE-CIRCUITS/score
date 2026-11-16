@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""Pure unit coverage for sky130 recipe identity and STA diagnostics.
+
+The fixtures are tiny already-liberty-mapped yosys JSON netlists, so this
+test needs neither yosys nor GHDL and belongs in the fast unit category.
+"""
+
+import json
+import hashlib
+import math
+import os
+import sys
+import tempfile
+from types import SimpleNamespace
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../")
+)
+
+import DEVICE_MODELS
+import LOGIC
+import SYN
+
+
+DFF = "sky130_fd_sc_hvl__dfxtp_1"
+INV = "sky130_fd_sc_hvl__inv_1"
+
+
+class _MuxCacheParserState:
+    part = DEVICE_MODELS.SELECTED_LIBRARY
+    struct_to_field_type_dict = {
+        "wrapped_uint32_t": {"value": "uint32_t"},
+    }
+    enum_info_dict = {
+        "state32_t": SimpleNamespace(int_c_type="uint32_t"),
+    }
+
+
+def _mux_logic(func_name, c_type):
+    logic = LOGIC.Logic()
+    logic.func_name = func_name
+    logic.is_c_built_in = True
+    logic.inputs = ["cond", "iftrue", "iffalse"]
+    logic.outputs = ["return_output"]
+    logic.wires = []
+    logic.wire_to_c_type = {
+        "cond": "uint1_t",
+        "iftrue": c_type,
+        "iffalse": c_type,
+        "return_output": c_type,
+    }
+    return logic
+
+
+def _run_fixture(module):
+    with tempfile.TemporaryDirectory(prefix="pipelinec_sta_unit_") as work_dir:
+        path = os.path.join(work_dir, "mapped.json")
+        with open(path, "w") as f:
+            json.dump({"modules": {"top": module}}, f)
+        return DEVICE_MODELS.run_sta(path, top="top")
+
+
+def test_register_path_components_and_arc_trace():
+    # launch.Q -> inverter -> capture.D. The primary input feeding launch.D
+    # and capture.Q output ensure unconstrained endpoints coexist with it.
+    result = _run_fixture(
+        {
+            "ports": {
+                "clk": {"direction": "input", "bits": [1]},
+                "data_in": {"direction": "input", "bits": [2]},
+                "data_out": {"direction": "output", "bits": [5]},
+            },
+            "cells": {
+                "launch": {
+                    "type": DFF,
+                    "connections": {"CLK": [1], "D": [2], "Q": [3]},
+                },
+                "logic": {
+                    "type": INV,
+                    "connections": {"A": [3], "Y": [4]},
+                },
+                "capture": {
+                    "type": DFF,
+                    "connections": {"CLK": [1], "D": [4], "Q": [5]},
+                },
+            },
+        }
+    )
+
+    assert result["start_reg_name"] == "launch", result
+    assert result["end_reg_name"] == "capture", result
+    assert result["critical_endpoint_kind"] == "register", result
+    assert result["critical_endpoint_pin"] == "D", result
+    assert result["critical_output_port"] is None, result
+    assert result["launch_clock_to_q_ns"] > 0.0, result
+    assert result["combinational_delay_ns"] > 0.0, result
+    assert result["setup_ns"] != 0.0, result
+    component_sum = (
+        result["launch_clock_to_q_ns"]
+        + result["combinational_delay_ns"]
+        + result["setup_ns"]
+    )
+    assert abs(result["worst_period_ns"] - component_sum) < 1e-12, result
+    assert result["critical_path_arc_count"] == 2, result
+    assert [a["kind"] for a in result["critical_path"]] == [
+        "clock_to_q",
+        "combinational",
+    ]
+    assert [a["instance"] for a in result["critical_path"]] == [
+        "launch",
+        "logic",
+    ]
+    assert sum(a["delay_ns"] for a in result["critical_path"]) == (
+        result["launch_clock_to_q_ns"] + result["combinational_delay_ns"]
+    )
+
+
+def test_primary_input_to_output_has_explicit_zero_components():
+    result = _run_fixture(
+        {
+            "ports": {
+                "data_in": {"direction": "input", "bits": [1]},
+                "data_out": {"direction": "output", "bits": [2]},
+            },
+            "cells": {
+                "logic": {
+                    "type": INV,
+                    "connections": {"A": [1], "Y": [2]},
+                }
+            },
+        }
+    )
+    assert result["start_reg_name"] is None, result
+    assert result["end_reg_name"] is None, result
+    assert result["critical_endpoint_kind"] == "primary_output", result
+    assert result["critical_output_port"] == "data_out", result
+    assert result["launch_clock_to_q_ns"] == 0.0, result
+    assert result["setup_ns"] == 0.0, result
+    assert result["combinational_delay_ns"] == result["worst_period_ns"], result
+    assert result["critical_path_arc_count"] == 1, result
+
+
+def test_path_from_an_input_names_its_port():
+    # rst -> inverter -> capture.D (a reset pin's fanout); a register path
+    # names no port, and a bus input names its bit
+    def run(start_bits, start_name):
+        return _run_fixture(
+            {
+                "ports": {
+                    "clk": {"direction": "input", "bits": [1]},
+                    start_name: {"direction": "input", "bits": start_bits},
+                },
+                "cells": {
+                    "logic": {"type": INV, "connections": {"A": [start_bits[-1]], "Y": [4]}},
+                    "capture": {
+                        "type": DFF,
+                        "connections": {"CLK": [1], "D": [4], "Q": [5]},
+                    },
+                },
+            }
+        )
+
+    result = run([2], "rst")
+    assert result["start_reg_name"] is None, result
+    assert result["start_port_name"] == "rst", result
+    assert run([2, 3], "data")["start_port_name"] == "data[1]"
+    registered = _run_fixture(
+        {
+            "ports": {"clk": {"direction": "input", "bits": [1]}},
+            "cells": {
+                "launch": {"type": DFF, "connections": {"CLK": [1], "D": [5], "Q": [3]}},
+                "logic": {"type": INV, "connections": {"A": [3], "Y": [4]}},
+                "capture": {"type": DFF, "connections": {"CLK": [1], "D": [4], "Q": [5]}},
+            },
+        }
+    )
+    assert registered["start_reg_name"] == "launch", registered
+    assert registered["start_port_name"] is None, registered
+
+
+def test_zero_logic_path_has_explicit_empty_diagnostics():
+    result = _run_fixture(
+        {
+            "ports": {
+                "data_in": {"direction": "input", "bits": [1]},
+                "data_out": {"direction": "output", "bits": [1]},
+            },
+            "cells": {},
+        }
+    )
+    assert result["worst_period_ns"] == 0.0, result
+    assert result["launch_clock_to_q_ns"] == 0.0, result
+    assert result["combinational_delay_ns"] == 0.0, result
+    assert result["setup_ns"] == 0.0, result
+    assert result["critical_endpoint_kind"] is None, result
+    assert result["critical_path"] == [], result
+
+
+def test_fixed_recipe_commands_and_cache_identity():
+    expected = {
+        "current",
+        "synth_flatten",
+        "synth_flatten_noabc",
+        "early_flatten_opt",
+        "early_flatten_noabc",
+    }
+    assert set(DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS) == expected
+    suffixes = {
+        name: DEVICE_MODELS.GET_SYNTHESIS_RECIPE_CACHE_SUFFIX(name)
+        for name in expected
+    }
+    default_recipe = DEVICE_MODELS._DEFAULT_SYNTHESIS_RECIPE
+    assert default_recipe == "early_flatten_noabc"
+    assert suffixes[default_recipe] == ""
+    assert len(set(suffixes.values())) == len(expected), suffixes
+    identities = {
+        name: DEVICE_MODELS.GET_MODEL_CACHE_IDENTITY(recipe_name=name)
+        for name in expected
+    }
+    assert len(set(identities.values())) == len(expected), identities
+    assert identities[default_recipe].endswith(
+        f"_v{DEVICE_MODELS.MODEL_VERSION}"
+    )
+
+    commands = {
+        name: DEVICE_MODELS._get_synthesis_recipe_commands(
+            "frozen_top", "/tmp/sky130.lib", name
+        )
+        for name in expected
+    }
+    for command in commands.values():
+        assert command.count("abc -liberty /tmp/sky130.lib -fast") == 1, command
+        assert command.endswith("flatten; "), command
+    assert "synth -top frozen_top -flatten;" in commands["synth_flatten"]
+    assert (
+        "synth -top frozen_top -flatten -noabc; opt -full;"
+        in commands["synth_flatten_noabc"]
+    )
+    assert (
+        "synth -top frozen_top; flatten; opt -full;"
+        in commands["early_flatten_opt"]
+    )
+    assert (
+        "synth -top frozen_top -noabc; flatten; opt -full;"
+        in commands["early_flatten_noabc"]
+    )
+
+    try:
+        DEVICE_MODELS._get_synthesis_recipe_name("arbitrary-yosys-flags")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown recipe did not fail closed")
+    try:
+        DEVICE_MODELS._get_synthesis_recipe_name("")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty explicit recipe did not fail closed")
+
+
+def test_artifact_paths_fit_filename_limit():
+    # Regression: generated factory entity names (~190 bytes) plus the model
+    # suffix, an extension and _run_synth_and_sta's ".tmp.<pid>.<ns>" tail
+    # exceeded the 255-byte filename limit ("File name too long").
+    real_leaf = (
+        "soft_cmp_prefix_from_operators_soft_cmp_factory_greater_True_"
+        "is_signed_True_n_bits_16_strict_True_common_t_int16_t_u2_t_uint2_t_"
+        "tree_soft_cmp_prefix_n_leaves_16_level_0_0CLK_2bd97a5c_top"
+    )
+    worst_tmp_tail = ".tmp.4194304." + "9" * 20
+    shared = "a" * 200
+    work_dir = "/some/work/dir"
+    for recipe in DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS:
+        for name in (real_leaf, "x" * 250, "y_" * 500, shared + "_one", shared + "_two"):
+            paths = DEVICE_MODELS._get_synthesis_recipe_artifact_paths(
+                name, work_dir, recipe
+            )
+            assert paths == DEVICE_MODELS._get_synthesis_recipe_artifact_paths(
+                name, work_dir, recipe
+            ), "artifact names must be deterministic"
+            basenames = [os.path.basename(p) for p in paths.values()]
+            basenames.append(os.path.basename(paths["mapped_json"]) + worst_tmp_tail)
+            for basename in basenames:
+                assert len(basename.encode()) <= 255, (recipe, len(basename), basename)
+        stems = {
+            os.path.basename(
+                DEVICE_MODELS._get_synthesis_recipe_artifact_paths(
+                    shared + tail, work_dir, recipe
+                )["mapped_json"]
+            )
+            for tail in ("_one", "_two")
+        }
+        assert len(stems) == 2, "long names sharing a prefix must not collide"
+
+        # Names that already fit keep their exact historical filenames, so
+        # existing output directories stay reusable.
+        short = "frozen_top_0CLK_12345678_top"
+        suffix = DEVICE_MODELS.GET_MODEL_ARTIFACT_SUFFIX(recipe)
+        paths = DEVICE_MODELS._get_synthesis_recipe_artifact_paths(
+            short, work_dir, recipe
+        )
+        assert paths == {
+            "mapped_json": f"{work_dir}/{short}{suffix}_liberty.json",
+            "synthesis_log": f"{work_dir}/{short}{suffix}_synth.log",
+            "synthesis_script": f"{work_dir}/{short}{suffix}_syn.sh",
+            "synthesis_yosys_script": f"{work_dir}/{short}{suffix}_syn.ys",
+        }, paths
+
+
+def test_syn_disk_caches_are_recipe_scoped():
+    class ParserState:
+        part = DEVICE_MODELS.SELECTED_LIBRARY
+
+    old_tool = SYN.SYN_TOOL
+    old_recipe = DEVICE_MODELS._SELECTED_SYNTHESIS_RECIPE
+    old_comb_weights = SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS
+    try:
+        SYN.SYN_TOOL = DEVICE_MODELS
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = False
+        DEVICE_MODELS._SELECTED_SYNTHESIS_RECIPE = (
+            DEVICE_MODELS._DEFAULT_SYNTHESIS_RECIPE
+        )
+        production_path = SYN.GET_PATH_DELAY_CACHE_DIR(ParserState())
+        DEVICE_MODELS._SELECTED_SYNTHESIS_RECIPE = "synth_flatten"
+        flatten_path = SYN.GET_PATH_DELAY_CACHE_DIR(ParserState())
+        flatten_period_path = SYN.GET_PATH_DELAY_CACHE_DIR(
+            ParserState(), "pipeline_min_period"
+        )
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = True
+        comb_planner_suffix = SYN.GET_PLANNER_DELAY_CACHE_SUFFIX()
+        comb_planner_path = SYN.GET_PATH_DELAY_CACHE_DIR(ParserState())
+    finally:
+        SYN.SYN_TOOL = old_tool
+        DEVICE_MODELS._SELECTED_SYNTHESIS_RECIPE = old_recipe
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = old_comb_weights
+
+    suffix = DEVICE_MODELS.GET_SYNTHESIS_RECIPE_CACHE_SUFFIX("synth_flatten")
+    # Delay lives under the one combined cache root as a sibling of the area
+    # tree, and a non-default subtree name is a sibling too -- not a whole
+    # separate root (see SYN.GET_CACHE_ROOT_DIR).
+    assert "/cache/delay/" in production_path, production_path
+    assert "/cache/pipeline_min_period/" in flatten_period_path, flatten_period_path
+    assert suffix not in production_path, production_path
+    assert suffix in flatten_path, flatten_path
+    assert suffix in flatten_period_path, flatten_period_path
+    assert production_path != flatten_path
+    assert comb_planner_suffix == "__comb_planner_v1"
+    assert comb_planner_suffix in comb_planner_path, comb_planner_path
+
+
+def test_mux_cache_keys_canonicalize_packed_types_by_width():
+    parser_state = _MuxCacheParserState()
+    same_width = [
+        _mux_logic("MUX_uint32_t", "uint32_t"),
+        _mux_logic("MUX_int32_t", "int32_t"),
+        _mux_logic("MUX_float_8_23_t", "float_8_23_t"),
+        _mux_logic("MUX_state32_t", "state32_t"),
+        _mux_logic("MUX_uint8_t_4", "uint8_t[4]"),
+        _mux_logic("MUX_wrapped_uint32_t", "wrapped_uint32_t"),
+    ]
+    different_width = _mux_logic("MUX_uint16_t", "uint16_t")
+    old_tool = SYN.SYN_TOOL
+    old_override = SYN.MUX_DELAY_KEY_BY_WIDTH
+    try:
+        SYN.SYN_TOOL = DEVICE_MODELS
+        SYN.MUX_DELAY_KEY_BY_WIDTH = True
+        keys = {
+            SYN.GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+            for logic in same_width
+        }
+        assert keys == {"MUX_uint32_t"}, keys
+        assert (
+            SYN.GET_CACHED_LOGIC_FILE_KEY(different_width, parser_state)
+            == "MUX_uint16_t"
+        )
+        assert SYN.LOGIC_PATH_DELAY_IS_CACHEABLE(same_width[-1], parser_state)
+
+        owners = {}
+        first_key, first_owner = SYN.CLAIM_MUX_PATH_DELAY_SYNTH_OWNER(
+            same_width[0], parser_state, owners
+        )
+        for equivalent in same_width[1:]:
+            key, owner = SYN.CLAIM_MUX_PATH_DELAY_SYNTH_OWNER(
+                equivalent, parser_state, owners
+            )
+            assert (key, owner) == (first_key, first_owner)
+        assert owners == {"MUX_uint32_t": same_width[0].func_name}
+
+        user_logic = LOGIC.Logic()
+        user_logic.func_name = "user_struct_func"
+        user_logic.is_c_built_in = False
+        user_logic.inputs = ["i"]
+        user_logic.outputs = ["return_output"]
+        user_logic.wires = []
+        user_logic.wire_to_c_type = {
+            "i": "wrapped_uint32_t",
+            "return_output": "wrapped_uint32_t",
+        }
+        assert not SYN.LOGIC_PATH_DELAY_IS_CACHEABLE(user_logic, parser_state)
+
+        SYN.MUX_DELAY_KEY_BY_WIDTH = False
+        assert {
+            SYN.GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+            for logic in same_width + [different_width]
+        } == {"mux"}
+    finally:
+        SYN.SYN_TOOL = old_tool
+        SYN.MUX_DELAY_KEY_BY_WIDTH = old_override
+
+
+def test_struct_mux_reads_plain_uint_cache_entry():
+    parser_state = _MuxCacheParserState()
+    struct_mux = _mux_logic("MUX_wrapped_uint32_t", "wrapped_uint32_t")
+    old_tool = SYN.SYN_TOOL
+    old_override = SYN.MUX_DELAY_KEY_BY_WIDTH
+    original_cache_dir = SYN.GET_PATH_DELAY_CACHE_DIR
+    with tempfile.TemporaryDirectory(prefix="pipelinec_mux_cache_unit_") as td:
+        try:
+            SYN.SYN_TOOL = DEVICE_MODELS
+            SYN.MUX_DELAY_KEY_BY_WIDTH = True
+            SYN.GET_PATH_DELAY_CACHE_DIR = (
+                lambda parser_state, dir_name="delay": td
+            )
+            with open(os.path.join(td, "MUX_uint32_t.delay"), "w") as f:
+                f.write("3.25\n")
+            assert SYN.GET_CACHED_PATH_DELAY(struct_mux, parser_state) == 3.25
+            assert SYN.GET_CACHED_PATH_DELAY_FILE_PATH(
+                struct_mux, parser_state
+            ).endswith("/MUX_uint32_t.delay")
+        finally:
+            SYN.SYN_TOOL = old_tool
+            SYN.MUX_DELAY_KEY_BY_WIDTH = old_override
+            SYN.GET_PATH_DELAY_CACHE_DIR = original_cache_dir
+
+
+def test_planner_component_weight_is_optional_and_deepcopied():
+    class PathReport:
+        path_delay_ns = 1.5
+        launch_clock_to_q_ns = 0.4
+        combinational_delay_ns = 0.9
+        setup_ns = 0.2
+
+    components = SYN._PATH_REPORT_DELAY_COMPONENTS(PathReport())
+    assert components == {
+        "path_delay_ns": 1.5,
+        "launch_clock_to_q_ns": 0.4,
+        "combinational_delay_ns": 0.9,
+        "setup_ns": 0.2,
+    }
+    logic = LOGIC.Logic()
+    logic.delay = 15
+    SYN._SET_LOGIC_DELAY_COMPONENTS(logic, components)
+    assert logic.planner_delay == 9
+
+    old_comb_weights = SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS
+    try:
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = False
+        assert SYN.GET_PLANNER_DELAY(logic) == 15
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = True
+        assert SYN.GET_PLANNER_DELAY(logic) == 9
+    finally:
+        SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS = old_comb_weights
+
+    copied = logic.DEEPCOPY()
+    assert copied.planner_delay == logic.planner_delay
+    assert copied.delay_components == logic.delay_components
+    assert copied.delay_components is not logic.delay_components
+
+
+def test_component_cache_sidecar_round_trip_and_validation():
+    logic = LOGIC.Logic()
+    logic.func_name = "cache_test"
+    logic.is_c_built_in = True
+
+    class ParserState:
+        part = DEVICE_MODELS.SELECTED_LIBRARY
+
+    components = {
+        "path_delay_ns": 2.0,
+        "launch_clock_to_q_ns": 0.5,
+        "combinational_delay_ns": 1.25,
+        "setup_ns": 0.25,
+    }
+    original_cache_dir = SYN.GET_PATH_DELAY_CACHE_DIR
+    with tempfile.TemporaryDirectory(prefix="pipelinec_component_cache_unit_") as td:
+        try:
+            SYN.GET_PATH_DELAY_CACHE_DIR = lambda parser_state, dir_name="delay": td
+            SYN._WRITE_CACHED_PATH_DELAY_COMPONENTS(
+                logic, ParserState(), components
+            )
+            loaded = SYN.GET_CACHED_PATH_DELAY_COMPONENTS(
+                logic, ParserState(), expected_delay_ns=2.0
+            )
+            mismatched = SYN.GET_CACHED_PATH_DELAY_COMPONENTS(
+                logic, ParserState(), expected_delay_ns=2.1
+            )
+        finally:
+            SYN.GET_PATH_DELAY_CACHE_DIR = original_cache_dir
+    assert loaded == components
+    assert mismatched is None
+
+
+def test_log_and_structured_report_round_trip():
+    result = _run_fixture(
+        {
+            "ports": {
+                "data_in": {"direction": "input", "bits": [1]},
+                "data_out": {"direction": "output", "bits": [2]},
+            },
+            "cells": {
+                "logic": {
+                    "type": INV,
+                    "connections": {"A": [1], "Y": [2]},
+                }
+            },
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="pipelinec_sta_report_unit_") as work_dir:
+        log_path = os.path.join(work_dir, "timing.log")
+        DEVICE_MODELS._write_sta_log(
+            log_path,
+            result,
+            DEVICE_MODELS.DEFAULT_LIBRARY,
+            DEVICE_MODELS.DEFAULT_CORNER,
+            "synth_flatten",
+        )
+        timing_json_path = DEVICE_MODELS._write_sta_json(
+            log_path,
+            result,
+            DEVICE_MODELS.DEFAULT_LIBRARY,
+            DEVICE_MODELS.DEFAULT_CORNER,
+            "synth_flatten",
+        )
+        with open(log_path) as f:
+            cached_log_text = f.read()
+            report = DEVICE_MODELS.PathReport(cached_log_text)
+        with open(timing_json_path) as f:
+            structured = json.load(f)
+
+    assert report.synthesis_recipe == "synth_flatten"
+    assert report.start_reg_name is None and report.start_port_name == "data_in"
+    assert report.launch_clock_to_q_ns == 0.0
+    assert report.setup_ns == 0.0
+    assert report.critical_path_arc_count == 1
+    assert structured["synthesis_recipe"] == "synth_flatten"
+    assert structured["fmax_mhz"] == 1000.0 / structured["worst_period_ns"]
+    assert structured["model_version"] == DEVICE_MODELS.MODEL_VERSION
+    assert structured["model_cache_identity"] == (
+        DEVICE_MODELS.GET_MODEL_CACHE_IDENTITY(recipe_name="synth_flatten")
+    )
+    assert structured["critical_path"][0]["instance"] == "logic"
+    assert DEVICE_MODELS._timing_report_has_components(
+        DEVICE_MODELS.ParsedTimingReport(cached_log_text)
+    )
+    assert not DEVICE_MODELS._timing_report_has_components(
+        DEVICE_MODELS.ParsedTimingReport(
+            "Worst period (ns): 1.000000\nStart reg: None\nEnd reg: None\n"
+        )
+    )
+
+
+def test_cached_timing_requires_exact_inputs_model_and_mapped_json_hash():
+    with tempfile.TemporaryDirectory(prefix="pipelinec_sta_cache_identity_") as td:
+        log_path = os.path.join(td, "timing.log")
+        mapped_path = os.path.join(td, "mapped.json")
+        with open(mapped_path, "w") as f:
+            f.write('{"modules": {}}\n')
+        synthesis_inputs = {"identity_sha256": "a" * 64}
+        result = {
+            "worst_period_ns": 1.0,
+            "start_port_name": None,
+            "mapping_succeeded": True,
+            "mapped_json_path": mapped_path,
+            "mapped_json_sha256": DEVICE_MODELS._sha256_file(mapped_path),
+        }
+
+        def write(result):
+            DEVICE_MODELS._write_sta_json(
+                log_path,
+                result,
+                DEVICE_MODELS.DEFAULT_LIBRARY,
+                DEVICE_MODELS.DEFAULT_CORNER,
+                "current",
+                synthesis_inputs,
+            )
+
+        # A report from before reports named a path's input port
+        write({k: v for k, v in result.items() if k != "start_port_name"})
+        assert (
+            DEVICE_MODELS._cached_timing_mismatch_reason(
+                log_path, synthesis_inputs, "current"
+            )
+            == "report predates input-port startpoints"
+        )
+        write(result)
+        assert DEVICE_MODELS._cached_timing_matches(
+            log_path, synthesis_inputs, "current"
+        )
+        assert not DEVICE_MODELS._cached_timing_matches(
+            log_path, {"identity_sha256": "b" * 64}, "current"
+        )
+        assert not DEVICE_MODELS._cached_timing_matches(
+            log_path, synthesis_inputs, "synth_flatten"
+        )
+        with open(mapped_path, "a") as f:
+            f.write(" ")
+        assert not DEVICE_MODELS._cached_timing_matches(
+            log_path, synthesis_inputs, "current"
+        )
+        assert (
+            DEVICE_MODELS._cached_timing_mismatch_reason(
+                log_path, synthesis_inputs, "current"
+            )
+            == "mapped JSON netlist hash changed"
+        )
+
+
+def test_cached_timing_mismatch_reason_names_changed_input():
+    # The "remeasuring" message says which input moved, so an unexpected
+    # cache miss (ex. a shared package rewritten by another process) is
+    # diagnosable from the log alone.
+    def inputs(files, yosys_sha="y"):
+        return {
+            "identity_sha256": hashlib.sha256(repr((files, yosys_sha)).encode()).hexdigest(),
+            "vhdl": {"files": [{"path": p, "bytes": 1, "sha256": h} for p, h in files]},
+            "yosys": {"sha256": yosys_sha},
+        }
+
+    base = inputs([("/o/c_structs_pkg.pkg.vhd", "1"), ("/o/leaf.vhd", "2")])
+    with tempfile.TemporaryDirectory(prefix="pipelinec_sta_mismatch_") as td:
+        log_path = os.path.join(td, "timing.log")
+        mapped_path = os.path.join(td, "mapped.json")
+        reason = DEVICE_MODELS._cached_timing_mismatch_reason(log_path, base)
+        assert reason.startswith("unreadable timing_timing.json"), reason
+        with open(mapped_path, "w") as f:
+            f.write('{"modules": {}}\n')
+        DEVICE_MODELS._write_sta_json(
+            log_path,
+            {
+                "worst_period_ns": 1.0,
+                "start_port_name": None,
+                "mapping_succeeded": True,
+                "mapped_json_path": mapped_path,
+                "mapped_json_sha256": DEVICE_MODELS._sha256_file(mapped_path),
+            },
+            DEVICE_MODELS.DEFAULT_LIBRARY,
+            DEVICE_MODELS.DEFAULT_CORNER,
+            None,
+            base,
+        )
+        assert DEVICE_MODELS._cached_timing_mismatch_reason(log_path, base) is None
+        cases = [
+            (
+                inputs([("/o/c_structs_pkg.pkg.vhd", "X"), ("/o/leaf.vhd", "2")]),
+                "synthesis inputs changed: VHDL file content changed: "
+                "/o/c_structs_pkg.pkg.vhd",
+            ),
+            (
+                inputs([("/o/c_structs_pkg.pkg.vhd", "1"), ("/o/other.vhd", "2")]),
+                "synthesis inputs changed: VHDL file list differs at "
+                "/o/leaf.vhd vs /o/other.vhd",
+            ),
+            (
+                inputs([("/o/c_structs_pkg.pkg.vhd", "1")]),
+                "synthesis inputs changed: VHDL file count 2 -> 1",
+            ),
+            (
+                inputs(
+                    [("/o/c_structs_pkg.pkg.vhd", "1"), ("/o/leaf.vhd", "2")],
+                    yosys_sha="z",
+                ),
+                "synthesis inputs changed: yosys changed",
+            ),
+        ]
+        for current, expected in cases:
+            reason = DEVICE_MODELS._cached_timing_mismatch_reason(log_path, current)
+            assert reason == expected, (reason, expected)
+        os.unlink(mapped_path)
+        reason = DEVICE_MODELS._cached_timing_mismatch_reason(log_path, base)
+        assert reason == "mapped JSON netlist missing", reason
+
+
+def test_synthesis_identity_survives_copying_the_output_directory():
+    # pypeline_sim_debug.py gives its native and VHDL runs separate copies of
+    # one warm build directory. VHDL inputs under the output root are
+    # recorded relative to it, and the mapped netlist relative to the log,
+    # so each copy reuses its own cached reports.
+    import shutil
+
+    with tempfile.TemporaryDirectory(prefix="pipelinec_sta_copy_") as td:
+        build = os.path.join(td, "build")
+        leaf_dir = os.path.join(build, "leaf")
+        os.makedirs(leaf_dir)
+        for name, text in (("c_structs_pkg.pkg.vhd", "pkg"), ("leaf/leaf.vhd", "leaf")):
+            with open(os.path.join(build, name), "w") as f:
+                f.write(text + "\n")
+        files_text = " ".join(
+            os.path.join(build, name)
+            for name in ("c_structs_pkg.pkg.vhd", "leaf/leaf.vhd")
+        )
+
+        def record(root, files):
+            return DEVICE_MODELS._vhdl_input_record(files, os.path.join(root, "leaf"), root)
+
+        original = record(build, files_text)
+        assert [f["path"] for f in original["files"]] == [
+            "c_structs_pkg.pkg.vhd",
+            os.path.join("leaf", "leaf.vhd"),
+        ]
+        copy = os.path.join(td, "native")
+        shutil.copytree(build, copy)
+        assert record(copy, files_text.replace(build, copy)) == original
+        # Files outside the root keep their absolute path.
+        outside = os.path.join(td, "outside.vhd")
+        with open(outside, "w") as f:
+            f.write("x\n")
+        assert record(build, outside)["files"][0]["path"] == outside
+
+        # A report's relative mapped_json_path resolves next to its own log.
+        log_path = os.path.join(copy, "leaf", "timing.log")
+        mapped_path = os.path.join(copy, "leaf", "mapped.json")
+        with open(mapped_path, "w") as f:
+            f.write('{"modules": {}}\n')
+        inputs = {"identity_sha256": "c" * 64}
+        DEVICE_MODELS._write_sta_json(
+            log_path,
+            {
+                "worst_period_ns": 1.0,
+                "start_port_name": None,
+                "mapping_succeeded": True,
+                "mapped_json_path": "mapped.json",
+                "mapped_json_sha256": DEVICE_MODELS._sha256_file(mapped_path),
+            },
+            DEVICE_MODELS.DEFAULT_LIBRARY,
+            DEVICE_MODELS.DEFAULT_CORNER,
+            None,
+            inputs,
+        )
+        assert DEVICE_MODELS._cached_timing_mismatch_reason(log_path, inputs) is None
+        os.unlink(mapped_path)
+        assert (
+            DEVICE_MODELS._cached_timing_mismatch_reason(log_path, inputs)
+            == "mapped JSON netlist missing"
+        )
+
+
+def test_durable_qor_evidence_matrices_are_self_consistent():
+    qor_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "qor")
+    )
+    with open(os.path.join(qor_dir, "synthesis_recipe_pre_divzero_matrix.json")) as f:
+        pre = json.load(f)
+    wrapper_path = os.path.join(
+        qor_dir, "synthesis_recipe_pre_divzero_wrapper.vhd"
+    )
+    with open(wrapper_path, "rb") as f:
+        wrapper_hash = hashlib.sha256(f.read()).hexdigest()
+    assert wrapper_hash == pre["provenance"]["frozen_wrapper"]["sha256"]
+    # Historical matrices are frozen evidence for the recipe set that existed
+    # when they were taken; a later promotion may add recipes they never ran.
+    assert set(pre["recipes"]) <= set(
+        DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS
+    )
+    current = pre["recipes"]["current"]
+    flatten = pre["recipes"]["synth_flatten"]
+    assert current["metrics"]["n_max_capacitance_violations"] > 0
+    assert flatten["metrics"]["n_max_capacitance_violations"] == 0
+    assert flatten["metrics"]["worst_period_ns"] < (
+        0.5 * current["metrics"]["worst_period_ns"]
+    )
+
+    with open(
+        os.path.join(qor_dir, "synthesis_recipe_forced32_matrix.json")
+    ) as f:
+        full = json.load(f)
+    assert set(full["recipes"]) <= set(
+        DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS
+    )
+    assert full["target"]["measured_stages"] == (
+        full["target"]["measured_slices"] + 1
+    )
+    # This matrix promoted V3/early_flatten_opt on a "maximise our own fmax"
+    # policy. It stays valid as a record of that decision, but it is no
+    # longer what selects the production recipe -- see the latchup-match
+    # matrix below, whose policy is to predict latchup's number, not beat it.
+    former = full["selected_production_recipe"]
+    assert former in DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS
+    assert full["promoted_model_version"] < DEVICE_MODELS.MODEL_VERSION
+    winner = full["recipes"][former]
+    assert winner["fmax_mhz"] == max(
+        result["fmax_mhz"] for result in full["recipes"].values()
+    )
+    assert winner["mapper_sources_unchanged_through_mapping"]
+    assert winner["n_unmapped_cells"] == 0
+    assert not winner["incomplete_topo"]
+    assert all(result["acceptance_passed"] for result in full["recipes"].values())
+
+    # Current production selection: reproduce latchup's post-early-flatten
+    # netlists and reported period.
+    with open(
+        os.path.join(qor_dir, "latchup_early_flatten_match_matrix.json")
+    ) as f:
+        match = json.load(f)
+    assert set(match["recipes"]) == set(
+        DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS
+    )
+    selected = match["selected_production_recipe"]
+    assert selected == DEVICE_MODELS._DEFAULT_SYNTHESIS_RECIPE
+    assert match["promoted_model_version"] == DEVICE_MODELS.MODEL_VERSION
+    assert match["previous_model_version"] < DEVICE_MODELS.MODEL_VERSION
+    # The promoted recipe must be the most accurate one on BOTH scores, or the
+    # selection policy quoted in the file is not what actually chose it.
+    scores = {
+        name: result["period_error_mae_pct"]
+        for name, result in match["recipes"].items()
+    }
+    assert scores[selected] == min(scores.values()), scores
+    worst = {
+        name: result["period_error_worst_pct"]
+        for name, result in match["recipes"].items()
+    }
+    assert worst[selected] == min(worst.values()), worst
+    # ...and it must actually reproduce their mapping, not merely their number.
+    assert len(
+        match["recipes"][selected]["designs_with_exact_latchup_histogram"]
+    ) >= 3
+    # Every design's VHDL was hash-verified identical to latchup's own build.
+    for design, truth in match["ground_truth"].items():
+        assert truth["stages"] == truth["slices"] + 1, design
+        assert truth["reproduced_top_entity"].startswith("solution_"), design
+    # Engine-only physics is recipe-independent and must stay at its bar.
+    engine = match["engine_only_on_latchup_netlists"]
+    assert engine["post_early_flatten_mae_pct"] < 5.0
+    assert engine["post_early_flatten_worst_pct"] < 10.0
+
+    with open(os.path.join(qor_dir, "divider_qor_acceptance.json")) as f:
+        acceptance = json.load(f)
+    # The full Divider QoR acceptance run is expensive (one gate build is
+    # about an hour) and was NOT re-run for the V4/early_flatten_noabc
+    # promotion, which was selected purely on latchup-match evidence. So this
+    # file legitimately describes an earlier production configuration; assert
+    # exactly that, rather than pretending it tracks the current default.
+    assert acceptance["production"]["model_version"] < DEVICE_MODELS.MODEL_VERSION
+    assert acceptance["production"]["synthesis_recipe"] in (
+        DEVICE_MODELS._SYNTHESIS_RECIPE_CACHE_TAGS
+    )
+    for variant in ("gate", "arithmetic"):
+        baseline = acceptance[variant]["clean_c81ca31f"]
+        result = acceptance[variant]["automatic_v3"]
+        target = acceptance["targets"][variant]
+        assert baseline["stages"] == baseline["slices"] + 1
+        assert result["stages"] == result["slices"] + 1
+        assert not baseline["acceptance_passed"]
+        assert result["acceptance_passed"]
+        assert result["functional_passed"]
+        assert result["fmax_mhz"] > target["strict_fmax_mhz"]
+        assert result["slices"] <= target["maximum_slices"]
+        assert result["n_unmapped_cells"] == 0
+        assert not result["incomplete_topo"]
+        assert result["slices"] < baseline["slices"]
+
+    with open(
+        os.path.join(qor_dir, "divider_gate_clean_baseline_critical_paths.json")
+    ) as f:
+        baseline = json.load(f)
+    assert [point["slices"] for point in baseline["points"]] == [
+        28,
+        50,
+        63,
+        67,
+        70,
+        73,
+        66,
+    ]
+    for point in baseline["points"]:
+        assert point["pipeline_stages"] == point["slices"] + 1
+        metrics = point["metrics"]
+        component_sum = sum(
+            metrics[name]
+            for name in (
+                "launch_clock_to_q_ns",
+                "combinational_delay_ns",
+                "setup_ns",
+            )
+        )
+        assert abs(metrics["worst_period_ns"] - component_sum) < 1e-12
+        assert abs(
+            metrics["fmax_mhz"] - 1000.0 / metrics["worst_period_ns"]
+        ) < 1e-12
+    assert baseline["points"][-3]["metrics"]["worst_period_ns"] == (
+        baseline["points"][-4]["metrics"]["worst_period_ns"]
+    )
+    point_73 = next(point for point in baseline["points"] if point["slices"] == 73)
+    assert point_73["pre_step_floor_knee"][
+        "left_eff_mux_latency_slices"
+    ] == 2
+    assert point_73["timing_met"]
+    assert baseline["points"][-1]["slices"] == 66
+    assert baseline["points"][-1]["timing_met"]
+
+    with open(
+        os.path.join(qor_dir, "latchup_area_match_matrix.json")
+    ) as f:
+        area_match = json.load(f)
+    assert area_match["definitional_area_sum_check"]["mae_pct"] < 0.01
+    for design, truth in area_match["ground_truth"].items():
+        assert truth["stages"] == truth["slices"] + 1, design
+        sum_check = area_match["definitional_area_sum_check"]["results"][design]
+        assert abs(sum_check["error_pct"]) < 0.01, design
+    builds = area_match["reproduced_builds"]["results"]
+    matching = [
+        design for design, result in builds.items() if result["slices_match_latchup"]
+    ]
+    # At least the recipe-selection matrix's own historical designs must
+    # still be independently checkable against real measured area -- if this
+    # ever drops to zero, the whole matrix's headline MAE is meaningless.
+    assert len(matching) >= 2, matching
+    for design in matching:
+        result = builds[design]
+        assert result["measured_vs_latchup_error_pct"] is not None, design
+        assert abs(result["measured_vs_latchup_error_pct"]) < 5.0, design
+        # Sequential area is exact per-FF by construction on both sides.
+        assert math.isclose(
+            result["measured_sequential_area_um2"]
+            / result["measured_n_sequential_cells"],
+            DEVICE_MODELS.GET_SEQUENTIAL_CELL_AREA()[0],
+            rel_tol=1e-9,
+        ), design
+    for design, result in builds.items():
+        if result["slices_match_latchup"]:
+            continue
+        # A non-matching design's comparison against latchup must be
+        # explicitly suppressed, not silently wrong.
+        assert result["measured_vs_latchup_error_pct"] is None, design
+    assert area_match["reproduced_builds"]["slices_match_mae_pct"] < 5.0
+
+
+def test_max_capacitance_violations_are_parsed():
+    # Design-wide count, distinct from the pre-existing critical-path-only
+    # field -- found for real on the mux select-fanout cliff, where the two
+    # differed (1 on the critical path, 4 design-wide) and only the
+    # design-wide one actually explained the measured fmax collapse.
+    text = (
+        "Worst period (ns): 9.438620\n"
+        "Critical path max_capacitance violations: 1\n"
+        "N max_capacitance violations: 4\n"
+    )
+    report = DEVICE_MODELS.PathReport(text)
+    assert report.critical_path_max_capacitance_violations == 1
+    assert report.n_max_capacitance_violations == 4
+
+
+def test_max_capacitance_violations_default_none_when_absent():
+    report = DEVICE_MODELS.PathReport("Worst period (ns): 1.0\n")
+    assert report.n_max_capacitance_violations is None
+
+
+if __name__ == "__main__":
+    from _test_main import run_module_tests
+
+    run_module_tests()

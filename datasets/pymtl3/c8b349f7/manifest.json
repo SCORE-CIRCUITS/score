@@ -1,0 +1,9 @@
+{
+  "project": "pymtl/pymtl3",
+  "commit_short": "c8b349f7",
+  "dataset_name": "pymtl3",
+  "generated_at_utc": "2026-11-16T23:23:08Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

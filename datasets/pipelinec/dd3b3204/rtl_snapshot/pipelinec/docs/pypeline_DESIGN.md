@@ -1,0 +1,2939 @@
+# pypeline.py — Design Document
+
+This document covers `pypeline.py` — the shared runtime foundations used by both the
+hardware elaborator (`PY_TO_LOGIC.py`) and the simulation layer. For elaboration-specific
+internals (Logic() graph, FuncElaborator, CONST_REF_RD, etc.) see
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md). For simulation-specific internals
+(`@hw_func`, `_build_reg_sim_func`, multi-MAIN runner, performance tuning) see
+[`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md).
+
+Auto-pipelined RAM factories use `SET_AUTO_PIPELINE_RAM_PLAN_CACHE` and
+`AUTO_PIPELINE_RAM_PLAN_CACHE` to retain complete implementations across design
+re-imports. Plans include request/write timing and bank structure, not just output
+latency. See [auto-pipelined RAM](AUTO_PIPELINE_DESIGN.md#ram-compiler-sweep-and-simulation).
+
+# Documentation conventions
+
+**Reference, not a logbook.** `docs/*.md` are **reference documents**: they describe
+the compiler and language as they are today, in the present tense. They are not
+logbooks.
+
+- **`git log` is the change record.** Don't duplicate it in prose — no dated entries,
+  no "recently added"/"now supports"/"used to"/"this round", no session write-ups, no
+  status updates.
+- **The [showcase](showcase.md) is a dated bibliography.** Publication and event
+  dates organize its external links, so `doc_links_test` exempts that file from
+  the dated-body-text restriction while retaining its link and heading checks.
+- When behavior changes, **edit the affected section in place** so it states the
+  current behavior.
+- If the *reason* something is the way it is is worth keeping — an alternative that
+  was tried and lost, a bug class that shaped an invariant — put it in that file's
+  `## History` section, if it has one. History entries are keyed by **topic, not
+  date**: revise the existing entry that owns the topic rather than appending a new
+  one. Keep a fact there only if it still changes a decision today (an alternative
+  someone would otherwise retry, or a measurement still used as a regression
+  reference).
+- **Numbers carry the conditions they were measured under** (tool, FPGA/ASIC part,
+  model version, a commit hash where it pins a specific artifact) — not the date they
+  were taken. A bare number with the date stripped rots silently; state the
+  conditions instead and it stays meaningful indefinitely.
+- **Cite another doc by anchor, never by section number**, from source comments as
+  much as from other docs — `SYN_DESIGN.md#karatsuba-base-case-threshold`, not
+  "`SYN_DESIGN.md` section 10". A numbered section is a moving target the moment
+  that file's structure changes; a named anchor keyed to a heading's own text
+  survives renumbering, and a stale one is at least greppable by the words in it.
+
+**Recording a change — worked example.** Say you switch the default comparator
+implementation. Don't add a dated changelog line announcing the switch. Instead: (1)
+update the section that states the current default so it now names the new one; (2) if
+the previous default is something a future reader might reasonably retry, revise the
+`History` entry that already owns comparator selection so it names the new winner and
+why the previous one lost. The entry stays about one paragraph — it does not grow by
+one paragraph per change.
+
+
+## Table of Contents
+
+- [Overview](#overview)
+- [C Type System](#c-type-system)
+  - [`_CTypeMeta` Metaclass](#_ctypemeta-metaclass)
+  - [Type Factories](#type-factories)
+  - [Floating-point types](#floating-point-types)
+  - [Predefined Types](#predefined-types)
+  - [`_INT_CTYPE_RE`](#_int_ctype_re)
+- [Type Utilities](#type-utilities)
+  - [`_ctype_is_int(c_type: str) → bool`](#_ctype_is_intc_type-str--bool)
+  - [`_ctype_info(c_type: str) → (is_signed: bool, width: int)`](#_ctype_infoc_type-str--is_signed-bool-width-int)
+  - [`_int_ctype(signed: bool, width: int) → str`](#_int_ctypesigned-bool-width-int--str)
+  - [`_infer_literal_ctype(val: int) → str`](#_infer_literal_ctypeval-int--str)
+  - [`_arith_promote(l_type: str, r_type: str) → (eff_l: str, eff_r: str)`](#_arith_promotel_type-str-r_type-str--eff_l-str-eff_r-str)
+  - [`_arith_output_ctype(op: str, eff_l: str, eff_r: str, result_signed: bool) → ctype`](#_arith_output_ctypeop-str-eff_l-str-eff_r-str-result_signed-bool--ctype)
+  - [`_is_scalar_pypeline_int(ctype) → bool`](#_is_scalar_pypeline_intctype--bool)
+  - [`_ctype_str(t) → str`](#_ctype_strt--str)
+- [Naming Metadata](#naming-metadata)
+  - [User names (`name=`)](#user-names-name)
+- [Struct Support](#struct-support)
+  - [`NamedTuple`](#namedtuple)
+  - [`@struct` Decorator](#struct-decorator)
+- [Enum Support](#enum-support)
+  - [`@enum` Decorator](#enum-decorator)
+  - [`_enum_bit_width(enum_cls) → int`](#_enum_bit_widthenum_cls--int)
+  - [`_is_scalar_pypeline_int(ctype)` — Enum Path](#_is_scalar_pypeline_intctype--enum-path)
+  - [Parameterizable Enums](#parameterizable-enums)
+  - [`PypelineEnum` Base Class](#pypelineenum-base-class)
+  - [Introspection API](#introspection-api)
+- [Char Array Support](#char-array-support)
+  - [`char_t` — Predefined Scalar Type](#char_t--predefined-scalar-type)
+  - [String Literal Initializers](#string-literal-initializers)
+  - [`strlen(arr)` Builtin](#strlenarr-builtin)
+  - [Known Limitation: `Reg[T]` Initializers](#known-limitation-regt-initializers)
+- [Type ↔ Bytes Conversion](#type--bytes-conversion)
+  - [One walk, three consumers](#one-walk-three-consumers)
+  - [The host-export registry](#the-host-export-registry)
+- [Byte-Stream Serialization](#byte-stream-serialization)
+- [Annotation Types](#annotation-types)
+  - [`Reg[T]` / `_RegType`](#regt--_regtype)
+  - [`Feedback[T]` / `_FeedbackType`](#feedbackt--_feedbacktype)
+  - [`Wire[T]` / `_WireType`](#wiret--_wiretype)
+  - [Pipeline timing: aligned globals and `VOLATILE`](#pipeline-timing-aligned-globals-and-volatile)
+  - [Wire markers: `VOLATILE`, `ASYNC` and clocks](#wire-markers-volatile-async-and-clocks)
+  - [`Input[T]` / `_InputType`](#inputt--_inputtype)
+  - [`Output[T]` / `_OutputType`](#outputt--_outputtype)
+  - [`Inst[f]` / `_InstType` — global instances](#instf--_insttype--global-instances)
+  - [`Fifo[T]` / `_FifoType` — global FIFOs](#fifot--_fifotype--global-fifos)
+- [`PART()` and `@MAIN` Pragmas](#part-and-main-pragmas)
+  - [`PART(part_string)`](#partpart_string)
+  - [`@MAIN` / `MAIN(fn)` — Registering MAINs](#main--mainfn--registering-mains)
+  - [`make_clock(mhz, name=, syn_mhz=, reset=)` — Clocks](#make_clockmhz-name-syn_mhz-reset--clocks)
+  - [`make_reset()` — Resets](#make_reset--resets)
+  - [`AUTO_PIPELINE(func, latency=None, start_latency=None, max_latency=None)` — Forced Submodule Pipelining with `.latency`](#auto_pipelinefunc-latencynone-start_latencynone-max_latencynone--forced-submodule-pipelining-with-latency)
+  - [`AUTO_COMB_AREA_OPT(func)` — Zero-Cycle Resource Sharing](#auto_comb_area_optfunc--zero-cycle-resource-sharing)
+  - [`AUTO_FSM(func)` — Resource-Shared State Machines with `.latency`](#auto_fsmfunc--resource-shared-state-machines-with-latency)
+  - [`MULTI_CYCLE[ncycles]` — Multi-Cycle Path Tag](#multi_cyclencycles--multi-cycle-path-tag)
+  - [`AUTO_MULTI_CYCLE(...)` — Tool-Tuned Multi-Cycle Path Tag](#auto_multi_cycle--tool-tuned-multi-cycle-path-tag)
+  - [Fixed User Pipelines](#fixed-user-pipelines)
+  - [`wires(func)` — Just-Wires Synthesis Hint](#wiresfunc--just-wires-synthesis-hint)
+  - [Registries](#registries)
+- [Design Parameters (`param()`, `-D`)](#design-parameters-param--d)
+- [Operator Registry](#operator-registry)
+  - [Op String Values](#op-string-values)
+  - [Global Registries](#global-registries)
+  - [Generic (Matcher-Based) Registrations](#generic-matcher-based-registrations)
+  - [MUX Registry](#mux-registry)
+  - [Scoped Registrations](#scoped-registrations)
+  - [The Native-Sim Dispatch Gate](#the-native-sim-dispatch-gate)
+  - [`SIM_SOFT_OPS`](#sim_soft_ops)
+  - [Scoped Generic Registrations Are Not Memoized Globally](#scoped-generic-registrations-are-not-memoized-globally)
+  - [Struct-Type Operator Dispatch](#struct-type-operator-dispatch)
+- [Casting](#casting)
+  - [Scalar int/char: a language primitive, not a registered cast](#scalar-intchar-a-language-primitive-not-a-registered-cast)
+  - [Compound casts: `register_cast` / `@cast`](#compound-casts-register_cast--cast)
+  - [Interface-half casts bend three checks, deliberately](#interface-half-casts-bend-three-checks-deliberately)
+  - [Interface wrap/unwrap casts (`stream.make_stream_interface`)](#interface-wrapunwrap-casts-streammake_stream_interface)
+- [Soft Operator Library (`include/pypeline/operators/`)](#soft-operator-library-includepypelineoperators)
+  - [Activation](#activation)
+  - [Current defaults](#current-defaults)
+  - [Default replacements for C-generated operators](#default-replacements-for-c-generated-operators)
+  - [What is *not* routed through the registry](#what-is-not-routed-through-the-registry)
+- [`SimVal` — Typed Simulation Integer](#simval--typed-simulation-integer)
+  - [Core Design](#core-design)
+  - [`__getitem__` — Hardware Bit Slicing](#__getitem__--hardware-bit-slicing)
+  - [Operator Dispatch](#operator-dispatch)
+  - [Hardware-Accurate Arithmetic (`SIM_STRICT_ARITH=True`)](#hardware-accurate-arithmetic-sim_strict_arithtrue)
+  - [Allocation Helpers](#allocation-helpers)
+  - [`_RawField(int)` — Raw Mode Struct Fields](#_rawfieldint--raw-mode-struct-fields)
+  - [Type Invariant](#type-invariant)
+- [`concat(*args)` — Bit Concatenation](#concatargs--bit-concatenation)
+  - [`BIT_MANIP_FUNC_NAMES`](#bit_manip_func_names)
+- [`vhdl(text)` — Raw VHDL Passthrough](#vhdltext-resetnone--raw-vhdl-passthrough)
+- [Reference: `pypeline.py` Public API](#reference-pypelinepy-public-api)
+- [Tests](#tests)
+- [History](#history)
+  - [Reset syntax](#reset-syntax)
+  - [FSM-owned pipeline placement and native simulation](#fsm-owned-pipeline-placement-and-native-simulation)
+  - [Multi-clock syntax](#multi-clock-syntax)
+
+---
+
+## Overview
+
+`pypeline.py` is the shared runtime support module for the Pypeline hardware design system.
+It provides three categories of functionality:
+
+1. **Type foundations** — C-style integer types, the `@struct` decorator, annotation
+   descriptors (`Reg[T]`, `Wire[T]`, etc.), and arithmetic promotion rules used identically
+   by the elaborator and simulator.
+
+2. **Pragma and registry infrastructure** — `PART()`, `@MAIN`, and the operator registry
+   that both the hardware elaborator and the simulation layer consult.
+
+3. **Simulation primitives** — `SimVal` (typed simulation integer), `concat()` dual-mode
+   bit concatenation, and the `_sim_cast` / `_sim_val_make` helpers.
+
+`PY_TO_LOGIC.py` imports the type utilities and operator registries directly:
+
+```python
+from pypeline import (
+    _RegType, _FeedbackType, _WireType, _InputType, _OutputType,
+    BIT_MANIP_FUNC_NAMES, _INT_CTYPE_RE, _ctype_is_int, _ctype_info,
+    _int_ctype, _arith_promote, _arith_output_ctype,
+)
+```
+
+Hardware design files import user-facing names (`uint32_t`, `Reg`, `@struct`, etc.).
+The simulation layer uses `SimVal`, `_sim_cast`, and the operator registries at runtime.
+
+---
+
+## C Type System
+
+### `_CTypeMeta` Metaclass
+
+All Pypeline C types are real Python classes with `_CTypeMeta` as their metaclass.
+This makes them acceptable as `NamedTuple` field annotations (Pylance/pyright sees a class)
+while still encoding the type name as a string.
+
+Key dunder methods on `_CTypeMeta`:
+
+```python
+str(uint32_t)          # → "uint32_t"   (via __str__ / __repr__)
+uint32_t[4]            # → _make_ctype("uint32_t[4]")   (via __getitem__)
+len(uint32_t)          # → 32   (bit width via __len__, or the array dimension)
+uint32_t.width         # → 32   (property, raises for array types)
+```
+
+`__getitem__` calls `_make_ctype(f"{cls._ctype_name}[{dim}]")`, so `point_t[10]`
+returns a proper class object with `_ctype_name = "point_t[10]"`. This is why
+`uint32_t[4]` works as a type annotation in `NamedTuple` fields.
+
+The returned array class also gets `arr._elem_ctype` and `arr._arr_len` set — a direct
+reference to the element type object (not just its name string) and this array's own
+outer element count. This lets the simulator zero-initialize arrays of structs correctly
+(`_make_sim_zero`, see [`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md)): re-deriving
+the element type by parsing `_ctype_name` only recovers a name string, which is enough
+for scalar elements (`_make_ctype("uint1_t")` is equivalent to `uint1_t`) but not for
+struct elements, since a struct's field layout isn't recoverable from its name alone.
+`_elem_ctype`/`_arr_len` are preferred when present; the string-derived fallback (leftmost
+`[N]`) still exists for array types constructed without going through `__getitem__`.
+
+For a single dimension (`cls` is scalar/struct), `arr._elem_ctype = cls` and
+`arr._arr_len = dim`, as above. When chaining further brackets on an already-array `cls`
+(e.g. `int8_t[3][4]`, evaluated as `(int8_t[3])[4]`), `__getitem__` does **not** wrap
+`cls` as the new element type — it pushes the new dimension onto `cls`'s own element type
+(`arr._elem_ctype = cls._elem_ctype[dim]`) and keeps `arr._arr_len = cls._arr_len`. This
+matters because Python evaluates `T[A][B]` left-to-right, so a naive wrap-outside
+implementation would make the *last*-written bracket the array's outer dimension — the
+reverse of C's `T x[A][B]` (`A`, the first-written/leftmost bracket, is outer; `B` is
+inner). Pushing new dimensions onto the leaf keeps the first-applied dimension as the
+permanent outer/first dimension no matter how many further brackets are chained, matching
+C and `PY_TO_LOGIC.py`'s elaboration-side `_array_first_dim`/`_array_elem_type`
+(`PY_TO_LOGIC_DESIGN.md`), which always treat the leftmost bracket as outer.
+
+### Type Factories
+
+```python
+make_uint_t(width: int) → uintN_t       # e.g. make_uint_t(24) → uint24_t
+make_int_t(width: int)  → intN_t        # e.g. make_int_t(33) → int33_t
+make_array_t(elem_t, n) → array type     # n elem_t values; outer dimension even
+                                         # when elem_t is an array
+```
+
+`make_array_t` rebuilds the array from its leaf, `leaf[n][d1]...`, because
+`elem_t[n]` on an array `elem_t` pushes `n` inward. That is the intended C order
+(see above), not something `make_array_t` works around.
+
+`_make_ctype(name)` is the primitive: creates a class with `_CTypeMeta` metaclass and
+`_ctype_name = name`. Both factories call it.
+
+HDL factories return their primary object rather than a tuple of an object and
+metadata. Function factories expose the complete annotated result type as
+`.return_t`; type factories return the type itself. `_sim_type_wrap` assigns
+`fn.return_t = fn.__annotations__.get("return")` before creating any wrapper,
+so `functools.wraps` copies it onto both strict and raw simulation variants.
+Explicit metadata handles the few library callables that remain undecorated.
+Neither this attribute nor a Python call-site alias determines hardware identity.
+
+RAM and generated-interface memoization caches store the callable itself, with
+its result type attached, so cache hits preserve both function and type identity.
+The FIR core exposes its intermediate accumulator type as `.accum_t`; private
+carry-save stages expose `.is_wires` alongside `.return_t`. Constructors of
+peer types use named `SimpleNamespace` bundles instead of positional tuples.
+
+### Floating-point types
+
+`make_float_t(E, M)` (builds a `@struct` NamedTuple type with three fields: `sign`
+(1 bit), `exp` (E bits), `man` (M bits), matching IEEE 754 layout for standard
+sizes, plus a `.as_const(value)` staticmethod converting a Python `float` to the
+field dict at elaboration time using `struct.pack` for FP32/FP64 or a rebased
+FP64 approximation for other widths, and a `__float__` method — the inverse of
+`.as_const` — for reading a value back out as a Python `float`) lives in the
+`floating_point` library, not core `pypeline.py`, alongside the
+arithmetic/conversion factories built on it (`make_float_adder`,
+`make_float_subtractor`, `make_float_multiplier`, `make_float_divider`,
+`make_float_converter`, `make_float_to_int`, `make_int_to_float`,
+`register_float_ops`), since none of that is generic beyond floats. Core
+`pypeline.py` keeps the generic building blocks it's built from: `make_uint_t`,
+`make_int_t`, `struct`, and the operator-registration functions (see
+[Operator Registry](#operator-registry)).
+
+`register_float_ops` and `register_fixed_ops` return operations namespaces:
+`.operand_t`, `.add`, `.subtract`, `.multiply`, and float `.divide` or fixed
+`.negate` (`None` for unsigned fixed point). Each function's `.return_t` is
+independent of `.operand_t`, since fixed-point results can widen. Predefined
+`float16_ops`/`float32_ops`/`float64_ops` contain the registered functions;
+the existing individual arithmetic exports alias those functions.
+
+### Predefined Types
+
+```
+uint1_t  uint2_t  uint3_t  uint4_t  uint8_t  uint16_t  uint32_t  uint64_t
+int1_t   int2_t   int3_t   int4_t   int8_t   int16_t   int32_t   int64_t
+```
+
+All declared as proper `class` statements (not variable assignments) so static analysis tools
+accept them. `float16_t`, `float32_t`, `float64_t` are predefined (with `+`/`-`/`*`/`/`
+already registered) in `include/pypeline/floating_point.py`, not here.
+
+### `_INT_CTYPE_RE`
+
+A compiled `re.Pattern` that matches C integer type strings like `"uint32_t"` or `"int8_t"`.
+Imported by `PY_TO_LOGIC.py` for type classification during elaboration.
+
+---
+
+## Type Utilities
+
+These pure functions are the single source of truth for integer type arithmetic shared by
+the simulator (`SimVal` operators) and the elaborator (`PY_TO_LOGIC._elab_binop`).
+All are cached with `@lru_cache(maxsize=None)` for performance.
+
+### `_ctype_is_int(c_type: str) → bool`
+
+Returns True if `c_type` is a C integer type (`uint*_t` or `int*_t`). Uses `_INT_CTYPE_RE`.
+
+### `_ctype_info(c_type: str) → (is_signed: bool, width: int)`
+
+Parses a C type string into its (signed, width) components.
+
+### `_int_ctype(signed: bool, width: int) → str`
+
+Constructs a C type string from (signed, width). Inverse of `_ctype_info`.
+
+### `_infer_literal_ctype(val: int) → str`
+
+Computes the minimum-width C type for a Python integer literal:
+
+```python
+_infer_literal_ctype(0)    # "uint1_t"
+_infer_literal_ctype(5)    # "uint3_t"
+_infer_literal_ctype(255)  # "uint8_t"
+_infer_literal_ctype(-1)   # "int1_t"
+_infer_literal_ctype(-2)   # "int2_t"
+```
+
+Non-negative: `val.bit_length()` bits unsigned (minimum 1). Negative: `(-val - 1).bit_length() + 1`
+bits signed.
+
+### `_arith_promote(l_type: str, r_type: str) → (eff_l: str, eff_r: str)`
+
+Computes the effective (promoted) types for a binary arithmetic operation following C-style
+mixed-signedness rules. If one operand is signed and the other unsigned, and the unsigned
+type is at least as wide, the signed type is extended by one bit so the result is signed.
+Returns the two effective types after promotion.
+
+### `_arith_output_ctype(op: str, eff_l: str, eff_r: str, result_signed: bool) → ctype`
+
+Computes the output type for arithmetic operations:
+
+| `op` | Output width |
+|---|---|
+| `"add"` | `max(lw, rw) + 1` |
+| `"sub"` | `max(lw, rw) + 1` if `result_signed`, else `max(lw, rw)` (wraps) |
+| `"mul"` | `lw + rw` |
+| others | `max(lw, rw)` |
+
+Returns a `_CTypeMeta` class object. Cached so that the same `(op, types)` key always
+returns the **same class object** — enabling `is`-comparison fast-paths in `_sim_val_make`.
+
+### `_is_scalar_pypeline_int(ctype) → bool`
+
+True if `ctype` is a scalar (non-array, non-struct) Pypeline integer type.
+
+### `_ctype_str(t) → str`
+
+Returns the canonical C type name string for a type object (handles both `_CTypeMeta`
+instances and `@struct` NamedTuple types via `_pypeline_ctype_name`).
+
+## Naming Metadata
+
+Every generated hardware object has two names. The **logical key** is what the
+compiler indexes by: a `FuncLogicLookupTable` key, a C type name. It is
+deterministic and unique, but it encodes implementation detail. The **description** is
+what a person reads in VHDL. It records where the object came from: its source
+symbol, module, enclosing factory, file and line, parameter values and field types.
+This section covers the description half. It lives in the "Naming metadata"
+section of `pypeline.py`, so the runtime decorators can use it without importing
+the compiler. [Generated VHDL names](PY_TO_LOGIC_DESIGN.md#generated-vhdl-names)
+covers how `PY_TO_LOGIC.EmissionNames` renders descriptions into VHDL
+identifiers.
+
+- **`_NameInfo`** is a frozen dataclass with `kind`, `symbol`, `module`, `qualname`,
+  `source`, `line`, `params`, `fields` and `identity`. A parameter or field value is
+  either a string fragment or a nested `_NameInfo`.
+  - `render(limit=None, context=True)` composes the readable base. That is the symbol,
+    then `_from_<module>` and enclosing scopes when `context` is set, then each
+    parameter as `_<name>_<value>`. Scalar settings come first, then primitive types,
+    then nested types.
+  - Above `limit`, the largest nested descriptions shrink first. The result ends in
+    `_h<digest>` of the full identity.
+- **`_stable_key(value)` / `_name_identity(value)`** are the typed, address-free
+  snapshot that specialization identity is built from (`_name_identity` is its
+  JSON form).
+  - Lists and tuples, strings and numbers, and punctuation-bearing strings never alias.
+  - A callable contributes its module, qualname, bytecode, constants, closure cells and
+    defaults.
+  - An AUTO_PIPELINE contributes its constructor constraint, never its served
+    `.latency`.
+  - An AUTO_MULTI_CYCLE contributes its resolved count (see
+    [`AUTO_MULTI_CYCLE(...)`](#auto_multi_cycle--tool-tuned-multi-cycle-path-tag)).
+  - Cycles are bounded by their defining type or symbol, never by object address.
+- **`_name_digest(text)`** is the 12-hex SHA-256 prefix used in `_s<digest>` and
+  `_h<digest>` suffixes.
+- **`_value_description(value)`** is a readable fragment for one value: a type's own
+  description, an array as `n`/`of`, a function with its factory or closure
+  parameters, a wrapper tag around its function, numbers as `neg5`/`1p5`, and
+  sequences joined by `_`. Anything else is `<type>_h<digest>`.
+- **`_describe(obj, kind, params, frame)`** snapshots a declaration at decoration
+  time, while its factory arguments are still available.
+  - Callers:
+    - `@struct`, `@enum`, `@interface` and `@hw_func`;
+    - `_exec_generated_func`, for generated functions;
+    - `interface_func`, AUTO_FSM and the RAM generators, which describe the
+      generated function by the factory or user function that caused it.
+  - **Shared helpers:** `_derived_type` describes an interface's `fwd`/`fb`/`wire`
+    halves, and `_replace_name_info` (`dataclasses.replace`) adjusts a description.
+- **Limits:** `_NAME_BASE_LIMIT` (192) applies to bases and `_NAME_IDENTIFIER_LIMIT`
+  (240) to composed identifiers. `_shorten_name` truncates on whole `_` tokens, keeps
+  timing and role suffixes, and appends a hash of what it omitted. `_safe_name`
+  reduces any text to an identifier fragment.
+
+Descriptions never decide identity. Two objects with equal descriptions but different
+logical keys are hashed apart at emission. Equal logical keys merge, however their
+descriptions read.
+
+### User names (`name=`)
+
+`@hw_func(name=)`, `@struct(name=)` and `@enum(name=)` give factory-produced hardware a
+name of the user's choosing. `AUTO_PIPELINE(name=)` and `AUTO_MULTI_CYCLE(name=)` name a
+latency group instead (see their sections below). Nothing in the library or the
+examples uses these: automatic names are the default everywhere, and the user guide's
+[naming section](pypeline_guide.md#naming-factory-produced-hardware-name) is the user
+documentation.
+
+- **Validation.** `_check_user_name` runs at decoration or construction, without the
+  compiler:
+  - the name must match `_USER_NAME_RE` (a VHDL basic identifier) and be at most 64
+    characters;
+  - it must not be a VHDL reserved word. `_VHDL_RESERVED_WORDS` lives here, and
+    PY_TO_LOGIC uses the same set for identifier mangling. So do `_sanitize_vhdl_name`
+    and `_hw_func_name` (PY_TO_LOGIC's `HW_FUNC_NAME`), which name @MAINs without the
+    compiler.
+  - it must not end in a suffix the compiler generates (`_USER_NAME_ROLE_SUFFIX_RE`).
+
+  A bad name raises; it is never sanitized.
+- **The prefix rule.** A named function or type's logical key is `_named_key(name,
+  unnamed)`: `<name>_s<_name_digest(unnamed key)>`.
+  - For a function, the unnamed key is `_canonical_func_name` with `user_names=False`.
+  - For a struct or enum, it is the `_pypeline_ctype_name` it would have had, kept as
+    `_pypeline_unnamed_ctype_name`.
+
+  Keys therefore change exactly when unnamed keys would, which keeps cross-pass and
+  cross-build reuse as safe as before.
+- **Descriptions.** `_NameInfo.user_name` makes `render()` return the name verbatim, so
+  `EmissionNames` uses it as the VHDL base and adds `_h<digest>` only on a collision.
+  `render(user=False)` is the automatic description, used by `-- Specialization:`
+  comments and `name_index.log`. A named type's identity also covers its name.
+- **Where names are allowed.** `@hw_func(name=)` takes only factory-produced functions
+  (a `.<locals>.` qualname). A top-level function's key comes from PARSE_FILE's
+  pre-registration (`HW_FUNC_NAME`), and its Python name already is its name.
+  `@hw_func(name=)` on an already-wrapped function is an error too: give the name where
+  the function is first decorated.
+- **MAIN names are not prefixes.** `@MAIN(name=)` and `MAIN(fn, name=)` take any
+  function, and the name is the MAIN's table key itself, with no `_s<digest>`: a MAIN
+  is one instance, and its name is protected from `EmissionNames` renaming (see
+  [Registering MAINs](#main--mainfn--registering-mains)).
+- **The capture rule.** `capture_factory_args` and `_exec_generated_func`'s frame
+  capture skip a parameter named `name` whose value is `None`. A factory can forward an
+  optional `name=` without renaming any product of an unnamed call. A real name is
+  captured like any argument (`…_name_chacha20_…`). No factory had a `name=None`
+  parameter before this rule, so it renamed nothing.
+
+---
+
+## Struct Support
+
+### `NamedTuple`
+
+Re-export of `typing.NamedTuple` for user convenience:
+
+```python
+from pypeline import NamedTuple, struct, uint32_t
+
+@struct
+class point_t(NamedTuple):
+    x: uint32_t
+    y: uint32_t
+```
+
+### `@struct` Decorator
+
+The `@struct` decorator does three things at decoration time:
+
+**1. Stamps logical type identity and source metadata.** `_pypeline_ctype_name`
+is the backend's C type key, derived from the class name, field types, and captured
+factory arguments in declaration order. It does not depend on the Python alias at a
+call site. Array brackets are mangled (`[` → `_`, `]` removed). Above 96 characters,
+`collapse_overflow_name` keeps a readable prefix plus eight SHA-256 digits; the
+pre-collapse string remains in `_pypeline_ctype_canonical`.
+
+`_pypeline_name_info` is a separate immutable `_NameInfo` description (see
+[Naming Metadata](#naming-metadata)):
+the source class, module, enclosing factory, file/line, parameter values, and field
+types. Nested types carry their descriptions, so a short logical type key does not
+hide their meaning in VHDL. For example:
+
+```text
+make_kept_data_bus_t(uint8_t, 4)
+logical C type: kept_data_bus_t_data_uint8_t_4_keep_uint1_t_4_data_t_uint8_t_n_4
+VHDL record:   kept_data_bus_t_from_kept_data_bus_n_4_data_t_uint8_t
+```
+
+Two calls with identical class name, fields, and factory arguments can share a
+logical type and one VHDL declaration. Source metadata preserves all contributing
+origins without changing that structural compatibility. Registration rejects
+conflicting layouts or structural identities under one logical key.
+
+Factory arguments distinguish types with equal bit layouts but different settings:
+`make_fixed_t(4, 8)` and `make_fixed_t(8, 4)` remain distinct even if both contain
+`val: int12_t`. An interface argument carries its complete structural identity,
+including payload width, rather than the bare Python class name `stream_intrf`.
+
+VHDL presentation uses a 192-character base budget and a 240-character composed
+identifier budget, retaining useful scalar settings and explicit hashes where
+necessary. These limits are independent of logical C type keys. See
+[Generated VHDL names](PY_TO_LOGIC_DESIGN.md#generated-vhdl-names) for the rendering
+rules, examples, and source-index lookup.
+
+**Field names** are Python identifiers at this layer and are not mangled here — VHDL
+reserved-word mangling for individual field names (e.g. a field literally named `label` or
+`signal`) happens on the elaboration side, in `PY_TO_LOGIC.py`, everywhere a field name is
+turned into a `struct_to_field_type_dict` key or ref_toks token. See
+[PY_TO_LOGIC_DESIGN.md's VHDL Identifier Safety section](PY_TO_LOGIC_DESIGN.md#vhdl-identifier-safety--name-sanitization)
+for the full list of call sites.
+
+**2. Adds `__class_getitem__`** via `_struct_class_getitem` so that `point_t[10]`
+produces `_make_ctype("point_t_x_uint32_t_y_uint32_t[10]")` — a valid array C type usable
+in further annotations. The canonical name is used as the base. As with `_CTypeMeta.__getitem__`
+above, the returned array class also gets `_elem_ctype = point_t` set, so the simulator can
+zero-initialize `point_t[10]` arrays as a list of zero-valued `point_t` instances rather than
+a list of bare `0`s.
+
+**3. Overrides `__new__`** with `_typed_new` to wrap scalar integer fields — and scalar
+*array* fields, element-wise — in typed simulation values when constructing struct
+instances. This enables `left.exp` in `float_add` to carry the correct `_ctype` (`uint8_t`
+for float32) so `concat(x_hidden, left.man)` can infer field widths without being told.
+`_typed_new` first normalizes positional args to keyword args by zipping them against
+`klass._fields`, then updates with any explicit keyword args — supporting positional-only,
+keyword-only, and mixed positional+keyword struct construction identically (mirroring
+Python's own `NamedTuple.__new__` semantics). Two code paths:
+
+- **Normal sim mode** (`SIM_RAW_INTS=False`): scalar fields are cast via `_sim_cast(v, ftype)`
+  — mask/sign-extend to the field's declared bit width, exactly like a hardware-typed
+  assignment. This runs *unconditionally*, even when `v` already carries some other `_ctype`:
+  `_sim_cast` itself short-circuits to a no-op only when the value's ctype already matches
+  `ftype` exactly. This matters because arithmetic on a struct field's value can promote its
+  width (e.g. `uint4_t + int` yields a `uint5_t`-tagged `SimVal`) — a value carrying *any*
+  ctype is not the same as a value already typed to *this* field, so recasting down to `ftype`
+  is required, matching what field assignment (`o.c = a.c+1`) already does via
+  `_sim_cast_deep` regardless of the RHS's existing ctype.
+  A field whose type is an array of a scalar pypeline int (e.g. `keep: uint1_t[n]`) and whose
+  value is a plain Python `list` (e.g. a list-literal argument) has each element cast
+  individually via `_sim_cast(e, elem_ctype)`, using the element ctype resolved by
+  `_array_elem_ctype`
+  (see [`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md#regt-simulation--stateful-registers-across-clock-cycles)).
+- **Raw sim mode** (`SIM_RAW_INTS=True`): wraps scalar fields with `_RawField(int(v))` —
+  `int` subclass keeping C-level arithmetic, with `__getitem__` for bit-slicing. Scalar array
+  fields get the same per-element `_RawField` wrap.
+
+Nested-struct fields are passed through unchanged in both modes — a struct-typed value
+arriving here is either already a typed instance (built through its own `_typed_new`) or a
+raw object the elaborator/sim layer doesn't need to touch at this level. Without the
+array-of-scalar handling above, a raw list literal passed straight into a struct constructor
+(e.g. `narrow_bus_t(data=[0]*n, keep=[0]*n)`) would silently keep untyped `int` elements,
+breaking `~`/other bit-width-sensitive ops on values read back out of such a field (see
+[`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md#regt-simulation--stateful-registers-across-clock-cycles)
+for the full mechanism, including the matching `_make_sim_zero`/Rule 4 handling).
+
+**Hardware transparency:** `SimVal` subclasses `int`, and `_RawField` subclasses `int`, so
+struct instances returned by `as_const` or any constant helper are seen as plain integers by
+`_elab_compound_init_from_pyval` in the elaborator.
+
+---
+
+## Enum Support
+
+### `@enum` Decorator
+
+The `@enum` decorator turns a Python `IntEnum` subclass (or a plain class with int members,
+which is auto-converted) into a Pypeline enum type.  Enums are integer-encoded scalar types —
+not compound types like structs.
+
+**At decoration time**, `@enum`:
+
+1. Converts a plain class to `IntEnum` if needed.  The plain-class branch iterates
+   `vars(cls)` **in definition order** (Python 3.7+ dict order is insertion order).
+   Each non-underscore member is handled as follows:
+   - `isinstance(v, auto)` → assigns the current 0-based counter, then increments it.
+   - `isinstance(v, int)` → uses the explicit value and resets the counter to `v + 1`.
+   
+   This gives `auto()` a 0-based start (matching PipelineC's C enum convention) with
+   no special base class required.  The result is passed to `IntEnum("name", members_dict)`
+   which bypasses the `start=1` default entirely.
+2. Derives a canonical C type name: `name_MEMBER1_val1_MEMBER2_val2` (members sorted by
+   value). SHA256-truncates if the name exceeds `_MAX_MANGLE_NAME_LEN`.
+3. Stamps `_pypeline_ctype_name`, `_pypeline_ctype_canonical`, `_pypeline_is_enum = True`,
+   and `_pypeline_enum_int_ctype` (e.g. `"uint2_t"`) on the class.
+4. Preserves the original source in `_pypeline_name_info` before any plain-class
+   conversion, then snapshots member names/values for readable VHDL presentation.
+
+The `_pypeline_ctype_name` attribute means enum types are handled uniformly by
+`_inner_ctype_to_str`, `_annotation_to_ctype`, and `_ctype_str` — the same machinery
+that already handles struct types.
+
+### `_enum_bit_width(enum_cls) → int`
+
+Computes the minimum uint bit width to represent all enum member values:
+```
+max(1, max_value.bit_length()) if max_value > 0 else 1
+```
+Never stored — computed fresh from the IntEnum members whenever needed.
+
+### `_is_scalar_pypeline_int(ctype)` — Enum Path
+
+Updated to check `getattr(ctype, "_pypeline_is_enum", False)` before the `_ctype_name`
+path. This makes enum types transparent scalars throughout simulation: `_TypedAnnAssignRewriter`
+inserts `_sim_cast` calls, struct `_typed_new` wraps enum-typed fields, and `_sim_type_wrap`
+casts arguments and return values.
+
+### Parameterizable Enums
+
+Since `@enum` is callable with a class as its argument, user factories call
+`enum(IntEnum("name", members_dict))` — directly analogous to the `@struct` pattern.
+No library-provided `make_enum_t` helper: each project writes its own factories.
+
+### `PypelineEnum` Base Class
+
+For users who prefer the `IntEnum`-subclass style over plain classes, `PypelineEnum`
+is an `IntEnum` subclass that overrides `_generate_next_value_` to return `count`
+(0-based) instead of `start` (1-based):
+
+```python
+class PypelineEnum(_IntEnum):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return count   # 0, 1, 2, …
+```
+
+`EnumMeta` resolves `auto()` during class construction, so by the time `@enum` sees
+a `PypelineEnum` subclass the values are already correct integers.  No special handling
+needed in `@enum` itself — the IntEnum-subclass branch is taken unchanged.
+
+Both `auto()` forms (plain class and `PypelineEnum`) produce identically-typed enums
+with the same canonical name and `_pypeline_enum_int_ctype`.
+
+### Introspection API
+
+```python
+enum_bit_width(enum_cls) → int       # minimum bit width from member values
+enum_uint_type(enum_cls) → uintN_t   # corresponding pypeline uint type
+```
+
+---
+
+## Char Array Support
+
+### `char_t` — Predefined Scalar Type
+
+```python
+char_t = _make_ctype("char")
+```
+
+A plain predefined scalar, exactly parallel to `uint8_t` (single global instance, no
+factory function). `char_t[16]` rides the existing `_CTypeMeta.__getitem__` array
+machinery for free, producing C-type-string `"char[16]"` — the same convention
+PipelineC's C frontend already uses, so the shared backend (`LOGIC.py`/`VHDL.py`)
+needs no changes to understand `char`/`char[N]` from Pypeline.
+
+`_CTypeMeta.width` special-cases `"char"` → 8 (mirroring `VHDL.py`'s
+`GET_WIDTH_FROM_C_N_BITS_INT_TYPE_STR`), since its general `(u?)int(\d+)_t` regex doesn't
+match the bare name `"char"`. `_ctype_is_int("char")` correctly returns `False` — `char_t`
+is excluded from generic integer arithmetic promotion (`_arith_promote`), matching the C
+frontend's own behavior where `char` is interchangeable with `uint8_t` only via an
+explicit swap in binary ops, not general promotion.
+
+Fixed-size char arrays (`char_t[N]`) require **no other special-casing anywhere** in the
+array/struct machinery: `_array_elem_ctype`, `_array_len`, `_make_sim_zero`,
+`_sim_cast_deep` (this file) and `_is_array`/`_annotation_to_ctype`/struct discovery
+(`PY_TO_LOGIC.py`) are all generic over any scalar element ctype already. A `char_t[16]`
+struct field, function param/return, or nested `char_t[3][3]` grid works through the
+exact same code paths as `uint8_t[16]` today.
+
+### String Literal Initializers
+
+`name: char_t[16] = "hello"` (and the equivalent struct-field, return, and call-argument
+forms) elaborate a Python `str` constant to a **single CONST wire**, mirroring PipelineC's
+C frontend exactly (`C_TO_LOGIC.NON_ENUM_CONST_VALUE_STR_TO_LOGIC`/`LOGIC.BUILD_CONST_WIRE`) —
+not per-character wires. See
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#string-literal-initializers) for the full
+elaboration-side writeup, including the target-type-override trick that gives free
+zero-padding via the existing VHDL `to_byte_array` helper, and the known
+underscore-in-literal bug ([#356](https://github.com/JulianKemmerer/PipelineC/issues/356)) inherited unmodified from the shared backend.
+
+### `strlen(arr)` Builtin
+
+Constant-folds to `arr`'s **declared array length** (its first dimension) at elaboration
+time — deliberate parity with PipelineC's `C_AST_STRLEN_FUNC_CALL_TO_LOGIC`, which is
+*not* a runtime scan for a NUL terminator. `strlen()` on a `char_t[16]` holding `"hello"`
+returns `16`, not `5`. Works for any array type, not just char arrays. The sim-mode
+equivalent (`pypeline.strlen`) is just `len(arr)`.
+
+For content-length string display in simulation, use `str(arr)` instead (see
+[`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md) — a `char_t[N]` sim value is a
+`CharArray` whose `__str__` stops at the first NUL byte) — deliberately distinct from
+`strlen()` so the capacity-vs-content distinction stays visible in the API surface.
+
+### Known Limitation: `Reg[T]` Initializers
+
+`Reg[T]` where `T`'s leaf element type is `"char"` (a bare `char_t` register, or any
+`char_t[...]` array) **cannot have an explicit initializer** — `= 65`, `= "hello"`, and
+`= [65, 66, ...]` all hit a pre-existing bug in `VHDL.CONST_VAL_STR_TO_VHDL`'s char branch,
+which assumes its input is always a quoted C-AST character-literal token (e.g. `"'A'"`)
+and mishandles a plain Python-int-derived value from Pypeline's
+`INIT_PYTHON_VAL_TO_VHDL_INIT_STR` register-init path. This reproduces even for the
+simplest case (`Reg[char_t] = 65`, no arrays or strings involved), so it predates and is
+independent of char-array support specifically; fixing it would require editing
+`VHDL.py`, which char-array support deliberately avoids. `Reg[char_t[N]]` with **no**
+initializer (zero-init) is unaffected and works normally through the generic `Reg[T]`
+machinery. The C front end reaches the same branch with an integer initializer:
+`static char c = 65;` builds, and GHDL rejects the generated `character'pos('65')`.
+Tracked in [#357](https://github.com/JulianKemmerer/PipelineC/issues/357).
+
+---
+
+## Type ↔ Bytes Conversion
+
+```python
+byte_length(t) → int
+make_type_to_bytes(t, endian="little") → hardware function
+make_type_from_bytes(t, endian="little") → hardware function
+```
+
+Generic packing of any pypeline type (scalar, array, `@struct`, or any nesting) into a
+fixed `uint8_t[N]` array and back, as a packed/unpadded layout (each leaf scalar field
+rounds up to a whole byte; no other padding). Replaces hand-written per-type
+`concat()`/bit-slicing conversion code such as wireguard-fpga's `bytes_to_uint320()`.
+
+`@enum` leaves are supported. They are carried through a same-width `uintN_t` temporary
+in the generated source, in *both* directions and even for a single-byte enum. That is
+not a stylistic choice: `@enum` lowers to `unsigned(N-1 downto 0)` in VHDL and
+`TYPE_RESOLVE_ASSIGNMENT_RHS` substitutes the enum's `int_c_type` for both sides' width
+and signedness, so an assignment between an enum wire and its same-width uint wire is a
+width-identical no-op needing no cast entity — while a direct assignment to or from a
+`uint8_t` array element would be a width mismatch. Casting *to* an enum is not an option
+either: `@enum` returns an `IntEnum` subclass whose metaclass is `EnumMeta`, and
+`some_enum_t(2)` already means member lookup (see the Casting section). Arrays *of* enums
+remain inexpressible, for the same `__class_getitem__` reason.
+
+A pure-Python `type_to_bytes(t, value)`/`type_from_bytes(t, data)` pair (plus
+`T.to_bytes`/`T.from_bytes` classmethods, attached by `struct()` immediately before its
+`_CastDispatchMeta` rebuild) provides the same layout in software, for host code that
+only has byte arrays. They share `_enumerate_leaves` and `_leaf_bit_width` with the
+hardware factories rather than reimplementing the walk, which is what makes drift between
+the two impossible rather than merely unlikely; `type_from_bytes` builds its result with
+`sim_zero` + `_sim_lens_set`, so what it returns is structurally identical to a
+`sim_call` return value and can be fed straight back in as an argument.
+
+`byte_length(t)` is a pure-Python recursive walk over the type object — `ceil(width /
+8)` per leaf, summed/multiplied through arrays and structs — with no elaborator
+involvement, the same shape as `enum_bit_width`/`enum_uint_type` above.
+
+`make_type_to_bytes`/`make_type_from_bytes` generate a **flat** (non-nested)
+`def <name>(...): ...` source string per `(type, direction, endian)`, `exec()` it after
+patching `linecache` so `inspect.getsource()` succeeds on the result, and tag it
+`@wires`. Full mechanics — why the source must be flat rather than a closure, the
+`_try_elab_bit_slice` restriction that requires materializing array-indexed leaves into
+a plain local before bit-slicing them, and the nested-struct auto-registration helper
+— are in [`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#type-to-bytes-conversion-byte_length-make_type_to_bytes-make_type_from_bytes).
+
+### One walk, three consumers
+
+There are three places that must agree about where a field's bytes are: the generated
+hardware (`make_type_to_bytes`), in-repo software (`type_to_bytes`), and the standalone
+host module `pypelinec` writes into `<out_dir>/host/` (`src/pypeline_host.py`). None of
+them re-derives the layout. All three walk `_enumerate_leaves(t)`, size each leaf with
+`_leaf_bit_width()`, total with `byte_length()`, and take mask/sign from
+`_sim_cast_params()` — the same function `_sim_cast` uses, so an `int16_t` comes back
+negative identically in all three.
+
+That is a structural argument, not a convention, and it is what makes a *generated* host
+module the right answer rather than a hand-written one. A hand copy of a wire format
+(old PipelineC hosts wrote `struct` format strings; so does
+`examples/pypeline/dsp/pdw`'s host code today) fails in the worst way available: a
+drifted copy still produces a well-formed frame of the right length, and the receiver
+loads the wrong values into the wrong registers with nothing to flag it. Hence the
+generator, and hence the test chain — `type_to_bytes` is asserted equal to simulated
+hardware (`inst/type_bytes_sw_test.py`), and the generated module is asserted equal to
+`type_to_bytes` from a subprocess that cannot import Pypeline
+(`inst/host_types_test.py`), so: host module ≡ software ≡ native-sim hardware ≡ VHDL.
+
+### The host-export registry
+
+`_host_register` is called from `make_type_to_bytes`/`make_type_from_bytes` rather than
+from the stream factories, because that is the single choke point every serialization
+path passes through — `make_type_to_axis`, `make_axis_to_type`,
+`make_type_to_byte_stream` and `make_byte_stream_to_type` all reach it. A struct the
+hardware has serialized is by construction a wire format someone must parse, so the
+registration needs no design edit; `host_export()` adds types the design never streams,
+plus constant values.
+
+Two deliberate choices in the generator. Emission is topological (nested types first)
+over exports visited in canonical-name order, so the output text is a pure function of
+the design rather than of import sequence — the same determinism rule entity names
+follow. And generated `@struct` types get `to_bytes`/`from_bytes` attributes while
+`@enum` types do not: an `@enum` lowers to an `IntEnum`, whose members already inherit
+`int.to_bytes`, and shadowing that would break ordinary integer code on the host. Enums
+convert through the module-level functions instead — the same call `pypeline.struct()`
+declines to make for the same reason.
+
+---
+
+## Byte-Stream Serialization
+
+`include/pypeline/stream/{serdes_common,serializer,deserializer,type_byte_stream}.py` and
+`include/pypeline/axi/type_axis.py` port old PipelineC's `serializer.h`/`deserializer.h`/
+`axis.h` conversion macros. Three design decisions are worth recording.
+
+**One algorithm, mirrored.** Both directions are a fill-index elastic buffer, not the old
+shift register: `buf: Reg[elem_t[buf_n]]` plus a fill count, output taken from the bottom
+`out_n` elements, input landing at `buf[fill + i]`. The sizing `buf_n = in_n + out_n - 1`
+is the exact value that makes "there is room for another input beat" and "the buffer does
+not already hold a whole output" the same condition —
+
+```
+nbase + in_n <= buf_n   <=>   nbase <= out_n - 1   <=>   nbase < out_n
+```
+
+— so `ready` collapses to a single comparison and neither module needs a full/empty flag.
+
+**No barrel shifter on receive.** The obvious way to consume a partial-keep beat is a
+running-prefix scatter (`if keep[i]: buf[base + running] = data[i]`), which builds an
+`in_n`-way barrel shifter per lane. It is unnecessary: `keep` is a contiguous prefix
+(Xilinx-style, and `make_axis_byte_sink` and the deserializer both assert it), so kept
+lane `i` always sits at `nbase + i` and the write can be unconditional, with only the
+*count* conditional. The `in_n - n_kept` garbage elements written past the kept prefix
+are provably never read — a following beat overwrites the whole garbage region, and if
+none follows then the value completed and the garbage all sits at an index ≥ `out_n`,
+outside the output window. That proof is the second reason `buf_n` is `in_n + out_n - 1`.
+
+**Padding is expressed in `keep`, never in data.** A non-divisible size produces a partial
+final beat rather than zero-filled data, and `padding="exact"` rejects the case at
+factory-call time. The old macros instead stepped their counters *over* the target
+(`deserializer.h:41`, `serializer.h:42`) and wedged forever with no diagnostic — the
+single worst property of the code being replaced, and the reason the sizing checks live
+in a pure-Python module that runs during design import.
+
+One consequence worth noting for module authors: unkept lanes' data is explicitly zeroed
+rather than left holding stale buffer contents, because an unwritten register reads `'U'`
+in GHDL but `0` in native simulation, which would otherwise surface as a spurious
+mismatch in a cycle-by-cycle native-vs-VHDL diff.
+
+---
+
+## Annotation Types
+
+Each annotation type is a descriptor class returned by `__class_getitem__` with the following
+pattern (using `Reg` as example):
+
+```python
+class _RegType:
+    def __class_getitem__(cls, inner_type):
+        return cls(inner_type)  # creates a typed descriptor
+```
+
+The five annotation types and what they mean conceptually:
+
+### `Reg[T]` / `_RegType`
+
+Declares a **hardware register** (D flip-flop). Persists across clock cycles.
+- Default initial value: zero
+- Optional initializer: `cnt: Reg[uint32_t] = 10` sets the initial value: the FPGA
+  power-up value and the value a reset loads
+- Optional markers `RESET` / `NO_RESET` (`_ResetMarker`, `_RegType.reset_mode` "reset" /
+  "no_reset"): the register resets under either `reset_registers` policy, or under none;
+  a plain `Reg[T]` follows its MAIN's policy. `_RegMeta.__getitem__` takes the markers and
+  a `MULTI_CYCLE` role in any order; two reset markers are a `TypeError`
+  ([Resets](#make_reset--resets))
+- Valid only inside hardware function bodies
+- Implies clock-enable behaviour: writes inside `if` only latch when condition is true
+- `@hw_func` (or `@MAIN`) required for simulation infrastructure to engage
+- Optional second subscript argument tags the register as one endpoint of a
+  `MULTI_CYCLE[...]` timing constraint: `Reg[T, tag]` where `tag` is
+  `MULTI_CYCLE[ncycles].start` or `.end` — see
+  [`MULTI_CYCLE[ncycles]` — Multi-Cycle Path Tag](#multi_cyclencycles--multi-cycle-path-tag)
+- When `T` is a struct/array, nested field/element writes (`reg.field = expr`,
+  `reg.nested.arr = [...]`, `reg.nested.field = SubStruct_t(...)`) are supported in both
+  backends: simulation via
+  `_sim_lens_set` (Rule 3b/4 in [`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md#_typedannassignrewriter--truncation-at-every-typed-assignment)),
+  hardware elaboration via `_elab_compound_init` (see
+  [`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#compound-initializer-syntax))
+
+### `Feedback[T]` / `_FeedbackType`
+
+Declares a **combinatorial feedback wire** — a signal whose driver appears later in
+Python source order than its first use. No flip-flop is inferred; no initial value.
+- Valid only inside hardware function bodies
+- `@hw_func` required for simulation convergence loop to engage
+- Cannot have an initializer at declaration site (elaboration error)
+
+### `Wire[T]` / `_WireType`
+
+Declares a **shared combinatorial wire** at module level, visible across `@MAIN` functions.
+- Valid only at module (global) scope — error if used inside a function body
+- At least one writer function; any number of readers; each writer function must have
+  exactly one instance in the design hierarchy. Compound-typed wires (structs and
+  arrays, nested arbitrarily) may be split across **multiple** writer functions with
+  pairwise-disjoint driven leaves — see "Splitting a compound wire across writers"
+  below. A writer may live anywhere in the hierarchy (a helper called from a `@MAIN`),
+  not only in a `@MAIN` body.
+- No initializer allowed at declaration
+- The bare name means the wire only inside the declaring module, and there it is
+  reserved. A local binding of it (a parameter, an annotated local, a loop variable,
+  ...) raises `GlobalWireNameError` when sim builds the function, and
+  `ElaborationError` during elaboration. Both use the shared list from
+  `_local_name_bindings`; see [`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#which-names-mean-a-wire).
+- In single-function simulation (`sim_call`): limited support; multi-MAIN simulation via `pypeline_sim.py` is the intended path
+
+**The flattened-leaf model.** A compound global wire behaves exactly as if flattened
+into one independent global wire per scalar leaf (each leaf = one scalar reachable
+through struct fields / array indices): each leaf is driven by whichever function
+writes it, leaves nobody drives read zero, and every reader — including the writer
+functions themselves — sees each leaf's live value. All of the semantics below follow
+from this one model.
+
+**Reading and writing the same wire, in its writer function.** The writer function
+may read the wire it writes. For leaves it drives itself: normal local-variable
+semantics — writes/reads interleave in program order, read-before-write returns
+**zero**, and the value everyone else sees that cycle is the value at the end of the
+writer's body. For leaves a **different** function drives: the read returns that
+function's live value (a real cross-function read, not local zeros).
+
+**Partial (field/element) writes and the implicit zero default.** A `Wire[T]` (or
+`Output[T]`) of struct/array type does not need every field/element assigned by its
+writer(s). Every leaf no function ever touches — and, within a writer, every own leaf
+read before it is written — resolves to zero, as if the wire had been implicitly
+assigned a whole-value zero immediately on entry to each writer, before its real
+assignments. Writes may also be conditional (`if en: w.x = v`): on cycles the branch
+doesn't execute, the leaf reads its zero default — the write lowers to a mux whose
+else-value is the implicit zero init. Mechanically: `elaborate()` **hoists**
+write-declaration of every pre-scanned written wire to before the body (so a wire
+whose first textual touch is inside an `if` still has its base declared ahead of the
+branch merge), and `_declare_global_write_wire` in `PY_TO_LOGIC.py` gives the base an
+implicit first alias using the exact same alias-chain mechanism `_declare_var` uses
+for an ordinary local variable (see
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#global-wires-wiret)). That first alias is
+driven by zeros (`0` / `LOGIC.COMPOUND_NULL`) for a write-only function, or by
+an internal **readback input wire** (below) for a function that also reads the wire.
+
+**Readback: a writer that also reads its wire.** When the pre-scan finds a function
+both writes and reads the same wire, `_declare_global_write_wire` creates an extra
+input wire `<name>_PYPELINE_READBACK` of the same type, registers it in the function's
+`read_only_global_wires` (so the existing `global_to_module` record-field / entity
+read-stage machinery feeds it with zero extra plumbing) and in
+`Logic.readback_global_wires`, and uses it as the implicit first alias's driver. The
+top level (`VHDL.py`) then feeds that readback record field per region: **zeros in the
+regions this function itself drives** (own read-before-write = 0, conditional own
+writes default to 0) and **the owning writer's live `module_to_global` value in
+foreign regions** — which is precisely the flattened-leaf readback semantics, decided
+entirely at the top level with no own/foreign distinction needed during elaboration.
+For a single-writer wire every region is its own, so the feed is all zeros; if the
+wire is used by nobody else (`GLOBAL_VAR_IS_SHARED` false), a dedicated pass still
+emits the all-zeros readback feed. The write side is untouched: the final alias still
+drives the base wire and `module_to_global.<name>` exactly as before.
+
+**Splitting a compound wire across writers.** Any static path may be claimed by a
+writer, at any depth: nested struct leaves (`w.a.x = ...`), whole subtrees
+(`w.a = some_point` — note a struct *literal* RHS is decomposed by
+`_elab_compound_init` into per-leaf writes, so only a struct-typed variable/expression
+RHS records the interior path itself), and constant array indices (`w.arr[2] = ...`,
+including unrolled-loop indices, which elaboration resolves to precise int tokens).
+`_write_ref` records each driven path in
+`LOGIC.Logic.global_wire_driven_paths[wire_name]` — a set of path tuples of
+field-name strs / index ints, `()` meaning "whole wire" — skipping the implicit
+zero-init write itself (that's a fallback default, not a claimed leaf). A
+variable-index write instead marks the wire in
+`Logic.global_wire_dynamic_index_writes`, since its concrete driven path can't be
+known until runtime and so can't be safely combined with a second writer.
+
+Post-elaboration validation (`PY_TO_LOGIC.py`, end of `PARSE_FILE`) requires at least
+one writer per `Wire`/`Output`, each with exactly one hierarchy instance, and — when
+there is more than one writer — runs `_check_no_overlapping_driven_paths` over every
+writer's driven-path set: two paths from different writers conflict iff one is a
+prefix of the other (so `()` conflicts with everything, equal paths conflict, and a
+whole-subtree claim conflicts with any deeper claim inside it), which is exactly
+"these two writers' claimed leaf territory overlaps," independent of nesting shape.
+Any writer of a multi-writer wire found in `global_wire_dynamic_index_writes` is
+rejected outright.
+
+On the VHDL side, `VHDL.py`'s "Directly connected global wires" top-level wiring keeps
+today's single whole-wire assignment **byte-identical** when a wire has exactly one
+writer and no readback (protecting every existing C-frontend and Pypeline design).
+When a wire has more than one writer, `BUILD_MULTI_WRITER_REGIONS` recursively splits
+the wire's type tree against all writers' driven-path sets into the coarsest list of
+`(vhdl_suffix, region_c_type, owner_or_None)` regions — an exactly-claimed path
+becomes one region at its own depth, structs/arrays with claims strictly below recurse
+per field / per constant element, unclaimed subtrees get `owner=None` — and, for every
+reader instance, the `Output[T]` port case, and each writer's readback feed, emits one
+concurrent VHDL assignment per region:
+`global_to_module.<reader>.<var><suffix> <= module_to_global.<owner>.<var><suffix>;`
+for an owned region (array steps render as `(i)`, struct steps as `.field`), or
+`... <= <zero constant for that region's type>;` (`C_TYPE_STR_TO_VHDL_NULL_STR`) for
+an unclaimed region — and, in a writer's own readback feed, for that writer's own
+regions too. Per-region concurrent assignment to distinct static sub-elements of a
+shared record/array signal is not a new VHDL pattern here — it mirrors the existing
+`INST_ARRAY` multiple-write-instance mechanism (`(i)` sub-element assignment from
+distinct writer instances), generalized over the whole type tree. The per-function
+`<func>_module_to_global_t` record type is unchanged either way — a writer's own
+internal variable still holds the *whole* wire value (implicit zeros in the leaves it
+doesn't drive included); only the *top-level* wiring harvests just each writer's own
+claimed regions.
+
+Native sim mirrors the per-writer zero default with **runtime claim tracking** rather
+than static analysis: every rewritten write call carries a key for the writing function
+(`claim_key`: its qualified name plus a serial per decorated function,
+`_wire_claim_serial`, as closures of one def — lanes made by one factory — share a
+qualified name) and records the concrete path it wrote — static fields,
+nested paths, unrolled-loop and dynamic indices all land as the exact elements touched
+— into `_sim_wire_claims`; a one-line prologue (`_sim_wire_reset_claims`) zeros
+exactly those claimed leaves at the top of each of that function's invocations.
+Resetting only the function's own claims (never the whole wire) is essential for
+multi-writer wires: a whole-wire reset would transiently wipe a different writer's
+already-committed leaves within the same simulated cycle's convergence loop, since
+`_sim_wire_state` is shared, persistent process state, not per-invocation-scoped. See
+[`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md).
+
+### Pipeline timing: aligned globals and `VOLATILE`
+
+`Wire[T, VOLATILE]` (also `Input`/`Output`) passes a marker after the type to the
+metaclass; [Wire markers](#wire-markers-volatile-async-and-clocks) lists them all.
+`VOLATILE` is the `_VolatileMarker` singleton.
+
+A function with pipeline stages treats every global it touches like an extra argument
+or return value. Reads are sampled with its arguments, and writes are published with its
+return value, through its IO registers if it has them. The wire itself is connected
+directly to the function instance that uses it, wherever it sits in an enclosing
+pipeline. A `VOLATILE` wire is not aligned: each consumer reads it at its own stage, and
+writes are driven when ready.
+
+Elaboration records this as `VariableInfo.pipeline_timing` ("aligned"/"volatile"; see
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#global-wires-wiret)). The emitter
+applies it in [`AUTO_PIPELINE_DESIGN.md`](AUTO_PIPELINE_DESIGN.md#global-wires-in-pipelines).
+User guide: [Global wires in pipelined code](pypeline_guide.md#global-wires-in-pipelined-code).
+
+Native sim models aligned globals used in a pipelined region root's own body exactly,
+and refuses the rest with `SimPipelineModelError`. See
+[`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md#pipelined-native-sim-non---comb-pipelinec---sim)
+(`_sim_regions`, `_sim_region_for`). `_build_reg_sim_func` and
+`pypeline_sim._discover_wire_names` record `VOLATILE` sim keys in `_sim_wire_volatile`.
+
+### Wire markers: `VOLATILE`, `ASYNC` and clocks
+
+`_wire_ann_args(kind, item)` splits a `Wire`/`Input`/`Output[...]` subscript into
+`(inner ctype, volatile, is_async, clock)`, which `_WireType`, `_InputType` and
+`_OutputType` store as `volatile`, `is_async` and `clock`. After the type come markers in
+any order:
+
+- `VOLATILE` (`_VolatileMarker`): not aligned in pipelined functions.
+- `ASYNC` (`_AsyncMarker`): an async wire, readable by functions on other clocks than its
+  writer's ([guide](pypeline_guide.md#async-wires-wiret-async)). `volatile` is set too,
+  since an async wire is not aligned either.
+- a clock from `make_clock`: the clock the wire's functions must be on (a stated clock).
+
+These are `TypeError`s: a marker given twice or anything else after the type, `ASYNC`
+with a clock ("use one of them"), and `ASYNC` with `VOLATILE` ("ASYNC already behaves as
+VOLATILE"). `_wire_ann_str(kind, ann)` prints an annotation with its markers, as messages
+show it: `Wire[uint8_t, ASYNC]`, `Input[uint1_t, clk_25p0_eth_rx]`. `Inst[f]` and
+`Fifo[T]` take no marker: their metaclasses reject any second subscript.
+
+The markers mean nothing to native simulation, which runs one clock, apart from
+`volatile`. The compiler reads them in `_discover_global_wires`
+([`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#clock-domains)).
+
+### `Input[T]` / `_InputType`
+
+Module-level annotation declaring a **top-level FPGA input port**.
+- Globally read-only — no function may write it
+- Name appears verbatim as VHDL entity port (no module prefix)
+- Must be a legal VHDL identifier (elaboration error if not)
+
+### `Output[T]` / `_OutputType`
+
+Module-level annotation declaring a **top-level FPGA output port**.
+- At least one writing function, each with exactly one hierarchy instance; a compound
+  `Output[T]` may be split across writers exactly like a `Wire[T]`
+- Name appears verbatim as VHDL entity port (no module prefix)
+- Must be a legal VHDL identifier
+
+### `Inst[f]` / `_InstType` — global instances
+
+`alu0: Inst[f]` places one instance of the hardware `f` at module level
+([guide](pypeline_guide.md#instf--global-instances)). `_InstType` and `_FifoType` both
+subclass `_GlobalInstType(_WireType)`: an instance is an ordinary compound global wire
+everywhere wires are handled (native-sim rewriting and lens writes, elaboration,
+multi-writer regions, readback), plus the MAIN that holds the instance, built by
+`_make_global_inst_main`. A subclass supplies `kind_name` ("global instance" / "global
+FIFO"), `main_suffix` (`_INST` / `_FIFO`), `stem` (the generated MAIN's local names),
+`arg_alias(port)`, `hardware(wire_name, init)` and `exec_main(...)`.
+
+- **Subscript** (`_InstMeta`): `Inst[f]` builds `_InstType(f)` when the declaration
+  runs. `f` is a hw_func, or an AUTO_PIPELINE tag whose `.func` is one (`_hardware_func`
+  finds the function whose signature gives the ports). `GlobalInstError` (a `TypeError`)
+  for `Inst[a, b]`, a `@MAIN` (`_pypeline_main` set), anything else, and the port errors
+  below.
+- **Ports.** `_global_inst_ports(fn, fail)` returns `_InstPort` records (name, `arg_t`,
+  `ret_t`, `interface`, `is_input`, `whole_return`), arguments first in signature order,
+  then return fields. An argument is an input port. An interface half
+  (`_interface_half_of`) pairs with the return field of the same name holding the other
+  half; the port is an input when its argument is the `.fwd_t` half (with no argument,
+  when its field is `.fb_t`). A return value with at least one interface-half field is a
+  port bundle: each field is a port, a plain field an output port of its own. Any other
+  return value is the one output port `out`. `fail(why)` is called for an argument
+  without a type, an array of interface halves (not supported yet), a return field that
+  shares an argument's name without being its other half, an argument `out` next to a
+  plain return value, and no ports at all. `_InstPort.wire_t` is the port's field type:
+  `interface.wire_t` (both halves as plain fields) for an interface port, else its own
+  type.
+- **Wire type.** `_global_inst_types(hardware, ports)` builds `global_inst_t`, one field
+  per port, with `struct(typing.NamedTuple(...))`. Its C name comes from its field names
+  and types, so two hardware modules with the same ports share one type. It is cached
+  per hardware object, keyed by identity (an AUTO_PIPELINE tag need not be hashable).
+- **No initializer.** `_InstType.hardware(wire_name, init)` returns `(f, ports, {})`; a
+  non-None `init` is a `GlobalInstError`, so native sim rejects an initializer too.
+- **MAIN generator.** `_make_global_inst_main(func_name, wire_name, ann, hardware,
+  module_globals, reserved)` takes the `(module, ports, bindings)` that `ann.hardware`
+  gave (a binding maps a port to its wire path; ports without one sit at their own name)
+  and builds the flat hw_func `func_name` with `_exec_generated_func`, from a frame of
+  `ann.exec_main` whose arguments become its name info (folder
+  `pypeline_generated_insts`, so `dump_generated_sources` writes it). Its body makes one
+  keyword call of the module: a plain input port gets its whole path, an interface port
+  its argument half built field by field (`<alias>(f=W.p.f, ...)`). Then the returned
+  halves drive the wire: an interface port's field by field, a bundle's plain field and
+  the whole return value as wholes. With no output port the call is a bare statement. It
+  is exec'd in a copy of the declaring module's globals, so the body names the wire by
+  its bare name, and both the native-sim rewriter and the elaborator resolve it by that
+  module. The injected names (the module and each argument half's type) and the one
+  local avoid every name of that module and `reserved`; the compiler passes the top
+  design file's globals as `reserved`, since elaboration merges them in. The result is
+  marked `_pypeline_global_inst = ann.kind_name`, which `PY_TO_LOGIC`'s
+  `ELABORATE_LIVE_ROOTS` reads as its no-added-latency reason.
+- **MAIN name.** `_global_inst_main_name(module_name, bare_name, ann)`: the module
+  prefix, the VHDL-safe bare name and the kind's suffix, as `PY_TO_LOGIC`'s wire key plus
+  the suffix. Native sim names the MAINs it registers with it.
+- **Registration.** An `Inst`'s MAIN is a made `@MAIN` (`_register_main`, never
+  `MAIN()`, so its name skips the user-name check): `PY_TO_LOGIC`'s PARSE_FILE Step 7.1
+  and `pypeline_sim.run_sim` register it
+  ([`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#global-instances-instf-fifot),
+  [`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md#the-mains-that-run-global-instances-root-frames-refusals)).
+
+### `Fifo[T]` / `_FifoType` — global FIFOs
+
+`rx: Fifo[T] = hardware` declares a global FIFO
+([guide](pypeline_guide.md#fifot--global-fifos)): a global instance of its hardware
+(`_FifoType` is a `_GlobalInstType`, see
+[`Inst[f]`](#instf--_insttype--global-instances)) whose wire has a fixed type and whose
+two stream ports are bound to the ends `wr` and `rd`.
+
+- **The wire type.** `_global_fifo_types(T)` builds `{wr: end, rd: end}` with
+  end = `{stream: make_stream_t(T), ready: uint1_t}`. The stream half is the library's
+  `make_stream_t` (`include/pypeline/stream/stream.py`), so `rx.wr.stream =
+  r.x_out_if.stream` type-matches. It is imported when a `Fifo[T]` is first evaluated,
+  never at load: `pypeline.py` keeps no load-time dependency on `include/pypeline` (see
+  `_make_auto_fsm_stream_t`). `_global_fifo_type_cache` keeps one pair of types per `T`.
+- **Subscript errors** (`_FifoMeta`): `Fifo[T, ...]`; `T` an interface or a port half
+  (the message says the FIFO supplies valid and ready itself); `T` not a hardware type.
+- **Initializers.** `global_fifo(n, impl=None)`, `global_sync_fifo(n)` and
+  `global_async_fifo(n, impl=None)` return a `_GlobalFifoInit(kind, n, impl)`; `kind` is
+  the function's name, which says which clocks the ends may be on. A non-int or
+  non-positive `n` is an error, and so is an `impl` outside `_GLOBAL_FIFO_IMPLS`
+  (`None`: by synthesis tool; `"builtin"`: the built-in async FIFO on every tool). On one
+  clock all three build `make_stream_fifo(T, 2**ceil(log2(max(n, 2))))`
+  (`_global_fifo_hardware`), which is also every FIFO's native-sim model. Any other
+  initializer is the FIFO's module itself, which works on one clock only.
+- **Port helper.** `_stream_module_ports(module, T, what)` returns the module's
+  `(input port, output port)` as `_InstPort` records: its ports
+  (`_global_inst_ports`) must be exactly one valid/ready input port and one output port,
+  each an interface port with both halves, carrying `make_stream_t(T)` with a `uint1_t`
+  ready. Otherwise `GlobalFifoError` (a `GlobalInstError`) names the module and why.
+- **FIFO MAIN.** `_FifoType.hardware(wire_name, init)` resolves the hardware
+  (`_global_fifo_hardware`), checks it with `_stream_module_ports`, and binds the input
+  port to `('wr',)` and the output port to `('rd',)`, in that order. The generic
+  `_make_global_inst_main` then builds `<key>_FIFO`: it reads `wr.stream` and `rd.ready`
+  and drives `wr.ready` and `rd.stream`. The FIFO keeps its own local names
+  (`fifo_hardware`, `fifo_in_t`, `fifo_out_t`, `fifo_ports`), folder
+  (`pypeline_generated_fifos`) and name-info frame (`global_fifo_main(fifo, data_t,
+  hardware)`). Native sim registers it like an instance's MAIN; the compiler adds it after
+  clock assignment with `_add_late_mains`, from `PY_TO_LOGIC._check_global_insts`
+  ([`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#global-instances-instf-fifot)).
+- **Async parts.** When the ends are on two clocks the compiler builds no FIFO MAIN.
+  `_make_global_fifo_async_parts(crossing, wire_name, ann, module_globals, reserved)`
+  returns a `_GlobalFifoAsyncParts(write_stub, read_stub, wr_main, rd_main)`, the shape of
+  PipelineC's `GLOBAL_STREAM_FIFO`, named after the crossing `<key>_FIFO`:
+  - `<crossing>_WRITE_1(write_data: T[1], write_enable: uint1_t)` and
+    `<crossing>_READ_1(read_enable: uint1_t)` are stubs returning an unassigned
+    `{ready}` and `{data: T[1], valid}` (`_global_fifo_async_types`, cached per `T` in
+    `_global_fifo_async_type_cache`). Their names, argument names and field names are the
+    back end's crossing convention; the compiler tags them as the crossing, and the back
+    end connects their calls to `clk_cross_<crossing>`.
+  - `<crossing>_wr` copies `wr.stream` into the write stub's call and drives `wr.ready`
+    from its result; `<crossing>_rd` calls the read stub with `rd.ready` and drives
+    `rd.stream`. Both carry `_pypeline_global_inst`, like a FIFO MAIN.
+
+  The injected type names and locals come from `_free_name_picker(module_globals,
+  reserved)`, which `_make_global_inst_main` uses too, and every source goes through
+  `_FifoType.exec_async_part`, whose frame `global_async_fifo_part(fifo, data_t, part)`
+  is the name info (folder `pypeline_generated_fifos`). Only the compiler calls this:
+  native simulation refuses two clocks before it would need them.
+
+---
+
+## `PART()` and `@MAIN` Pragmas
+
+### `PART(part_string)`
+
+Called once at module level to register the FPGA target device:
+
+```python
+PART("xc7a35ticsg324-1l")
+```
+
+Sets the module-level `_part_registry` string. `PY_TO_LOGIC.PARSE_FILE` reads it after
+executing the design module and writes it to `parser_state.part`. When `None`, the toolchain
+defaults to a software timing estimator.
+
+### `@MAIN` / `MAIN(fn)` — Registering MAINs
+
+```python
+@MAIN                          # no clock: inferred, or the default clock
+@MAIN(100.0)                   # positional MHz: the unnamed clock of that rate
+@MAIN(mhz=25.0)                # keyword MHz
+@MAIN(eth_clk)                 # a clock from make_clock(...)
+@MAIN(clock=eth_clk)           # keyword clock
+@MAIN(name="top0")             # a given name, with or without a clock
+MAIN(fn, name="lane0", mhz=…)  # called on a function: MAINs made in code
+MAIN(fn, clock=eth_clk, name="rx")
+```
+
+`MAIN` dispatches on whether its first argument is callable. `_main_clock_arg(positional,
+mhz, clock, origin)` turns the clock arguments into one `_Clock` or None: at most one of a
+positional rate or clock, `mhz=` and `clock=` (two are a `TypeError`, "names its clock
+twice"), and a rate becomes `_Clock(rate, origin=origin)`, the unnamed clock of that rate.
+A positional value that is not a number, a clock or a function is a `TypeError`, as is a
+`clock=` that is not a clock. `reset=` (a `_Reset`, `None`, or the default `_CLOCK_RESET`:
+the clock's primary reset) and `reset_registers=` (`"requested"` or `"all"`) are checked by
+`_main_reset_args` and stored in `_MainInfo.reset` / `.reset_registers`
+([Resets](#make_reset--resets)). Every form ends in `_register_main(func, clock, name,
+origin, reset, reset_registers)`, where `origin` is `"file.py:line"` of the `MAIN()` call or the decorator, from
+the caller's frame (`_frame_origin`).
+`_register_main`:
+
+1. **Checks.** `func` must unwrap to a Python function. No simulation run may be in
+   progress: `_sim_run_in_progress`, set by `pypeline_sim.run_sim` from its
+   `@initial(sim)` hooks to the end of its `@final(sim)` hooks, after its MAINs are
+   collected. `_sim_active` cannot serve, as `run_sim` never resets it. A user's `name`
+   has passed `_check_user_name(name, "MAIN")` in `MAIN()` already; `_register_main` uses
+   a name verbatim, since a global instance's `<key>_INST` may be longer than a user name
+   may be.
+2. **Wraps** with `_sim_type_wrap`, so `@MAIN` implies `@hw_func`; it is idempotent, so
+   `@MAIN` stacks with `@hw_func`, `@wires` and `pipeline_latency`.
+3. **Refuses a wrapper already registered** (identity in `_main_registry`): each MAIN
+   needs a function of its own, and the record lives on the wrapper.
+4. **Names it:** `name`, else the function's `@hw_func(name=)` (`_pypeline_user_name`),
+   else `_hw_func_name(_module_prefix(fn.__module__), fn.__name__)`. That is the name
+   PY_TO_LOGIC gives a top-level def of the same module: `_module_prefix` is None for the
+   top design file (`"pypeline_design"`) and a script (`"__main__"`), else the module's
+   name with dots as underscores, as import discovery prefixes it. Names come only from
+   source, so every re-execution of the design (pin-and-confirm passes, `--sim` after a
+   build) gives each MAIN the same name.
+5. **Records** `_MainInfo(name, named, clock, origin)` on the wrapper as `_pypeline_main`
+   (`named`: given by `name=` or `@hw_func(name=)`), and appends the wrapper to
+   `_main_registry`.
+
+`_duplicate_main_names(mains)` returns the message for the first two MAINs whose names
+are equal ignoring case, as VHDL compares them, naming both qualnames and origins; None
+when all differ. `PY_TO_LOGIC` raises it as an `ElaborationError`, and `pypeline_sim`
+exits with it.
+
+Consumers of the record: PY_TO_LOGIC elaborates each MAIN under `.name` on clock
+`.clock` (Steps 5/7/7.2 of PARSE_FILE, and `ELABORATE_LIVE_ROOTS`); `pypeline_sim` uses
+`.name` for root frames, its refusals and build results, and `.clock` for the
+multi-clock refusal; `stream_perf_probe` labels a `named` MAIN's taps by `.name`.
+
+### `make_clock(mhz, name=, syn_mhz=, reset=)` — Clocks
+
+`make_clock(mhz, name=None, syn_mhz=None, reset=None)` returns a `_Clock` with `mhz`,
+`name`, `syn_mhz`, `origin` (`"file.py:line"` of the call) and the read-only `reset`, its
+primary reset ([Resets](#make_reset--resets)), the Python equivalent of
+PipelineC's `MAIN_MHZ` groups, `MAIN_SYN_MHZ` and `CLK_MHZ`
+([guide](pypeline_guide.md#declaring-a-clock-make_clock)):
+
+- **Identity.** `identity` is `(mhz, name)`, and `__eq__`/`__hash__` follow it: every
+  unnamed clock of one rate is one clock, so `@MAIN(85.0)` and `make_clock(85.0)` agree.
+  `syn_mhz` is not part of it. The default clock, `(None, None)`, has no object.
+- **Port name.** `port_name` is `"clk_" + _clock_text(mhz, name)`: `clk_125p0_eth_rx`.
+  `_clock_text` mirrors `VHDL.CLK_MHZ_GROUP_TEXT`, since `pypeline.py` may not import the
+  compiler; `clock_api_unit_test.py` compares the two.
+- **Checks.** `mhz` and `syn_mhz` are positive numbers, and `name` matches
+  `_CLOCK_NAME_RE` (letters and digits, single underscores between them), since it
+  becomes part of a VHDL identifier. `_clock_conflict(clocks)` gives the message for a
+  design's first conflict: one clock with two `syn_mhz` values or two primary resets, or
+  two names of one rate that differ only in case. The compiler raises it. `reset` is not
+  part of the identity.
+
+A clock is used by `@MAIN(clk)` / `MAIN(fn, clock=clk)`, as a [wire
+marker](#wire-markers-volatile-async-and-clocks), and as the initializer of a global
+`Input[uint1_t]` or `Wire[uint1_t]`, which binds the clock to that pin or wire:
+`pll_clk: Input[uint1_t] = make_clock(85.0)` brings `@MAIN(85.0)`'s clock in on the port
+`pll_clk`. There is no registry: `PY_TO_LOGIC._discover_global_wires` reads bindings off
+the live module namespace, and the clocks' Python names from its other globals
+([`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#clock-domains)). Native sim never reads
+a global wire's bound value, only its annotation, so a binding is inert there.
+
+Board modules name their clocks the same way:
+[`include/pypeline/board/arty/clocks.py`](../include/pypeline/board/arty/clocks.py) binds
+`clk100 = make_clock(100.0)` to the pin `CLK100MHZ`.
+
+
+### `make_reset()` — Resets
+
+`make_reset(kind="sync", active="high")` returns a `_Reset` (`kind`, `active`, `origin`);
+any other `kind` or `active` raises `NotImplementedError` naming the workaround. Like a
+clock, it is bound on its declaration line to a module-level `uint1_t` `Input` or `Wire`,
+which `PY_TO_LOGIC._discover_global_wires` reads off the live module namespace
+([elaboration](PY_TO_LOGIC_DESIGN.md#resets-_assign_resets)). A `_Reset` reaches MAINs as
+a clock's primary reset (`make_clock(reset=)`) or `MAIN(reset=)`.
+
+Two pure functions give a MAIN its reset, so elaboration (`_assign_resets`) and native
+sim (`pypeline_sim._sim_reset_table`) agree: `_resolve_main_reset(info, clock_identity,
+clock_primaries)` returns `(reset, reset_registers)` from a `_MainInfo` and its clock
+(`clock_primaries` from `_clock_primary_resets(clocks)`), and
+`_global_inst_main_reset(clock_identity, clock_primaries)` gives a global instance's MAIN
+its clock's primary reset under `"all"`.
+
+`_sanitize_vhdl_name` renames an identifier `reset` (any case, `_IMPLICIT_PORT_NAMES`)
+like a VHDL reserved word, since VHDL reads it as the `RESET` port the compiler adds. A
+global `Input`/`Output` named `reset` is not affected: top-level ports and record fields
+do not collide with an entity's port.
+
+Native simulation state for resets (`_sim_reg_modes`, `_sim_root_resets`,
+`_sim_reset_inputs`, `_sim_apply_resets`) is described in
+[pypeline_sim_DESIGN.md](pypeline_sim_DESIGN.md#register-commit-timing).
+
+### `AUTO_PIPELINE(func, latency=None, start_latency=None, max_latency=None)` — Forced Submodule Pipelining with `.latency`
+
+The compiler also uses fixed tags internally for AUTO_FSM functional units.
+`_auto_fsm_implementation` defaults to `None`; an internal tag records a concrete
+placement recipe and digest there. It is copied into the elaborated latency
+constraint and enforced by AUTO_PIPELINE. It adds no public constructor option.
+
+Python equivalent of PipelineC's `#pragma AUTOPIPELINE [N]`, plus a feedback
+channel the C pragma doesn't have. `AUTO_PIPELINE(func)` is a class (all-caps factory
+style, like `MULTI_CYCLE`) whose instances are callable tags. Calls made through one
+force the synthesizer to slice (insert pipeline registers) through that call's
+submodule, even inside a register/feedback context that would otherwise forbid added
+latency. The instance's `.latency` attribute reads back how many registers (clocks
+of latency) were built there:
+
+```python
+MY_AP = AUTO_PIPELINE(some_func)                                  # tool picks, from 0
+MY_AP = AUTO_PIPELINE(some_func, latency=2)                       # fixed: exactly 2, every build
+MY_AP = AUTO_PIPELINE(some_func, start_latency=3)                 # sweep starts at 3
+MY_AP = AUTO_PIPELINE(some_func, max_latency=6)                   # sweep never exceeds 6
+MY_AP = AUTO_PIPELINE(some_func, start_latency=3, max_latency=6)
+rv = MY_AP(x)                                                    # some_func(x), auto-pipelined
+MY_AP.latency                                                    # int
+```
+
+| Arguments | `.latency` during a sweep build's bootstrap pass | Throughput sweep | Plain native sim, `--comb` / `--no_synth` / `--yosys_json` builds |
+|---|---|---|---|
+| none | 0 | free, as always | 0; passthrough, no registers |
+| `latency=N` | N (in every context) | exactly N registers | N-cycle delay line; exactly N registers built |
+| `start_latency=S` | S | first iteration builds S, grows if timing fails; the post-met trim may go below S | 0; passthrough, no registers |
+| `max_latency=M` | 0 | free but never more than M; a cap that blocks the clock goal stops the sweep with a warning naming it and fails the build | 0; passthrough, no registers |
+
+Latencies count inserted register slices, not combinational stages: `latency=2`
+separates three stages. Arguments are validated at construction, in the style of
+AUTO_FSM's `max_latency=`:
+- each value is an `int` (not `bool`) and at least 0;
+- `latency` can't be combined with the other two;
+- `start_latency <= max_latency`;
+- a function declared `@pipeline_latency(k)` needs `latency == k`, `start_latency == k`
+  and `max_latency >= k`.
+
+The removed `depth=` keyword raises a `TypeError` that names its replacements.
+
+`.latency` is decided when the tag is constructed, in this order:
+1. A fixed `latency=N` is always N.
+2. Otherwise, the harvested stage count once the module-level cache
+   (`pypeline._auto_pipeline_latency_cache`) holds the tag's binding (`binding_key`: its
+   key, or its key at the clock goal of the MAINs that use it, see
+   [AUTO objects and clock goals](#auto-objects-and-clock-goals)). `AUTO_PIPELINE.DO_AUTO_PIPELINE_LATENCY_PASSES`
+   installs the cache between pin-and-confirm passes, and again before a non-`--comb`
+   `--sim` run imports the design for native sim.
+3. Otherwise, in a synthesizing build, a starting latency from the latency memory or
+   a `--latency_hints` file (`SET_LATENCY_SEEDS`, see
+   [SWEEP_DESIGN.md](SWEEP_DESIGN.md#5-latency-memory)), clamped to `max_latency`. The
+   tag keeps it as `.seed`, which `LOGIC.AutoPipelineLatency.from_tag` copies.
+   A `@pipeline_latency` callee is never seeded. A harvested value (step 2) clears the
+   seed.
+4. Otherwise, `start_latency` in a synthesizing build.
+5. Otherwise, 0.
+
+The build kind comes from `pypeline.SET_AUTO_PIPELINE_BUILD_MODE`, which the `pypelinec`
+driver calls before its first `PARSE_FILE`. There are three modes:
+- `None`: plain native sim.
+- `"sweep"`: a synthesizing build.
+- `"fixed_only"`: `--comb`, `--no_synth` and `--yosys_json` builds.
+
+The no-tool fallback (`AUTO_PIPELINE.SWITCH_TO_FIXED_ONLY_BUILD`) also switches to
+`"fixed_only"`, and re-elaborates the design if it had already read a `start_latency`.
+
+In native simulation, a call site with a nonzero `.latency` behaves as an N-stage
+pipeline, implemented as a per-call-site delay line. At 0 it is a plain passthrough
+(`func(x)`). A fixed latency's delay line also works in plain sim without importing
+the compiler: its instance key falls back to `module.qualname#serial`. See
+`pypeline_sim_DESIGN.md` §"Pipelined native sim".
+
+`.latency` is a read-tracked property. Any read flips a module flag
+(`AUTO_PIPELINE_LATENCY_WAS_READ`). Inside a build, each read also records the value it
+returned (`AUTO_PIPELINE_SERVED_LATENCIES`). The driver skips the pin-and-confirm
+re-elaboration in two cases:
+- nothing was read;
+- every returned value already equals the stage count harvested for its binding. That
+  covers fixed latencies, a correct `start_latency` guess, and a discovered 0.
+
+Naming: an unconstrained tag's identity is exactly its wrapped function's identity. This
+holds for `canonical_key`, for `encode_param_value`, and for the `_stable_key`
+config `()`, so no existing entity name moved. A constraint appends its constructor
+settings (`_latency_N`, `_start_latency_S`, `_max_latency_M`). These are fixed at
+construction and never include the discovered `.latency`, so wrappers stay distinct
+and stable across pin-and-confirm passes. `AUTO_PIPELINE.__repr__` stays address-free
+and shows the constraint as written.
+
+**Named tags.** `AUTO_PIPELINE(func, name=)` makes `canonical_key` the name plus the
+`_latency_N` / `_max_latency_M` suffix. `start_latency` is left out of a named
+`latency_suffix()`, and so out of the key and of `_stable_key`'s config, which is
+`(("name", name),)` plus the fixed and max settings. Computing the key needs no
+compiler.
+- **Encoding.** `_callable_canonical_name` and `encode_param_value` encode a named tag
+  as `AUTO_PIPELINE_<name><suffix>`; `_value_description` describes it by its name.
+- **One name, one group.** `_auto_pipeline_names` records, per design execution, the
+  first construction under each name: the wrapped function's identity, its
+  constraint, and its site (`_construction_site`, which also names the design line when
+  a library built the tag). A later tag under that name with a different signature
+  raises `TypeError` naming both sites.
+- **Two names on one function** are two keys, so two groups, sized independently by
+  the sweep. The elaborator keeps callee-derived call-site instance labels, identical
+  to unnamed tags. A group name never changes the emitted hierarchy or attribution.
+  The callee's own entity is the function's, unchanged.
+- **Reports.** `USER_NAMED_AUTO_TAGS()` lists the named tags for `name_index.log`.
+  `RESET_AUTO_MULTI_CYCLE_TRACKING` clears both name registries at the start of every
+  design execution.
+
+The class-level `_is_auto_pipeline_pragma` flag is the only thing the elaborator
+duck-type probes (mirroring `@sim_output`'s `_is_sim_output` flag). See
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#auto_pipelinefunc-latency-start_latency-max_latency--forced-submodule-pipelining)
+for how `PY_TO_LOGIC.FuncElaborator._elab_call` elaborates the wrapped func and tags
+the resulting submodule instance with a `LOGIC.AutoPipelineLatency` constraint in
+`sub_inst_to_auto_pipeline_latency`. The C frontend's `#pragma AUTOPIPELINE [N]` fills
+the same field. The Pypeline frontend also records `sub_inst_to_auto_pipeline_key`
+(instance -> `AUTO_PIPELINE.canonical_key`), so the stage counts the sweep builds can be
+harvested per call site and fed back into `.latency`. How the sweep, the coarse sweep
+and no-sweep builds enforce constraints is in
+[`AUTO_PIPELINE_DESIGN.md`](AUTO_PIPELINE_DESIGN.md#6-constrained-auto_pipeline-regions-latency--start_latency--max_latency).
+
+The internal helper
+`_auto_pipeline_with_io_regs(func, has_input_reg, has_output_reg, *, latency=None, start_latency=None, max_latency=None, name=None)`
+wraps `AUTO_PIPELINE(func, latency=, start_latency=, max_latency=, name=)` with optional
+unconditional `Reg[T]` boundary registers. It returns the wrapped callable with
+`.return_t` and `.auto_pipeline` metadata, so library code can read
+`.auto_pipeline.latency`. The constraints are passed through unchanged, so they
+cover the core only and never the boundary registers.
+
+`make_stream_auto_pipeline` uses the helper, and so do the DSP factories in valid_only
+mode (`make_fir`, `make_fir_decim`, `make_dc_block`, `make_moving_avg`, `make_magnitude`).
+Each of these factories takes the same keyword-only arguments, and so does
+`make_fir_interp` through `make_fir`. Each one passes them to its single core
+AUTO_PIPELINE, whose `.latency` also sizes the elastic FIFO.
+
+The stream wrapper itself has no `.latency`, because valid/ready is not a fixed latency.
+The factories capture these parameters like any others
+(`pypeline.capture_factory_args`), so their names appear in the generated entity names
+even when left at `None`. `make_stream_auto_pipeline` also takes `name=`, which names
+its core's group. Under the [capture rule](#user-names-name) an unset `name=` is not
+captured.
+
+### `AUTO_COMB_AREA_OPT(func)` — Zero-Cycle Resource Sharing
+
+`AUTO_COMB_AREA_OPT` is a lightweight callable tag with
+`_is_auto_comb_area_opt_pragma` and `_is_hw_func` markers. It retains `.func`, copies
+the original annotated signature, and reports `.latency == 0`. It deliberately
+does not expose `__wrapped__`: generic hardware type introspection should work,
+but the elaborator must still see the tag and perform the transformation.
+Ordinary Python/native simulation calls forward to `.func` without importing
+the optimizer. No simulation state or latency feedback cache is needed.
+
+Canonical identity includes the wrapped function, not the chosen implementation.
+`encode_param_value` and `_stable_key` preserve the tag in factory identities;
+fixed-pipeline reachability follows through to its underlying callable.
+`PY_TO_LOGIC._elaborate_live_func` substitutes the chosen ordinary hardware
+function, which permits composition with `AUTO_PIPELINE` and stream factories.
+Purity lives in `AUTO_COMB_OPT` and the exact typed rewrites in `AUTO`; see
+[`AUTO_COMB_OPT_DESIGN.md`](AUTO_COMB_OPT_DESIGN.md).
+
+`AUTO_COMB_DELAY_OPT` reuses the lightweight signature/forwarding contract with
+`_is_auto_comb_delay_opt_pragma`, a distinct canonical identity, and a delay-first
+objective. Both tags stay visible to elaboration; mixed nesting applies in
+written order, while repeating the same tag is idempotent. The selected pure
+function is still zero-cycle. Timing uses read-only caches/estimates, without
+new finalist synthesis jobs. The two stream factories share one elastic shell
+(latency 2, II=1); both expose the tag as `.comb_opt`. See
+[`AUTO_COMB_OPT_DESIGN.md`](AUTO_COMB_OPT_DESIGN.md).
+
+### `AUTO_FSM(func)` — Resource-Shared State Machines with `.latency`
+
+Where `AUTO_PIPELINE(func)` builds
+one full copy of `func`'s hardware cut by serial register slices (N slices give
+N clocks of latency and N+1 combinational regions; initiation interval 1,
+extra register area), `AUTO_FSM(func)` builds a resource-shared state machine
+and runs `func` over several cycles. Its default area search includes the same
+combinational candidates as `AUTO_COMB_AREA_OPT`, plus bounded delay-ranked
+`AUTO_COMB_DELAY_OPT` finalists, scored by complete FSM area.
+Twelve identical adds can become one adder used in twelve states; unsharing is
+also considered when mux/register overhead or a latency cap warrants it.
+
+```python
+UPDATE = AUTO_FSM(next_state)     # pure single-argument @hw_func
+o = UPDATE(req)                  # req/o are {data, valid}: UPDATE.in_stream_t / .out_stream_t
+UPDATE.latency                   # fixed in->out cycle count; 0 until a real build
+```
+
+Structurally a sibling of `AUTO_PIPELINE`, and deliberately so: a duck-type marker
+the elaborator probes for (`_is_auto_fsm_pragma`), a module-global cache
+`AUTO_FSM.DO_SCHEDULE_PASSES` installs between passes (`SET_AUTO_FSM_SCHEDULE_CACHE`,
+carrying `binding_key -> schedule dict` instead of `-> stage count`; `AUTO_FSM.REPARSE`
+adds call sites new to the build), a
+snapshot taken at construction so one design execution sees one consistent view,
+a `canonical_key` computed lazily via `PY_TO_LOGIC.CANONICAL_CALLABLE_KEY`, a
+`binding_key` (the key at the clock goal of the MAINs that use the object, see
+[AUTO objects and clock goals](#auto-objects-and-clock-goals)), and an
+address-free `__repr__` for the same entity-naming-determinism reason.
+
+The differences worth knowing:
+
+- **The call site's submodule is not `func`.** It is a generated wrapper: a
+  combinational passthrough when no schedule is installed, and the generated FSM
+  when one is. Both are built by `src/AUTO_FSM.py` and elaborated as ordinary
+  Pypeline source.
+- **`.latency` is not read-tracked.** AUTO_PIPELINE can skip its second pass when
+  no Python consumed the value; an AUTO_FSM schedule always changes the hardware,
+  so the second pass is unconditional.
+- **`in_stream_t` / `out_stream_t`** are auto-generated `{data, valid}` structs
+  built by the pypeline.py-local `_make_auto_fsm_stream_t`. It is a deliberate
+  twin of `include/pypeline/stream/stream.py`'s `make_stream_t` rather than an
+  import of it: `pypeline.py` is the base module every design imports and keeps
+  zero dependency on the `include/pypeline` library. The two are structurally
+  identical and duck-type compatible.
+- **`max_latency=`** caps the in→out latency, validated at construction (`int`,
+  `>= 2` with the default registered output, `>= 1` with
+  `register_output=False`) so the error names the user's own construction site.
+  The output policy and cap are part of `__repr__` and the typed naming identity,
+  so two tags differing only in their cap do not share a specialization. It is also recorded
+  in the schedule dict, and a cached schedule whose recorded cap differs from
+  the tag's is treated as a miss: building hardware that violates the cap the
+  source asks for is not an acceptable failure mode.
+- **`register_output=False`** exposes data/valid in the final execution state
+  and removes that register bank. `make_stream_auto_fsm` uses it because its own
+  holding register already provides the registered/backpressured boundary.
+- **Native simulation** models the generated FSM's registers directly
+  (`_sim_fsm`, keyed on `_SIM_AUTO_FSM_STATE_KEY`), following the same
+  committed-read / buffered-write discipline as `_sim_delay_line`. It evaluates
+  the original pure function after the scheduled latency; generated adapters,
+  fused groups and pipeline datapaths require GHDL checks. Empty-cache native
+  construction imports no compiler modules. Installed schedules receive
+  lightweight version/state/latency checks here; graph, source, target and pinned
+  recipe validation belongs to the compiler before emission.
+
+Full design in [`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md).
+
+### `MULTI_CYCLE[ncycles]` — Multi-Cycle Path Tag
+
+Its untagged launch-to-capture logic stays combinational across sweep locks and
+re-elaboration; see the [caller-context invariant](AUTO_MULTI_CYCLE_DESIGN.md).
+
+Python equivalent of PipelineC's `#pragma MULTI_CYCLE <ncycles> <start_reg> <end_reg>`.
+Unlike `PART(...)`, this is not a call at all — `MULTI_CYCLE` (like `AUTO_PIPELINE`) is a
+subscriptable class (same idiom as `Reg`/`Feedback`/`Wire`), and the cycle count and two
+register endpoints are attached directly to the `Reg[T]` declarations they constrain:
+
+```python
+MC = MULTI_CYCLE[32]
+data0: Reg[my_struct_t, MC.start]
+data1: Reg[my_struct_t, MC.end]
+```
+
+```python
+class _MultiCycleRole:
+    def __init__(self, tag, is_start):
+        self.tag = tag
+        self.is_start = is_start
+
+class _MultiCycleTag:
+    def __init__(self, ncycles):
+        self.ncycles = ncycles
+        self.start = _MultiCycleRole(self, is_start=True)
+        self.end = _MultiCycleRole(self, is_start=False)
+
+class _MultiCycleMeta(type):
+    def __getitem__(cls, ncycles):
+        if not isinstance(ncycles, int):
+            raise TypeError(f"MULTI_CYCLE[ncycles] expects an int, got {ncycles!r}")
+        return _MultiCycleTag(ncycles)
+
+class MULTI_CYCLE(metaclass=_MultiCycleMeta):
+    pass
+```
+
+`_RegType`/`_RegMeta` (see [`Reg[T]` / `_RegType`](#regt--_regtype) above) accept this as
+an optional second subscript argument, storing it as `_RegType.multi_cycle_role`.
+`MULTI_CYCLE`/`_MultiCycleTag`/`_MultiCycleRole` are plain Python objects with no
+hardware-wire involvement, so this whole mechanism is ordinary Python at every layer
+(module exec, proto-simulation, elaboration's `_try_eval_const`) — no simulation-specific
+code is needed. See
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#multi_cyclencycles--regt-tag--multi-cycle-path-constraint)
+for how `PY_TO_LOGIC.FuncElaborator._elab_ann_assign`/`_tag_multi_cycle_reg` consume the
+role and populate `Logic.mcp_tuples` — shared, unmodified, with the C frontend.
+
+### `AUTO_MULTI_CYCLE(...)` — Tool-Tuned Multi-Cycle Path Tag
+
+Its untagged launch-to-capture logic stays combinational across sweep locks and
+re-elaboration; see the [caller-context invariant](AUTO_MULTI_CYCLE_DESIGN.md).
+
+`AUTO_MULTI_CYCLE(*, latency=None, start_latency=None, max_latency=None, name=None)` is a `MULTI_CYCLE`-shaped
+tag whose cycle count the throughput sweep picks. It has `.start` / `.end`
+`_MultiCycleRole`s, so `Reg[T, MC.start]` needs no `_RegMeta` change. It mirrors
+AUTO_PIPELINE's `.latency` feedback, with a few deliberate differences:
+
+- **Resolution.** The count resolves once, at construction, to the driver-installed cache
+  (`SET_AUTO_MULTI_CYCLE_LATENCY_CACHE`), else `latency=`, else (in a synthesizing build)
+  a starting count from the latency memory or a hints file (`SET_LATENCY_SEEDS`, kept as
+  `.seed` and clamped to `max_latency`), else `start_latency=`, else 1.
+  - There is no build-mode dependency: a multi-cycle count never changes how many
+    registers exist, so native sim, `--comb` and a sweep's bootstrap all read the same
+    value.
+  - A cached value that conflicts with `latency=` or exceeds `max_latency=` is a
+    `ValueError`.
+- **Canonical key.** One of three bases, plus the `_latency_N` / `_start_latency_S` /
+  `_max_latency_M` suffix:
+  - **A raw tag:** `module.co_name_line<lineno>_<ordinal>`, the construction site plus a
+    per-site ordinal, because there is no wrapped function to key on. The ordinal
+    disambiguates one factory line building several tags. Ordinals restart with every
+    design execution (`RESET_AUTO_MULTI_CYCLE_TRACKING`, called from
+    `CLEAR_AUTO_PIPELINE_LATENCY_READ_FLAG`, i.e. `PARSE_FILE`, and before
+    `pypeline_sim.run_sim`'s design import), so keys are deterministic across the
+    pin-and-confirm re-executions.
+  - **A `make_stream_auto_multi_cycle` tag:** `CANONICAL_CALLABLE_KEY(func)` plus `_mcp`,
+    from the private `_func=` that factory passes. Calls over one function with the same
+    constraints have one key, and their wrapper closures are equal, so they share one
+    holder function and one count, like two AUTO_PIPELINE tags on one function.
+    `factory_closure_naming_test` checks the key is not the library line.
+  - **A named tag:** its name plus the `_latency_N` / `_max_latency_M` suffix
+    (`start_latency` is left out). It consumes no site ordinal, so unnamed keys at the
+    same site never move. A name is one group: `_auto_multi_cycle_names` holds the first
+    tag's signature (the wrapped function's `_name_identity`, if any, and the three
+    constraints), and a tag whose signature differs is a `TypeError` naming both sites,
+    as for AUTO_PIPELINE.
+  - The key is resolved on first use (`canonical_key`), since a wrapped function's key
+    needs `PY_TO_LOGIC`, which plain native sim never imports. The constructor resolves
+    it only when a seed table, the build cache or `_built_unbuilt_reads` is installed.
+    `binding_key` is the canonical key (one count per tag at every clock goal), for
+    `_require_built`.
+- **Construction inside a `@hw_func` body is a `TypeError`.** Detected by the calling
+  frame's pseudo file name (`<local_const>`, `<const_eval>`, ...) or `_sim_active`. A tag
+  re-created on every evaluation would break key identity.
+- **Read tracking.**
+  - `.latency` (alias `.ncycles`) records the value in `_auto_multi_cycle_served` and the
+    read site in `_auto_multi_cycle_read_sites`, both keyed by the tag object; the
+    accessors (`AUTO_MULTI_CYCLE_SERVED_LATENCIES`, `AUTO_MULTI_CYCLE_READ_SITES`,
+    `AUTO_MULTI_CYCLE_CONSTRUCTED`) resolve keys when the compiler asks, merging the tags
+    of one key.
+  - The compiler reads through `_ncycles_for_compiler()`, which records nothing.
+  - `AUTO_MULTI_CYCLE_UNREAD_KEYS()` lists non-fixed tags no design code read; the driver refuses
+    those (`AUTO_MULTI_CYCLE.CHECK_AUTO_MULTI_CYCLE_TAGS_READ`).
+- **Name identity.** `_stable_key` encodes the key, the constraint **and the
+  resolved count** (for a named tag, the key, `latency=`, `max_latency=` and the count:
+  its `start_latency` is only a starting value). An unnamed stream tag encodes its
+  wrapped function's `_stable_key` in place of the key, which leaves the key
+  unresolved. An AUTO_PIPELINE's identity
+  deliberately omits its served latency.
+  Here the function holding the tagged registers bakes `.latency`-derived constants into
+  its logic, so a count change between passes must rename that entity, not reuse a
+  skip-if-exists file.
+
+Automatic count selection uses endpoint-qualified isolated measurements to
+seed all groups, then whole-design feedback. A provisional seed may be confirmed
+down once per datapath shape without crossing its elaborated/user floor; after
+that, feedback is grow-only. A count elaborated from a latency memory or hints seed
+is provisional from the start, with its floor at `start_latency=` (or 1). A changed
+datapath is measured and seeded before pinned confirmation. See
+[sweep and confirmation rules](AUTO_MULTI_CYCLE_DESIGN.md#3-sweep-feedback).
+
+The library factories `make_stream_multi_cycle(func, latency)` (fixed `MULTI_CYCLE`) and
+`make_stream_auto_multi_cycle(func, *, latency=, start_latency=, max_latency=, name=)` live in
+`include/pypeline/stream/stream_multi_cycle.py`; the auto one exposes its tag as `func_mcp.mcp`.
+Sweep and pin-and-confirm handling are in
+[`AUTO_MULTI_CYCLE_DESIGN.md`](AUTO_MULTI_CYCLE_DESIGN.md); elaboration is in
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#multi_cyclencycles--regt-tag--multi-cycle-path-constraint).
+
+### AUTO objects and clock goals
+
+An AUTO_PIPELINE or AUTO_FSM object is implemented for the clock goals of the MAINs
+that use it. The compiler decides which goals those are
+([AUTO_DESIGN.md](AUTO_DESIGN.md#7-clock-goals-of-auto-objects)); this module holds
+what a design execution resolves with, without importing the compiler.
+
+- **Sites.** Every AUTO_PIPELINE / AUTO_FSM object records where it was built,
+  `.site` (`_auto_construction_site`): the `(module, function, line)` of each frame
+  from its construction out to the first module-level frame, so a factory's own line
+  and the line that called it both count, plus an ordinal among objects with that
+  chain (a loop, a comprehension). An object built while a `@hw_func` body is
+  elaborated (`_const_folding`) is one per body line, with no ordinal; one built while
+  native simulation run steps its cycles (in a body, every cycle) has no site and is not recorded.
+  `AUTO_CONSTRUCTED()` lists the current execution's objects (kind, key, site, and
+  whether its latency can depend on a goal: not a fixed `latency=`, not an AUTO_FSM
+  pinned unit). Sites live within one build; they never enter names, records or
+  caches.
+- **Tables.** `PY_TO_LOGIC.PARSE_FILE` installs `SET_AUTO_GOAL_TABLES(site_bindings,
+  split_keys)` before each parse. `_auto_site_bindings` maps (kind, site) to the
+  object's binding; `_auto_split_keys` maps (kind, key) of a key split by goal to
+  `"site"` or `{site: goals}`. Only keys used at more than one goal have entries.
+- **Bindings.** `binding_key` (`_auto_binding`) is the key an object's installed
+  results are under: its site's binding, else its `canonical_key`. `GOAL_BINDING(key,
+  goal)` spells one, `key@50p0mhz` (`GOAL_TEXT`: the clock-port style, `nogoal` for a
+  MAIN with no goal). A native simulation replaying per-goal results sets
+  `SET_AUTO_RUN_GOAL`: an object then takes its key's own entry when the record has
+  one, else its key at the run's goal.
+- **Split identity.** `_stable_key` adds `("split", component)` to a tag's identity
+  when its key is split (`_auto_split_component`: its site, or the `GOAL_TEXT` of its
+  goals). Every other tag's identity is unchanged.
+- **Reads.** An AUTO_PIPELINE's `.latency` read outside a native simulation run is recorded
+  per object (`AUTO_READS()`), so a read of an object used at several goals can be
+  reported with its read sites.
+
+### Fixed User Pipelines
+
+`@pipeline_latency(cycles)` is the Python equivalent of `#pragma FUNC_LATENCY`.
+It declares an existing immutable user pipeline and implies `@hw_func`, stacking
+with `@MAIN` or `@hw_func` in either order. `_sim_type_wrap` preserves the original
+source and factory identity; the returned callable carries `_pipeline_latency`.
+
+`cycles` must be a nonnegative integer, excluding booleans. Invalid types raise
+`TypeError`; negative or conflicting repeated declarations raise `ValueError`.
+Repeating the same declaration is idempotent. The compiler trusts the declared
+latency and does not create missing registers or infer latency from register count.
+See the [user example](pypeline_guide.md#fixed-user-pipelines) and
+[simulation design](pypeline_sim_DESIGN.md#fixed-user-pipelines) for selective
+native alignment and its compatibility gate.
+
+### `wires(func)` — Just-Wires Synthesis Hint
+
+Python equivalent of PipelineC's `#pragma FUNC_WIRES <func_name>`. Tags a function
+definition as pure rewiring/bit-casting logic with no real combinational delay, so the
+synthesizer treats its whole hierarchy as zero-delay instead of estimating timing for it
+(see `include/leds/leds_port.c` for the C original — it tags its
+`#pragma MAIN leds_module` function this way). Unlike the C pragma, the Pypeline tag is
+checked: elaboration rejects a `@wires` function with any register or logic in its
+hierarchy (see
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#validation--_validate_wires_funcs)):
+
+```python
+from pypeline import wires
+
+@wires
+def my_struct_to_bytes(x: my_struct_t) -> uint8_t[4]:
+    ...
+```
+
+Unlike `AUTO_PIPELINE(...)` (a callable tag for calls) or `MULTI_CYCLE[...]` (tags a `Reg[T]`
+declaration), `FUNC_WIRES` tags a *function definition* — the same shape as `@MAIN` and
+`@sim_output`. Implementation mirrors `_register_main`'s "implies `@hw_func`" pattern
+(see [`@MAIN` / `MAIN(fn)` — Registering MAINs](#main--mainfn--registering-mains)
+above):
+
+```python
+def wires(func):
+    wrapped = _sim_type_wrap(func)
+    wrapped._is_func_wires_pragma = True
+    return wrapped
+```
+
+**`@wires` implies `@hw_func`:** like `@MAIN`, it calls `_sim_type_wrap` before stamping
+the flag, so a "just wires" helper can be passed straight to `sim_call()` — no separate
+`@hw_func` needed. Because `_sim_type_wrap` already sets `__wrapped__` via
+`functools.wraps`, `inspect.unwrap()` in `PY_TO_LOGIC._elaborate_live_func` recovers the
+original source exactly as it already does for `@hw_func`/`@MAIN` — `wires` adds no
+extra wrapping layer of its own. It stacks with `@MAIN` in either order (mirroring the two
+independent C pragmas on `leds_module`); whichever decorator runs last is the one bound to
+the module-level name, and the `_is_func_wires_pragma` flag survives either order because
+`_sim_type_wrap`'s `functools.wraps` merges `__dict__` from the wrapped object.
+
+The `_is_func_wires_pragma` flag is the only thing the elaborator inspects (mirroring
+`@sim_output`'s `_is_sim_output` flag and `AUTO_PIPELINE`'s `_is_auto_pipeline_pragma`
+flag). See
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#wires--just-wires-synthesis-hint) for how
+`PY_TO_LOGIC.PARSE_FILE` / `FuncElaborator._elaborate_live_func` consume it and populate
+`parser_state.func_marked_wires`. The underlying `ParserState.func_marked_wires` set and
+`SYN.LOGIC_IS_ZERO_DELAY` consumer are shared, unmodified, with the C frontend.
+
+### Registries
+
+| Name | Type | Content | Consumer |
+|---|---|---|---|
+| `_main_registry` | `list` | Every registered `@MAIN`'s wrapper (each with its `_MainInfo` as `_pypeline_main`), in registration order | `PY_TO_LOGIC.PARSE_FILE` (Steps 3, 5 and 7.2) and `ELABORATE_LIVE_ROOTS`; `pypeline_sim.run_sim`, which runs them |
+| `_global_fifo_type_cache` | `dict[type, (type, type)]` | `T` → the end and wire types of `Fifo[T]` | `_global_fifo_types` |
+| `_global_fifo_async_type_cache` | `dict[type, (type, type, type)]` | `T` → the word, write-result and read-result types of an async `Fifo[T]`'s crossing stubs | `_global_fifo_async_types` |
+| `_part_registry` | `str \| None` | FPGA part string | `PY_TO_LOGIC.PARSE_FILE` — populates `parser_state.part` |
+| `_design_param_decls` | `dict[str, _ParamDecl]` | `param()` declarations of the current design import (reset per import) | `DESIGN_PARAM_LIST_TEXT` (`--list_params`), the parameter banner, `DESIGN_PARAM_REPORT` (`source_provenance.json`) |
+| `_design_param_values` | `dict[str, (value, source)]` | Each design parameter's value and its source (`-D`, `env:VAR`, `default`), resolved once per process | every later `param()` call: re-elaboration passes and simulation imports |
+| `_design_param_defines` | `dict[str, str \| True]` | The `-D` table (`SET_DESIGN_PARAMS`); every name is also installed in `builtins` | `param()`, the injected-global checks |
+
+`param()` and `-D NAME=VALUE` are described for users in
+[Build Parameters](pypeline_guide.md#build-parameters-param-and--d) and below in
+[Design Parameters](#design-parameters-param--d).
+
+---
+
+## Design Parameters (`param()`, `-D`)
+
+The user-facing rules are in
+[Build Parameters](pypeline_guide.md#build-parameters-param-and--d). Everything here is
+in `pypeline.py`'s "Design parameters" section. The elaborator's part (per-parse reset,
+injected constants in hardware bodies, provenance) is in
+[PY_TO_LOGIC_DESIGN.md](PY_TO_LOGIC_DESIGN.md#design-parameters-param--d).
+
+- **State** lives in this runtime module, like the AUTO_PIPELINE latency cache, so
+  eviction between passes never drops it:
+  - `_design_param_defines` holds the `-D` table, installed by `SET_DESIGN_PARAMS`
+    before the first import;
+  - `_design_param_values` holds `name -> (value, source)`. A name resolves once per
+    process, at its first `param()` call, so every parse and every simulation import
+    returns the same value, and an `env=` variable is read once;
+  - `_design_param_decls` holds the declarations of the current import.
+    `PARSE_FILE` and `pypeline_sim.import_design` reset it
+    (`RESET_DESIGN_PARAM_DECLARATIONS`), and the re-executed design re-registers.
+- **Injected globals.** `SET_DESIGN_PARAMS` also installs every `-D` name in
+  `builtins` (parsed as a Python literal, else a string), saving whatever it replaced.
+  A new table restores it.
+- **Checks after each import** (`CHECK_DESIGN_PARAM_USE`). Only run when a `-D` table
+  is installed. They cover the design's own source files (`DESIGN_PARAM_SOURCE_FILES`):
+  the top file plus the modules the import loaded, minus the standard library,
+  installed packages, `src/*.py` and `include/`. `symtable` reads each file (the frozen
+  text, when frozen) and lists:
+  - module-scope bindings, including `global` assignments in functions;
+  - unbound global reads, at module scope and in every nested scope.
+
+  From those, the check rejects:
+  - an injected name nothing reads (with `difflib` suggestions);
+  - an injected name some file binds at module level;
+  - a declared name some file reads as an unbound global.
+- **Recording.** `PRINT_DESIGN_PARAM_BANNER_ONCE` prints the table after the first
+  import of a process. `DESIGN_PARAM_REPORT()` is the `design_params` record in
+  `source_provenance.json`, and `DESIGN_PARAM_LIST_TEXT` is the `--list_params` output
+  (`pypeline_sim.design_param_list_text` imports the design without elaborating it, and
+  the listing replaces the banner).
+- **Drivers.** `pipelinec` and `pypeline_sim.py` both parse `-D`
+  (`PARSE_DESIGN_PARAM_DEFINES`). `pipelinec` installs the table before anything
+  imports the design: the comb native-sim shortcut, `--list_params`, or the first
+  `PARSE_FILE`. It turns `DesignParamError` into a one-line error.
+
+`design_params_test.py` (unit) and `design_params_build_test.py`
+(build_report_device_models) cover it; see
+[pypeline_TESTS.md](pypeline_TESTS.md#design-parameter-coverage).
+
+---
+
+## Operator Registry
+
+Custom hardware operators can be registered for specific type pairs. The registry is consulted
+by both the hardware elaborator (to pick the right submodule) and the simulator (`SimVal`
+operator dispatch). Three registration functions are exported:
+
+```python
+register_operator(op, lhs_t, rhs_t, impl, scope=None)
+register_left_operator(op, lhs_t, impl, scope=None)
+register_unary_operator(op, operand_t, impl, scope=None)
+```
+
+### Op String Values
+
+| `op_str` | Python operator |
+|---|---|
+| `"PLUS"` | `+` |
+| `"MINUS"` | `-` (binary) |
+| `"INFERRED_MULT"` | `*` — not `"MULT"`/`"TIMES"`; `"MULT"` is a separate name the C frontend uses |
+| `"DIV"` | `/` — not `"DIVIDE"` |
+| `"SL"` | `<<` |
+| `"SR"` | `>>` |
+| `"NEGATE"` | `-` (unary) |
+| `"GT"` `"GTE"` `"LT"` `"LTE"` | `>` `>=` `<` `<=` |
+| `"EQ"` `"NEQ"` | `==` `!=` |
+
+(`BIN_OP_MAP` in `PY_TO_LOGIC.py` is the source of truth mapping each `ast`
+operator node type to its op string.) Comparison operators are consulted by
+`PY_TO_LOGIC._elab_compare` the same way `_elab_binop` consults `PLUS`/`MINUS`/etc,
+so any type (struct or int) can override `<`/`<=`/`>`/`>=` by registering against it.
+
+### Global Registries
+
+```python
+_operator_registry:       dict[(op, lhs_type, rhs_type), impl]  # exact match
+_left_operator_registry:  dict[(op, lhs_type), impl]             # left-type match
+_unary_operator_registry: dict[(op, operand_type), impl]         # unary
+```
+
+The elaborator tries exact match first, then left match. `impl` is either a string
+(module-level callable name) or a callable.
+
+### Generic (Matcher-Based) Registrations
+
+`left_type`/`right_type`/`operand_type` above may also be a **type matcher** instead of a
+concrete type, letting one registration cover many concrete widths -- essential for a soft
+adder, which cannot be registered per-width:
+
+```python
+from pypeline import any_uint_t, any_int_t, any_integer_t, uint_upto, int_upto, INFERRED
+
+register_operator("PLUS", any_integer_t, any_integer_t, make_soft_add)
+#                        matcher implies factory semantics: make_soft_add(l_t, r_t) is
+#                        called with the concrete types the first time that pair is seen,
+#                        and returns a @hw_func -- the result is memoized back into the
+#                        exact dict, so every later occurrence is an O(1) hit again.
+```
+
+Matchers: `any_uint_t`, `any_int_t`, `any_integer_t` (either signedness), `uint_upto(n)` /
+`int_upto(n)` (width-bounded). Each has a small, deterministic `__repr__` for diagnostics;
+typed naming snapshots retain matcher state without object addresses.
+
+Resolution order (all four registries -- binary, left, unary, MUX -- follow the same shape):
+1. Exact dict hit (`_operator_registry[(op, l, r)]`, etc.) -- unchanged, O(1).
+2. **New:** scan the matching generic list, **most-recently-registered first**
+   (`reversed()`), so a later `register_soft_mult_karatsuba()` overrides an earlier
+   `register_soft_mult()` for the same matcher. First match wins; its factory is called
+   with the concrete type(s) and the result is memoized into the exact dict (step 1 above
+   short-circuits on every subsequent lookup for that same concrete pair).
+3. Built-in inferred path (unchanged).
+
+**`INFERRED`** is a reserved sentinel that can be registered like any other impl; resolving
+to it falls through to the built-in path instead of instantiating anything. This is the
+escape hatch for "everything of this op/type is soft except this one case" -- e.g. pin one
+function's multiply back onto a DSP block while the rest of the design goes soft:
+
+```python
+register_operator("INFERRED_MULT", any_integer_t, any_integer_t, INFERRED, scope=hot_func)
+```
+
+The generic registries and their memoization caches:
+
+```python
+_generic_operator_registry:       list[(op, l_matcher, r_matcher, factory_or_INFERRED)]
+_generic_left_operator_registry:  list[(op, l_matcher, factory_or_INFERRED)]
+_generic_unary_operator_registry: list[(op, matcher, factory_or_INFERRED)]
+_generic_operator_cache / _generic_left_operator_cache / _generic_unary_operator_cache
+```
+
+`_resolve_generic_operator(op, l_str, r_str)` (and its left/unary counterparts) implement
+the scan-and-memoize step above; `_elab_binop`/`_elab_compare`/`_elab_unary` call them as a
+fallback after an exact-dict miss, and `SimVal._dispatch_binary`/`_dispatch_unary` do the
+same in native sim.
+
+### MUX Registry
+
+`MUX(cond, iftrue, iffalse)` has its own small registry, `register_mux_impl(type_, func,
+scope=None)`, keyed by the muxed type alone (there's no operator string -- MUX has one fixed
+shape). It applies only where the elaborator already routes MUX through a lookup: the
+VAR_REF_RD binary mux tree built for variable-index array reads
+(`_build_binary_mux_tree` in `PY_TO_LOGIC.py`). Struct/array MUX elsewhere (ternary
+expressions, `if`/`else` value muxing, VAR_REF_ASSIGN's per-slot writeback mux) stays
+inferred -- pure wiring, not routed through this registry.
+
+```python
+_mux_registry: dict[type_str, impl]                       # exact
+_generic_mux_registry: list[(matcher, factory_or_INFERRED)]  # generic, same scan/memoize shape
+```
+
+### Scoped Registrations
+
+`scope=<callable>` limits a registration to the duration of one function's elaboration/call.
+Scoped entries are stored separately:
+
+```python
+_scoped_operator_registry:      dict[id(func), {key: impl}]
+_scoped_left_operator_registry: dict[id(func), {key: impl}]
+_scoped_unary_operator_registry: dict[id(func), {key: impl}]
+```
+
+**`_push_scoped_registrations(scope_key)`** merges scoped entries for `scope_key` into the
+global registries and returns a save-list of `(registry, key, old_value)` triples for
+restoration. **`scope_key` must be the exact object passed as `scope=...` at registration
+time** — since `register_*(..., scope=my_func)` runs *after* `@hw_func` has already wrapped
+`my_func`, that object is the wrapper, not the pre-decoration function. Every internal
+caller inside `_sim_type_wrap` (both `_run_body`, shared by the two non-`SIM_RAW_INTS`
+wrapper variants, and the two `SIM_RAW_INTS` wrapper variants' own inline push/pop) passes
+its own `wrapper`, not the `fn` closure variable that same code also has in scope — passing
+`fn` there is a bug that silently disables a function's own scoped registrations for every
+call that isn't itself wrapped in an *outer* `sim_call(the_wrapper, ...)` (which pushes
+using the correct object as an independent side effect), i.e. for any plain nested call
+from inside another `@hw_func` body.
+
+**`_pop_scoped_registrations(saved)`** restores the previous global registry state (dict
+entries *and* fast-path set membership, see below) using that save-list.
+
+**Performance:** `_scoped_funcs: set` tracks `id(func)` for any function that has ever had
+a scoped registration. `_push_scoped_registrations` returns the module-level singleton
+`_EMPTY_SAVED = []` immediately when `id(func) not in _scoped_funcs`, avoiding the dict
+iteration entirely for the vast majority of functions.
+
+### The Native-Sim Dispatch Gate
+
+**`_registered_binary_op_names`**, **`_registered_unary_op_names`** and
+**`_registered_mux_type_names`** are module-level sets that `SimVal`'s dunders check
+before looking in the precise per-type registries at all, so an unregistered design pays
+one set lookup and nothing else (see `pypeline_sim_DESIGN.md` performance section).
+
+**Hardware elaboration never consults them.** `PY_TO_LOGIC` goes straight to the
+registries, so what is or is not in these sets can only make simulation more or less
+faithful to the hardware — it can never change the hardware that gets built.
+
+They are derived, not written directly. Two bookkeeping sets feed them:
+
+| source | recorded in | dispatches in sim |
+|---|---|---|
+| concrete — `register_operator("SR", signed_man_t, exp_t, impl)` | `_concrete_binary_op_names` / `_concrete_unary_op_names` / `_concrete_mux_type_names` | always |
+| matcher — `register_operator("DIV", any_uint_t, any_uint_t, factory)` | `_matcher_binary_op_names` / `_matcher_unary_op_names` / `_matcher_mux_type_names` | subject to `SIM_SOFT_OPS` |
+
+`_recompute_sim_gate_sets()` rebuilds the gate sets from those two plus the policy, and is
+called whenever a registration or the policy changes — never per operator evaluation. The
+distinction is that a concrete registration names an exact type and is a deliberate, narrow
+override, while a matcher registration is a process-wide default:
+`operators.soft.register_sw_lib_replacements()` installs one covering every integer op in
+every design at once.
+
+The name is recorded at **registration** time. It used to be added lazily, by
+`_resolve_generic_*` on the first successful resolution, with the matcher branch of
+`register_*_operator` returning before any `.add()` at all. That had two consequences,
+both fixed: every matcher registration — i.e. every family in
+`register_sw_lib_replacements()` — was elaboration-only and never ran in native sim; and
+because elaboration *did* back-fill the sets as a side effect, a sim that followed a build
+in the same process behaved differently from a pure native run.
+
+For a *scoped* registration, `_push_scoped_registrations` provisionally records the name in
+the same bookkeeping sets (save-list entries tagged `_SCOPED_SET_ADD`, removed again on pop
+via `.discard()`, only if the name wasn't already present) and then recomputes — without
+this, a scoped-only registration (the common case: a factory's own internal NEGATE/SR/SL
+helpers, never registered globally) would never dispatch unless some unrelated module
+happened to also hold a global registration for that same op name. Scoped *matcher* entries
+get the same treatment; they previously had no name recorded at all.
+
+### `SIM_SOFT_OPS`
+
+Which matcher-registered ops execute their implementation during native simulation.
+`PYPELINE_SIM_SOFT_OPS` (read once at import) or `set_sim_soft_ops(spec)`:
+
+| spelling | meaning |
+|---|---|
+| unset, `all`, `1` | every registered op dispatches (**default**) |
+| `none`, `0` | matcher registrations do not dispatch; built-in fallbacks run |
+| comma list, e.g. `NEGATE,LT,LTE,GT,GTE` | only those op names |
+
+Both paths compute the same **value** — verified for every default soft family — so this
+is a fidelity/performance trade, not a correctness one. Dispatching gives *structural*
+fidelity: sim runs the same unrolled per-bit logic the hardware will, which is what you
+want when the thing under test is the operator implementation itself. It is expensive.
+Measured on uint16 operands, steady state:
+
+| op | built-in | dispatched | ratio |
+|---|---|---|---|
+| `DIV` | 1.55 µs | 41,842 µs | 27,000x |
+| `LT` | 0.50 µs | 1,353 µs | 2,700x |
+| `NEGATE` | 1.31 µs | 16.8 µs | 13x |
+
+The `none` path is not a correctness compromise: the built-in fallbacks are value- *and*
+ctype-faithful to elaboration (`SimVal.__neg__`'s widening rule, the constant-shift split
+— both below). It costs structural fidelity and nothing else.
+
+### Scoped Generic Registrations Are Not Memoized Globally
+
+`_resolve_generic_*` memoizes a resolved implementation into the precise registry so later
+lookups skip the list scan. Doing that for an entry that came from a `scope=` registration
+leaked it past scope exit — `_pop_scoped_registrations` pops the generic list entries but
+cannot reach a memo — so one function's scoped implementation silently became every other
+function's. That is wrong *hardware*, not just wrong sim, since elaboration reads the same
+memo. `_scoped_generic_tail` counts how many entries at the tail of each `_generic_*`
+registry list are currently scope-pushed; a resolution matching one of those is cached in
+the (pop-cleared) `_generic_*_cache` but never written to the precise registry.
+
+### Struct-Type Operator Dispatch
+
+The registries above are also consulted by `@struct`-decorated types directly, not just
+`SimVal`: `struct()` gives every decorated class `__add__` / `__sub__` / `__mul__` /
+`__truediv__` (bound to `_struct_dispatch_binary_op`), `__neg__` (bound to
+`_struct_dispatch_unary_op`), and `__lt__` / `__le__` / `__gt__` / `__ge__` (also
+`_struct_dispatch_binary_op`, ops `"LT"`/`"LTE"`/`"GT"`/`"GTE"`), so `a + b` or `a < b` on
+two registered struct instances works the same
+whether it's elaborated to hardware or executed as plain Python (`sim_call` or otherwise).
+Unlike `SimVal`'s int fallback, there's no meaningful default for `+` on a struct with
+nothing registered — an unregistered pair raises `TypeError` naming the op and both
+ctypes, rather than falling through to `NamedTuple`'s tuple concatenation/repeat.
+
+Both dispatch functions route through `_struct_dispatch_call(fn, args)`, which mirrors
+`sim_call`'s own body (activate `_sim_active`, push `fn`'s scoped registrations, call, pop,
+restore) for the looked-up impl. This matters because `_sim_type_wrap`'s wrapper only casts
+arguments/return values and honors `Reg[T]` state (via its "AST-rewritten sim body", see
+`PY_TO_LOGIC_DESIGN.md`) while `_sim_active` is already `True` — a bare `a + b` at module
+scope, with no enclosing `sim_call`, would otherwise silently run the impl's raw,
+un-rewritten source.
+
+---
+
+## Casting
+
+`T(x)` — a call on a pypeline type with **exactly one positional argument and no
+keywords** — is a cast. It never consults the registry at the *classification* step: the
+1-positional/0-keyword shape alone decides "this is a cast," so an argument is always
+elaborated exactly once and the decision never depends on what happens to be registered
+elsewhere. `T(field=x, ...)` (any keyword) stays an ordinary struct constructor, unaffected.
+
+```python
+y = type2_t(x)   # cast
+y = type2_t(a=x, b=0)  # struct init, not a cast (has a keyword)
+```
+
+### Scalar int/char: a language primitive, not a registered cast
+
+Casting between two scalar int/uint (or `char`) types is **not** in the cast registry at
+all — `y = type2_t(x)` behaves *identically* to `y: type2_t = x` (same truncation/sign-
+extension), because both lower to the exact same mechanism: elaboration adds a wire of the
+destination type and connects the source wire to it, and
+`VHDL.TYPE_RESOLVE_ASSIGNMENT_RHS` inserts whatever resize the two types need — the same
+function assignment already goes through. An identity cast (source and destination
+already the same type) costs nothing: the source wire is returned directly, no new wire,
+no entity. `PY_TO_LOGIC._elab_cast_call` is the implementation; it deliberately does
+**not** use the pre-existing `CAST_TO_<t>` C-frontend backend path
+(`C_TO_LOGIC.C_AST_CAST_TO_LOGIC`) — that path's passthrough elimination lives in
+`TRY_CONST_REDUCE_*`, which PY_TO_LOGIC never calls; its entity base name omits the input
+type, so two different-width casts to the same destination would collide and silently
+reuse the first one's resize width; and (before the fix described below) its VHDL body
+resized a signed source *before* converting to unsigned, which disagreed with assignment
+for a narrowing signed source.
+
+Passing a scalar int/char argument to a parameter of a different scalar type converts the
+same way. `f(c + 100)` into `f(x: uint16_t)` behaves as `x: uint16_t = c + 100` would, in
+native sim (`_sim_type_wrap` casts annotated arguments) and in VHDL (the call's port wire
+is declared at the parameter type). See `PY_TO_LOGIC_DESIGN.md`, "Call arguments convert
+at the call boundary".
+
+On native sim, `_CTypeMeta.__call__` (the metaclass every `uintN_t`/`intN_t` shares)
+implements the same contract: registry first (for a genuinely registered cast — see
+below), then `_sim_cast(val, cls)` for a scalar destination. It rejects 0 or >1 arguments
+and rejects casting *to* an array ctype outright (`uint8_t[4](x)` would otherwise reach
+`_sim_cast` → `_CTypeMeta.__len__`, which reads the `[4]` as a bit width and masks to the
+wrong thing — silently). `char_t` and enum destinations are explicitly **not** part of
+this contract: `char_t` happens to work through `_sim_cast` (its width is special-cased to
+8 in `_CTypeMeta.width`) but is excluded from the elaborator's built-in path, so a
+`char_t` cast is a hard error at elaboration time, matching arrays. Enums are excluded
+entirely — `@enum` returns an `_IntEnum` subclass whose metaclass is `EnumMeta`, not
+`_CTypeMeta`, so `_CTypeMeta.__call__` never fires for them, and `state_t(2)` already has
+a meaning (`IntEnum` member lookup) that casting would silently override.
+
+#### Making integer conversion match C
+
+The governing intent is that `x: int8_t = a_i32` and `x: int8_t = int8_t(a_i32)` agree
+with each other and with C's actual conversion rule (§6.3.1.3): take the low `Wd` bits of
+the source's two's-complement representation and reinterpret per the destination's
+signedness; widening sign-extends a signed source and zero-extends an unsigned one;
+source signedness is irrelevant when narrowing. Native sim's `_sim_cast` already
+implements this exactly (`v = int(val) & mask; if is_signed and v >= sign_bit: v -= mask +
+1`) and needs no source-type information to do it. `VHDL.TYPE_RESOLVE_ASSIGNMENT_RHS` had
+exactly one non-conforming case: **signed → signed narrowing** emitted plain
+`resize(x, Wd)`, and `numeric_std.resize` on a `SIGNED` value is *sign-preserving* (copies
+the sign bit into the new MSB, keeps the low `Wd-1` bits) — not C's rule. Fixed by routing
+that one case through `unsigned` first, the same shape already used for signed→unsigned
+narrowing: `signed(std_logic_vector(resize(unsigned(std_logic_vector(x)), Wd)))`. Every
+other quadrant (unsigned→unsigned, unsigned→signed, signed→unsigned either direction,
+signed→signed widening) was already correct. `src/tests/pypeline_tests/inst/
+nested_truncate_test.py` (formerly a `known_issues` XFAIL entry,
+`nested_truncate_vhdl_mismatch_known_issue.py`) is the regression test — confirmed against
+real GHDL: was `7233`, now `-25535`, matching native sim.
+
+Left deliberately unfixed: the C frontend's own explicit-cast entity
+(`RAW_VHDL.GET_CAST_C_BUILT_IN_C_ENTITY_WIRES_DECL_AND_PROCESS_STAGES_TEXT`) resizes its
+input in the *source's* signedness before reinterpreting, so it is non-C-conformant for a
+signed source and disagrees with `TYPE_RESOLVE_ASSIGNMENT_RHS` — in PipelineC C,
+`(uint8_t)x` and `uint8_t y = x;` can differ for negative `x` today. Confirmed directly
+(`--no_synth` on a two-function `.c` reproducer, comparing the generated VHDL for
+`return (uint8_t)x;` against `uint8_t y = x; return y;`): the explicit cast emits
+`unsigned(std_logic_vector(resize(rhs, 8)))` (resizes the signed value first — sign-
+preserving, wrong), the assignment emits `resize(unsigned(std_logic_vector(x)), 8)`
+(converts first — correct). Pypeline casting never reaches this code (it has its own
+lowering, above); fixing it would change emitted VHDL for every existing `.c` design
+that narrows a signed value through an explicit cast, which is out of scope here. Not
+tracked as a `known_issues_tests.py` entry — that suite is pypeline-only (`src/tests/
+pypeline_tests/`), and this bug is in the separate C frontend (`src/tests/c_tests/`),
+whose conventions this work didn't otherwise touch. Tracked in [#367](https://github.com/JulianKemmerer/PipelineC/issues/367).
+
+### Compound casts: `register_cast` / `@cast`
+
+Anything that isn't a scalar int/char pair is a **registered** cast — an ordinary hardware
+function, `def f(x: src_t) -> dst_t`, looked up by `(src_ctype_str, dst_ctype_str)` and
+instantiated as a real submodule call (native sim: an ordinary function call through
+`_struct_dispatch_call`, which activates `_sim_active` and pushes `f`'s own scoped
+registrations — the same mechanism struct operator dispatch uses, see Operator Registry
+above). There is no built-in compound cast, not even for the interface-half wrap/unwrap
+casts described below — everything goes through this one mechanism.
+
+```python
+_cast_registry: dict[(src_ctype_str, dst_ctype_str), hw_func]
+
+register_cast(src_t, dst_t, func)   # imperative form -- a factory that already
+                                     # built the function just wires it in
+```
+
+```python
+@cast
+def f(x: src_t) -> dst_t:
+    ...
+```
+
+`@cast` applied to a **plain, undecorated** function wraps it with `@wires` itself (a cast
+is assumed to be pure rewiring unless the caller pre-wraps with plain `@hw_func` for real
+delay-bearing logic; an auto-wrapped cast that does compute something fails elaboration's
+`@wires` check, which says to add `@hw_func`) and — critically — stamps `fn._pypeline_is_cast = True` **before**
+that wrapping runs, not after. This ordering is load-bearing, not stylistic: `@wires`/
+`@hw_func` call `_sim_type_wrap`, which runs `_check_partial_interface_ports` as part of
+wrapping, and that check must see the cast marker to exempt an interface-half arg/return
+(see below) — since Python decorators evaluate bottom-up, marking a *result* after the
+fact would be too late for a check that already ran during the wrap. `@cast` on an
+*already*-wrapped function (e.g. `@cast` applied outermost over a hand-written
+`@hw_func`) is also accepted, for a cast whose types are never a lone interface half.
+
+**Compound dispatch lives in a metaclass, not in `struct()`'s `__new__` override.**
+`struct()` rebuilds every decorated class, as its last step, through `_CastDispatchMeta`
+— a `type` subclass whose `__call__` does the registry lookup for a 1-positional/0-
+keyword call before delegating to `super().__call__`. `_typed_new` (the `__new__`
+override that masks/casts scalar fields and handles `SIM_RAW_INTS`) is completely
+unaware casting exists — it is exactly the same positional/keyword field-fill it always
+was. This split exists because `copy.deepcopy`/`copy.copy` reconstruct a NamedTuple
+instance via `cls.__new__(cls, *fields)` **directly, bypassing `__call__` entirely** —
+and for a **one-field** struct, that is the identical `(1 positional, 0 keyword)` shape a
+cast call has. Dispatching in `__new__` would silently reinterpret a deepcopy
+reconstruction as a cast whenever *any* code, anywhere, registered a cast whose source
+type matches that struct's own field type — a realistic shape, since `make_fixed_t`
+(`include/pypeline/fixed_point.py`) produces exactly one-field structs. A metaclass
+`__call__` is the only interception point that can tell `T(x)` (goes through `__call__`)
+from `T.__new__(T, x)` (does not) apart. Measured cost: ~20% on every `@struct`
+construction in native sim (all struct types, not just cast targets) — accepted so that
+no future copy/serialization protocol can silently reintroduce the corruption; a narrower
+`__deepcopy__`/`__copy__` override would have been free but is a denylist, not a fix.
+`src/tests/pypeline_tests/inst/cast_test.py`'s
+`test_deepcopy_and_copy_not_reinterpreted_as_cast` is the direct regression test.
+
+On a registry **miss**: a destination struct with exactly **one field** falls back to
+positional field-fill — the same thing `T(x)` means when no cast is involved, and what
+`copy.deepcopy`'s `__getnewargs__`-based reconstruction of an *unregistered* one-field
+struct relies on continuing to mean. Any other miss (multi-field struct, no cast
+registered) is a hard `ElaborationError` naming both types, rather than silently binding
+only the first field via `zip(callee._fields, init_node.args)` and leaving the rest
+undriven (the same class of bug `struct_ctor_positional_test.py` guards against for the
+*0-positional-args-missing* case).
+
+At elaboration, casts are recognized in `PY_TO_LOGIC._elab_call` (`_is_cast_call`/
+`_is_pypeline_type`, checked immediately after the `AUTO_PIPELINE`/`AUTO_FSM` special
+forms and before ordinary callee resolution, so both `uint8_t(x)` and `intrf.fb_t(x)`
+are caught) and de-classified out of every pre-existing struct-constructor interception
+site (`_elab_assign`, `_elab_ann_assign`, `_elab_compound_init`'s own recursive branch,
+`_elab_return`, and `_elab_call`'s inline-constructor-as-argument path) so a cast-shaped
+call falls through to the ordinary expression path instead of the positional-zip struct
+init those sites otherwise apply. A cast target reached *purely* through cast syntax
+(never as some other function's own signature type) has no other path into
+`parser_state.struct_to_field_type_dict` — `_elab_cast_call` calls
+`_register_struct_recursive(dst_t, ...)` itself, before touching the argument, which also
+recursively registers `dst_t`'s own struct-typed fields (e.g. `fwd_t.stream: stream_t`).
+
+### Interface-half casts bend three checks, deliberately
+
+A cast converts between one interface half (`.fwd_t`/`.fb_t`) and its plain payload —
+that is a value transformation, not a port crossing, so there is no second half to pair.
+Three pre-existing checks are exempted for a `_pypeline_is_cast`-marked function (or,
+equivalently, a callee whose `_pypeline_interface_role` resolves it directly):
+
+1. `_check_partial_interface_ports` (`pypeline.py`) — would otherwise raise
+   `InterfacePortError` for a cast taking (or returning) a lone half without its pair.
+2. Its `_if`-naming-convention warning — same early return.
+3. `PY_TO_LOGIC._check_no_indirect_interface_pairing_return` — would otherwise ban a
+   plain function from returning an interface half.
+
+(3) resolves the callee via `_try_eval_const` and checks `_pypeline_interface_role`/
+`_pypeline_is_cast` on the **value**, which is alias-proof by construction — it does not
+key off literal AST attribute names, so a factory-stamped alias of the sanctioned
+`intrf.fwd_t(...)`/`intrf.fb_t(...)` idiom (`fir.out_fb_t(...)`, `stream_fifo.fb_t(...)`,
+a closure alias with a different name) is recognized correctly rather than wrongly
+raising whenever such a call happens to const-fold. See
+[`PY_TO_LOGIC_DESIGN.md`](PY_TO_LOGIC_DESIGN.md#interface-half-bans-three-exemptions)
+for the elaborator-side counterpart of this same exemption.
+
+The bans this does **not** touch: `.fwd_t`/`.fb_t` may still only be constructed inline at
+a real port crossing — a bare local of that type is still an `ElaborationError`
+regardless of whether the value came from a cast or a keyword constructor, since that ban
+keys off the *declared type*, not the call shape. `cast_error_test.py`'s
+`test_bare_local_fwd_t_still_banned_via_cast_call` is the regression test for this
+distinction.
+
+### Interface wrap/unwrap casts (`stream.make_stream_interface`)
+
+`make_stream_interface` registers four casts — both directions, both halves — via
+`_register_stream_casts` in `include/pypeline/stream/stream.py`:
+
+| Cast | Field |
+|---|---|
+| `stream_t → fwd_t` (wrap) | `stream` |
+| `fwd_t → stream_t` (unwrap) | `stream` |
+| `feedback_t → fb_t` (wrap) | `ready` |
+| `fb_t → feedback_t` (unwrap) | `ready` |
+
+```python
+axis_out_if = axis128_intrf.fb_t(early_out_ready)        # was fb_t(ready=early_out_ready)
+in_stream_if = axis128_intrf.fwd_t(verify_fifo_in_s)      # was fwd_t(stream=verify_fifo_in_s)
+```
+
+Only the **wrap** direction is worth writing as a cast in practice: `fb_t`/`fwd_t` each
+have exactly one field, so the keyword form's field name (`ready=`/`stream=`) carries no
+information — the cast drops it for free. The **unwrap** direction is registered too, for
+symmetry and because user code can call it directly, but a cast is *never* shorter than
+the plain field read it would replace (`uint1_t(fb)` vs. `fb.ready`), so no call site in
+this repository or in wireguard-fpga was rewritten to use it —
+`cast_interface_test.py` is its only exercise.
+
+Generated **lazily**: `register_lazy_cast`/`_LazyCast`/`_resolve_cast_entry` defer
+building the four `@cast` functions (real generated source, `exec`'d into a synthetic
+module via `pypeline._exec_generated_func` so `inspect.getsource` can recover it — the
+same technique `interface_func.make_hw_func_from_interface_func` and the `@stream_func`
+sugar use, reused rather than duplicated a third time, with a `folder` parameter added so
+this caller's synthetic paths land under `pypeline_generated_casts` instead of the
+original `pypeline_generated_bytes`) until the first time a design actually casts that
+specific interface. A design that builds a stream interface but never casts it — the
+overwhelming majority of existing designs and tests — pays nothing: no generated source,
+no extra VHDL entity. Entity names are a pure function of the source/destination
+canonical type names (`project_canonical_name_determinism`): two independently derived
+interfaces with identical field types produce identical cast entity names.
+
+Deliberately **not** auto-registered inside `include/pypeline/floating_point.py`'s
+`make_fixed_resize`-equivalent for fixed-point (`include/pypeline/fixed_point.py`'s
+`make_fixed_resize`): it takes `rounding`/`overflow` parameters and is legitimately
+called multiple times for the same `(src_t, dst_t)` pair with different modes
+(`fixed_point_test.py` does exactly this) — auto-registering would silently pick
+whichever call happened to run last as "the" cast for that pair. `make_float_converter`/
+`make_float_to_int`/`make_int_to_float` (`include/pypeline/floating_point.py`) have no
+such ambiguity — each `(src_t, dst_t)` float pair has exactly one sensible conversion —
+so they self-register via `register_cast` directly inside the factory, the same
+"supplied where the type is made" pattern as the stream casts.
+
+---
+
+## Soft Operator Library (`include/pypeline/operators/`)
+
+Ordinary user-level Pypeline HDL, shipped in the repo, implementing integer operators via
+bitwise primitives instead of relying on an inferred/fabric lowering. It is not a new
+compiler concept — every file here calls the exact same `register_operator` /
+`register_left_operator` / `register_unary_operator` / `register_mux_impl` API described
+above, using generic (matcher-based) registrations so one call covers every width.
+
+```
+soft_add.py    make_soft_add_ripple, make_soft_add_carry_select, make_soft_sub,
+               make_soft_add_split, make_soft_sub_split (two half-width built-in adds)
+soft_mult.py   make_soft_mult_shift_add, make_soft_mult_karatsuba(leaf=), make_soft_mult_carry_save,
+               make_inferred_mult, make_mult_karatsuba_inferred_leaves (FPGA hybrid, opt-in),
+               make_soft_mult_split(leaf=) (wider operand halved, two inferred products)
+soft_div.py    make_soft_div, make_soft_mod           (restoring division, unsigned)
+soft_cmp.py    make_soft_cmp_prefix(op)               (parallel-prefix magnitude compare, default)
+               make_soft_cmp_sub_swapped(op)          (widen/subtract/sign-bit, narrow-width alt)
+soft_shift.py  make_soft_shift_barrel_sl, make_soft_shift_barrel_sr
+soft_misc.py   make_soft_negate, make_soft_eq(negate), make_soft_mux
+soft.py        activation layer -- register_soft_*() functions, register_soft_ops()
+```
+
+Composability falls out of the registry itself: a soft multiply's internal adds, a soft
+divide's internal compares/subtracts, all resolve through the same generic-matcher lookup —
+no special-casing needed for nested soft ops.
+
+### Activation
+
+Nothing in this package changes hardware behavior merely by being imported (unlike
+`floating_point.py`'s float16/32/64_t side effect). Register explicitly, globally or
+`scope=`d to one function:
+
+```python
+from operators.soft import register_soft_ops
+register_soft_ops()                # whole design, all the way to bitwise leaves
+register_soft_ops(scope=my_func)   # only my_func's own body
+
+from operators.soft import register_soft_mult, register_soft_mult_karatsuba
+register_soft_mult()               # carry-save, max_width=2 (default flavor)
+register_soft_mult_karatsuba()     # overrides it -- last registration wins
+```
+
+`make_soft_mult_karatsuba`'s base case is a parameter, `leaf` (any multiplier factory,
+used at every recursion level, default `make_soft_mult_shift_add`). `make_inferred_mult`
+is the built-in `*` as a factory, pinned against redispatch: it registers `INFERRED` for its
+own exact operand types, `scope=` itself. Elaboration of a factory closure and native sim
+both push that scope, and a scoped exact entry overrides every global exact or matcher
+entry, so the leaf stays a built-in multiply even under a global registration that matches
+its width. `make_mult_karatsuba_inferred_leaves` (threshold 34) and
+`register_mult_karatsuba_inferred_leaves` are the opt-in FPGA hybrid; see
+[`SYN_DESIGN.md`](SYN_DESIGN.md#karatsuba-with-inferred-leaves). `threshold` and `leaf` are
+captured factory arguments, so each configuration is its own entity and cache identity.
+
+`register_inferred_ops(mult=True, scope=hot_func)` is the escape hatch: pin one op back to
+the built-in inferred path (via the `INFERRED` sentinel) for one scope, overriding a broader
+soft registration everywhere else.
+
+### Current defaults
+
+Four operator families are QoR-selected, not arbitrary:
+
+| operator | current default | why |
+|---|---|---|
+| `GT`/`GTE`/`LT`/`LTE` | parallel-prefix soft comparator (`make_soft_cmp_prefix`) | Vivado-confirmed wins 28/32 (op,width) combinations at `n_cuts≥1`, margin widening with width (up to 40% faster at uint64 `GTE`); the 4 losses are `GTE`/`LTE` at 8/16-bit widths, where the older operand-swapped subtract is still cheaper — PyRTL's own sweep missed all four |
+| variable-amount `SL`/`SR` (`make_soft_shift_barrel_sl/sr`) | minimal mux-stage-count barrel | comb delay, the slicing floor, and cuts-to-floor are all set purely by how many mux stages the chain has |
+| `register_soft_mult_karatsuba`'s `threshold` | 16 | below 16 bits, Karatsuba's recombination cost is never earned back — splitting is pure loss at every cut count measured |
+| `register_soft_mult()` (`INFERRED_MULT`) | carry-save / deferred-carry (`make_soft_mult_carry_save`, `max_width=2`) | a direct port of a real sky130 reference design; its ASIC-shaped reduction beats `make_soft_mult_shift_add`'s FPGA-carry-chain-shaped tree |
+
+The QoR investigations that established these live in
+[`SYN_DESIGN.md`](SYN_DESIGN.md#history)'s History section.
+
+### Default replacements for C-generated operators
+
+Five operator families have no inferred/raw-VHDL lowering, so without an explicit soft
+registration they would reach `C_TO_LOGIC.BUILD_LOGIC_AS_C_CODE` — the C front end's C code
+generation, shelled out through `cpp` and pycparser: int unary `NEGATE`, int
+`GT`/`GTE`/`LT`/`LTE`, `DIV`, `MOD`, and
+variable-amount shift (`SL`/`SR` with a non-constant right operand). `PY_TO_LOGIC.PARSE_FILE`
+and `pypeline_sim.py`'s `import_design` both call
+`operators.soft.register_sw_lib_replacements()` once per process, globally, *before* the
+design file itself is imported — so a later, more specific registration in the design
+(an exact pin, a different flavor, or `INFERRED`) still wins, since generic resolution
+always scans most-recently-registered-first. This function is idempotent (guarded by a
+module-level flag) so `PY_TO_LOGIC.PARSE_FILE`'s repeated-parse callers (AUTO_PIPELINE's
+pin-and-confirm loop, `double_parse_file_test`) don't grow the generic registry lists
+unboundedly.
+
+`LOGIC.PYPELINE_NO_SW_LIB_GUARD`, armed by `PY_TO_LOGIC.PARSE_FILE` right after that
+registration, makes `LOGIC.BUILD_C_BUILT_IN_SUBMODULE_FUNC_LOGIC` raise (naming the offending
+entity) instead of calling `BUILD_LOGIC_AS_C_CODE` if a Pypeline build ever reaches it anyway — the permanent enforcement that this path stays dead
+for Pypeline.
+
+`PY_TO_LOGIC.ELABORATE_LIVE_ROOTS`, the other elaboration entry point, is what a plain
+`sim_call` uses to align a caller of a `@pipeline_latency` function. It needs the same
+lowerings and guard, but only for its own duration (`_push_default_operator_lowerings`).
+A global registration there would switch native sim to the soft implementations
+(`SIM_SOFT_OPS`) for every later `sim_call` in the process, just because one call reached
+a fixed pipeline. So the lowerings are registered once under a private `scope=` object,
+and each call pushes them with `pypeline._push_fallback_registrations`. That puts them at
+the *head* of the generic lists, the lowest priority. The design's registrations already
+exist by then, and the head keeps them winning, as registering first does under
+`PARSE_FILE`. Head entries record no sim gate name and are never memoized into the precise
+registries (`_fallback_generic_head`, the counterpart of `_scoped_generic_tail`), so
+popping them leaves the process exactly as it was. The guard is restored to its previous
+value on exit. The C code generation itself stays in `C_TO_LOGIC.py` for the C front end;
+the cheap name predicates `VHDL.py` / `RAW_VHDL.py` / `SYN.py` use (`IS_BIT_MANIP`, `IS_MEM`,
+`IS_AUTO_GENERATED`, RAM helpers), which were never C generation, live in `LOGIC.py`.
+
+Constant-amount shifts are unaffected — those already lower to a built-in `CONST_SL`/`CONST_SR`
+submodule directly in `_elab_binop` and never consult the operator registry at all.
+
+### What is *not* routed through the registry
+
+MUX outside the VAR_REF_RD binary mux tree (ternary expressions, `if`/`else` value muxing,
+VAR_REF_ASSIGN's per-slot writeback mux) stays inferred unconditionally — see the MUX
+Registry note above. `register_soft_ops()` therefore does not make every design
+zero-inferred-ops; it makes arithmetic/compare/shift/negate zero-inferred-ops.
+
+---
+
+## `SimVal` — Typed Simulation Integer
+
+`SimVal` is a thin `int` subclass that adds hardware-type awareness for simulation. The
+hardware elaborator (`PY_TO_LOGIC.py`) **never** uses `SimVal` — it treats all `SimVal`
+values as plain `int` because `SimVal` subclasses `int`.
+
+### Core Design
+
+```python
+class SimVal(int):
+    __slots__ = ("_ctype",)   # one extra attribute: the C type string
+```
+
+`_ctype` is `None` for untyped simulation values and a `_CTypeMeta` class for typed ones.
+Using `__slots__` avoids a per-instance dict but is only possible here (not for full `int`
+decoupling — see performance section in `pypeline_sim_DESIGN.md`).
+
+### `__getitem__` — Hardware Bit Slicing
+
+```python
+v[i]      # extract bit i     → int (0 or 1)
+v[hi:lo]  # extract bits hi down to lo inclusive → int
+```
+
+Python's `int` has no `__getitem__`; `SimVal` adds it to match hardware bit-slice syntax.
+High index first, matching Verilog/VHDL convention.
+
+### Operator Dispatch
+
+`SimVal.__neg__`, `__invert__`, `__rshift__`, `__lshift__`, `__lt__`, `__le__`, `__gt__`,
+`__ge__`, `__truediv__`, `__mod__` all check the operator registries for custom
+implementations before falling back to Python arithmetic. `+`/`-`/`*`/bitwise are handled
+separately (see Hardware-Accurate Arithmetic below) — they always have an inferred
+lowering, so there's no equivalent "nothing registered" fallback gap for them to close.
+
+Fast-path: check `_registered_binary_op_names` / `_registered_unary_op_names` sets first.
+If the op name is not in the set, skip registry lookup entirely and compute the result
+directly (with `_ctype` preserved for shifts/DIV/MOD). What is in those sets is governed by
+`SIM_SOFT_OPS` — see The Native-Sim Dispatch Gate above.
+
+Two built-in paths carry hardware type rules that are easy to get wrong, and were:
+
+- **Unary `-` on an integer widens by one bit and becomes signed.** `C_TO_LOGIC`'s
+  `GET_UNARY_OP_NEGATE_INT_UINT_C_CODE` is the authority (`result_t = "int" +
+  str(in_width + 1) + "_t"`); `PY_TO_LOGIC._elab_unary` applies the same rule, and the
+  library's `make_soft_negate` is annotated to match. `SimVal.__neg__` used to mask back
+  into the operand's own type, so `-uint24_t(5)` was `uint24_t 16777211` in sim against
+  hardware's `int25_t -5` — wrong for *every* unsigned value, and for the signed minimum
+  too (wrapped instead of widened). `_negate_ctype` now computes the widened type; the
+  result always fits it, so there is nothing to mask.
+- **A constant shift amount is not a dispatch point.** `PY_TO_LOGIC._elab_binop` sends it
+  to the `CONST_SL`/`CONST_SR_<n>_<type>` built-in (pure rewiring) and never consults the
+  registry; only a variable amount looks up a registered implementation. `__lshift__` /
+  `__rshift__` mirror that split by dispatching only when the right operand is a *typed*
+  `SimVal`. Without it, a registered barrel shifter recurses forever — its own body shifts
+  by a constant (`operators/soft_shift.py`: `result << (1 << i)`) — and takes `DIV`/`MOD`
+  down with it, since the divider shifts internally.
+
+Before the soft-operator-library work, `<`/`<=`/`>`/`>=` fell straight through to `int`'s own
+comparison (silently never consulting the registry, matching `_elab_compare`'s gap at the
+time), and `__truediv__` didn't exist on `SimVal` at all — plain int `/` returned a Python
+**float** via `int.__truediv__`, not an integer sim value, since only `@struct` types had a
+registered `DIV` dunder. Both are now real dispatch points, gated by the same
+`_registered_binary_op_names` fast path as everything else — an unregistered design computes
+the identical result it always did (a bare comparison, or now truncating integer division
+instead of a float), just through an explicit code path instead of an inherited one.
+
+### Hardware-Accurate Arithmetic (`SIM_STRICT_ARITH=True`)
+
+When `SIM_STRICT_ARITH = True` (default), `__add__`, `__sub__`, and `__mul__` apply
+hardware type-promotion before returning, provided **both** operands carry a known `_ctype`:
+
+```python
+SimVal(20000, int16_t) + SimVal(20000, int16_t)
+# → _arith_promote("int16_t", "int16_t") — no change (same sign)
+# → _arith_output_ctype("add", "int16_t", "int16_t", signed=True) → int17_t
+# → mask to int17_t → SimVal(40000, int17_t)
+```
+
+Masking is now inlined directly in each operator (avoiding the `_sim_cast` function call
+overhead in the hot path).
+
+When either operand lacks `_ctype` (plain int literal, shift result, etc.), the result
+falls back to a bare `SimVal` with no `_ctype`. Typed operands are re-injected by
+`@hw_func` input casts and `_TypedAnnAssignRewriter` at assignment points.
+
+Bitwise ops (`&`, `|`, `^`, `~`) **preserve** `_ctype` via `_bitwise_ctype` — hardware
+requires matching-width operands and the result keeps that width. (They used to return a
+bare `SimVal` with no `_ctype`, which made downstream width inference fall back to
+`int(v).bit_length()` and silently corrupt `rotl`/`rotr`/`bswap` applied to a bitwise
+result. The stale version of this sentence is what the float library's `a * -1` workaround
+was reasoning from: it blamed a simulation-layer promotion bug that no longer existed.)
+
+### Allocation Helpers
+
+**`_sim_val_make(v, ctype)`** — bypasses `SimVal.__new__` (a Python function, adding
+~0.1 µs per allocation) by calling the C-level constructors directly:
+
+```python
+_int_new = int.__new__
+_obj_setattr = object.__setattr__
+
+def _sim_val_make(v, ctype):
+    if 0 <= v <= _SIM_CONST_MAX:
+        cached = _SIM_CONST_CACHE.get((v, ctype))
+        if cached is not None:
+            return cached
+    obj = _int_new(SimVal, v)
+    _obj_setattr(obj, "_ctype", ctype)
+    return obj
+```
+
+**`_SIM_CONST_CACHE`** — flyweight cache for `SimVal` instances of values 0–15 per ctype
+(`_SIM_CONST_MAX = 15`). Populated lazily on first use of each ctype by `_sim_type_init`.
+VGA control signals (`hs`, `vs`, enable flags) and CORDIC step counters produce heavy reuse
+of 0 and 1 for `uint1_t`, making this cache effective.
+
+### `_RawField(int)` — Raw Mode Struct Fields
+
+Used when `SIM_RAW_INTS=True`. `int` subclass that only adds `__getitem__` for bit slicing.
+All arithmetic inherits from `int` at C level — no Python dispatch overhead. Arithmetic
+results are plain `int`, breaking any SimVal chain, which is intentional in raw mode.
+
+### Type Invariant
+
+**`type(x) is SimVal`** is used throughout the hot paths rather than `isinstance(x, SimVal)`.
+Subclassing `SimVal` is therefore prohibited as a design constraint — the `is`-comparison
+would fail for subclasses, causing incorrect simulation results.
+
+---
+
+## `concat(*args)` — Bit Concatenation
+
+`concat` packs multiple unsigned integers end-to-end, first argument in the
+most-significant position. It is dual-mode: it works in both hardware elaboration and
+simulation without requiring separate implementations.
+
+The other `BIT_MANIP_FUNC_NAMES` members (`bit_dup`, `rotl`, `rotr`, `bswap`, `bit_assign`,
+`array_to_uint_be/le`, `uint_to_array_be/le`) are dual-mode the same way: each has a real
+Python body in `pypeline.py` (shared width-inference via `_bit_manip_width`/
+`_bit_manip_result_ctype`) whose bit-level semantics mirror the VHDL each one elaborates to
+in `RAW_VHDL.py` (`x rol/ror n`, big/little-endian byte packing, etc.) — verified by direct
+comparison against those VHDL code generators, not just re-derived independently.
+
+```python
+out: uint64_t = concat(hi_word, lo_word)   # uint32_t ++ uint32_t → uint64_t
+packed: uint24_t = concat(r, g, b)         # three uint8_t values → uint24_t
+```
+
+**In hardware elaboration:** `concat` is in `BIT_MANIP_FUNC_NAMES`. The `concat` branch in
+`_elab_bit_manip_call` synthesizes a synthetic `ast.Tuple` from the positional arguments
+and delegates to `_elab_tuple_concat`, which emits a chain of `TUPLE_CONCAT_<types>`
+submodule instances. Any `out_t=` keyword argument is silently ignored.
+
+**In simulation:** width of each argument is inferred:
+- `SimVal` with `_ctype` → `len(_ctype)` bits
+- Plain Python `int` → `max(1, val.bit_length())` bits (matches hardware literal inference)
+
+The result is a `SimVal` with `_ctype = make_uint_t(total_bits)`.
+
+### `BIT_MANIP_FUNC_NAMES`
+
+A `frozenset` of function names that the elaborator intercepts as built-in bit manipulation
+rather than resolving as user-defined callables:
+
+```python
+BIT_MANIP_FUNC_NAMES = frozenset({
+    "concat", "bit_dup", "rotl", "rotr", "bswap",
+    "bit_assign", "array_to_uint_be", "array_to_uint_le",
+    "uint_to_array_be", "uint_to_array_le",
+})
+```
+
+---
+
+## `vhdl(text, reset=None)` — Raw VHDL Passthrough
+
+Like the bit-manipulation primitives above, `vhdl` is a real top-level function in
+`pypeline.py` that the elaborator (`PY_TO_LOGIC.py`) recognizes structurally by name and
+never actually calls. Unlike them, it is **not** dual-mode: there is no general way to
+simulate arbitrary user-supplied VHDL text in Python, so `vhdl`'s body unconditionally
+raises:
+
+```python
+def vhdl(vhdl_text, reset=None):
+    raise NotImplementedError(
+        "vhdl(...) has no attached simulation model. ..."
+    )
+```
+
+`reset="sync"` lets the text use the `std_logic` `RESET`
+([guide](pypeline_guide.md#raw-vhdl-passthrough-vhdl)); the elaborator stores it in
+`Logic.vhdl_reset`. `_raw_vhdl_keeps_state(fn)` reads a target's source when a model is
+attached (`sim_model`), so the model of a raw function without `reset=` keeps its state
+through a reset, as its hardware does.
+
+This means a function whose body is `vhdl(...)` elaborates to hardware normally, but
+cannot be exercised through `sim_call()`/`pypeline_sim.py`/a direct call — doing so
+raises `NotImplementedError` immediately, rather than silently returning a wrong value or
+running real (but unrelated) Python code, as could happen if `vhdl` were missing
+entirely (`NameError`) or aliased to something else. To simulate a `vhdl(...)`-bodied
+function, attach a Python simulation model with `sim_model(target)` — either an
+`@hw_func` delegate or an arbitrary Python class — which the wrapper then runs instead of
+the body (see `pypeline_sim_DESIGN.md` → "`sim_model` — Python Simulation Models"; the
+attached model is simulation-only and invisible to elaboration). See
+`PY_TO_LOGIC_DESIGN.md` → "Raw VHDL Passthrough (`vhdl(...)`)" for the elaboration side,
+including how the text argument is resolved via `_try_eval_const` (so it can be any
+compile-time-computed Python string, not just a literal) and how it's stored on the
+shared `Logic.vhdl_module_text` field (also used by the C frontend's `__vhdl__("...")`).
+
+---
+
+## Reference: `pypeline.py` Public API
+
+| Name | Purpose |
+|---|---|
+| `uint1_t` … `uint64_t` | C unsigned integer types as real Python classes (`_CTypeMeta` metaclass) |
+| `int1_t` … `int64_t` | C signed integer types |
+| `make_uint_t(n)` | Dynamically creates `uintN_t` for arbitrary bit width `n` |
+| `make_int_t(n)` | Dynamically creates `intN_t` for arbitrary bit width `n` |
+| `NamedTuple` | Re-export of `typing.NamedTuple` |
+| `@struct` | Adds `__class_getitem__`, stamps canonical `_pypeline_ctype_name`, wraps scalar fields in sim |
+| `@MAIN` / `MAIN(fn, name=, mhz=, clock=, reset=, reset_registers=)` | Registers a function as a hardware entry point, also one made in code; implies `@hw_func`; records its name, clock and reset and appends to `_main_registry` |
+| `make_clock(mhz, name=, syn_mhz=, reset=)` / `_Clock` | A clock, identified by rate and name, with its primary reset; for `@MAIN(clk)`, wire markers and pin/wire bindings ([`make_clock`](#make_clockmhz-name-syn_mhz-reset--clocks)) |
+| `make_reset(kind=, active=)` / `_Reset` | A synchronous active-high reset, bound to an `Input` or `Wire` ([`make_reset`](#make_reset--resets)) |
+| `RESET` / `NO_RESET` | `Reg[T, ...]` markers: reset under any policy / never ([`Reg[T]`](#regt--_regtype)) |
+| `param(name, default, *, type, choices, help, env)` | Declares a build parameter and returns its value for this build: `-D NAME=VALUE`, else environment variable `env` (only when given and set), else `default` ([Design Parameters](#design-parameters-param--d)) |
+| `SET_DESIGN_PARAMS`, `PARSE_DESIGN_PARAM_DEFINES`, `CHECK_DESIGN_PARAM_USE`, `DESIGN_PARAM_REPORT`, `DESIGN_PARAM_LIST_TEXT`, `PRINT_DESIGN_PARAM_BANNER_ONCE` | Driver side of `param()`: install and parse the `-D` table, check how the design uses injected names after an import, and produce the `source_provenance.json` record, the `--list_params` text and the build banner |
+| `@sim_output` | Marks a function as simulation output-only; no-op during convergence passes; executes in final pass per cycle |
+| `sim_print(fstring_or_str)` | printf-style console output — same once-per-cycle firing as `@sim_output`, but *also* elaborates to a real VHDL `write(output, ...)` statement (see `PY_TO_LOGIC_DESIGN.md`) |
+| `sim_assert(cond, msg=None)` | simulation-only condition check — raises `AssertionError` in native sim, elaborates to VHDL `assert ... report ... severity failure;` (see `PY_TO_LOGIC_DESIGN.md`) |
+| `sim_finish()` | simulation-only stop signal — raises `SimFinish` in native sim (caught by `pypeline_sim.py`'s CLI run loop), elaborates to VHDL `std.env.finish;` (see `PY_TO_LOGIC_DESIGN.md`) |
+| `@initial` / `@final` (`sim=`, `syn=`) | Host-Python hooks run once at the start / end of a simulation and/or a `pypelinec` build (bare form = both); never elaborated, zero-argument; marks `_is_pypeline_hook`, appends `(fn, when, sim, syn)` to `_hook_registry` (see `pypeline_sim_DESIGN.md` and `PY_TO_LOGIC_DESIGN.md`) |
+| `RUN_INITIAL_HOOKS(flow, hooks=None)` / `RUN_FINAL_HOOKS(flow, hooks=None, pending_exc=None)` / `SNAPSHOT_HOOKS()` | Tool-side hook runners (`flow` = `"sim"`/`"syn"`): every final runs even if one raises; with `pending_exc` hook errors are printed so the original error propagates; `SNAPSHOT_HOOKS` copies the registry (`_syn_hook_snapshot`) |
+| `AUTO_PIPELINE(func, latency=, start_latency=, max_latency=)` | Callable tag: calls through it may be auto-pipelined inside register/feedback contexts; `.latency` reads the built register count; optional fixed / starting / maximum latency (equivalent to `#pragma AUTOPIPELINE [N]`) |
+| `SET_BUILT_HARDWARE_SOURCE(dir, unbuilt_reads)` / `BUILT_HARDWARE_SOURCE()` / `BuiltHardwareError` | Native simulation of a testbench on a top's built hardware: while a build directory is set, an AUTO tag or RAM that build never decided raises `BuiltHardwareError` when used, except a `.latency` read of a tag that build also read without building it, which returns the value it read ([Simulating another top's built hardware](pypeline_sim_DESIGN.md#simulating-another-tops-built-hardware)) |
+| `AUTO_COMB_AREA_OPT(func)` | Experimental area-first combinational callable; same types/bits, zero added cycles, `.func`, `.latency == 0`; composes with pipeline/MCP/FSM wrappers |
+| `AUTO_COMB_DELAY_OPT(func)` | Experimental delay-first combinational callable; same zero-cycle contract, allowing area growth; cached timing/estimates, no extra selection synthesis |
+| `AUTO_MULTI_CYCLE` | `AUTO_MULTI_CYCLE(latency= / start_latency= / max_latency=)` multi-cycle tag whose count the throughput sweep raises; `.start`/`.end` like `MULTI_CYCLE`, `.latency` read-tracked (see [`AUTO_MULTI_CYCLE(...)`](#auto_multi_cycle--tool-tuned-multi-cycle-path-tag)) |
+| `MULTI_CYCLE` / `_MultiCycleTag` / `_MultiCycleRole` | `MULTI_CYCLE[ncycles]` tag; `.start`/`.end` attach to `Reg[T, tag]` declarations to relax setup timing between them (equivalent to `#pragma MULTI_CYCLE`) |
+| `wires` | Marks a function as pure rewiring/bit-casting with no real delay; implies `@hw_func`; stacks with `@MAIN` in either order (equivalent to `#pragma FUNC_WIRES`) |
+| `pipeline_latency(cycles)` | Declares an existing fixed user pipeline; implies `@hw_func`; callers align around its latency (equivalent to `#pragma FUNC_LATENCY`) |
+| `Reg` / `_RegType` | Register descriptor; `Reg[T]` declares a stateful register; optional init value (`Reg[T] = val`); optional markers: a multi-cycle role and `RESET` / `NO_RESET` |
+| `Feedback` / `_FeedbackType` | Feedback wire descriptor; `Feedback[T]` declares a combinatorial feedback wire (no flip-flop) |
+| `Wire` / `_WireType` | Global wire descriptor; `Wire[T]` at module level declares a shared combinatorial wire (one writer) |
+| `VOLATILE`, `ASYNC` | Wire markers: not aligned in pipelined functions; readable on other clocks ([Wire markers](#wire-markers-volatile-async-and-clocks)) |
+| `GlobalWireNameError` / `_local_name_bindings` / `_check_no_local_binds_wire_name` | Rejects, at decoration time, a local binding of a same-module wire name or wire-module alias; `_local_name_bindings` is the binding list shared with `PY_TO_LOGIC` |
+| `Input` / `_InputType` | Top-level input port; `Input[T]` at module level; any function may read, none may write |
+| `Output` / `_OutputType` | Top-level output port; `Output[T]` at module level; exactly one function/instance may write |
+| `Inst` / `_InstType` / `_GlobalInstType` | Global instance; `name: Inst[f]` at module level; its ports are fields of one global wire, and a compiler-made MAIN `name_INST` holds it ([`Inst[f]`](#instf--_insttype--global-instances)) |
+| `GlobalInstError` | `Inst[f]` of something that cannot be an instance (not a hw_func, a `@MAIN`, ports that do not map onto a wire) |
+| `Fifo` / `_FifoType` | Global FIFO; `name: Fifo[T] = hardware` at module level; one function uses each end `.wr` / `.rd` ([`Fifo[T]`](#fifot--_fifotype--global-fifos)) |
+| `global_fifo(n, impl=)` / `global_sync_fifo(n)` / `global_async_fifo(n, impl=)` | `Fifo[T]` initializers asking for a FIFO holding at least `n` words: the library FIFO on one clock, an async FIFO across two |
+| `GlobalFifoError` | A `Fifo[T]` initializer module without one stream input port and one output port of `T` (a `GlobalInstError`) |
+| `register_operator(op, lhs, rhs, impl, scope=None)` | Binds a binary operator on an exact `(lhs, rhs)` type pair |
+| `register_left_operator(op, lhs, impl, scope=None)` | Binds a binary operator matching only on left operand type |
+| `register_unary_operator(op, operand, impl, scope=None)` | Binds a unary operator for a specific operand type |
+| `@cast` | Registers a `def f(x: src_t) -> dst_t` as the implementation of `dst_t(value)` for a `src_t` value; wraps a plain function with `@wires` itself, marking it as a cast before that wrapping's interface-port check runs (see Casting) |
+| `register_cast(src_t, dst_t, func)` | Imperative form of `@cast`, for a factory that already built the function |
+| `register_lazy_cast(src_t, dst_t, build)` | Like `register_cast`, but `build()` (a zero-arg callable) only runs on first actual use of the pair |
+| `_cast_registry` | `(src_ctype_str, dst_ctype_str) → hw_func` (or `_LazyCast`); consulted by `_CTypeMeta.__call__`, `_CastDispatchMeta.__call__`, and `PY_TO_LOGIC._elab_cast_call` |
+| `_CastDispatchMeta` | Metaclass every `@struct` class is rebuilt through; its `__call__` is where compound cast dispatch happens (never `__new__` — see Casting for why) |
+| `_push_scoped_registrations(func)` | Merges scoped operator entries for `func` into globals; returns save-list |
+| `_pop_scoped_registrations(saved)` | Restores global registries from save-list |
+| `bit_dup`, `rotl`, `rotr`, `bswap`, `bit_assign` | Bit manipulation primitives (hardware + sim) |
+| `array_to_uint_be/le`, `uint_to_array_be/le` | Array ↔ integer packing primitives (hardware + sim) |
+| `concat(*args)` | Bit concatenation — works in hardware (→ `TUPLE_CONCAT`) and simulation (→ typed `SimVal`) |
+| `BIT_MANIP_FUNC_NAMES` | Frozenset of function names intercepted as built-in bit manipulation by the elaborator |
+| `vhdl(text, reset=None)` | Raw VHDL passthrough; `reset="sync"` gives the text `RESET` — recognized structurally by name in `PY_TO_LOGIC._elab_stmt`, never called during elaboration; the real function only runs when called outside elaboration (directly, via `sim_call()`, or via `pypeline_sim.py`) and raises `NotImplementedError` unless a simulation model is attached via `sim_model` |
+| `sim_model(target, copy_state=True)` | Attaches a Python simulation model to an `@hw_func`/`@MAIN` function (exactly one per target): an `@hw_func` delegate with matching signature, or a class/callable holding arbitrary per-instance state with Reg-like deepcopy-commit timing; sim-only, invisible to elaboration (see `pypeline_sim_DESIGN.md`) |
+| `sim_zero(ctype)` | Returns a zero-initialized simulation value for any pypeline ctype (scalar/struct/array) — the same value `Reg[T]` uses for its reset default; a public wrapper around `_make_sim_zero` for `sim_model` authors needing a typed placeholder (e.g. an empty buffer/queue's output slot) |
+| `_make_ctype(name)` | Dynamically creates C type class objects (used by `make_uint_t`, array subscript, etc.) |
+| `SimVal` | Simulation typed integer: bit-slice `__getitem__`, operator dispatch, hardware-accurate arithmetic |
+| `_RawField` | Raw-mode int subclass for struct fields: C-level arithmetic + `__getitem__` for bit slicing |
+| `_sim_cast(val, ctype)` | Mask/sign-extend a Python int/SimVal to a pypeline scalar ctype's bit width — assignment's own truncation logic, and (via `_CTypeMeta.__call__`) `T(x)` scalar casting's, since the two are defined to be identical (see Casting) |
+| `_sim_val_make(v, ctype)` | Fast `SimVal` allocation bypassing Python `__new__`; checks flyweight cache first |
+| `_SIM_CONST_CACHE` | Flyweight cache: `(int_value, ctype)` → `SimVal` for values 0–15 per ctype |
+| `AUTO_FSM(func)` | Tag object: implements a pure single-argument function as a resource-shared FSM; `.latency`, `.in_stream_t`, `.out_stream_t`; see AUTO_FSM_DESIGN.md |
+| `hw_func` | Decorator for inner hardware functions; adds sim-mode type casting and register state management |
+| `hw_arg_types(func)` | Returns a hardware function's parameter types, in declaration order, as a tuple — reads through `__wrapped__`/`__annotations__` so it works on `@hw_func`-wrapped or plain functions alike |
+| `hw_return_type(func)` | Returns a hardware function's declared return type — same unwrapping as `hw_arg_types` |
+| `is_hw_func(func)` | Returns True if `func` is already `@hw_func`/`@MAIN`-decorated (checks the `_is_hw_func` marker `_sim_type_wrap` sets on its wrapper); used by factories (`make_auto_pipeline`, `make_stream_multi_cycle`, `make_stream_auto_pipeline`, `make_stream_auto_fsm`) to validate a caller-supplied `func` before calling it from their own hardware function body |
+| `sim_call(func, *args)` | Call a pypeline function in simulation mode with scoped operators active |
+| `sim_reset()` | Clear all simulated register state and global wire state; restores declared init values |
+| `sim_wire_reset()` | Clear only `_sim_wire_state`; leaves register state intact |
+| `_sim_inst_stack` | Module-level list: current simulation instance path; `pypeline_sim._call_main` pushes a root frame (`_SIM_MAIN_FRAME_PREFIX` + MAIN name) per MAIN, and stateful `@hw_func` wrappers and transformed `for`/`while` iteration bodies push/pop frames below it |
+| `_sim_reg_state` | Module-level dict: `inst_path → {reg_name: value}`; persistent register values across `sim_call` |
+| `_sim_wire_state` | Module-level dict: `wire_name → int`; current global wire values (keyed by name, not instance) |
+| `_sim_wire_readers` | Module-level dict: `wire_name → set[MAIN fn]`; dependency graph for convergence queue |
+| `_sim_converging` | Module-level bool; `True` during delta-cycle convergence; checked by `@sim_output` wrappers |
+| `_sim_current_main` | Module-level variable; MAIN function currently executing; enables wire reader recording |
+| `_sim_reg_begin_buffer()` | Switch register writes to buffered mode (used by `pypeline_sim.py` per cycle) |
+| `_sim_reg_flush_buffer()` | Commit buffered register writes atomically — the simulated clock edge |
+| `_main_registry` | Module-level list of all registered `@MAIN` wrappers in registration order |
+| `_sim_run_in_progress` | Module-level bool; `True` from a `pypeline_sim` run's `@initial(sim)` hooks to the end of its `@final(sim)` hooks; `MAIN()` refuses then |
+| `_hook_registry` / `_syn_hook_snapshot` | `@initial`/`@final` hooks of the current design import (cleared with `_main_registry`); the syn hooks the driver ran `@initial` from, reused for syn `@final` |
+| `_part_registry` | Module-level str or None: FPGA part string (read by `PY_TO_LOGIC.PARSE_FILE`) |
+| `SIM_STRICT_ARITH` | Bool flag (default `True`): apply hardware type-promotion and masking on arithmetic |
+| `SIM_RAW_INTS` | Bool flag (default `False`): bypass all `SimVal` wrapping for maximum speed |
+| `SIM_TRACE_LOCATIONS` | Bool flag (default `False`): capture column positions for multi-instance register designs |
+| `_arith_promote` | Compute promoted types for mixed signed/unsigned arithmetic (shared with elaborator) |
+| `_arith_output_ctype` | Compute output type for arithmetic operations (shared with elaborator) |
+| `_ctype_is_int` | Test whether a C type string is an integer type (shared with elaborator) |
+| `_ctype_info` | Parse C type string into (is_signed, width) (shared with elaborator) |
+| `_ctype_str` | Get canonical C type name string for a type object (shared with elaborator) |
+
+All types are declared as proper Python `class` statements with `_CTypeMeta` as metaclass
+(not variable assignments), so Pylance/pyright accepts them as valid type expressions.
+Adding `# pyright: reportInvalidTypeForm=none` to design files suppresses warnings for
+dynamically-produced types like factory structs.
+
+## Tests
+
+`src/tests/pypeline_tests/` exercises the type system, struct support, operator registry,
+and elaboration paths described above against real `.py` design files in `inst/`, across
+eight categories run together via `run_all.py` — see
+[pypeline_TESTS.md](pypeline_TESTS.md) for the full category breakdown, naming
+conventions, and CLI. In short: `native_sim_tests.py` covers plain `python3 <file>`
+simulation (no elaboration; see [pypeline_sim_DESIGN.md § Tests](pypeline_sim_DESIGN.md#tests)),
+`elab_tests.py`/`synth_tests.py` cover `pipelinec` elaboration and synthesis runs (see
+[PY_TO_LOGIC_DESIGN.md § Tests](PY_TO_LOGIC_DESIGN.md#tests)), and
+`native_vs_vhdl_sim_tests.py`, `elab_introspect_tests.py`, `unit_tests.py`,
+`build_report_tests.py`, and `known_issues_tests.py` round out the rest.
+Generated entity identity, stage alignment, and final file-list mechanics are
+documented separately in [VHDL_DESIGN.md](VHDL_DESIGN.md); built-in leaf split
+semantics live in [RAW_VHDL_DESIGN.md](RAW_VHDL_DESIGN.md).
+
+The bidirectional-port mechanism `@interface`
+(`include/pypeline/interface/interface.py`) reuses this module's compound-type introspection
+(`_array_elem_ctype`/`_array_len`, `@struct` `_fields`/`__annotations__`) to split an interface
+into its two one-directional structs, and `_enclosing_factory_param_suffix` to name generated
+modules deterministically. It exposes no new pypeline.py API — the generated function is an
+ordinary `@hw_func` + `@struct` pair, and `make_stream_t(data_t, feedback_t=uint1_t)` is now just
+the feedforward half of `make_stream_interface(...)`. Library modules that carry backpressure
+declare interface ports: `stream/stream_auto_pipeline.py`, `stream/stream_fifo.py`, `stream/stream_ram.py`,
+`stream/stream_auto_fsm.py`, `stream_multi_cycle.py`, `dsp/`, and all of `axi/axis.py` (whose
+`make_axis_broadcast_interlock` uses an *array* interface port for fan-out). `fifo.py`'s raw
+`make_fifo` deliberately does not, nor do `ram.py`'s `make_ram` and the raw handshake core under `make_stream_ram` —
+its three loose signals are literally the wrapped VHDL entity's ports. See
+[PY_TO_LOGIC_DESIGN.md § `@interface`](PY_TO_LOGIC_DESIGN.md#interface--generated-reverse-wiring)
+and tests `inst/interface_test.py`, `inst/interface_func*_test.py`,
+`inst/interface_boundary_test.py`, `inst/interface_array_port_test.py`,
+`inst/interface_mixing_rules_test.py`.
+
+```
+python3 src/tests/pypeline_tests/run_all.py            # default categories, in parallel
+python3 src/tests/pypeline_tests/run_all.py -j 4        # cap parallelism at 4 workers
+python3 src/tests/pypeline_tests/run_all.py --category native_sim
+python3 src/tests/pypeline_tests/run_all.py --category known_issues   # opt-in, see below
+```
+
+These scripts replace the old `run_all.sh`: each test gets its own tmp output directory
+(`common.py`'s `make_tmp_root()`/`run_test()`), tests run in parallel via a thread pool
+(default worker count = `cpu_count() // 2`) with a per-category default timeout, and all
+paths are resolved relative to the repository root (`common.REPO_ROOT`) rather than
+hardcoded — the suite runs unmodified on any checkout. A summary table reports
+PASS/FAIL/XFAIL/XPASS/SKIP/TIMEOUT per test, with output directories of any failed test
+printed for inspection. `known_issues_tests.py` (expected-to-fail bug reproducers) is
+excluded from the default category set — see [pypeline_TESTS.md](pypeline_TESTS.md).
+Every category module can also be run standalone.
+
+## History
+
+### Reset syntax
+
+The reset API of the [guide](pypeline_guide.md#resets) keeps three decisions apart:
+which signal is available (`make_reset()`, `make_clock(reset=)`, `MAIN(reset=)`), which
+registers participate (`reset_registers=`, `Reg[T, RESET]` / `Reg[T, NO_RESET]`) and what
+value reset loads (the initializer). The alternatives below lost, for these reasons:
+
+- **One `reset=` / `auto_reset=` switch** for both the signal and participation: a
+  design must be able to read a reset, or have one available, without every register
+  resetting; and a register list should not depend on which signal is chosen.
+- **A separate reset value** (`reset_to=`, or a `reset=`/`reset_value=` pair on `Reg`):
+  with one value, every register that resets is in its power-up state after a reset,
+  so one oracle covers power-up and reset. It can be added later.
+- **A reset bound to a definition** (`@hw_func(reset=...)`, a `with_reset(func, ...)`
+  binding, a `reg(...)` declaration helper): reusable functions inherit their caller
+  MAIN's reset and policy; a definition naming a concrete signal cannot be reused.
+- **`with` scopes** selecting a reset or policy for a region: not needed by the three
+  designs that drove the feature (PDW, WireGuard, a StreamSoC port), and they hide what
+  resets where. They can be added later.
+- **A second, policy-gated reset port** beside `RESET`, so one entity could serve
+  every policy: hardware readers do not recognize such a port, and it is a signal
+  tied to a constant in most instances.
+- **A VHDL generic for the policy:** one entity name would then cover two different
+  pieces of hardware, so every name-keyed cache and the sweep's attribution would need
+  the generic's value; generated entities have no generics. The policy is an element of
+  the entity's hash instead, the mechanism I/O-register flags and multi-cycle tuples
+  already use.
+- **Draining FIFOs** (holding reset for a FIFO's depth while forcing its read side), the
+  workaround before resets existed: a reset empties a FIFO in one cycle.
+
+### FSM-owned pipeline placement and native simulation
+
+The internal AUTO_PIPELINE marker carries an FSM unit's concrete placement;
+surrounding sweeps restore and verify it instead of selecting another placement.
+Native AUTO_FSM construction shares a schedule version constant with the
+compiler while keeping deep validation out of the runtime tag. The cycle model
+continues to evaluate the original function, so generated datapath equivalence
+is checked in GHDL.
+
+### Multi-clock syntax
+
+The syntax of the guide's
+[Part IV](pypeline_guide.md#part-iv--multiple-clock-domains) was picked from reviewed
+options, starting from the proposals in
+[pipelinec_multiple_clock_domains.md](pipelinec_multiple_clock_domains.md#16-ideas-for-multiple-clock-domains-in-pypeline)
+and [other HDLs](pipelinec_multiple_clock_domains.md#how-other-hdls-handle-clock-domains).
+The alternatives below lost, for these reasons:
+
+- **A rate plus a group string** on `@MAIN` and `make_clock` (`@MAIN(25.0,
+  group="eth_rx")`, C's `MAIN_MHZ_GROUP`): every use repeats the same two values. A clock
+  value is shared instead, and its `name=` is the group.
+- **A `ClockDomain` class** with rate, edge, enable and target in one constructor, as in
+  SpinalHDL: most designs use two of them. `make_clock` can grow keyword arguments.
+- **A new clock per `make_clock` call**: identity by rate, then name, keeps `pll_clk:
+  Input[uint1_t] = make_clock(85.0)` binding the clock `@MAIN(85.0)` runs on, and most
+  designs never need two clocks of one rate.
+- **`@clk.main`**, a second spelling of `@MAIN(clk)`; and **`with clk:` blocks** around
+  MAIN definitions, which save nothing that inference does not and hide where a function
+  is placed.
+- **A whole wire on one clock**: crossings would always join two wires, status flags
+  written on several clocks would need a wire per clock, and a global FIFO's two ends
+  could not be one wire. Each leaf is on its writer's clock instead.
+- **Clock inference through async wires and FIFOs**: it never passes through them, so it
+  cannot loop the way C's does when a crossing side spans two clocks
+  ([Inference never ends](pipelinec_multiple_clock_domains.md#inference-never-ends-when-a-crossing-side-spans-two-clocks)).
+- **Raw reads marked where they happen**, `with unsafe_cdc("reason"):` as Veryl's `unsafe
+  (cdc)` blocks: it needs `with` blocks inside hardware functions. The `ASYNC` marker sits
+  at the declaration, and on one clock it warns that it does nothing, where C's
+  `ASYNC_WIRE` silently skips the checks.
+- **A FIFO factory with `.write()` / `.read()` halves** (`make_async_fifo(T, n)`, the
+  proposal's sketch): a factory cannot declare a global wire, so a global FIFO is a
+  module-level declaration with ends. Factory-made FIFOs stay future work.
+- **The kind in the type**, `SyncFifo[T, 16]` / `AsyncFifo[T, 64]`: choosing a particular
+  implementation then needs another argument, which the initializer gives.
+- **`push()` / `pop()` calls** instead of ends: each would have to be called exactly
+  once, with both handshake directions in its arguments and results.
+- **One stream wire read as `rx.stream` by both sides**: nothing at a use says which side
+  a function is on or which half it drives. `.wr` and `.rd` say it.
+- **`Fifo[some_intrf]`**: a FIFO supplies valid and ready itself, so `T` is the data type,
+  as for `Wire[T]`.
+- **`stream_fifo`, `stream_sync_fifo`, `stream_async_fifo`** as initializer names:
+  `stream_fifo` is already the usual name of a `make_stream_fifo(...)` result and of the
+  module `stream/stream_fifo.py`. The `global_` prefix overlaps no name and matches
+  PipelineC's `GLOBAL_FIFO`, which is also sync or async by its users' clocks.
+- **Matching C mechanism for mechanism**: name-based crossing detection, generated
+  headers, `ID_INST`, `IO_PAIR` and `ASYNC_WIRE` on one clock do not come back
+  ([What to keep, what to leave behind](pipelinec_multiple_clock_domains.md#what-to-keep-what-to-leave-behind)).

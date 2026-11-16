@@ -1,0 +1,29 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+  \page eucalyptus_overview Eucalyptus
+
+  Eucalyptus is the characterization tool of the PandA framework.
+  It is used to analyze and populate technology-library information that can then be consumed by synthesis and back-end flows.
+
+  This page is intentionally concise: operational details should stay aligned with the currently shipped technology descriptions, scripts, and command-line interface.
+
+*/

@@ -167,7 +167,7 @@ detect_environment_status() {
     fi
     
     # Check HERO environment setup
-    if [[ -f "$PROJECT_ROOT/setup_hero_env.sh" ]]; then
+    if [[ -f "$PROJECT_ROOT/scripts/setup_hero_env.sh" ]]; then
         success "✅ HERO environment script: Available"
         hero_env_setup=true
     else
@@ -293,7 +293,7 @@ detect_environment_status() {
     
     if [[ $needs_work == false ]]; then
         success "🎉 All components are already installed and configured!"
-        info "You can run: source $PROJECT_ROOT/setup_hero_env.sh"
+        info "You can run: source $PROJECT_ROOT/scripts/setup_hero_env.sh"
         info "Then use: ./scripts/generate_hero.sh"
         return 1  # Signal that no installation is needed
     fi
@@ -600,7 +600,7 @@ initialize_hero_hardware() {
 create_hero_env_script() {
     log "=== Creating HERO Environment Script ==="
     
-    local env_script="$PROJECT_ROOT/setup_hero_env.sh"
+    local env_script="$PROJECT_ROOT/scripts/setup_hero_env.sh"
     
     cat > "$env_script" << 'EOF'
 #!/bin/bash
@@ -608,7 +608,8 @@ create_hero_env_script() {
 # Source this script to set up the HERO development environment
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLS_DIR="$SCRIPT_DIR/tools"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+TOOLS_DIR="$PROJECT_ROOT/tools"
 HERO_DIR="$TOOLS_DIR/hero"
 
 echo "Setting up HERO development environment..."
@@ -688,7 +689,7 @@ test_hero_functionality() {
     log "=== Testing HERO Functionality ==="
     
     # Source the environment
-    source "$PROJECT_ROOT/setup_hero_env.sh" >/dev/null 2>&1
+    source "$PROJECT_ROOT/scripts/setup_hero_env.sh" >/dev/null 2>&1
     
     cd "$HERO_DIR/hardware"
     
@@ -797,7 +798,7 @@ main() {
     log "Total time: ${minutes}m ${seconds}s"
     
     # Show installed tools
-    source "$PROJECT_ROOT/setup_hero_env.sh" >/dev/null 2>&1
+    source "$PROJECT_ROOT/scripts/setup_hero_env.sh" >/dev/null 2>&1
     
     log "Installed components:"
     success "✅ HERO Platform: $HERO_DIR"
@@ -817,7 +818,7 @@ main() {
     
     log ""
     log "Installation complete!"
-    log "To use HERO, run: source $PROJECT_ROOT/setup_hero_env.sh"
+    log "To use HERO, run: source $PROJECT_ROOT/scripts/setup_hero_env.sh"
     log "Then you can use: $PROJECT_ROOT/scripts/generate_hero.sh"
     log "==================================================================="
 }
@@ -860,7 +861,7 @@ show_help() {
     echo "  8. Tests HERO functionality"
     echo ""
     echo "After installation, source the environment script:"
-    echo "  source $PROJECT_ROOT/setup_hero_env.sh"
+    echo "  source $PROJECT_ROOT/scripts/setup_hero_env.sh"
 }
 
 # Parse command line arguments
@@ -936,7 +937,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
         echo "🎉 Perfect! Your HERO environment is completely set up and ready to use."
         echo ""
         echo "Next steps:"
-        echo "  1. Source the environment: source $PROJECT_ROOT/setup_hero_env.sh"
+        echo "  1. Source the environment: source $PROJECT_ROOT/scripts/setup_hero_env.sh"
         echo "  2. Run RTL generation: ./scripts/generate_hero.sh"
         exit 0
     else

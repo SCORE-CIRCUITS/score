@@ -70,7 +70,7 @@
 
 [submodule "tools/bambu"]
 	path = tools/bambu
-	url = https://github.com/SCORE-CIRCUITS/PandA-bambu.git
+	url = https://github.com/ferrandi/PandA-bambu.git
 	branch = score-v1.0
 
 [submodule "tools/pipelinec"]
@@ -85,7 +85,7 @@
 
 [submodule "tools/spinalhdl"]
 	path = tools/spinalhdl
-	url = https://github.com/SCORE-CIRCUITS/SpinalHDL.git
+	url = https://github.com/SCORE-CIRCUITS/spinalhdl.git
 	branch = score-v1.0
 
 [submodule "tools/myhdl"]
@@ -100,7 +100,7 @@
 
 [submodule "tools/peakrdl"]
 	path = tools/peakrdl
-	url = https://github.com/SCORE-CIRCUITS/PeakRDL.git
+	url = https://github.com/SCORE-CIRCUITS/peakrdl.git
 	branch = score-v1.0
 
 [submodule "tools/rggen"]
@@ -286,4 +286,8 @@
 	path = tools/riscv-compliance
 	url = https://github.com/SCORE-CIRCUITS/riscv-arch-test.git
 	branch = score-v1.0
+
+[submodule "tools/ghdl"]
+	path = tools/ghdl
+	url = https://github.com/ghdl/ghdl.git
 

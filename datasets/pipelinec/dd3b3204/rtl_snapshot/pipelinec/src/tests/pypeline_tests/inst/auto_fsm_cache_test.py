@@ -1,0 +1,945 @@
+"""Carried schedule validity, pinned recipe integrity, model-only updates,
+call sites new to a build (AUTO_FSM.REPARSE) and search results reused by a
+later build with identical inputs."""
+
+import copy
+import json
+import os
+from pathlib import Path
+import sys
+import subprocess
+import tempfile
+import textwrap
+
+# Standalone compiler imports; tests write only under the runner's TMPDIR.
+sys.path[:0] = [
+    str(Path(__file__).resolve().parents[3]),
+    str(Path(__file__).resolve().parents[4] / "include" / "pypeline"),
+]
+
+import AUTO
+import AUTO_FSM
+import PY_TO_LOGIC
+import pypeline
+
+# Scope pins the written chain while keeping ordinary unsigned arithmetic.
+DESIGN = textwrap.dedent("""
+from pypeline import AUTO_FSM, INFERRED, MAIN, NamedTuple, hw_func, register_operator, struct, uint1_t, uint16_t
+from pypeline import Input, make_reset, uint1_t
+rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+@struct
+class input_t(NamedTuple):
+    a: uint16_t
+    b: uint16_t
+    c: uint16_t
+    d: uint16_t
+@hw_func
+def chain(x: input_t) -> uint16_t:
+    a: uint16_t = x.a + x.b
+    b: uint16_t = a + x.c
+    return b + x.d
+register_operator("PLUS", uint16_t, uint16_t, INFERRED, scope=chain)
+FSM = AUTO_FSM(chain)
+@MAIN(10.0, reset=rst, reset_registers="all")
+def top(x: input_t, valid: uint1_t) -> uint16_t:
+    request: FSM.in_stream_t
+    request.data = x
+    request.valid = valid
+    response = FSM(request)
+    return response.data
+""")
+
+
+def parse(path):
+    parser = PY_TO_LOGIC.PARSE_FILE(path)
+    ((key, tag),) = AUTO_FSM.GET_TAGS(parser).items()
+    return parser, key, tag
+
+
+def test_schedule_cache_rejects_stale_source_target_and_version():
+    pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cache_design.py")
+            Path(path).write_text(DESIGN)
+            parser, key, tag = parse(path)
+            for name, logic in parser.FuncLogicLookupTable.items():
+                if name.startswith("BIN_OP_PLUS_"):
+                    logic.delay = 30
+            schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key: schedule})
+            replay, replay_key, replay_tag = parse(path)
+            assert replay_key == key and replay_tag.schedule is not None
+            assert not replay.pypeline_auto_fsm_schedule_rejections
+            AUTO_FSM.CHECK_SCHEDULES_APPLIED(replay)
+            provenance = replay.pypeline_auto_fsm_provenance[key]
+            source = replay_tag._generated._auto_fsm_generated_src
+            assert len(provenance["lines"]) == len(source.splitlines())
+            assert any(
+                row["kind"] == "unit" and row["node_ids"] for row in provenance["lines"]
+            )
+            assert any(
+                row["role"] == "work" for row in provenance["registers"].values()
+            )
+
+            stale = dict(schedule, version=schedule["version"] - 1)
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key: stale})
+            assert parse(path)[2].schedule is None
+
+            target = copy.deepcopy(schedule)
+            target["target_context"][2] = "different-part"
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key: target})
+            refused, _key, refused_tag = parse(path)
+            assert refused_tag.schedule is None
+            # A build re-parses only with schedules it has just produced, so
+            # a refusal there is an internal error, never a silent passthrough.
+            assert key in refused.pypeline_auto_fsm_schedule_rejections
+            try:
+                AUTO_FSM.CHECK_SCHEDULES_APPLIED(refused)
+            except AUTO_FSM.AutoFsmInternalError as error:
+                assert key in str(error)
+            else:
+                raise AssertionError("a refused schedule must not pass silently")
+
+            Path(path).write_text(DESIGN.replace("return b + x.d", "return b - x.d"))
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key: schedule})
+            _parser, changed_key, changed = parse(path)
+            assert changed_key == key and changed.schedule is None
+    finally:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+
+
+# An AUTO_FSM sized from an AUTO_PIPELINE depth, the shape of WireGuard's
+# Poly1305 kernels (lanes = depth + 2): a different depth is a different function
+# and so a different call site.
+LATENCY_SIZED_DESIGN = textwrap.dedent("""
+from pypeline import AUTO_FSM, AUTO_PIPELINE, MAIN, NamedTuple, hw_func, struct, uint1_t, uint8_t, uint16_t
+from pypeline import Input, make_reset, uint1_t
+rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+@hw_func
+def core(x: uint8_t) -> uint8_t:
+    return x + 1
+CORE = AUTO_PIPELINE(core)
+CAPACITY = CORE.latency + 2
+def make_lane_sum(capacity):
+    @struct
+    class lanes_t(NamedTuple):
+        values: uint8_t[capacity]
+    @hw_func
+    def lane_sum(x: lanes_t) -> uint16_t:
+        total: uint16_t = 0
+        for i in range(capacity):
+            total = total + x.values[i]
+        return total
+    return lanes_t, lane_sum
+lanes_t, lane_sum = make_lane_sum(CAPACITY)
+FSM = AUTO_FSM(lane_sum)
+@MAIN(10.0, reset=rst, reset_registers="all")
+def core_top(x: uint8_t) -> uint8_t:
+    return CORE(x)
+@MAIN(10.0, reset=rst, reset_registers="all")
+def fsm_top(x: lanes_t, valid: uint1_t) -> uint16_t:
+    request: FSM.in_stream_t
+    request.data = x
+    request.valid = valid
+    response = FSM(request)
+    return response.data
+""")
+
+
+def fake_delay_schedule(parser, key, tag):
+    for name, logic in parser.FuncLogicLookupTable.items():
+        if name.startswith("BIN_OP_PLUS_"):
+            logic.delay = 30
+    return AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+
+
+def test_reparse_schedules_call_sites_new_to_the_build():
+    # AUTO_PIPELINE pin-and-confirm pass 2 re-executes the design with the
+    # built depth installed; the AUTO_FSM call site it creates has no schedule
+    # (WireGuard's cold 40 MHz build stopped here with AutoFsmInternalError).
+    pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE({})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "latency_sized_design.py")
+            Path(path).write_text(LATENCY_SIZED_DESIGN)
+            parser, old_key, tag = parse(path)
+            assert old_key.startswith("lane_sum_capacity_2_"), old_key
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE(
+                {old_key: fake_delay_schedule(parser, old_key, tag)}
+            )
+            (core_key,) = {
+                key
+                for logic in parser.FuncLogicLookupTable.values()
+                for key in logic.sub_inst_to_auto_pipeline_key.values()
+                if key is not None
+            }
+            pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE({core_key: 1})
+            calls = []
+
+            def schedule_call_sites(state, keys):
+                calls.append(list(keys))
+                tags = AUTO_FSM.GET_TAGS(state)
+                return state, {
+                    key: fake_delay_schedule(state, key, tags[key]) for key in keys
+                }
+
+            state = AUTO_FSM.REPARSE(
+                path, None, schedule_call_sites=schedule_call_sites
+            )
+            ((new_key, new_tag),) = AUTO_FSM.GET_TAGS(state).items()
+            assert new_key.startswith("lane_sum_capacity_3_"), new_key
+            assert calls == [[new_key]], calls
+            assert new_tag.schedule is not None
+            assert not state.pypeline_auto_fsm_schedule_rejections
+            assert set(pypeline.AUTO_FSM_SCHEDULE_CACHE()) == {old_key, new_key}
+    finally:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+        pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE({})
+
+
+def test_reparse_still_refuses_a_rejected_schedule():
+    # Only a call site with no installed schedule is new. One whose schedule
+    # was refused is never rescheduled: that is still an internal error.
+    pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "refused_design.py")
+            Path(path).write_text(DESIGN)
+            parser, key, tag = parse(path)
+            stale = fake_delay_schedule(parser, key, tag)
+            stale["target_context"][2] = "different-part"
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key: stale})
+            calls = []
+
+            def schedule_call_sites(state, keys):
+                calls.append(list(keys))
+                return state, {}
+
+            try:
+                AUTO_FSM.REPARSE(path, None, schedule_call_sites=schedule_call_sites)
+            except AUTO_FSM.AutoFsmInternalError as error:
+                assert key in str(error), error
+            else:
+                raise AssertionError("a refused schedule must not pass silently")
+            assert calls == [], calls
+    finally:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+
+
+def test_call_site_created_during_a_pass_is_scheduled_blamed_and_tightened():
+    # DO_SCHEDULE_PASSES with measurement, search and sweep stubbed. Pass 1's
+    # sweep re-elaborates the design into a new call site (as AUTO_PIPELINE
+    # pass 2 does for a function sized from a depth) and that FSM misses
+    # timing. It must be scheduled from the requested budget scale, blamed,
+    # tightened, and rescheduled by pass 2.
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import AUTO_PIPELINE
+    import SWEEP
+    import SYN
+
+    design = ["old"]
+
+    def state():
+        key = design[0]
+        logic = SimpleNamespace(sub_inst_to_auto_fsm_key={"fsm": key})
+        return SimpleNamespace(
+            part="part",
+            pypeline_auto_fsm_tags={key: SimpleNamespace(schedule={})},
+            pypeline_auto_fsm_schedule_rejections={},
+            pypeline_auto_fsm_provenance={},
+            FuncLogicLookupTable={"top": logic},
+            LogicInstLookupTable={"top": logic},
+        )
+
+    harvested = []
+
+    def harvest(parser, budget_scales, previous, keys=None, **_options):
+        keys = sorted(parser.pypeline_auto_fsm_tags if keys is None else keys)
+        scales = {
+            key: budget_scales.get(key, AUTO_FSM.DEFAULT_BUDGET_SCALE) for key in keys
+        }
+        harvested.append(sorted(scales.items()))
+        return {
+            key: dict(
+                entity="auto_fsm_" + key,
+                budget_scale=scales[key],
+                # Hardware that follows the budget, so a tightening changes it
+                n_states=int(4 / scales[key]),
+                worst_state_du=150,
+                at_floor=False,
+                latency_infeasible=False,
+            )
+            for key in keys
+        }
+
+    sweeps = []
+
+    def sweep(parser, args, src_file, schedule_call_sites=None):
+        sweeps.append(design[0])
+        if len(sweeps) == 1:
+            design[0] = "new"
+            parser = AUTO_FSM.REPARSE(
+                src_file, "part", schedule_call_sites=schedule_call_sites
+            )
+            failures = [("top", 100.0, 80.0, "auto_fsm_new")]
+        else:
+            failures = []
+        return parser, SimpleNamespace(sweep_timing_failures=failures)
+
+    def calibrate(parser, budget_scales, ctl, previous, keys=None):
+        keys = parser.pypeline_auto_fsm_tags if keys is None else keys
+        return parser, {key: {} for key in keys}
+
+    noop = lambda *args, **kwargs: None
+    args = SimpleNamespace(
+        auto_fsm_budget_scale=2.5,
+        auto_fsm_unshare=[],
+        auto_fsm_open=[],
+        auto_fsm_ctl="auto",
+        auto_fsm_no_area_sweep=False,
+        auto_fsm_sweep_debug=False,
+    )
+    pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    try:
+        with ExitStack() as stack:
+            for obj, name, value in [
+                (SYN, "ADD_PATH_DELAY_TO_LOOKUP", lambda parser: parser),
+                (AUTO_FSM, "_measure_schedule_inputs", lambda parser, *a: parser),
+                (AUTO_FSM, "_calibrate_controls", calibrate),
+                (AUTO_FSM, "HARVEST_AUTO_FSM_SCHEDULES", harvest),
+                (AUTO_FSM, "_confirm_unit_placements", lambda parser, s, h: s),
+                (AUTO_FSM, "DESCRIBE_SCHEDULE", lambda *a: ""),
+                (AUTO_FSM, "DESCRIBE_FUS", lambda schedule: []),
+                (AUTO_FSM, "DUMP_GENERATED_SOURCE", noop),
+                (AUTO_FSM, "_unit_measurements", lambda *a: {}),
+                (AUTO_FSM, "_fsm_instance_aliases", lambda *a: ()),
+                (
+                    AUTO_FSM,
+                    "_collect_timing_evidence",
+                    lambda p, t, s: {k: [] for k in s},
+                ),
+                (AUTO_FSM, "_period_du", lambda parser, key: 100.0),
+                (
+                    PY_TO_LOGIC,
+                    "PARSE_FILE",
+                    lambda src_file, resolved_part=None: state(),
+                ),
+                (AUTO_PIPELINE, "WRITE_0_ADDED_CLKS_INIT_FILES", noop),
+                (AUTO_PIPELINE, "DO_SWEEP_AND_AUTO_PIPELINE", sweep),
+                (SWEEP, "RETAINED_OBSERVATION", noop),
+            ]:
+                stack.enter_context(patch.object(obj, name, value))
+            AUTO_FSM.DO_SCHEDULE_PASSES(state(), args, "design.py")
+            # 80 of 100 MHz, a 15 ns worst state against a 10 ns period
+            tightened = AUTO_FSM.TIGHTENED_BUDGET_SCALE(state(), "new", 2.5, 0.8, 150)
+    finally:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    assert sweeps == ["old", "new"], sweeps
+    assert harvested == [
+        [("old", 2.5)],  # pass 1
+        [("new", 2.5)],  # REPARSE, during pass 1's sweep
+        [("new", tightened)],  # tightened after pass 1's miss
+        [("new", tightened)],  # pass 2
+    ], harvested
+
+
+def test_next_pass_reschedules_only_the_blamed_fsm():
+    # Two call sites; the failing path names only `enc`. Tightening reschedules
+    # `enc`, and so does the next pass. `dec` keeps its schedule: rescheduling
+    # an FSM nothing blamed can only change hardware that already met timing
+    # (WireGuard's decrypt epilogue went from 37 to 44 states that way), at the
+    # cost of a full area search and its pinned-unit rounds.
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import AUTO_PIPELINE
+    import SWEEP
+    import SYN
+
+    keys = ("dec", "enc")
+
+    def state():
+        logic = SimpleNamespace(sub_inst_to_auto_fsm_key={k: k for k in keys})
+        return SimpleNamespace(
+            part="part",
+            pypeline_auto_fsm_tags={k: SimpleNamespace(schedule={}) for k in keys},
+            pypeline_auto_fsm_schedule_rejections={},
+            pypeline_auto_fsm_provenance={},
+            FuncLogicLookupTable={"top": logic},
+            LogicInstLookupTable={"top": logic},
+        )
+
+    harvested = []
+
+    def harvest(parser, budget_scales, previous, keys=None, **_options):
+        keys = sorted(parser.pypeline_auto_fsm_tags if keys is None else keys)
+        scales = {
+            key: budget_scales.get(key, AUTO_FSM.DEFAULT_BUDGET_SCALE) for key in keys
+        }
+        harvested.append(sorted(scales.items()))
+        return {
+            key: dict(
+                entity="auto_fsm_" + key,
+                budget_scale=scales[key],
+                n_states=int(4 / scales[key]),
+                worst_state_du=150,
+                at_floor=False,
+                latency_infeasible=False,
+            )
+            for key in keys
+        }
+
+    sweeps = []
+
+    def sweep(parser, args, src_file, schedule_call_sites=None):
+        sweeps.append(len(sweeps))
+        failures = [("top", 100.0, 80.0, "auto_fsm_enc")] if len(sweeps) == 1 else []
+        return parser, SimpleNamespace(sweep_timing_failures=failures)
+
+    def calibrate(parser, budget_scales, ctl, previous, keys=None):
+        keys = parser.pypeline_auto_fsm_tags if keys is None else keys
+        return parser, {key: {} for key in keys}
+
+    noop = lambda *args, **kwargs: None
+    args = SimpleNamespace(
+        auto_fsm_budget_scale=None,
+        auto_fsm_unshare=[],
+        auto_fsm_open=[],
+        auto_fsm_ctl="auto",
+        auto_fsm_no_area_sweep=False,
+        auto_fsm_sweep_debug=False,
+    )
+    pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    try:
+        with ExitStack() as stack:
+            for obj, name, value in [
+                (SYN, "ADD_PATH_DELAY_TO_LOOKUP", lambda parser: parser),
+                (AUTO_FSM, "_measure_schedule_inputs", lambda parser, *a: parser),
+                (AUTO_FSM, "_calibrate_controls", calibrate),
+                (AUTO_FSM, "HARVEST_AUTO_FSM_SCHEDULES", harvest),
+                (AUTO_FSM, "_confirm_unit_placements", lambda parser, s, h: s),
+                (AUTO_FSM, "DESCRIBE_SCHEDULE", lambda *a: ""),
+                (AUTO_FSM, "DESCRIBE_FUS", lambda schedule: []),
+                (AUTO_FSM, "DUMP_GENERATED_SOURCE", noop),
+                (AUTO_FSM, "_unit_measurements", lambda *a: {}),
+                (AUTO_FSM, "_fsm_instance_aliases", lambda *a: ()),
+                (
+                    AUTO_FSM,
+                    "_collect_timing_evidence",
+                    lambda p, t, s: {k: [] for k in s},
+                ),
+                (AUTO_FSM, "_period_du", lambda parser, key: 100.0),
+                (
+                    PY_TO_LOGIC,
+                    "PARSE_FILE",
+                    lambda src_file, resolved_part=None: state(),
+                ),
+                (AUTO_PIPELINE, "WRITE_0_ADDED_CLKS_INIT_FILES", noop),
+                (AUTO_PIPELINE, "DO_SWEEP_AND_AUTO_PIPELINE", sweep),
+                (SWEEP, "RETAINED_OBSERVATION", noop),
+            ]:
+                stack.enter_context(patch.object(obj, name, value))
+            AUTO_FSM.DO_SCHEDULE_PASSES(state(), args, "design.py")
+            default = AUTO_FSM.DEFAULT_BUDGET_SCALE
+            tightened = AUTO_FSM.TIGHTENED_BUDGET_SCALE(state(), 1, default, 0.8, 150)
+    finally:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+    assert sweeps == [0, 1], sweeps
+    assert harvested == [
+        [("dec", default), ("enc", default)],  # pass 1
+        [("enc", tightened)],  # tightened after pass 1's miss
+        [("enc", tightened)],  # pass 2: only the blamed FSM
+    ], harvested
+
+
+def test_unit_characterization_counts_repeated_serial_operations():
+    import SYN
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "profile_design.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        # The build driver resolves the backend before characterizing units.
+        # Otherwise the planner's first lazy tool selection changes context.
+        SYN.PART_SET_TOOL(parser.part)
+        entity = AUTO._entity_key_for_callable(parser, tag.func)
+        logic = parser.FuncLogicLookupTable[entity]
+        delays = {}
+        for name, child in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                child.delay = 30
+                delays[name] = 30
+        logic.delay = None
+        unit = dict(
+            kind="call",
+            op=dict(kind="call"),
+            entity=entity,
+            port_types=[pypeline.ctype_name(tag.in_type)],
+            out_type="uint16_t",
+        )
+        profiles = AUTO_FSM._unit_profiles(parser, key, unit, delays)
+        assert AUTO_FSM._unit_profiles(parser, key, unit, delays) is profiles
+        first = next(profile for profile in profiles if profile["latency"] == 1)
+        # Three serial 3 ns operations require at least 4.5 ns on one side
+        # of a single cut. Summing unique entity kinds underpriced this as 3 ns.
+        assert first["worst_stage_du"] >= 45, first
+        parser.part = "xc7a200tffg1156-2"
+        retargeted = AUTO_FSM._unit_profiles(parser, key, unit, delays)
+        assert retargeted is not profiles
+        assert {row["context"] for row in profiles}.isdisjoint(
+            row["context"] for row in retargeted
+        )
+
+
+def test_sparse_unit_recipe_restores_implicit_zero_placements():
+    import AUTO_PIPELINE
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sparse_recipe.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        entity = AUTO._entity_key_for_callable(parser, tag.func)
+        delays = {}
+        for name, logic in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                logic.delay = 30
+                delays[name] = 30
+        parser.FuncLogicLookupTable[entity].delay = None
+        node = dict(
+            kind="call",
+            op=dict(kind="call"),
+            entity=entity,
+            port_types=[pypeline.ctype_name(tag.in_type)],
+            out_type="uint16_t",
+        )
+        implementation = AUTO_FSM._unit_profiles(parser, key, node, delays)[0]
+        isolated, root = AUTO_FSM._unit_isolated_tree(parser, entity, delays)
+        table = {
+            inst: AUTO_PIPELINE.TimingParams(inst, logic)
+            for inst, logic in isolated.LogicInstLookupTable.items()
+        }
+        retained = {root + row["path"] for row in implementation["timing"]}
+        omitted = sorted(set(table) - retained)
+        assert omitted, "fixture must contain an implicit zero placement"
+        table[omitted[0]]._has_input_regs = True
+        AUTO_FSM.RESTORE_UNIT_PLACEMENT(root, implementation, isolated, table)
+        assert not table[omitted[0]]._has_input_regs
+        assert all(params.params_are_fixed for params in table.values())
+        assert AUTO_FSM._unit_timing_recipe(root, table) == implementation["timing"]
+
+
+def test_model_only_updates_keep_hardware_identity():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "identity_design.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        changed = copy.deepcopy(schedule)
+        changed.update(
+            budget_scale=0.75,
+            worst_state_du=1234,
+            est_area=12345,
+            cleanup=dict(folded=987),
+            repair_history=["diagnostic"],
+            comb_opt_moves=["demanded/known-bit narrowing"],
+        )
+        for node in changed["nodes"].values():
+            node["end_du"] = 999
+        assert AUTO_FSM.SCHEDULES_EQUAL({key: schedule}, {key: changed})
+        assert AUTO_FSM._schedule_entity_name(
+            schedule["func_entity"], schedule
+        ) == AUTO_FSM._schedule_entity_name(changed["func_entity"], changed)
+        assert AUTO_FSM.SCHEDULE_CACHE_USABLE(changed)
+
+
+def test_forced_schedule_is_applied_on_reelaboration():
+    # --auto_fsm_unshare/--auto_fsm_open schedules carry a report flag added
+    # after naming; hashing it made re-elaboration refuse every forced schedule.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "forced_design.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        anchor = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        entity = next(
+            node["entity"] for node in anchor["nodes"].values() if node.get("fu")
+        )
+        forced = AUTO_FSM.FORCE_SCHEDULE(
+            parser, key, tag, 0.9, unshare_patterns=[(entity, 2)]
+        )
+        assert forced["forced"] and AUTO_FSM.SCHEDULE_CACHE_USABLE(forced)
+
+
+def test_malformed_carried_data_is_always_a_cache_miss():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "malformed.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        for field, value in (
+            ("node_order", [[]]),
+            ("nodes", None),
+            ("implementations", [None]),
+            ("n_states", "3"),
+            ("fu_order", [[]]),
+        ):
+            bad = dict(schedule, **{field: value})
+            assert not AUTO_FSM.SCHEDULE_CACHE_USABLE(bad), (field, value)
+
+
+def emit_deterministic_source():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "deterministic.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        for name, logic in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                logic.delay = 30
+        schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        _name, source, _globals = AUTO_FSM.GENERATE_FSM_SOURCE(tag, schedule, parser)
+        print(
+            "SOURCE_JSON=" + json.dumps(dict(entity=schedule["entity"], source=source))
+        )
+
+
+def test_different_hash_seeds_emit_identical_source():
+    results = []
+    for seed in ("1", "777"):
+        completed = subprocess.run(
+            [sys.executable, __file__, "--emit-source"],
+            env=dict(os.environ, PYTHONHASHSEED=seed),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+        results.append(
+            next(
+                row
+                for row in completed.stdout.splitlines()
+                if row.startswith("SOURCE_JSON=")
+            )
+        )
+    assert results[0] == results[1]
+
+
+def test_corrected_unit_tries_its_pipeline_before_forced_descent():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "repair_pipeline.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        for name, logic in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                logic.delay = 30
+        previous = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        entity = next(
+            node["entity"] for node in previous["nodes"].values() if node.get("fu")
+        )
+        previous["corrected_entity_delays"] = {entity: 1000}
+        repaired = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9, previous)
+        assert entity in repaired["implementations"], repaired
+        bound = [node for node in repaired["nodes"].values() if node.get("fu")]
+        assert len(bound) == 3 and all(node["entity"] == entity for node in bound)
+        assert not repaired["at_floor"]
+
+
+def test_encoding_memo_does_not_reuse_a_different_select_arrival():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "encoding_model.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        for name, logic in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                logic.delay = 30
+        previous = dict(
+            control_delays_snapshot={
+                "binary": dict(ctl="v3", delay_du=10),
+                "hot": dict(ctl="onehot", delay_du=100),
+            }
+        )
+        memo = {}
+        binary = AUTO_FSM.BUILD_SCHEDULE(
+            parser, key, tag, 0.9, previous, ctl="v3", build_memo=memo
+        )
+        hot = AUTO_FSM.BUILD_SCHEDULE(
+            parser, key, tag, 0.9, previous, ctl="onehot", build_memo=memo
+        )
+        fresh = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9, previous, ctl="onehot")
+        assert (
+            hot["worst_state_du"] == fresh["worst_state_du"] > binary["worst_state_du"]
+        )
+
+
+def test_binding_search_reuses_clean_graph_without_sharing_mutable_results():
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "graph_memo.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        for name, logic in parser.FuncLogicLookupTable.items():
+            if name.startswith("BIN_OP_PLUS_"):
+                logic.delay = 30
+        memo = AUTO_FSM._AreaSearchMemo()
+        with patch.object(AUTO, "cleanup", wraps=AUTO.cleanup) as cleanup:
+            anchor = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9, _graph_memo=memo)
+            entity = next(iter(anchor["fus"].values()))
+            count = cleanup.call_count
+            choices = dict(unshared=((entity, 2),))
+            cached = AUTO_FSM.BUILD_SCHEDULE(
+                parser, key, tag, 0.9, _graph_memo=memo, **choices
+            )
+            assert cleanup.call_count == count
+            fresh = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9, **choices)
+            assert AUTO_FSM.SCHEDULES_EQUAL({key: cached}, {key: fresh})
+            cached["nodes"].clear()
+            replay = AUTO_FSM.BUILD_SCHEDULE(
+                parser, key, tag, 0.9, _graph_memo=memo, **choices
+            )
+            assert AUTO_FSM.SCHEDULES_EQUAL({key: replay}, {key: fresh})
+            # Width merges rebind the cleaned graph; they do not clean it again.
+            rebinding = dict(merged=(("absent_narrow", entity),))
+            count = cleanup.call_count
+            merged = AUTO_FSM.BUILD_SCHEDULE(
+                parser, key, tag, 0.9, _graph_memo=memo, **rebinding
+            )
+            assert cleanup.call_count == count
+            assert AUTO_FSM.SCHEDULES_EQUAL(
+                {key: merged},
+                {key: AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9, **rebinding)},
+            )
+            count = cleanup.call_count
+            AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.8, _graph_memo=memo)
+            assert cleanup.call_count > count
+
+
+def test_search_with_identical_inputs_is_reused_and_any_change_searches():
+    """A harvest whose inputs match an earlier search reads that search's result
+    from the output directory or the --syn_cache store: no search, the same
+    schedule byte for byte. A changed delay of an operation the function uses,
+    budget, encoding, carried schedule, clock or compiler searches again, and
+    an unreadable file is a miss, not a failure."""
+    import SYN
+
+    def dumps(schedule):
+        return json.dumps(schedule, sort_keys=True, default=str)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "search_cache.py"
+        path.write_text(DESIGN)
+        parser, key, tag = parse(str(path))
+        # A build selects its tool before any search; a search otherwise
+        # defaults it, which changes the target the first result was keyed on
+        SYN.PART_SET_TOOL(parser.part)
+        adders = sorted(
+            name for name in parser.FuncLogicLookupTable if name.startswith("BIN_OP_PLUS_")
+        )
+        for name in adders:
+            parser.FuncLogicLookupTable[name].delay = 30
+        searches = []
+        real_search = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE
+
+        def counting_search(*args, **kwargs):
+            searches.append(kwargs.get("ctl"))
+            return real_search(*args, **kwargs)
+
+        def harvest(**kwargs):
+            kwargs.setdefault("ctl", "v3")
+            return AUTO_FSM.HARVEST_AUTO_FSM_SCHEDULES(parser, **kwargs)[key]
+
+        saved = (SYN.SYN_OUTPUT_DIRECTORY, SYN.SYNTHESIS_STORE_DIR,
+                 SYN._COMPILER_SOURCE_HASH)
+        SYN.SYN_OUTPUT_DIRECTORY = os.path.join(tmp, "out")
+        SYN.SYNTHESIS_STORE_DIR = os.path.join(tmp, "store")
+        AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE = counting_search
+        try:
+            first = harvest()
+            assert len(searches) == 1
+            assert dumps(harvest()) == dumps(first) and len(searches) == 1
+            # A fresh parse, as the next build makes, hits too: what the first
+            # search materialized into its own parser state is not an input
+            parser, _key, _tag = parse(str(path))
+            for name in adders:
+                parser.FuncLogicLookupTable[name].delay = 30
+            assert dumps(harvest()) == dumps(first) and len(searches) == 1
+            # The store alone serves a new output directory, and fills it
+            SYN.SYN_OUTPUT_DIRECTORY = os.path.join(tmp, "out2")
+            assert dumps(harvest()) == dumps(first) and len(searches) == 1
+            assert os.listdir(os.path.join(tmp, "out2", "auto_fsm_searches"))
+            misses = [
+                ("budget scale", dict(budget_scales={key: 0.8})),
+                ("encoding", dict(ctl="onehot")),
+                ("carried schedule", dict(prev_schedules={key: first})),
+            ]
+            for what, kwargs in misses:
+                count = len(searches)
+                harvest(**kwargs)
+                assert len(searches) == count + 1, what
+            count = len(searches)
+            # An adder the function itself uses (other widths belong to
+            # candidates this search never opens)
+            used = AUTO._subtree_entities(
+                parser, AUTO._entity_key_for_callable(parser, _tag.func)
+            )
+            adder = next(name for name in adders if name in used)
+            parser.FuncLogicLookupTable[adder].delay = 31
+            harvest()
+            assert len(searches) == count + 1, "a changed delay"
+            parser.FuncLogicLookupTable[adder].delay = 30
+            harvest()
+            assert len(searches) == count + 1, "the original delay hits again"
+            # A MAIN's clock sets both its rate and its synthesis-only goal
+            # (PY_TO_LOGIC._set_main_clock)
+            parser.main_mhz = {main: mhz * 2 for main, mhz in parser.main_mhz.items()}
+            parser.main_syn_mhz = dict(parser.main_mhz)
+            harvest()
+            assert len(searches) == count + 2, "a changed clock goal"
+            parser.main_mhz = {main: mhz / 2 for main, mhz in parser.main_mhz.items()}
+            parser.main_syn_mhz = dict(parser.main_mhz)
+            SYN._COMPILER_SOURCE_HASH = "a different compiler"
+            harvest()
+            assert len(searches) == count + 3, "a changed compiler"
+            SYN._COMPILER_SOURCE_HASH = saved[2]
+            for directory in ("out2", "store"):
+                for dirpath, _dirs, files in os.walk(os.path.join(tmp, directory)):
+                    for name in files:
+                        Path(dirpath, name).write_bytes(b"not a search result")
+            assert dumps(harvest()) == dumps(first)
+            assert len(searches) == count + 4, "an unreadable file is a miss"
+        finally:
+            AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE = real_search
+            SYN.SYN_OUTPUT_DIRECTORY, SYN.SYNTHESIS_STORE_DIR = saved[:2]
+            SYN._COMPILER_SOURCE_HASH = saved[2]
+
+
+def test_search_result_is_stale_when_a_cache_delay_file_it_read_changes():
+    """A stored search result is reused only while every cache/delay file the
+    searching build had read still reads the same: changed, removed and newly
+    created files are all misses."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "search_cache.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        read = Path(tmp, "leaf.delay")
+        absent = Path(tmp, "absent.delay")
+        read.write_text("1.5\n")
+        entry = os.path.join(tmp, "entry.pkl.z")
+        reads = {("delay", str(read)): 1.5, ("delay", str(absent)): None}
+        AUTO_FSM._write_cached_search([entry], "digest", key, schedule, reads, [])
+
+        def reused(digest="digest"):
+            return (
+                AUTO_FSM._read_cached_search([entry], digest, key, parser, tag)[0]
+                is not None
+            )
+
+        assert reused()
+        assert not reused("other digest")
+        read.write_text("2.0\n")
+        assert not reused(), "a changed delay file"
+        read.unlink()
+        assert not reused(), "a removed delay file"
+        read.write_text("1.5\n")
+        assert reused()
+        absent.write_text("0.5\n")
+        assert not reused(), "a delay file that did not exist then"
+
+
+def test_pinned_unit_measurement_declares_a_unit_no_search_materialized():
+    """A schedule a forked search built, or one an earlier build stored, binds
+    a selected unit this parser state never materialized. Measuring it on its
+    own must still declare the unit's row-array type in the package the
+    isolated synthesis reads (Vivado: 'uint130_t_7 is not declared')."""
+    from types import SimpleNamespace
+    import SYN
+    import VHDL
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "selected_unit.py")
+        Path(path).write_text(DESIGN)
+        searched, key, tag = parse(path)
+        SYN.PART_SET_TOOL(searched.part)
+        schedule = fake_delay_schedule(searched, key, tag)
+        node = next(n for _nid, n in sorted(schedule["nodes"].items()) if n.get("fu"))
+        rows = 3
+        profiles = AUTO_FSM._unit_profiles(
+            searched, key, node, schedule["entity_delays_snapshot"], rows,
+            until=lambda found: bool(found),
+        )
+        implementation = profiles[0]
+        assert implementation["registered_selection"]
+        schedule = dict(schedule, implementations={node["entity"]: implementation})
+
+        fresh, _key, _tag = parse(path)
+        assert implementation["unit_entity"] not in fresh.FuncLogicLookupTable
+        row_type = f"{node['port_types'][0]}[{rows}]"
+        declared = []
+
+        def synthesize(root, logic, parser_state, table):
+            package = Path(SYN.SYN_OUTPUT_DIRECTORY, "c_structs_pkg" + VHDL.VHDL_PKG_EXT)
+            name = VHDL.C_TYPE_STR_TO_VHDL_TYPE_STR(row_type, parser_state)
+            declared.append(f"type {name} is" in package.read_text())
+            return SimpleNamespace(path_reports={})
+
+        saved = SYN.SYN_OUTPUT_DIRECTORY
+        SYN.SYN_OUTPUT_DIRECTORY = os.path.join(tmp, "out")
+        os.makedirs(SYN.SYN_OUTPUT_DIRECTORY)
+        real_synthesize = SYN.SYN_TOOL.SYN_AND_REPORT_TIMING
+        SYN.SYN_TOOL.SYN_AND_REPORT_TIMING = synthesize
+        try:
+            AUTO_FSM._synthesize_placements(
+                fresh, [(key, schedule, node["entity"], implementation)]
+            )
+        finally:
+            SYN.SYN_TOOL.SYN_AND_REPORT_TIMING = real_synthesize
+            SYN.SYN_OUTPUT_DIRECTORY = saved
+        assert declared == [True], declared
+
+
+def test_store_prune_removes_search_results_no_build_reused():
+    """--syn_cache_prune removes stored search results no build has written or
+    reused for that long; a reuse refreshes the file's time."""
+    import time
+    import SYN
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "search_cache.py")
+        Path(path).write_text(DESIGN)
+        parser, key, tag = parse(path)
+        schedule = AUTO_FSM.BUILD_SCHEDULE(parser, key, tag, 0.9)
+        saved = (SYN.SYN_OUTPUT_DIRECTORY, SYN.SYNTHESIS_STORE_DIR)
+        SYN.SYN_OUTPUT_DIRECTORY, SYN.SYNTHESIS_STORE_DIR = None, os.path.join(tmp, "store")
+        try:
+            old, recent = (
+                AUTO_FSM._search_cache_paths(parser, digest)[0]
+                for digest in ("old", "recent")
+            )
+            assert "/auto_fsm/" in old
+            for digest, entry in (("old", old), ("recent", recent)):
+                AUTO_FSM._write_cached_search([entry], digest, key, schedule, {}, [])
+            month_ago = time.time() - 30 * 86400
+            for entry in (old, recent):
+                os.utime(entry, (month_ago, month_ago))
+            assert (
+                AUTO_FSM._read_cached_search([recent], "recent", key, parser, tag)[0]
+                is not None
+            )
+            assert SYN.SYNTHESIS_STORE_PRUNE(7) == 1
+            assert not os.path.exists(old) and os.path.exists(recent)
+        finally:
+            SYN.SYN_OUTPUT_DIRECTORY, SYN.SYNTHESIS_STORE_DIR = saved
+
+
+if __name__ == "__main__":
+    if "--emit-source" in sys.argv:
+        emit_deterministic_source()
+    else:
+        from _test_main import run_module_tests
+
+        run_module_tests()

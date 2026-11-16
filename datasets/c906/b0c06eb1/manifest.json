@@ -1,0 +1,9 @@
+{
+  "project": "T-head-Semi/openc906",
+  "commit_short": "b0c06eb1",
+  "dataset_name": "c906",
+  "generated_at_utc": "2026-11-16T16:57:06Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

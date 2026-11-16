@@ -1,0 +1,1 @@
+setup_gemmini_env.sh

@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""In-process compiler-internals tests: each calls PY_TO_LOGIC.PARSE_FILE
+directly (not via the pypelinec CLI) and asserts on the resulting
+parser_state / FuncLogicLookupTable / raised ElaborationError -- checks that
+are otherwise invisible to a bare "did it elaborate" check (elab_tests.py) or
+to sim_call (a native-Python path that never touches these compiler
+internals at all). See unit_tests.py for compiler-helper tests that don't
+build a design at all.
+
+Run standalone: python3 elab_introspect_tests.py [-j N]
+"""
+
+import sys
+
+from common import INST_DIR, Test, main
+
+
+def get_tests() -> list:
+    tests = []
+    tests.append(Test(name="auto_comb_delay_opt_test", category="elab_introspect",
+                      cmd=[INST_DIR / "auto_comb_delay_opt_test.py"]))
+    tests.append(Test(name="auto_comb_area_opt_test", category="elab_introspect",
+                      cmd=[INST_DIR / "auto_comb_area_opt_test.py"]))
+    # AUTO_FSM rejects impure callees (global wires, Reg state) in its whole
+    # subtree, not just the levels its scheduler opens (AUTO.FIND_EFFECTS)
+    tests.append(Test(name="auto_fsm_purity_test", category="elab_introspect",
+                      cmd=[INST_DIR / "auto_fsm_purity_test.py"]))
+    # Both direct indexed reads and descent through a callee (issue #377).
+    tests.append(
+        Test(
+            name="auto_fsm_var_index_read_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "auto_fsm_var_index_read_test.py"],
+        )
+    )
+    # A hardware local must shadow a same-named module global/closure name in
+    # every constant-folding path (_try_eval_const and friends). Failure modes
+    # range from a raw KeyError to silent miscompiles (const-folded array index,
+    # stale const_env value), so it is checked against the Logic() graph.
+    tests.append(
+        Test(
+            name="local_shadows_global_const_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "local_shadows_global_const_test.py"],
+        )
+    )
+    # Global wire names vs. function locals: a local binding of a wire's name is
+    # rejected by native sim AND elaboration (they used to disagree silently),
+    # a local in a module that doesn't declare the wire stays a local (it used to
+    # drive the top file's same-named wire), and unpacking into a wire writes it
+    # in sim too. Checked against the Logic() graph and the raised errors.
+    tests.append(
+        Test(
+            name="local_binds_global_wire_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "local_binds_global_wire_test.py"],
+        )
+    )
+    # A @sim_input/@sim_output value reaches hardware only through a module-level
+    # wire: a local capture or a nested use is rejected by native sim AND
+    # elaboration (elaboration used to RUN the stimulus and bake its value in as
+    # a constant), elaboration never runs a sim-only body, and the bare-call and
+    # wire-target forms (incl. module.wire.field) still work.
+    tests.append(
+        Test(
+            name="sim_input_local_error_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "sim_input_local_error_test.py"],
+        )
+    )
+    # One AUTO object per clock domain through PARSE_FILE: identical factory
+    # products holding objects at different goals stop merging (separate
+    # calls, a comprehension, a dict, a bundle, a factory argument, a body
+    # loop, made MAINs, an inferred bare MAIN, AUTO_FSM), same-goal objects
+    # still share, the read error for one object at two goals, and names
+    # independent of construction order and hash seed.
+    tests.append(
+        Test(
+            name="auto_goal_split_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "auto_goal_split_test.py"],
+        )
+    )
+    # Regression-tests a FuncLogicLookupTable closure-callable naming
+    # collision: same signature on both sides means no type error either
+    # way, so it's undetectable except by inspecting FuncLogicLookupTable
+    # directly after PARSE_FILE.
+    tests.append(
+        Test(
+            name="two_factory_wrappers_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "two_factory_wrappers_test.py"],
+        )
+    )
+    # A silent miscompile (stale self.env entry after a coarser-granularity
+    # write) with no ElaborationError on either side of the fix -- checked via
+    # PY_TO_LOGIC.PARSE_FILE + direct Logic() object inspection.
+    tests.append(
+        Test(
+            name="mixed_granularity_reassign_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "mixed_granularity_reassign_test.py"],
+        )
+    )
+    # In-process PARSE_FILE regression test for _process_imports only
+    # following ast.Import, never ast.ImportFrom -- checks
+    # parser_state.struct_to_field_type_dict directly for a struct only
+    # reachable via a transitive ast.ImportFrom hop.
+    tests.append(
+        Test(
+            name="importfrom_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "importfrom_test.py"],
+        )
+    )
+    # Modules chosen by module-level if/try imports: only the branch that ran
+    # is discovered (wires, functions, MAINs, alias prefix), across both
+    # choices, factories, a shared diamond and a capacity-changing re-parse;
+    # untaken modules stay out even when already loaded; a @MAIN whose module
+    # ran but was never discovered raises instead of vanishing.
+    tests.append(
+        Test(
+            name="conditional_import_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "conditional_import_test.py"],
+        )
+    )
+    # A sub-file's bare helper call binds to that file's own (or imported)
+    # function, never the top file's same-named one pre-registered in Step 6.
+    tests.append(
+        Test(
+            name="cross_file_helper_name_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "cross_file_helper_name_test.py"],
+        )
+    )
+    # In-process PARSE_FILE regression test for _elaborate_live_func's
+    # struct-registration fallback -- checks
+    # parser_state.struct_to_field_type_dict directly for a struct defined
+    # entirely inside a factory closure.
+    tests.append(
+        Test(
+            name="closure_local_nested_struct_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "closure_local_nested_struct_test.py"],
+        )
+    )
+    # Checks the *type* of exception PARSE_FILE raises for a genuinely
+    # undefined reference (PY_TO_LOGIC.ElaborationError, not a raw KeyError).
+    tests.append(
+        Test(
+            name="pylist_value_context_error_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "pylist_value_context_error_test.py"],
+        )
+    )
+    # Checks the *type* and message of the ElaborationErrors global Wire[T]
+    # multi-writer split-field driving raises (overlapping fields, writing an
+    # Input), plus a positive case (disjoint constant-indexed array writes
+    # from two writers must NOT error).
+    tests.append(
+        Test(
+            name="global_wire_errors_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "global_wire_errors_test.py"],
+        )
+    )
+    # Global FIFOs, Fifo[T]: the FIFO MAIN (clock, protected name, no added
+    # latency, handshake users), access records, an imported module's FIFO, and
+    # every end/initializer/clock/AUTO_PIPELINE/name error.
+    tests.append(
+        Test(
+            name="global_fifo_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "global_fifo_elab_test.py"],
+        )
+    )
+    # Async global FIFOs: the crossing (ClkCrossVarInfo, T[depth] var, tagged
+    # stubs), its two side MAINs on the two clocks, impl="builtin", the kind
+    # errors (async on one clock, a module across clocks, a "_READ" name),
+    # and the crossing report's rows and files.
+    tests.append(
+        Test(
+            name="async_fifo_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "async_fifo_elab_test.py"],
+        )
+    )
+    # Clock assignment and the clock-crossing check: named clocks and
+    # syn_mhz, inference through wires, helpers, stated pins and global
+    # instances, the default clock's warning, the two-clock and crossing
+    # error texts, per-leaf splits, ASYNC rows and warnings, stated clocks,
+    # pins on two clocks, notes printed once, the Arty board clock.
+    tests.append(
+        Test(
+            name="clock_domains_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "clock_domains_elab_test.py"],
+        )
+    )
+    # A FIFO MAIN added after trimming (_add_late_mains) re-checks only the
+    # new functions: a design with stale AUTO_PIPELINE tags left by trimming
+    # and a pipeline_latency function parses, its self-timed set unchanged.
+    tests.append(
+        Test(
+            name="global_fifo_pipeline_latency_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "global_fifo_pipeline_latency_test.py"],
+        )
+    )
+    # Global instances, Inst[f]: the <key>_INST MAIN (clock inferred through
+    # the wire, protected name, no added latency, handshake users), an
+    # imported module's instance, an AUTO_PIPELINE call site inside one, and
+    # the output/clock/initializer/local/AUTO_PIPELINE/name errors.
+    tests.append(
+        Test(
+            name="global_inst_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "global_inst_elab_test.py"],
+        )
+    )
+    # @MAINs made in code: lanes from a loop (keys, rates, ports, wire users),
+    # an imported module's factory MAIN, a pure-factory library's function, a
+    # renamed top-level MAIN, plain defs passed to MAIN(), a closure's wire
+    # users, re-parse names, and the duplicate/clash/lost-module errors.
+    tests.append(
+        Test(
+            name="factory_main_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "factory_main_elab_test.py"],
+        )
+    )
+    # @wires must be literally just wires: registers or logic anywhere in its
+    # hierarchy (a stateful testbench MAIN, an adder, a variable index, a
+    # stateful callee, an auto-@wires @cast with logic, an untagged raw-VHDL
+    # callee) is an ElaborationError naming it. Rewiring, bit slices, casts,
+    # Input/Output connections, nested and raw-VHDL @wires, and an
+    # `if flag: sim_finish()` checker are accepted.
+    tests.append(
+        Test(
+            name="wires_contract_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "wires_contract_test.py"],
+        )
+    )
+    # A stateless user function with no submodules is only wiring and never
+    # timed (issue #373); one with a Reg or an operator still is.
+    tests.append(
+        Test(
+            name="wiring_only_leaf_zero_delay_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "wiring_only_leaf_zero_delay_test.py"],
+        )
+    )
+    # Resets: main_resets, RESET ports and per-policy entity names, NO_RESET,
+    # raw vhdl(reset=), each reset error and note, and the ASIC initializer
+    # rule with its SYN.RESOLVE_BUILD_TARGET hook.
+    tests.append(
+        Test(
+            name="reset_elab_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "reset_elab_test.py"],
+        )
+    )
+    # Calls PY_TO_LOGIC.PARSE_FILE twice in one process (what the
+    # AUTO_PIPELINE pin-and-confirm driver loop does) and compares the
+    # resulting parser_states -- guards the sys.modules eviction and
+    # trim-memo clearing that only repeated in-process parses exercise.
+    tests.append(
+        Test(
+            name="double_parse_file_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "double_parse_file_test.py"],
+        )
+    )
+    # Parses a design whose struct is sized by an AUTO_PIPELINE .latency
+    # twice in one output directory (pin-and-confirm pass 1, then pass 2
+    # latencies): its layout changes but its emitted VHDL name doesn't, and
+    # c_structs_pkg must still declare it once (GHDL-analyzed each pass). The
+    # WireGuard shared build failed in Vivado with a duplicate declaration.
+    tests.append(
+        Test(
+            name="c_structs_pkg_relayout_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "c_structs_pkg_relayout_test.py"],
+            requires=["ghdl"],
+        )
+    )
+    # In-process PARSE_FILE regression test for the _loc_str()
+    # multiline-instance-collision bug (missing node.end_lineno let
+    # same-width, different-line BinOp operands collide into the same
+    # submodule instance name).
+    tests.append(
+        Test(
+            name="loc_str_multiline_binop_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "loc_str_multiline_binop_test.py"],
+        )
+    )
+    # Checks the *type* and message of the ElaborationError raised when a
+    # non-port construct is declared with an @interface's .fwd_t/.fb_t
+    # port-pairing type -- merged from four originally separate files, one
+    # per declaration site checked: Reg[T]/Feedback[T] (a register is
+    # internal state, never a port), local variables (the same restriction,
+    # generalized), global Wire[T]/Input[T]/Output[T], and a plain
+    # (non-hw_func) function's return value. Plus each site's positive case
+    # (the correct .stream_t / inline-constructor-at-a-real-port replacement
+    # must stay clean). See the file's own docstring for the full mapping.
+    tests.append(
+        Test(
+            name="interface_type_error_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "interface_type_error_test.py"],
+        )
+    )
+    # In-process PARSE_FILE + FuncLogicLookupTable/submodule_instances
+    # inspection for the matcher-based generic operator registry --
+    # what got instantiated (built-in BIN_OP_* vs. a resolved generic impl)
+    # is not visible to sim_call or a bare "does it elaborate" check.
+    tests.append(
+        Test(
+            name="operator_scope_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "operator_scope_test.py"],
+        )
+    )
+    # Karatsuba leaf policies: which multiplier each leaf elaborated to
+    # (built-in vs soft shift-and-add), under global/exact registrations
+    # that would otherwise redispatch the leaves; one subprocess per case.
+    tests.append(
+        Test(
+            name="soft_mult_karatsuba_leaves_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "soft_mult_karatsuba_leaves_test.py"],
+        )
+    )
+    # Checks parser_state.clk_mhz / SYN.GET_ALL_USER_CLOCKS directly for a
+    # clock bound to a pin (pll_clk: Input[uint1_t] = make_clock(85.0)), plus
+    # the *type* of ElaborationError each invalid binding raises (a
+    # non-uint1_t wire, an Output, two pins bound to one clock, a clock no
+    # @MAIN runs on) -- none of which is visible to a bare "does it
+    # elaborate" check the way user_clock_test.py (in elab_tests.py) only
+    # proves the happy path builds.
+    tests.append(
+        Test(
+            name="clock_mhz_pragma_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "clock_mhz_pragma_test.py"],
+        )
+    )
+    # Casting's error paths: an unregistered (src, dst) pair, wrong arity on
+    # a scalar cast, casting to an array type, that the pre-existing
+    # interface-half-local ban still fires for a cast-shaped call (not just
+    # the keyword-ctor form it was originally written for), and that a
+    # multi-field struct's 1-positional-arg call is cast-shaped (raising
+    # "no cast registered") rather than silently under-driving one field via
+    # the old positional zip(_fields, args).
+    tests.append(
+        Test(
+            name="cast_error_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "cast_error_test.py"],
+        )
+    )
+    # Scalar char constants: a bare constant builtin call (c = ord("A"))
+    # folds in elaboration as it runs in native sim, a builtin on a hardware
+    # value is a clear error, and a str into a scalar char_t raises the same
+    # "use ord(...)" message on both sides (was two internal errors).
+    tests.append(
+        Test(
+            name="ord_char_literal_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "ord_char_literal_test.py"],
+        )
+    )
+    # The design diagram's data (DIAGRAM.WRITE_DIAGRAM after PARSE_FILE): the
+    # import tree, MAIN files and clocks, field-level wire links and their
+    # direction, @wires MAINs marked as wiring, function graphs with widths,
+    # variable names and Feedback edges, call-site kinds (AUTO_PIPELINE,
+    # AUTO_FSM, raw VHDL, operators, wiring), the type table's interface roles
+    # and readable names, async FIFO ends as one node, --no_synth latencies,
+    # byte-identical pages from two parses, no external references, and a C
+    # design (examples/shared_globals.c).
+    tests.append(
+        Test(
+            name="diagram_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "diagram_test.py"],
+        )
+    )
+    # name_index.log side-tables: pypeline_name_full/pypeline_type_canonical
+    # get populated exactly when a canonical name actually collapses, and
+    # pypeline_canonical_name_owner raises on a genuine collision (two
+    # different closures landing on one canonical name) instead of silently
+    # deduping onto the wrong Logic().
+    tests.append(
+        Test(
+            name="name_index_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "name_index_test.py"],
+        )
+    )
+    # Iteration-ordinal loop naming (_elab_for/_bind_const_target/
+    # _elab_unpack_assign, plus _elab_call's expression-callee branch):
+    # FOR_<var>_ITER_<n>_ shape + legality across tuple/dict/string/
+    # enumerate/zip iteration, tuple-target and tuple-unpack-assignment
+    # destructuring, an indexed call target, determinism across two
+    # PARSE_FILE calls, and every rejection path (set/frozenset, starred
+    # targets, arity mismatch, non-iterable, non-callable call target).
+    tests.append(
+        Test(
+            name="loop_iter_naming_test",
+            category="elab_introspect",
+            cmd=[INST_DIR / "loop_iter_naming_test.py"],
+        )
+    )
+    return tests
+
+
+if __name__ == "__main__":
+    sys.exit(
+        main(
+            get_tests,
+            "PipelineC pypeline in-process compiler-internals (PARSE_FILE + "
+            "parser_state) tests.",
+        )
+    )

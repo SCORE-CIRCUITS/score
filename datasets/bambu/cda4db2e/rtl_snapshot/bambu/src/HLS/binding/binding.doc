@@ -1,0 +1,33 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+  \page src_HLS_binding_page Binding
+
+The data path describes a register transfer level design analogous to a schematic diagram. The data path is described in terms of modules and their interconnections.
+
+<b>Datapath</B>: The datapath (\f$DP\f$) is a graph \f$DP(M_o \cup M_s \cup M_i, I)\f$ where
+- a set \f$M = M_o \cup M_s \cup M_i\f$, whose elements, called modules, are the nodes of the graph, with
+  - a set \f$M_o\f$ of <i>operational</i> modules like adders, multipliers and ALUs (see \ref src_HLS_module_binding_page),
+  - a set \f$M_s\f$ of <i>storage</i> modules like registers and register files (see \ref src_HLS_registerAllocation_page),
+  - a set \f$M_i\f$ of <i>interconnection</i> modules like multiplexers, demultiplexers busses and bus drivers;
+- an interconnection relation \f$I \subseteq M \times M\f$, whose elements are interconnection links. These are the edges of the datapath graph.
+
+*/

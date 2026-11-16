@@ -1,0 +1,513 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2018-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/**
+ * @file plugin_topfname.cpp
+ * @brief In case topfname function is available all global objects but the top function can be private.
+ * This is going to simplify quite much the obtained IR.
+ *
+ * @author Fabrizio Ferrandi <fabrizio.ferrandi@polimi.it>
+ *
+ */
+#ifndef NDEBUG
+#define NDEBUG
+#endif
+#include "plugin_includes.hpp"
+#if PANDA_LLVM_CLANG_MAJOR >= 16
+#include <llvm/Support/ModRef.h>
+#endif
+
+#include "llvm/Analysis/CallGraph.h"
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/StringSet.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/InitializePasses.h>
+#include <llvm/Pass.h>
+#include <llvm/PassRegistry.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/IPO/Internalize.h>
+
+#if PANDA_LLVM_CLANG_MAJOR >= 13
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/PassPlugin.h>
+#else
+#include <llvm/Transforms/IPO/PassManagerBuilder.h>
+#endif
+
+#include <pugixml.hpp>
+
+#include <cxxabi.h>
+#include <list>
+#include <set>
+#include <sstream>
+#include <string>
+
+#define DEBUG_TYPE "top-fname"
+
+// Helper to load an API list to preserve and expose it as a functor for internalization.
+class PreserveSymbolList
+{
+ public:
+   void addSymbol(const llvm::StringRef& symbol)
+   {
+      ExternalNames.insert(symbol);
+   }
+
+   llvm::StringSet<>::iterator begin()
+   {
+      return ExternalNames.begin();
+   }
+
+   llvm::StringSet<>::iterator end()
+   {
+      return ExternalNames.end();
+   }
+
+   bool operator()(const llvm::GlobalValue& GV)
+   {
+      return ExternalNames.count(GV.getName());
+   }
+
+ private:
+   // Contains the set of symbols loaded to preserve
+   static llvm::StringSet<> ExternalNames;
+};
+
+llvm::StringSet<> PreserveSymbolList::ExternalNames;
+
+static PreserveSymbolList preservedSyms;
+
+#define BUILTIN(N, C, T) #N,
+static const std::set<std::string> builtinsNames = {
+#include "clang/Basic/Builtins.def"
+};
+#undef BUILTIN
+
+static bool is_builtin_fn(const std::string& declname)
+{
+   return builtinsNames.count(std::string("__builtin_") + declname) + builtinsNames.count(declname);
+}
+
+static std::string getDemangled(const std::string& declname)
+{
+   int status;
+   char* demangled_outbuffer = abi::__cxa_demangle(declname.c_str(), nullptr, nullptr, &status);
+   if(status == 0)
+   {
+      std::string res = declname;
+      if(std::string(demangled_outbuffer).find_last_of('(') != std::string::npos)
+      {
+         res = demangled_outbuffer;
+         auto parPos = res.find('(');
+         assert(parPos != std::string::npos);
+         res = res.substr(0, parPos);
+      }
+      free(demangled_outbuffer);
+      return res;
+   }
+
+   assert(demangled_outbuffer == nullptr);
+
+   return declname;
+}
+
+namespace llvm
+{
+   static cl::opt<std::string> TopFunctionName_TFP("panda-TFN", cl::desc("Specify the list of top function symbols"),
+                                                   cl::value_desc("comma-separated list of top function symbols"));
+   static cl::opt<bool> Internalize_TFP("panda-Internalize", cl::init(false),
+                                        cl::desc("Specify if the global variables has to be internalized"));
+   static cl::opt<std::string> ExternSymbolsList("panda-ESL",
+                                                 cl::desc("Specify the list of symbols not to be internalized"),
+                                                 cl::value_desc("comma-separated list of external symbols"));
+   static cl::opt<std::string>
+       outdir_name("internalize-outputdir",
+                   cl::desc("Specify the directory where the external symbols file will be written"),
+                   cl::value_desc("directory path"));
+   static cl::opt<bool> add_noalias("add-noalias", cl::init(false), cl::desc("Force noalias to pointer parameters"),
+                                    cl::value_desc("specify if pointer parameters are noalias"));
+
+   struct topfname : public ModulePass
+#if PANDA_LLVM_CLANG_MAJOR >= 13
+       ,
+                     public PassInfoMixin<topfname>
+#endif
+   {
+      static char ID;
+
+      topfname() : ModulePass(ID)
+      {
+         initializeCallGraphWrapperPassPass(*PassRegistry::getPassRegistry());
+      }
+
+#if PANDA_LLVM_CLANG_MAJOR >= 13
+      topfname(const topfname&) : topfname()
+      {
+      }
+#endif
+
+      bool exec(Module& M, const CallGraph& CG)
+      {
+         bool changed = false;
+         bool hasTopFun = false;
+         std::vector<std::string> TopFunctionNames;
+         std::vector<std::string> RootFunctionNames;
+
+         const auto handleFunction = [&](Function* F, const std::string& fsymbol, const std::string& fname) {
+            if(!F->isIntrinsic() && !F->isDeclaration())
+            {
+               LLVM_DEBUG(llvm::dbgs() << "Checking function: " << fsymbol << " | " << fname << " (" << F->getLinkage()
+                                       << ")\n");
+               if(is_builtin_fn(fsymbol) || is_builtin_fn(fname))
+               {
+                  LLVM_DEBUG(llvm::dbgs() << "  builtin\n");
+                  preservedSyms.addSymbol(fsymbol);
+               }
+               else if(fname.find(".omp_outlined") != std::string::npos ||
+                       fsymbol.find(".omp_outlined") != std::string::npos)
+               {
+                  LLVM_DEBUG(llvm::dbgs() << " OpenMP outlined\n");
+                  preservedSyms.addSymbol(fname);
+                  if(F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+                  {
+                     F->removeFnAttr(llvm::Attribute::AlwaysInline);
+                  }
+                  F->addFnAttr(Attribute::NoInline);
+               }
+               else if(llvm::find(RootFunctionNames, fsymbol) != RootFunctionNames.end() ||
+                       llvm::find(RootFunctionNames, fname) != RootFunctionNames.end())
+               {
+                  LLVM_DEBUG(llvm::dbgs() << "  top function\n");
+                  if(F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+                  {
+                     F->removeFnAttr(llvm::Attribute::AlwaysInline);
+                  }
+                  F->addFnAttr(Attribute::NoInline);
+                  F->setLinkage(GlobalValue::LinkageTypes::ExternalLinkage);
+#if PANDA_LLVM_CLANG_MAJOR >= 7
+                  F->setDSOLocal(false);
+#endif
+                  preservedSyms.addSymbol(fsymbol);
+                  hasTopFun = true;
+                  /// in case add noalias
+                  if(add_noalias)
+                  {
+                     for(auto& par : F->args())
+                     {
+                        if(!par.hasNoAliasAttr() && par.getType()->isPointerTy())
+                        {
+                           par.addAttr(llvm::Attribute::NoAlias);
+                        }
+                     }
+                  }
+               }
+            }
+         };
+
+         std::stringstream ss(TopFunctionName_TFP);
+         std::string func_symbol;
+         LLVM_DEBUG(dbgs() << "|" << TopFunctionName_TFP << "|\n");
+         while(std::getline(ss, func_symbol, ','))
+         {
+            if(!func_symbol.empty())
+            {
+               LLVM_DEBUG(dbgs() << " - " << func_symbol << "\n");
+               TopFunctionNames.push_back(func_symbol);
+               RootFunctionNames.push_back(func_symbol);
+            }
+         }
+         pugi::xml_document doc;
+         const auto arch_filename = outdir_name + "/architecture.xml";
+         if(doc.load_file(arch_filename.c_str()))
+         {
+            for(auto& f : doc.child("module"))
+            {
+               const auto func_symbol = std::string(f.attribute("symbol").value());
+               const auto func_name = std::string(f.attribute("name").value());
+               const auto is_dataflow = !f.attribute("dataflow_top").empty() || !f.attribute("dataflow_module").empty();
+               if(is_dataflow && (llvm::find(RootFunctionNames, func_name) == RootFunctionNames.end() ||
+                                  llvm::find(RootFunctionNames, func_symbol) == RootFunctionNames.end()))
+               {
+                  LLVM_DEBUG(dbgs() << " - " << func_symbol << "|" << func_name << "\n");
+                  RootFunctionNames.push_back(func_symbol);
+               }
+            }
+         }
+         if(TopFunctionNames.empty())
+         {
+            LLVM_DEBUG(llvm::dbgs() << "No top function specified\n");
+            return false;
+         }
+         // Initialize external symbols list
+         if(!ExternSymbolsList.empty())
+         {
+            std::stringstream ss(ExternSymbolsList);
+
+            while(ss.good())
+            {
+               std::string substr;
+               std::getline(ss, substr, ',');
+               preservedSyms.addSymbol(substr);
+            }
+         }
+
+         SmallPtrSet<Function*, 32> Reachable;
+         SmallPtrSet<Function*, 32> Reached;
+         for(auto&& CGN : CG)
+         {
+            if(!CGN.second)
+            {
+               continue;
+            }
+            auto fun = CGN.second->getFunction();
+            if(!fun)
+            {
+               continue;
+            }
+            const auto fsymbol = fun->getName().str();
+            const auto fname = getDemangled(fsymbol);
+            if(!(is_builtin_fn(fsymbol) || is_builtin_fn(fname) ||
+                 llvm::find(TopFunctionNames, fsymbol) != TopFunctionNames.end() ||
+                 llvm::find(TopFunctionNames, fname) != TopFunctionNames.end()))
+            {
+               continue;
+            }
+
+            handleFunction(fun, fsymbol, fname);
+
+            SmallVector<const Function*, 8> Tmp({CGN.first});
+            do
+            {
+               auto F = std::move(Tmp.back());
+               Tmp.pop_back();
+
+               for(auto&& N : *CG[F])
+               {
+                  if(!N.second)
+                     continue;
+                  auto funCalled = N.second->getFunction();
+                  if(!funCalled)
+                     continue;
+                  if(Reachable.find(funCalled) != Reachable.end())
+                     continue;
+
+                  Tmp.push_back(funCalled);
+
+                  const auto _fsymbol = funCalled->getName().str();
+                  const auto _fname = getDemangled(_fsymbol);
+                  Reachable.insert(funCalled);
+                  if(!Reached.count(funCalled))
+                  {
+                     Reached.insert(funCalled);
+                     handleFunction(funCalled, _fsymbol, _fname);
+                  }
+               }
+            } while(!Tmp.empty());
+         }
+
+         if(!hasTopFun)
+         {
+            return changed;
+         }
+         // (tapa 03-stream) ac_channel hardware primitives: out-of-line declarations whose
+         // bodies are generated in Verilog. Give them their memory contract, per signature:
+         // read/write change the FIFO state; peek only observes it, unless its signature
+         // carries pointer outputs (a valid bit, an sret result) that the lowering writes.
+         // Every pointer argument (the channel, outputs, sret) stays in scope via argmem.
+         // Declarations only: a body would be a software implementation, which may touch
+         // allocators or other state, and must not be marked. The virtual-operand serializer
+         // (dumpBambuIr) relies on these effects, through the alias analysis, to drop the
+         // spurious orderings between seam calls of different channels. The mutation is
+         // reported through "changed" so that any analysis computed before this pass, which
+         // the effects depend on, is invalidated rather than preserved.
+         for(auto& F : M)
+         {
+            const auto op = bambu_ac_channel_primitives::classifyFunction(&F);
+            if(op == bambu_ac_channel_primitives::Op::None)
+            {
+               continue;
+            }
+            const bool read_only = (op == bambu_ac_channel_primitives::Op::Peek) &&
+                                   (bambu_ac_channel_primitives::countPointerArgs(&F) <= 1);
+#if PANDA_LLVM_CLANG_MAJOR >= 16
+            const llvm::MemoryEffects desired =
+                read_only ? llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref) : llvm::MemoryEffects::argMemOnly();
+            if(F.getMemoryEffects() != desired)
+            {
+               F.setMemoryEffects(desired);
+               changed = true;
+            }
+#else
+            /// LLVM 4--15: no MemoryEffects API; the equivalent "argmem" [+ "readonly"]
+            /// function attributes carry the same contract.
+            const bool has_readonly = F.hasFnAttribute(llvm::Attribute::ReadOnly);
+            const bool has_argmem = F.hasFnAttribute(llvm::Attribute::ArgMemOnly);
+            const bool has_readnone = F.hasFnAttribute(llvm::Attribute::ReadNone);
+            const bool has_writeonly = F.hasFnAttribute(llvm::Attribute::WriteOnly);
+            if(!has_argmem || has_readonly != read_only || has_readnone || has_writeonly)
+            {
+               F.setOnlyAccessesArgMemory();
+               F.removeFnAttr(llvm::Attribute::ReadNone);
+               F.removeFnAttr(llvm::Attribute::WriteOnly);
+               if(read_only)
+               {
+                  F.setOnlyReadsMemory();
+               }
+               else
+               {
+                  F.removeFnAttr(llvm::Attribute::ReadOnly);
+               }
+               changed = true;
+            }
+#endif
+            LLVM_DEBUG(llvm::dbgs() << "topfname: memory(argmem: " << (read_only ? "read" : "readwrite") << ") on "
+                                    << F.getName() << "\n");
+         }
+         LLVM_DEBUG(llvm::dbgs() << "Top function symbols: "
+                                 << llvm::join(TopFunctionNames.begin(), TopFunctionNames.end(), ", ") << "\n"
+                                 << "Root function symbols: "
+                                 << llvm::join(RootFunctionNames.begin(), RootFunctionNames.end(), ", ") << "\n");
+
+         if(!outdir_name.empty())
+         {
+            std::error_code EC;
+            std::string filename = outdir_name + "/external-symbols.txt";
+#if PANDA_LLVM_CLANG_MAJOR >= 7 && !defined(VVD)
+            llvm::raw_fd_ostream stream(filename, EC, llvm::sys::fs::FA_Read | llvm::sys::fs::FA_Write);
+#else
+            llvm::raw_fd_ostream stream(filename, EC, llvm::sys::fs::F_RW);
+#endif
+            for(const auto& symb : preservedSyms)
+            {
+               stream << symb.getKey() << "\n";
+            }
+         }
+
+         return changed;
+      }
+
+      bool runOnModule(Module& M) override
+      {
+#if PANDA_LLVM_CLANG_MAJOR < 13
+
+         CallGraphWrapperPass* CGPass = getAnalysisIfAvailable<CallGraphWrapperPass>();
+         if(!CGPass)
+         {
+            report_fatal_error("not able to retrieve the call graph");
+         }
+         return exec(M, CGPass->getCallGraph());
+#else
+         report_fatal_error("Call to runOnModule not expected with current LLVM version");
+         return false;
+#endif
+      }
+
+      StringRef getPassName() const override
+      {
+         return "topfname";
+      }
+
+      void getAnalysisUsage(AnalysisUsage& AU) const override
+      {
+         AU.addRequired<CallGraphWrapperPass>();
+      }
+
+#if PANDA_LLVM_CLANG_MAJOR >= 13
+      llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager& MAM)
+      {
+         const auto changed = exec(M, MAM.getResult<CallGraphAnalysis>(M));
+         return (changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all());
+      }
+#endif
+   };
+
+   char topfname::ID = 0;
+
+} // namespace llvm
+
+#ifndef _WIN32
+static llvm::RegisterPass<llvm::topfname> XPass("topfname", "Make all private/static but the top function",
+                                                false /* Only looks at CFG */, false /* Analysis Pass */);
+#endif
+
+#if PANDA_LLVM_CLANG_MAJOR >= 13
+llvm::PassPluginLibraryInfo gettopfnamePluginInfo()
+{
+   return {LLVM_PLUGIN_API_VERSION, "topfname", "v0.12", [](llvm::PassBuilder& PB) {
+              const auto load = [](llvm::ModulePassManager& MPM) {
+                 MPM.addPass(llvm::topfname());
+                 if(llvm::Internalize_TFP)
+                 {
+                    MPM.addPass(llvm::InternalizePass(preservedSyms));
+                 }
+                 return true;
+              };
+              PB.registerPipelineParsingCallback([&](llvm::StringRef Name, llvm::ModulePassManager& MPM,
+                                                     llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
+                 if(Name == "topfname")
+                 {
+                    return load(MPM);
+                 }
+                 return false;
+              });
+              PB.registerPipelineEarlySimplificationEPCallback([&](llvm::ModulePassManager& MPM,
+#if PANDA_LLVM_CLANG_MAJOR < 16
+                                                                   llvm::PassBuilder::OptimizationLevel
+#else
+                                                                   llvm::OptimizationLevel
+#endif
+                                                               ) { return load(MPM); });
+              PB.registerOptimizerLastEPCallback([&](llvm::ModulePassManager& MPM,
+#if PANDA_LLVM_CLANG_MAJOR < 16
+                                                     llvm::PassBuilder::OptimizationLevel
+#else
+                                                                   llvm::OptimizationLevel
+#endif
+                                                 ) { return load(MPM); });
+           }};
+}
+
+// This part is the new way of registering your pass
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK __attribute__((visibility("default")))
+llvmGetPassPluginInfo()
+{
+   return gettopfnamePluginInfo();
+}
+#else
+#if ADD_RSP
+// This function is of type PassManagerBuilder::ExtensionFn
+static void loadPass(const llvm::PassManagerBuilder&, llvm::legacy::PassManagerBase& PM)
+{
+   PM.add(new llvm::topfname());
+   if(llvm::Internalize_TFP)
+   {
+      PM.add(llvm::createInternalizePass(preservedSyms));
+   }
+}
+
+// These constructors add our pass to a list of global extensions.
+static llvm::RegisterStandardPasses topfname_Ox(llvm::PassManagerBuilder::EP_ModuleOptimizerEarly, loadPass);
+#endif
+#endif

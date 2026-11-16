@@ -508,7 +508,7 @@ detect_environment_status() {
     fi
     
     # Check Gemmini environment setup
-    if [[ -f "$PROJECT_ROOT/setup_gemmini_env.sh" ]]; then
+    if [[ -f "$PROJECT_ROOT/scripts/setup_gemmini_env.sh" ]]; then
         success "✅ Gemmini environment script: Available"
         gemmini_env_setup=true
     else
@@ -658,7 +658,7 @@ detect_environment_status() {
     
     if [[ $needs_work == false ]]; then
         success "🎉 All components are already installed and configured!"
-        info "You can run: source $PROJECT_ROOT/setup_gemmini_env.sh"
+        info "You can run: source $PROJECT_ROOT/scripts/setup_gemmini_env.sh"
         info "Then use: ./scripts/generate_gemmini.sh"
         return 1  # Signal that no installation is needed
     fi
@@ -1216,7 +1216,7 @@ setup_gemmini_environment() {
 create_gemmini_env_script() {
     log "=== Creating Gemmini Environment Script ==="
     
-    local env_script="$PROJECT_ROOT/setup_gemmini_env.sh"
+    local env_script="$PROJECT_ROOT/scripts/setup_gemmini_env.sh"
     
     cat > "$env_script" << 'EOF'
 #!/bin/bash
@@ -1224,9 +1224,10 @@ create_gemmini_env_script() {
 # Source this script to set up the Gemmini development environment
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLS_DIR="$SCRIPT_DIR/tools"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+TOOLS_DIR="$PROJECT_ROOT/tools"
 GEMMINI_DIR="$TOOLS_DIR/gemmini"
-WORKSHOP_DIR="${SCORE_GEMMINI_WORKSHOP:-$SCRIPT_DIR/datasets/gemmini/workshop}"
+WORKSHOP_DIR="${SCORE_GEMMINI_WORKSHOP:-$PROJECT_ROOT/datasets/gemmini/workshop}"
 CHIPYARD_DIR="$WORKSHOP_DIR/chipyard"
 
 # Chipyard env expects `conda` on PATH (install_gemmini.sh may install Miniconda here).
@@ -1340,7 +1341,7 @@ test_gemmini_functionality() {
     log "=== Testing Gemmini Functionality ==="
     
     # Source the environment
-    source "$PROJECT_ROOT/setup_gemmini_env.sh" >/dev/null 2>&1
+    source "$PROJECT_ROOT/scripts/setup_gemmini_env.sh" >/dev/null 2>&1
     
     cd "$GEMMINI_DIR"
     
@@ -1443,7 +1444,7 @@ main() {
     log "Total time: ${minutes}m ${seconds}s"
     
     # Show installed tools
-    source "$PROJECT_ROOT/setup_gemmini_env.sh" >/dev/null 2>&1
+    source "$PROJECT_ROOT/scripts/setup_gemmini_env.sh" >/dev/null 2>&1
     
     log "Installed components:"
     success "✅ Gemmini Platform: $GEMMINI_DIR"
@@ -1469,7 +1470,7 @@ main() {
     
     log ""
     log "Installation complete!"
-    log "To use Gemmini, run: source $PROJECT_ROOT/setup_gemmini_env.sh"
+    log "To use Gemmini, run: source $PROJECT_ROOT/scripts/setup_gemmini_env.sh"
     log "Then you can use: $PROJECT_ROOT/scripts/generate_gemmini.sh"
     log "==================================================================="
 }
@@ -1520,7 +1521,7 @@ show_help() {
     echo "  SCORE_GEMMINI_INSTALL_LOG_DIR  Directory for install_gemmini.log (default: <repo>/datasets/gemmini/logs)"
     echo ""
     echo "After installation, source the environment script:"
-    echo "  source $PROJECT_ROOT/setup_gemmini_env.sh"
+    echo "  source $PROJECT_ROOT/scripts/setup_gemmini_env.sh"
 }
 
 # Parse command line arguments
@@ -1608,7 +1609,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
         echo "🎉 Perfect! Your Gemmini environment is completely set up and ready to use."
         echo ""
         echo "Next steps:"
-        echo "  1. Source the environment: source $PROJECT_ROOT/setup_gemmini_env.sh"
+        echo "  1. Source the environment: source $PROJECT_ROOT/scripts/setup_gemmini_env.sh"
         echo "  2. Run RTL generation: ./scripts/generate_gemmini.sh"
         exit 0
     else

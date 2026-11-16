@@ -1,0 +1,178 @@
+# Copyright 2020 The XLS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("@protobuf//bazel:py_proto_library.bzl", "py_proto_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//xls/build_rules:py_oss_defs.bzl", "pytype_strict_contrib_test")
+
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//xls:xls_internal"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+cc_test(
+    name = "basic_ir_ops_test",
+    srcs = ["basic_ir_ops_test.cc"],
+    shard_count = 3,
+    deps = [
+        "//xls/common:xls_gunit_main",
+        "//xls/common/status:matchers",
+        "//xls/ir",
+        "//xls/ir:bits",
+        "//xls/ir:bits_ops",
+        "//xls/ir:function_builder",
+        "//xls/ir:ir_test_base",
+        "//xls/ir:value",
+        "//xls/simulation:sim_test_base",
+        "@abseil-cpp//absl/log",
+        "@abseil-cpp//absl/strings",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_test(
+    name = "ir_types_test",
+    srcs = ["ir_types_test.cc"],
+    deps = [
+        "//xls/common:xls_gunit_main",
+        "//xls/ir:bits",
+        "//xls/ir:value",
+        "//xls/simulation:sim_test_base",
+        "@abseil-cpp//absl/types:span",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_test(
+    name = "dslx_optimization_test",
+    srcs = ["dslx_optimization_test.cc"],
+    data = ["//xls/dslx/ir_convert:ir_converter_main"],
+    deps = [
+        "//xls/common:subprocess",
+        "//xls/common:xls_gunit_main",
+        "//xls/common/file:get_runfile_path",
+        "//xls/common/file:temp_file",
+        "//xls/common/status:matchers",
+        "//xls/common/status:status_macros",
+        "//xls/dslx:mangle",
+        "//xls/ir",
+        "//xls/ir:ir_matcher",
+        "//xls/ir:ir_test_base",
+        "//xls/ir:op",
+        "//xls/passes",
+        "//xls/passes:optimization_pass_pipeline",
+        "@abseil-cpp//absl/log",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/types:span",
+        "@googletest//:gtest",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "documentation_test",
+    timeout = "long",
+    srcs = ["documentation_test.py"],
+    data = [
+        "//docs_src:dslx_documentation_files",
+        "//docs_src/tutorials:all_files",
+        "//xls/dslx:dslx_fmt",
+        "//xls/dslx:interpreter_main",
+        "//xls/dslx/tests:mod_imported_file",
+    ],
+    deps = [
+        "//xls/common:runfiles",
+        "@abseil-py//absl/testing:absltest",
+        "@abseil-py//absl/testing:parameterized",
+    ],
+)
+
+cc_library(
+    name = "testbench",
+    hdrs = ["testbench.h"],
+    deps = [
+        ":testbench_thread",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings:str_format",
+        "@abseil-cpp//absl/synchronization",
+        "@abseil-cpp//absl/time",
+    ],
+)
+
+cc_library(
+    name = "testbench_builder",
+    hdrs = ["testbench_builder.h"],
+    deps = [
+        ":testbench",
+        ":testbench_builder_utils",
+    ],
+)
+
+cc_library(
+    name = "testbench_builder_utils",
+    hdrs = ["testbench_builder_utils.h"],
+    deps = [
+        "@abseil-cpp//absl/base",
+        "@abseil-cpp//absl/log",
+        "@abseil-cpp//absl/random",
+        "@abseil-cpp//absl/random:distributions",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+    ],
+)
+
+cc_test(
+    name = "testbench_builder_utils_test",
+    srcs = ["testbench_builder_utils_test.cc"],
+    deps = [
+        ":testbench_builder_utils",
+        "//xls/common:xls_gunit_main",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "testbench_thread",
+    hdrs = ["testbench_thread.h"],
+    deps = [
+        "//xls/common:thread",
+        "//xls/ir",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/synchronization",
+    ],
+)
+
+proto_library(
+    name = "testvector_proto",
+    srcs = ["testvector.proto"],
+)
+
+cc_proto_library(
+    name = "testvector_cc_proto",
+    deps = [":testvector_proto"],
+)
+
+py_proto_library(
+    name = "testvector_py_pb2",
+    deps = [":testvector_proto"],
+)

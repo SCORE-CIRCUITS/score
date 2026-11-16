@@ -1,0 +1,1690 @@
+# Note, for testing purposes, can do things like:
+#   python3 tests.py --exec 'check_for_dupes(1)'
+#   python3 tests.py --exec "print(*Tests.configs_list)"
+#   python3 tests.py --exec "Tests.show_config('full')" |& less
+
+# Find and/or install pyyaml
+from subprocess import run, DEVNULL
+import json
+
+# yaml occasionally causes problems here :(
+p=run('python3 -m ensurepip --default-pip', shell=True, stdout = DEVNULL) #, stderr = DEVNULL)
+p=run('python3 -m pip install pyyaml',      shell=True, stdout = DEVNULL) #, stderr = DEVNULL)
+assert p.returncode == 0, "Could not install pyyaml, sorry!"
+import yaml
+
+########################################################################
+class Tests:
+
+    # Valid configs as of Oct 2025:
+    #   "fast"    quick and dirty test of basic apps
+    #
+    #   "pr_aha1" thru "pr_aha9"
+    #             regression tests that run on every aha pull
+    #
+    #   "pr_aha"  combines all tests pr_aha1-9 into a single group
+    #
+    #   "full"    extensive set of apps that run every sunday night
+    #
+    #   "resnet"  three resnet tests---does anyone still use this?
+    #
+    #   "mu"      bunch of "external_mu_tests", mostly resnet18
+    #
+    #   "BLANK"   returns empty set of all test groups, useful for initializing a new group
+
+    configs_list = ["fast", "pr_aha1", "pr_aha2", "pr_aha3", "pr_aha4",
+                 "pr_aha5", "pr_aha6", "pr_aha7", "pr_aha8", "pr_aha9",
+                 "pr_aha", "full", "resnet", "mu", "dense_ml_models", "BLANK"]
+
+    glb_tests_fp_RV1 = [
+                "tests/fp_comp_RV",
+                "apps/relu_layer_fp_RV",
+    ]
+    glb_tests_fp_RV3 = []
+    glb_tests_fp_RV2 = [
+                "apps/rms_norm_pass1_fp_RV_E64_MB",
+                "apps/rms_norm_pass2_fp_RV_E64_MB",
+    ]
+    glb_tests_fp_RV7 = []
+    glb_tests_fp_RV8 = []
+    glb_tests_fp_RV9 = [
+                "apps/rope_fp_RV_E64_MB",
+    ]
+    dense_ml_unit_tests = [
+        # "transpose2d",  # This one stopped working 08/2026
+    ]
+    external_mu_tests_bert_attention = [
+        # BERT Attention*Value Using inner reduction workaround
+        "bert-matmul_mx_12 -> zircon_2d_nop_post_bert_AV_RV_E64_MB",
+    ]
+    external_mu_tests_llama_attention = [
+        # REMOVING this test b/c keeps failing
+        # LLaMA 3.2-1B Prefill Attention*Value Using inner reduction workaround
+        # "llama_prefill-matmul_mx_32 -> zircon_2d_nop_post_llama_prefill_AV_RV_E64_MB",
+    ]
+
+    def configs_template():
+        # Defaults
+        width, height = 28, 16  # default
+        sparse_tests = []
+        glb_tests_RV = []
+        glb_tests_fp_RV = []
+        glb_tests = []
+        glb_tests_fp = []
+        resnet_tests = []
+        resnet_tests_fp = []
+        voyager_cgra_tests_fp = []
+        behavioral_mu_tests = []
+        behavioral_mu_tests_fp = []
+        external_mu_tests = []
+        external_mu_tests_fp = []
+        hardcoded_dense_tests = []
+        dense_ml_models = []
+        dense_ml_unit_tests = []
+        no_zircon_sparse_tests = []
+
+        # Zircon specific parms; 'regress.py --no-zircon' ignores these
+        cols_removed, mu_oc_0 = 12, 32
+        return vars().copy()
+
+    def __init__(self, testname="BLANK", zircon=True):
+        self.__dict__.update(Tests.configs_template())
+
+        # Simplify: use pr_aha instead of "pr", "daily", or "pr_submod"
+        if testname in ["daily", "pr", "pr_submod"]:
+            print(f'WARNING "{testname}" config no longer exists, using "pr_aha" instead', flush=True)
+            testname = "pr_aha"
+
+
+        if testname == "fast":
+            width, height = 8, 8,
+            cols_removed, mu_oc_0 = 4, 8  # Ignored if --no-zircon is set
+            sparse_tests = [
+                "vec_identity"
+            ]
+            glb_tests_RV = [
+                "tests/conv_2_1_RV",
+                "apps/pointwise_RV_E64",
+                "apps/pointwise_RV_E64_MB",
+            ]
+            glb_tests_fp_RV = [
+                "tests/fp_pointwise_RV",
+            ]
+            glb_tests = [
+                "apps/pointwise",
+            ]
+            glb_tests_fp = [
+                "tests/fp_pointwise",
+            ]
+
+        elif testname == "pr_aha1":
+
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            sparse_tests = [
+                # pr_aha1
+                "vec_elemmul",
+                "mat_vecmul_ij",
+                "mat_elemadd_leakyrelu_exp",
+                "mat_elemdiv",
+                "mat_mattransmul",
+                "fp_relu_matmul_ikj",
+                "matmul_ikj",
+                "matmul_jik",
+                "fp_relu_spmm_ijk_crddrop",
+                "fp_spmm_ijk_crddrop_locator",
+                "spmv_relu",
+                "masked_broadcast",
+                "mat_sddmm",
+                "tensor3_mttkrp",
+                "tensor3_ttv",
+            ]
+            external_mu_tests_fp = [
+                # BERT down projection layer: All using gemm_reduction_tiling_workaround
+                "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel0_RV_E64_MB",
+                "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel1_RV_E64_MB",
+
+                 # LLaMA Prefill, down projection
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel2_RV_E64_MB",
+
+                # BERT Query projection: All using gemm_reduction_tiling_workaround
+                "bert-submodule_2 -> zircon_2d_nop_post_bert_query_projection_kernel0_RV_E64_MB",
+                "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel1_RV_E64_MB",
+                "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel2_RV_E64_MB",
+
+                # BERT Key projection: All using gemm_reduction_tiling_workaround
+                "bert-submodule -> zircon_2d_nop_post_bert_key_projection_kernel0_RV_E64_MB",
+
+                # LLaMA Prefill, Key projectiion
+                "llama_prefill-submodule_1 -> zircon_2d_nop_post_llama_prefill_key_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel2_RV_E64_MB",
+
+                # BERT Value projection: All using gemm_reduction_tiling_workaround
+                "bert-submodule_1 -> zircon_2d_nop_post_bert_value_projection_kernel0_RV_E64_MB",
+            ]
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV1
+
+        elif testname == "pr_aha2":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV2
+
+            voyager_cgra_tests_fp = [
+                # BERT GELU pass2 layers
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel0_RV_E64_MB",
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill SiLU
+                "llama_prefill-silu::add_gelu_pass2_fp_llama_prefill_RV_E64_MB",
+            ]
+            external_mu_tests = Tests.external_mu_tests_bert_attention
+
+            external_mu_tests_fp = [
+                # Conv2_x
+                "resnet18-submodule_2 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_3 -> zircon_deq_ResReLU_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_4 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_5 -> zircon_deq_ResReLU_quant_fp_post_conv2_x_RV_E64_MB",
+
+                # LLaMA prefill, final output projection
+                # Run 125 times on k dimension
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_125_RV_E64_MB",
+
+            ]
+            behavioral_mu_tests = [
+                "apps/mu2glb_path_balance_test_RV_E64",
+                "apps/get_e8m0_scale_tree_mu_input_RV_E64_MB",
+            ]
+
+        elif testname == "pr_aha3":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV3
+
+            voyager_cgra_tests_fp = [
+                # BERT apply_e8m0_scale layers
+                "bert-quantize_default::apply_e8m0_scale_multi_IOs_bert_RV_E64_MB",
+                "bert-quantize_default_1::apply_e8m0_scale_multi_IOs_bert_post_transpose_RV_E64_MB",
+
+                # LLaMA Prefill apply_e8m0_scale layers
+                "llama_prefill-quantize_default::apply_e8m0_scale_multi_IOs_llama_prefill_RV_E64_MB",
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                #"llama_prefill-quantize_default_1::apply_e8m0_scale_multi_IOs_llama_prefill_post_transpose_RV_E64_MB",
+
+                # BERT Pooling layer, using k-dim host tiling
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel0_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel1_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel2_RV_E64_MB",
+            ]
+            external_mu_tests_fp = [
+                # Conv3_1 strided conv
+                "resnet18-submodule_6 -> zircon_deq_q_relu_fp_post_conv3_1_RV_E64_MB",
+
+                # Conv3_1 pointwise conv
+                "resnet18-submodule_7 -> zircon_dequant_fp_post_conv3_1_RV_E64_MB",
+
+                # Conv3_x
+                "resnet18-submodule_8 -> zircon_deq_ResReLU_fp_post_conv3_x_RV_E64_MB",
+                "resnet18-submodule_9 -> zircon_deq_q_relu_fp_post_conv3_x_RV_E64_MB",
+                "resnet18-submodule_10 -> zircon_deq_ResReLU_quant_fp_post_conv3_x_RV_E64_MB",
+                
+                # Conv5_x (K-DIM HOST TILING, INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+            ]
+
+        elif testname == "pr_aha4":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+
+            glb_tests_RV = []
+            behavioral_mu_tests = []
+            # Resnet tests DISABLED see below
+            external_mu_tests_fp = [
+                # Conv4_1 strided conv (TILED OUTER REDUCTION WORKAROUND)
+                "resnet18-submodule_11 -> zircon_nop_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+                "resnet18-submodule_11 -> zircon_res_deq_ReLU_quant_fp_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+
+                # Conv4_1 pointwise conv (INNER REDUCTION WORKAROUND)
+                "resnet18-submodule_12 -> zircon_dequant_fp_post_conv4_1_inner_reduction_workaround_RV_E64_MB",
+
+                # BERT masked self-attention head
+                "bert-submodule_3 -> zircon_scale_add_fp_post_bert_masked_self_attention_head_RV_E64_MB",
+
+                 # LLaMA 3.2-1B Prefill masked self-attention head
+                "llama_prefill-submodule_7 -> zircon_scale_add_fp_post_llama_prefill_masked_self_attention_head_RV_E64_MB",
+
+
+                # BERT post-attention projection:All using gemm_reduction_tiling_workaround
+                "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel0_RV_E64_MB",
+                "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill post-attention projection
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel2_RV_E64_MB",
+
+            ]
+
+            # Run dense ML tests
+            dense_ml_models = []
+            dense_ml_unit_tests = Tests.dense_ml_unit_tests  # SSOT!
+
+        elif testname == "pr_aha5":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            # For sparse tests, we cherry pick some representative tests to run
+            no_zircon_sparse_tests = [
+                "vec_elemmul",
+                "mat_vecmul_ij",
+                "mat_elemadd_leakyrelu_exp",
+                "matmul_ikj",
+                "tensor3_mttkrp",
+            ]
+            # Tests below are non-zircon and won't run by default
+            glb_tests = [
+                "apps/maxpooling",
+                "apps/camera_pipeline_2x2",
+                "apps/gaussian",
+                "apps/harris_color",
+                "apps/unsharp",
+            ]
+            glb_tests_fp = [
+                "tests/fp_arith",
+                "tests/fp_comp",
+                "apps/matrix_multiplication_fp",
+            ]
+            voyager_cgra_tests_fp = [
+                # Standalone quantize layers
+                "resnet18-quantize_default_1::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_3::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_7::zircon_quant_fp_post_conv3x_RV_E64_MB",
+                "resnet18-quantize_default_11::zircon_quant_fp_post_conv4x_RV_E64_MB",
+                "resnet18-quantize_default_15::zircon_quant_fp_post_conv5x_RV_E64_MB",
+
+                # BERT permute layer
+                "bert-permute_3::nop_2d_mha_concat_bert_RV_E64_MB",
+
+                # BERT Softmax layers
+                "bert-softmax_1::stable_softmax_pass1_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass2_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass3_fp_bert_RV_E64_MB",
+
+                # LLaMA permute layer
+                "llama_prefill-transpose_4::nop_2d_mha_concat_llama_prefill_RV_E64_MB",
+
+                # LLaMA Prefill Softmax layers
+                "llama_prefill-softmax_1::stable_softmax_pass1_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass2_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass3_fp_llama_prefill_RV_E64_MB",
+
+                # LLaMA Prefill Query RoPE
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill Key RoPE
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel1_RV_E64_MB",
+
+            ]
+            external_mu_tests_fp = [
+                # Conv1 (im2col-based, X-DIM HOST TILING)
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel0_RV_E64_MB",
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel1_RV_E64_MB",
+            ]
+            hardcoded_dense_tests = [
+                "apps/unsharp_RV",
+            ]
+        elif testname == "pr_aha6":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            glb_tests_RV = [
+                "apps/maxpooling_dense_rv_mem_buf_fp_RV_E64_MB",
+            ]
+            resnet_tests = [
+                "conv1",
+                "conv2_x",
+                "conv5_x",
+            ]
+            resnet_tests_fp = [
+                # "conv2_x_fp" # not yet supported by zircon
+            ]
+            external_mu_tests_fp = [
+                # Conv4_x
+                "resnet18-submodule_13 -> zircon_deq_ResReLU_fp_post_conv4_x_RV_E64_MB",
+                "resnet18-submodule_14 -> zircon_deq_q_relu_fp_post_conv4_x_RV_E64_MB",
+                "resnet18-submodule_15 -> zircon_deq_ResReLU_quant_fp_post_conv4_x_RV_E64_MB",
+
+                # Conv5_1 strided Conv (INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_16 -> zircon_deq_q_relu_fp_post_conv5_1_RV_E64_MB",
+
+                # Conv5_1 pointwise conv (INNER REDUCTION WORKAROUND, INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_17 -> zircon_dequant_fp_post_conv5_1_inner_reduction_workaround_RV_E64_MB",
+
+                # LLaMA Prefill Query projection
+                "llama_prefill-submodule -> zircon_2d_nop_post_llama_prefill_query_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel2_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel3_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel4_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel5_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel6_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel7_RV_E64_MB",
+
+            ]
+        elif testname == "pr_aha7":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV7
+            external_mu_tests_fp = [
+                # BERT up projection layer + GELU pass 1: All using gemm_reduction_tiling_workaround; also with K-DIM HOST TILING for output tensor
+                "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel0_RV_E64_MB",
+                "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel1_RV_E64_MB",
+                "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel5_RV_E64_MB",
+
+                "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel6_RV_E64_MB",
+                "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel7_RV_E64_MB",
+                "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel11_RV_E64_MB",
+
+                # LLaMA Prefill, up projection
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_nop_post_llama_prefill_up_projection_kernel0_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel2_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel3_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel4_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel5_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel6_RV_E64_MB",
+
+                "llama_prefill-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_llama_prefill_up_projection_kernel7_RV_E64_MB", # SiLU
+
+            ]
+            behavioral_mu_tests_fp = []
+
+        elif testname == "pr_aha8":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+
+            glb_tests_RV = [
+                "apps/gaussian_RV",
+            ]
+
+            # This is currently the empty set
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV8
+
+            voyager_cgra_tests_fp = [
+                # ResNet-18 Average pooling layer
+                "resnet18-adaptive_avg_pool2d_default_1::avgpool_layer_fp_RV_E64_MB",
+
+                # ResNet-18 Fully connected layer (K-DIM HOST TILING)
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel0_RV_E64_MB",
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel1_RV_E64_MB",
+
+                # BERT get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "bert-quantize_mx_default::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_bert_shape1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::get_e8m0_scale_tree_gb_input_bert_shape2_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                "bert-quantize_mx_default::apply_e8m0_scale_single_IO_bert_quantize_mx_default_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::apply_e8m0_scale_single_IO_bert_quantize_mx_default_1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::apply_e8m0_scale_single_IO_bert_quantize_mx_default_6_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                # LLaMA Prefill get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::get_e8m0_scale_tree_gb_input_llama_prefill_shape0_RV_E64_MB", # 512, 2048 DONE
+                "llama_prefill-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_llama_prefill_shape1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::get_e8m0_scale_tree_gb_input_llama_prefill_shape2_RV_E64_MB", # 512, 512
+                "llama_prefill-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_llama_prefill_shape3_RV_E64_MB", # 512, 8192
+
+                # LLaMA Prefill apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_RV_E64_MB", # 512, 2048
+                # Commenting out b/c of overflow issue (gold = 0, sim = 255)
+                # "llama_prefill-quantize_mx_default_1::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_7_RV_E64_MB", # 512, 512
+                # "llama_prefill-quantize_mx_default_5::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_5_RV_E64_MB", # 512, 8192
+
+            ]
+
+            behavioral_mu_tests_fp = []
+            external_mu_tests_fp = [
+                # LLaMA prefill, final output projection
+                # Run 1 time on k dimension
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_1_RV_E64_MB",
+            ]
+
+        elif testname == "pr_aha9":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            glb_tests_fp_RV = Tests.glb_tests_fp_RV9
+            voyager_cgra_tests_fp = [
+                # BERT layer norm layers (didn't run post-FFN layer norm layer)
+                "bert-layer_norm::layer_norm_pass1_fp_bert_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass2_fp_bert_post_attn_RV_E64_MB",
+                # Channel slicing (unroll by 16)
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel0_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel1_RV_E64_MB",
+
+                # BERT get_e8m0_scale accum schedule layers
+                "bert-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_bert_RV_E64_MB",
+                "bert-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_bert_post_transpose_RV_E64_MB",
+
+                # LLaMA prefill get_e8m0_scale accum schedule layers
+                "llama_prefill-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_llama_prefill_RV_E64_MB",
+                "llama_prefill-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_llama_prefill_post_transpose_RV_E64_MB",
+
+                # BERT Classifier layer
+                "bert-linear_7::fully_connected_layer_fp_bert_classifier_RV_E64_MB",
+
+                # BERT tanh layer
+                "bert-tanh::tanh_fp_bert_RV_E64_MB",
+
+                # LLaMA Prefill RMS Norm
+                "llama_prefill-layer_norm_default::rms_norm_pass1_fp_llama_prefill_RV_E64_MB",
+
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel0_RV_E64_MB",
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel1_RV_E64_MB",
+                # LLaMA Prefill Swish Mul
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel0_RV_E64_MB",
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel1_RV_E64_MB",
+
+            ]
+            external_mu_tests_fp = [
+                # ResNet-18 Conv5_x (K-DIM HOST TILING, INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel1_RV_E64_MB",
+
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+            ]
+
+        # PR_AHA test suite for aha-repo push/pull;
+        # build pr_aha1,2,3 and then merge them all together
+        elif testname == "pr_aha":
+            def merge_tests(s1, s2):
+                for key in s2:
+                    if type(s2[key]) is list:
+                        s1[key] = list(dict.fromkeys(s1[key] + s2[key]))  # Removes dupes AND preserves list order
+                    else:
+                        # Non-lists (e.g. width, height) should be same for both sets
+                        assert s1[key] == s2[key], f'Found different values for "{key}" among pr_aha1,2,3'
+
+            pr_aha = Tests('pr_aha1').__dict__
+            merge_tests(pr_aha, Tests('pr_aha2').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha3').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha4').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha5').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha6').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha7').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha8').__dict__)
+            merge_tests(pr_aha, Tests('pr_aha9').__dict__)
+            self.__dict__.update(pr_aha)
+            # print(f"{self.resnet_tests=}", flush=True)
+            return
+
+        # FULL test is used by scheduled weekly aha regressions
+        elif testname == "full":
+
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            sparse_tests = [
+                "vec_elemadd",
+                "vec_elemmul",
+                "vec_identity",
+                "vec_scalar_mul",
+                "mat_vecmul_ij",
+                "mat_elemadd",
+                "mat_elemadd_relu",
+                "mat_elemadd_leakyrelu_exp",
+                "mat_elemadd3",
+                "mat_elemmul",
+                "mat_elemdiv",
+                "mat_identity",
+                "mat_mattransmul",
+                "matmul_ijk",
+                "matmul_ijk_crddrop",
+                "matmul_ikj",
+                "matmul_jik",
+                "spmm_ijk_crddrop",
+                "spmv",
+                "spmv_relu",
+                "masked_broadcast",
+                "trans_masked_broadcast",
+                "mat_dn2sp",
+                "mat_sp2dn",
+                # Turned off until SUB ordering fixed in mapping
+                # 'mat_residual',
+                "mat_sddmm",
+                "mat_mask_tri",
+                "mat_vecmul_iter",
+                "tensor3_elemadd",
+                "tensor3_elemmul",
+                "tensor3_identity",
+                "tensor3_innerprod",
+                "tensor3_mttkrp",
+                "tensor3_mttkrp_unfused1",
+                "tensor3_mttkrp_unfused2",
+                "tensor3_ttm",
+                "tensor3_ttv",
+                "fp_relu_matmul_ijk_crddrop",
+                "fp_relu_matmul_ikj",
+                "fp_spmm_ijk_crddrop",
+                "fp_spmm_ijk_crddrop_locator",
+                "fp_spmm_ikj",
+                "fp_relu_spmm_ijk_crddrop",
+                "fp_relu_spmm_ikj",
+                "fp_matmul_ijk_crddrop",
+                "fp_matmul_ikj",
+            ]
+            glb_tests_RV = [
+                "apps/pointwise_RV",
+                "apps/pointwise_RV_E64",
+                "apps/pointwise_RV_E64_MB",
+                "tests/arith_RV",
+                "tests/absolute_RV",
+                "tests/boolean_ops_RV",
+                "tests/equal_RV",
+                "tests/ternary_RV",
+                "tests/scomp_RV",
+                "tests/ucomp_RV",
+                "tests/sminmax_RV",
+                "tests/uminmax_RV",
+                "tests/sshift_RV",
+                "tests/ushift_RV",
+                "tests/conv_2_1_RV",
+                "tests/conv_3_3_RV",
+                "apps/gaussian_RV",
+                "apps/brighten_and_blur_RV",
+                "apps/maxpooling_dense_rv_mem_buf_fp_RV_E64_MB",
+                "apps/get_e8m0_scale_tree_gb_input_RV_E64_MB",
+                "apps/get_e8m0_scale_accum_gb_input_RV_E64_MB",
+                "apps/apply_e8m0_scale_single_IO_RV_E64_MB",
+                "apps/apply_e8m0_scale_multi_IOs_RV_E64_MB",
+            ]
+            glb_tests_fp_RV = [ "tests/fp_pointwise_RV" ]  # This is in 'fast' config but not aha1-9
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV1
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV2
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV3
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV7
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV8
+            glb_tests_fp_RV += Tests.glb_tests_fp_RV9
+            glb_tests_fp_RV += [
+                "apps/gelu_pass2_fp_RV_E64_MB",
+                "apps/layer_norm_pass1_fp_RV_E64_MB",
+                "apps/layer_norm_pass2_fp_RV_E64_MB",
+                "apps/layer_norm_pass3_fp_RV_E64_MB",
+                "apps/stable_softmax_pass1_fp_RV_E64_MB",
+                "apps/stable_softmax_pass2_fp_RV_E64_MB",
+                "apps/stable_softmax_pass3_fp_RV_E64_MB",
+                "apps/add_gelu_pass2_fp_RV_E64_MB",
+                "apps/tanh_fp_RV_E64_MB",
+            ]
+
+            # FIXME tests from here down are out of order; should be:
+            #   behavioral_mu_tests*
+            #   voyager_cgra_tests_fp
+            #   external_mu_tests*
+            #   hardcoded_dense_tests
+            #   no_zircon_sparse_tests
+            #   glb_tests*
+            #   resnet_tests*
+
+            hardcoded_dense_tests = [
+                "apps/unsharp_RV",
+                # TODO: Tests below are planned but not yet supported
+                # "apps/depthwise_conv" # down on Zircon
+            ]
+            # Tests below are non-zircon and won't run by default
+            glb_tests = [
+                "apps/maxpooling",
+                "apps/pointwise",
+                "tests/rom",
+                "tests/arith",
+                "tests/absolute",
+                "tests/boolean_ops",
+                "tests/equal",
+                "tests/ternary",
+                "tests/scomp",
+                "tests/ucomp",
+                "tests/sminmax",
+                "tests/uminmax",
+                "tests/sshift",
+                "tests/ushift",
+                "tests/conv_1_2",
+                "tests/conv_2_1",
+                "tests/conv_3_3",
+                "tests/bit8_packing_test",
+                "tests/bit8_unpack_test",
+                "tests/fp_get_shared_exp_test",
+                "tests/fp_e8m0_quant_test",
+                "apps/gaussian",
+                "apps/brighten_and_blur",
+                "apps/cascade",
+                "apps/harris",
+                "apps/resnet_layer_gen",
+                "apps/unsharp",
+                "apps/harris_color",
+                "apps/camera_pipeline_2x2",
+                "apps/matrix_multiplication",
+            ]
+            glb_tests_fp = [
+                "apps/maxpooling_fp",
+                "apps/relu_layer_fp",
+                "tests/fp_pointwise",
+                "tests/fp_arith",
+                "tests/fp_comp",
+                "tests/fp_conv_7_7",
+                "apps/matrix_multiplication_fp",
+                # TODO: Tests below are planned but not yet supported
+                # "apps/mcunet_in_sequential_0_fp", # not yet supported by zircon
+                # "apps/depthwise_conv_stream_fp", # not yet supported by zircon
+            ]
+
+            # FIXME would it be better here to do e.g.
+            # resnet_tests = Tests('resnet').resnet_tests ?
+
+            resnet_tests = [
+                "conv1",
+                "conv2_x",
+                "conv5_x",
+            ]
+            resnet_tests_fp = [
+                "sequential_0_fp",
+                "InvRes1_pw_fp",
+                "InvRes2_pw_exp_fp",
+                "InvRes2_pw_sq_fp",
+                "InvRes3_pw_exp_fp",
+                "InvRes3_pw_sq_residual_fp",
+                # TODO: Tests below are planned but not yet supported
+                # "conv2_x_fp", # not yet supported by zircon
+            ]
+
+            voyager_cgra_tests_fp = [
+                # ResNet-18 Standalone quantize layers
+                "resnet18-quantize_default_1::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_3::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_7::zircon_quant_fp_post_conv3x_RV_E64_MB",
+                "resnet18-quantize_default_11::zircon_quant_fp_post_conv4x_RV_E64_MB",
+                "resnet18-quantize_default_15::zircon_quant_fp_post_conv5x_RV_E64_MB",
+
+                # ResNet-18 Average pooling layer
+                "resnet18-adaptive_avg_pool2d_default_1::avgpool_layer_fp_RV_E64_MB",
+
+                # ResNet-18 Fully connected layer (K-DIM HOST TILING)
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel0_RV_E64_MB",
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel1_RV_E64_MB",
+
+                 # BERT permute layer
+                "bert-permute_3::nop_2d_mha_concat_bert_RV_E64_MB",
+
+                # BERT layer norm layers (didn't run post-FFN layer norm layer)
+                "bert-layer_norm::layer_norm_pass1_fp_bert_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass2_fp_bert_post_attn_RV_E64_MB",
+                # Channel slicing (unroll by 16)
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel0_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel1_RV_E64_MB",
+
+                # BERT GELU pass2 layers
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel0_RV_E64_MB",
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel1_RV_E64_MB",
+
+                # BERT get_e8m0_scale accum schedule layers
+                "bert-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_bert_RV_E64_MB",
+                "bert-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_bert_post_transpose_RV_E64_MB",
+
+                # BERT apply_e8m0_scale layers
+                "bert-quantize_default::apply_e8m0_scale_multi_IOs_bert_RV_E64_MB",
+                "bert-quantize_default_1::apply_e8m0_scale_multi_IOs_bert_post_transpose_RV_E64_MB",
+
+                # BERT get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "bert-quantize_mx_default::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_3::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_4::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_bert_shape1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::get_e8m0_scale_tree_gb_input_bert_shape2_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                "bert-quantize_mx_default::apply_e8m0_scale_single_IO_bert_quantize_mx_default_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_3::apply_e8m0_scale_single_IO_bert_quantize_mx_default_3_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_4::apply_e8m0_scale_single_IO_bert_quantize_mx_default_4_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::apply_e8m0_scale_single_IO_bert_quantize_mx_default_1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::apply_e8m0_scale_single_IO_bert_quantize_mx_default_6_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                # BERT Softmax layers
+                "bert-softmax_1::stable_softmax_pass1_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass2_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass3_fp_bert_RV_E64_MB",
+
+                # BERT Pooling layer, using k-dim host tiling
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel0_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel1_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel2_RV_E64_MB",
+
+                # BERT Classifier layer
+                "bert-linear_7::fully_connected_layer_fp_bert_classifier_RV_E64_MB",
+
+                # BERT tanh layer
+                "bert-tanh::tanh_fp_bert_RV_E64_MB",
+
+                # LLaMA permute layer
+                "llama_prefill-transpose_4::nop_2d_mha_concat_llama_prefill_RV_E64_MB",
+
+                # LLaMA prefill get_e8m0_scale accum schedule layers
+                "llama_prefill-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_llama_prefill_RV_E64_MB",
+                "llama_prefill-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_llama_prefill_post_transpose_RV_E64_MB",
+
+                # LLaMA Prefill apply_e8m0_scale layers
+                "llama_prefill-quantize_default::apply_e8m0_scale_multi_IOs_llama_prefill_RV_E64_MB",
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_default_1::apply_e8m0_scale_multi_IOs_llama_prefill_post_transpose_RV_E64_MB",
+
+                # LLaMA Prefill get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::get_e8m0_scale_tree_gb_input_llama_prefill_shape0_RV_E64_MB", # 512, 2048 DONE
+                "llama_prefill-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_llama_prefill_shape1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::get_e8m0_scale_tree_gb_input_llama_prefill_shape2_RV_E64_MB", # 512, 512
+                "llama_prefill-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_llama_prefill_shape3_RV_E64_MB", # 512, 8192
+
+                # LLaMA Prefill apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_RV_E64_MB", # 512, 2048
+                # Commenting out b/c of overflow issue (gold = 0, sim = 255)
+                # "llama_prefill-quantize_mx_default_1::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_7_RV_E64_MB", # 512, 512
+                # "llama_prefill-quantize_mx_default_5::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_5_RV_E64_MB", # 512, 8192
+
+                # LLaMA Prefill Softmax layers
+                "llama_prefill-softmax_1::stable_softmax_pass1_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass2_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass3_fp_llama_prefill_RV_E64_MB",
+
+                # LLaMA Prefill SiLU
+                "llama_prefill-silu::add_gelu_pass2_fp_llama_prefill_RV_E64_MB",
+
+                # LLaMA Prefill RMS Norm
+                "llama_prefill-layer_norm_default::rms_norm_pass1_fp_llama_prefill_RV_E64_MB",
+
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel0_RV_E64_MB",
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel1_RV_E64_MB",
+                # LLaMA Prefill Swish Mul
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel0_RV_E64_MB",
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill Query RoPE
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill Key RoPE
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel1_RV_E64_MB",
+
+                # "fakegemm-quantize_default::zircon_quant_fp_fakegemm_RV_E64_MB",
+
+            ]
+            behavioral_mu_tests = [
+                "apps/pointwise_mu_io_RV_E64",
+                "apps/pointwise_mu_io_RV_E64_MB",
+                "apps/mu2glb_path_balance_test_RV_E64",
+                "apps/abs_max_full_unroll_fp_RV",
+                "apps/get_e8m0_scale_tree_mu_input_RV_E64_MB",
+            ]
+            behavioral_mu_tests_fp = [
+                "apps/gelu_pass1_mu_input_fp_RV_E64_MB",
+                "apps/add_gelu_pass1_mu_input_fp_RV_E64_MB",
+            ]
+            external_mu_tests = Tests.external_mu_tests_bert_attention
+            external_mu_tests += Tests.external_mu_tests_llama_attention
+
+            external_mu_tests_fp = [
+                # LLaMA Prefill Query projection
+                "llama_prefill-submodule -> zircon_2d_nop_post_llama_prefill_query_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel2_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel3_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel4_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel5_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel6_RV_E64_MB",
+                "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel7_RV_E64_MB",
+
+                # LLaMA Prefill post-attention projection
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel2_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel3_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel4_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel5_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel6_RV_E64_MB",
+                "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel7_RV_E64_MB",
+
+                 # LLaMA Prefill, Key projection
+                 "llama_prefill-submodule_1 -> zircon_2d_nop_post_llama_prefill_key_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel2_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel3_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel4_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel5_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel6_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel7_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel8_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel9_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel10_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel11_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel12_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel13_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel14_RV_E64_MB",
+                "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel15_RV_E64_MB",
+
+
+                # LLaMA Prefill, up projection
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_nop_post_llama_prefill_up_projection_kernel0_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel2_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel3_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel4_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel5_RV_E64_MB",
+                "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel6_RV_E64_MB",
+
+                "llama_prefill-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_llama_prefill_up_projection_kernel7_RV_E64_MB", # SiLU
+
+                "llama_prefill-submodule_40 -> zircon_2d_nop_post_llama_prefill_up_projection_mul_path_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel2_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel3_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel4_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel5_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel6_RV_E64_MB",
+                "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel7_RV_E64_MB",
+
+
+                # LLaMA prefill, final output projection
+                # Run 125 times on k dimension
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel3_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel4_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel5_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel6_125_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel7_125_RV_E64_MB",
+
+                # Run 1 time on k dimension
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel3_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel4_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel5_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel6_1_RV_E64_MB",
+                "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel7_1_RV_E64_MB",
+
+
+                # LLaMA Prefill, down projection
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel1_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel2_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel3_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel4_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel5_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel6_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel7_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel8_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel9_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel10_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel11_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel12_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel13_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel14_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel15_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel16_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel17_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel18_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel19_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel20_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel21_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel22_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel23_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel24_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel25_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel26_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel27_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel28_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel29_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel30_RV_E64_MB",
+                "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel31_RV_E64_MB",
+
+               # BERT Query projection: All using gemm_reduction_tiling_workaround
+               "bert-submodule_2 -> zircon_2d_nop_post_bert_query_projection_kernel0_RV_E64_MB",
+               "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel1_RV_E64_MB",
+               "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel2_RV_E64_MB",
+
+               # BERT Key projection: All using gemm_reduction_tiling_workaround
+               "bert-submodule -> zircon_2d_nop_post_bert_key_projection_kernel0_RV_E64_MB",
+               "bert-submodule -> zircon_2d_psum_reduction_fp_post_bert_key_projection_kernel1_RV_E64_MB",
+               "bert-submodule -> zircon_2d_psum_reduction_fp_post_bert_key_projection_kernel2_RV_E64_MB",
+
+               # BERT Value projection: All using gemm_reduction_tiling_workaround
+               "bert-submodule_1 -> zircon_2d_nop_post_bert_value_projection_kernel0_RV_E64_MB",
+               "bert-submodule_1 -> zircon_2d_psum_reduction_fp_post_bert_value_projection_kernel1_RV_E64_MB",
+               "bert-submodule_1 -> zircon_2d_psum_reduction_fp_post_bert_value_projection_kernel2_RV_E64_MB",
+
+               # BERT masked self-attention head
+               "bert-submodule_3 -> zircon_scale_add_fp_post_bert_masked_self_attention_head_RV_E64_MB",
+
+               # BERT post-attention projection:All using gemm_reduction_tiling_workaround
+               "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel0_RV_E64_MB",
+               "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel1_RV_E64_MB",
+               "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel2_RV_E64_MB",
+
+               # BERT up projection layer + GELU pass 1: All using gemm_reduction_tiling_workaround; also with K-DIM HOST TILING for output tensor
+               "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel0_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel1_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel2_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel3_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel4_RV_E64_MB",
+               "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel5_RV_E64_MB",
+
+               "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel6_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel7_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel8_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel9_RV_E64_MB",
+               "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel10_RV_E64_MB",
+               "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel11_RV_E64_MB",
+
+               # BERT down projection layer: All using gemm_reduction_tiling_workaround
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel0_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel1_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel2_RV_E64_MB",
+
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel3_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel4_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel5_RV_E64_MB",
+
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel6_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel7_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel8_RV_E64_MB",
+
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel9_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel10_RV_E64_MB",
+               "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel11_RV_E64_MB",
+
+                # RESNET18
+                # Conv1 (im2col-based, X-DIM HOST TILING)
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel0_RV_E64_MB",
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel1_RV_E64_MB",
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel2_RV_E64_MB",
+                "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel3_RV_E64_MB",
+
+                # Conv2_x
+                "resnet18-submodule_2 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_3 -> zircon_deq_ResReLU_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_4 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+                "resnet18-submodule_5 -> zircon_deq_ResReLU_quant_fp_post_conv2_x_RV_E64_MB",
+
+                # Conv3_1 strided conv
+                "resnet18-submodule_6 -> zircon_deq_q_relu_fp_post_conv3_1_RV_E64_MB",
+
+                # Conv3_1 pointwise conv
+                "resnet18-submodule_7 -> zircon_dequant_fp_post_conv3_1_RV_E64_MB",
+
+                # Conv3_x
+                "resnet18-submodule_8 -> zircon_deq_ResReLU_fp_post_conv3_x_RV_E64_MB",
+                "resnet18-submodule_9 -> zircon_deq_q_relu_fp_post_conv3_x_RV_E64_MB",
+                "resnet18-submodule_10 -> zircon_deq_ResReLU_quant_fp_post_conv3_x_RV_E64_MB",
+
+                # Conv4_1 strided conv (TILED OUTER REDUCTION WORKAROUND)
+                "resnet18-submodule_11 -> zircon_nop_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+                "resnet18-submodule_11 -> zircon_res_deq_ReLU_quant_fp_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+
+                # Conv4_1 pointwise conv (INNER REDUCTION WORKAROUND)
+                "resnet18-submodule_12 -> zircon_dequant_fp_post_conv4_1_inner_reduction_workaround_RV_E64_MB",
+
+                # Conv4_x
+                "resnet18-submodule_13 -> zircon_deq_ResReLU_fp_post_conv4_x_RV_E64_MB",
+                "resnet18-submodule_14 -> zircon_deq_q_relu_fp_post_conv4_x_RV_E64_MB",
+                "resnet18-submodule_15 -> zircon_deq_ResReLU_quant_fp_post_conv4_x_RV_E64_MB",
+
+                # Conv5_1 strided Conv (INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_16 -> zircon_deq_q_relu_fp_post_conv5_1_RV_E64_MB",
+
+                # Conv5_1 pointwise conv (INNER REDUCTION WORKAROUND, INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_17 -> zircon_dequant_fp_post_conv5_1_inner_reduction_workaround_RV_E64_MB",
+
+                # Conv5_x (K-DIM HOST TILING, INPUT ACTIVATION PADDING WORKAROUND)
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel2_RV_E64_MB",
+                "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel3_RV_E64_MB",
+
+                "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel1_RV_E64_MB",
+
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel2_RV_E64_MB",
+                "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel3_RV_E64_MB",
+            ]
+
+            # Run dense ML tests
+            dense_ml_models = []
+            dense_ml_unit_tests = Tests.dense_ml_unit_tests  # SSOT!
+
+            # For sparse tests, we cherry pick some representative tests to run
+            no_zircon_sparse_tests = [
+                "vec_elemmul",
+                "mat_vecmul_ij",
+                "mat_elemadd_leakyrelu_exp",
+                "matmul_ikj",
+                "tensor3_mttkrp",
+            ]
+
+        elif testname == "resnet":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            sparse_tests = []
+            glb_tests = []
+            glb_tests_fp = []
+            glb_tests_RV = []
+            glb_tests_fp_RV = []
+            resnet_tests = [
+                "conv1",
+                "conv2_x",
+                "conv5_x",
+            ]
+            behavioral_mu_tests = []
+            external_mu_tests = []
+            external_mu_tests_fp = []
+
+        elif testname == "mu":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            sparse_tests = []
+            glb_tests = []
+            glb_tests_fp = []
+            glb_tests_RV = []
+            glb_tests_fp_RV = [
+            ]
+            resnet_tests = []
+            voyager_cgra_tests_fp = [
+                # ResNet-18 Standalone quantize layers
+                "resnet18-quantize_default_1::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_3::zircon_quant_fp_post_conv2x_RV_E64_MB",
+                "resnet18-quantize_default_7::zircon_quant_fp_post_conv3x_RV_E64_MB",
+                "resnet18-quantize_default_11::zircon_quant_fp_post_conv4x_RV_E64_MB",
+                "resnet18-quantize_default_15::zircon_quant_fp_post_conv5x_RV_E64_MB",
+
+                # ResNet-18 Average pooling layer
+                "resnet18-adaptive_avg_pool2d_default_1::avgpool_layer_fp_RV_E64_MB",
+
+                # ResNet-18 Fully connected layer (K-DIM HOST TILING)
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel0_RV_E64_MB",
+                "resnet18-linear::fully_connected_layer_fp_resnet18_kernel1_RV_E64_MB",
+
+                # BERT permute layer
+                "bert-permute_3::nop_2d_mha_concat_bert_RV_E64_MB",
+
+                # BERT layer norm layers (didn't run post-FFN layer norm layer)
+                "bert-layer_norm::layer_norm_pass1_fp_bert_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass2_fp_bert_post_attn_RV_E64_MB",
+                # Channel slicing (unroll by 16)
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel0_RV_E64_MB",
+                "bert-layer_norm::layer_norm_pass3_fp_bert_post_attn_kernel1_RV_E64_MB",
+
+                # BERT GELU pass2 layers
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel0_RV_E64_MB",
+                "bert-gelu::add_gelu_pass2_fp_bert_kernel1_RV_E64_MB",
+
+                # BERT get_e8m0_scale accum schedule layers
+                "bert-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_bert_RV_E64_MB",
+                "bert-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_bert_post_transpose_RV_E64_MB",
+
+                # BERT apply_e8m0_scale layers
+                "bert-quantize_default::apply_e8m0_scale_multi_IOs_bert_RV_E64_MB",
+                "bert-quantize_default_1::apply_e8m0_scale_multi_IOs_bert_post_transpose_RV_E64_MB",
+
+                # BERT get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "bert-quantize_mx_default::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_3::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_4::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_bert_shape1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::get_e8m0_scale_tree_gb_input_bert_shape2_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_bert_shape3_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                "bert-quantize_mx_default::apply_e8m0_scale_single_IO_bert_quantize_mx_default_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_3::apply_e8m0_scale_single_IO_bert_quantize_mx_default_3_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_4::apply_e8m0_scale_single_IO_bert_quantize_mx_default_4_RV_E64_MB", # 128, 768
+                "bert-quantize_mx_default_1::apply_e8m0_scale_single_IO_bert_quantize_mx_default_1_RV_E64_MB", # 12, 128, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "bert-quantize_mx_default_6::apply_e8m0_scale_single_IO_bert_quantize_mx_default_6_RV_E64_MB", # 128, 128
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel0_RV_E64_MB", # 128, 1536, tiling
+                "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel1_RV_E64_MB", # 128, 1536, tiling
+
+                # BERT Softmax layers
+                "bert-softmax_1::stable_softmax_pass1_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass2_fp_bert_RV_E64_MB",
+                "bert-softmax_1::stable_softmax_pass3_fp_bert_RV_E64_MB",
+
+                # BERT Pooling layer, using k-dim host tiling
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel0_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel1_RV_E64_MB",
+                "bert-linear_6::fully_connected_layer_fp_bert_pooling_kernel2_RV_E64_MB",
+
+                # BERT Classifier layer
+                "bert-linear_7::fully_connected_layer_fp_bert_classifier_RV_E64_MB",
+
+                # BERT tanh layer
+                "bert-tanh::tanh_fp_bert_RV_E64_MB",
+
+                # LLaMA permute layer
+                "llama_prefill-transpose_4::nop_2d_mha_concat_llama_prefill_RV_E64_MB",
+
+                # LLaMA prefill get_e8m0_scale accum schedule layers
+                "llama_prefill-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_llama_prefill_RV_E64_MB",
+                "llama_prefill-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_llama_prefill_post_transpose_RV_E64_MB",
+
+                # LLaMA Prefill apply_e8m0_scale layers
+                "llama_prefill-quantize_default::apply_e8m0_scale_multi_IOs_llama_prefill_RV_E64_MB",
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_default_1::apply_e8m0_scale_multi_IOs_llama_prefill_post_transpose_RV_E64_MB",
+
+                # LLaMA Prefill get_e8m0_scale tree schedule and apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::get_e8m0_scale_tree_gb_input_llama_prefill_shape0_RV_E64_MB", # 512, 2048 DONE
+                "llama_prefill-quantize_mx_default_1::get_e8m0_scale_tree_gb_input_llama_prefill_shape1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::get_e8m0_scale_tree_gb_input_llama_prefill_shape2_RV_E64_MB", # 512, 512
+                "llama_prefill-quantize_mx_default_5::get_e8m0_scale_tree_gb_input_llama_prefill_shape3_RV_E64_MB", # 512, 8192
+
+                # LLaMA Prefill apply_e8m0_scale_single_IO layers
+                "llama_prefill-quantize_mx_default::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_RV_E64_MB", # 512, 2048
+                # Commenting out b/c of overflow issue (gold = 0, sim = 255)
+                # "llama_prefill-quantize_mx_default_1::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_1_RV_E64_MB", # 32, 512, 64
+                # Commenting out b/c of overflow issue (gold = 0, sim = 127)
+                # "llama_prefill-quantize_mx_default_7::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_7_RV_E64_MB", # 512, 512
+                # "llama_prefill-quantize_mx_default_5::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_5_RV_E64_MB", # 512, 8192
+
+                # LLaMA Prefill Softmax layers
+                "llama_prefill-softmax_1::stable_softmax_pass1_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass2_fp_llama_prefill_RV_E64_MB",
+                "llama_prefill-softmax_1::stable_softmax_pass3_fp_llama_prefill_RV_E64_MB"
+
+                # LLaMA Prefill SiLU
+                "llama_prefill-silu::add_gelu_pass2_fp_llama_prefill_RV_E64_MB",
+
+                # LLaMA Prefill RMS Norm
+                "llama_prefill-layer_norm_default::rms_norm_pass1_fp_llama_prefill_RV_E64_MB",
+
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel0_RV_E64_MB",
+                "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel1_RV_E64_MB",
+                # LLaMA Prefill Swish Mul
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel0_RV_E64_MB",
+                "llama_prefill-mul_9::elemwise_mul_fp_llama_prefill_swish_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill Query RoPE
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_4::rope_fp_llama_prefill_query_kernel1_RV_E64_MB",
+
+                # LLaMA Prefill Key RoPE
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel0_RV_E64_MB",
+                "llama_prefill-submodule_6::rope_fp_llama_prefill_key_kernel1_RV_E64_MB",
+
+                # "fakegemm-quantize_default::zircon_quant_fp_fakegemm_RV_E64_MB",
+            ]
+            behavioral_mu_tests = [
+                "apps/pointwise_mu_io_RV",
+                "apps/pointwise_mu_io_RV_E64_MB",
+                "apps/zircon_psum_reduction_fp_RV",
+                "apps/zircon_scale_add_fp_RV"
+            ]
+            external_mu_tests = Tests.external_mu_tests_bert_attention
+            external_mu_tests += Tests.external_mu_tests_llama_attention
+
+            external_mu_tests_fp = [
+            # LLaMA Prefill Query projection
+            "llama_prefill-submodule -> zircon_2d_nop_post_llama_prefill_query_projection_kernel0_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel1_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel2_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel3_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel4_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel5_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel6_RV_E64_MB",
+            "llama_prefill-submodule -> zircon_2d_psum_reduction_fp_post_llama_prefill_query_projection_kernel7_RV_E64_MB",
+
+            # LLaMA Prefill post-attention projection
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel0_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel1_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel2_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel3_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel4_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel5_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel6_RV_E64_MB",
+            "llama_prefill-submodule_39 -> zircon_2d_psum_reduction_fp_post_llama_prefill_post_attn_projection_kernel7_RV_E64_MB",
+
+            # LLaMA Prefill, Key projectiion
+            "llama_prefill-submodule_1 -> zircon_2d_nop_post_llama_prefill_key_projection_kernel0_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel1_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel2_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel3_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel4_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel5_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel6_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel7_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel8_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel9_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel10_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel11_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel12_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel13_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel14_RV_E64_MB",
+            "llama_prefill-submodule_1 -> zircon_2d_psum_reduction_fp_post_llama_prefill_key_projection_kernel15_RV_E64_MB",
+
+            # LLaMA Prefill, Value projectiion
+            "llama_prefill-submodule_2 -> zircon_2d_nop_post_llama_prefill_value_projection_kernel0_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel1_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel2_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel3_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel4_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel5_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel6_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel7_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel8_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel9_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel10_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel11_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel12_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel13_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel14_RV_E64_MB",
+            "llama_prefill-submodule_2 -> zircon_2d_psum_reduction_fp_post_llama_prefill_value_projection_kernel15_RV_E64_MB",
+
+            # LLaMA Prefill, up projection
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_nop_post_llama_prefill_up_projection_kernel0_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel2_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel3_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel4_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel5_RV_E64_MB",
+            "llama_prefill-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_kernel6_RV_E64_MB",
+
+            "llama_prefill-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_llama_prefill_up_projection_kernel7_RV_E64_MB", # SiLU
+
+            "llama_prefill-submodule_40 -> zircon_2d_nop_post_llama_prefill_up_projection_mul_path_kernel0_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel1_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel2_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel3_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel4_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel5_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel6_RV_E64_MB",
+            "llama_prefill-submodule_40 -> zircon_2d_psum_reduction_fp_post_llama_prefill_up_projection_mul_path_kernel7_RV_E64_MB",
+
+
+            # LLaMA prefill, final output projection
+            # Run 125 times on k dimension
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel3_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel4_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel5_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel6_125_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel7_125_RV_E64_MB",
+
+            # Run 1 time on k dimension
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_nop_post_llama_prefill_final_output_projection_kernel0_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel1_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel2_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel3_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel4_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel5_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel6_1_RV_E64_MB",
+            "llama_prefill-linear_mx_default_7 -> zircon_2d_psum_reduction_fp_post_llama_prefill_final_output_projection_kernel7_1_RV_E64_MB",
+
+
+            # LLaMA Prefill, down projection
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel0_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel1_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel2_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel3_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel4_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel5_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel6_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel7_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel8_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel9_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel10_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel11_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel12_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel13_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel14_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel15_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel16_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel17_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel18_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel19_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel20_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel21_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel22_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel23_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel24_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel25_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel26_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel27_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel28_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel29_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel30_RV_E64_MB",
+            "llama_prefill-submodule_41 -> zircon_2d_psum_reduction_fp_post_llama_prefill_down_projection_kernel31_RV_E64_MB",
+
+
+
+
+            # LLaMA 3.2-1B Prefill masked self-attention head
+            "llama_prefill-submodule_7 -> zircon_scale_add_fp_post_llama_prefill_masked_self_attention_head_RV_E64_MB",
+
+            # BERT Query projection: All using gemm_reduction_tiling_workaround
+            "bert-submodule_2 -> zircon_2d_nop_post_bert_query_projection_kernel0_RV_E64_MB",
+            "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel1_RV_E64_MB",
+            "bert-submodule_2 -> zircon_2d_psum_reduction_fp_post_bert_query_projection_kernel2_RV_E64_MB",
+
+            # BERT Key projection: All using gemm_reduction_tiling_workaround
+            "bert-submodule -> zircon_2d_nop_post_bert_key_projection_kernel0_RV_E64_MB",
+            "bert-submodule -> zircon_2d_psum_reduction_fp_post_bert_key_projection_kernel1_RV_E64_MB",
+            "bert-submodule -> zircon_2d_psum_reduction_fp_post_bert_key_projection_kernel2_RV_E64_MB",
+
+            # BERT Value projection: All using gemm_reduction_tiling_workaround
+            "bert-submodule_1 -> zircon_2d_nop_post_bert_value_projection_kernel0_RV_E64_MB",
+            "bert-submodule_1 -> zircon_2d_psum_reduction_fp_post_bert_value_projection_kernel1_RV_E64_MB",
+            "bert-submodule_1 -> zircon_2d_psum_reduction_fp_post_bert_value_projection_kernel2_RV_E64_MB",
+
+            # BERT masked self-attention head
+            "bert-submodule_3 -> zircon_scale_add_fp_post_bert_masked_self_attention_head_RV_E64_MB",
+
+            # BERT post-attention projection:All using gemm_reduction_tiling_workaround
+            "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel0_RV_E64_MB",
+            "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel1_RV_E64_MB",
+            "bert-submodule_15 -> zircon_2d_psum_reduction_fp_post_bert_pre_layernorm_projection_kernel2_RV_E64_MB",
+
+            # BERT up projection layer + GELU pass 1: All using gemm_reduction_tiling_workaround; also with K-DIM HOST TILING for output tensor
+            "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel0_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel1_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel2_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel3_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel4_RV_E64_MB",
+            "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel5_RV_E64_MB",
+
+            "bert-linear_mx_default_4 -> zircon_2d_nop_post_bert_up_projection_kernel6_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel7_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel8_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel9_RV_E64_MB",
+            "bert-linear_mx_default_4 -> zircon_2d_psum_reduction_fp_post_bert_up_projection_kernel10_RV_E64_MB",
+            "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel11_RV_E64_MB",
+
+            # BERT down projection layer: All using gemm_reduction_tiling_workaround
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel0_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel1_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel2_RV_E64_MB",
+
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel3_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel4_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel5_RV_E64_MB",
+
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel6_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel7_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel8_RV_E64_MB",
+
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel9_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel10_RV_E64_MB",
+            "bert-submodule_16 -> zircon_2d_psum_reduction_fp_post_bert_down_projection_kernel11_RV_E64_MB",
+
+            # RESNET18
+            # Conv1 (im2col-based, X-DIM HOST TILING)
+            "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel0_RV_E64_MB",
+            "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel1_RV_E64_MB",
+            "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel2_RV_E64_MB",
+            "resnet18-submodule -> zircon_dequantize_relu_fp_post_conv1_kernel3_RV_E64_MB",
+
+            # Conv2_x
+            "resnet18-submodule_2 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+            "resnet18-submodule_3 -> zircon_deq_ResReLU_fp_post_conv2_x_RV_E64_MB",
+            "resnet18-submodule_4 -> zircon_deq_q_relu_fp_post_conv2_x_RV_E64_MB",
+            "resnet18-submodule_5 -> zircon_deq_ResReLU_quant_fp_post_conv2_x_RV_E64_MB",
+
+            # Conv3_1 strided conv
+            "resnet18-submodule_6 -> zircon_deq_q_relu_fp_post_conv3_1_RV_E64_MB",
+
+            # Conv3_1 pointwise conv
+            "resnet18-submodule_7 -> zircon_dequant_fp_post_conv3_1_RV_E64_MB",
+
+            # Conv3_x
+            "resnet18-submodule_8 -> zircon_deq_ResReLU_fp_post_conv3_x_RV_E64_MB",
+            "resnet18-submodule_9 -> zircon_deq_q_relu_fp_post_conv3_x_RV_E64_MB",
+            "resnet18-submodule_10 -> zircon_deq_ResReLU_quant_fp_post_conv3_x_RV_E64_MB",
+
+            # Conv4_1 strided conv (TILED OUTER REDUCTION WORKAROUND)
+            "resnet18-submodule_11 -> zircon_nop_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+            "resnet18-submodule_11 -> zircon_res_deq_ReLU_quant_fp_tiled_outer_reduction_workaround_post_conv4_1_RV_E64_MB",
+
+            # Conv4_1 pointwise conv (INNER REDUCTION WORKAROUND)
+            "resnet18-submodule_12 -> zircon_dequant_fp_post_conv4_1_inner_reduction_workaround_RV_E64_MB",
+
+            # Conv4_x
+            "resnet18-submodule_13 -> zircon_deq_ResReLU_fp_post_conv4_x_RV_E64_MB",
+            "resnet18-submodule_14 -> zircon_deq_q_relu_fp_post_conv4_x_RV_E64_MB",
+            "resnet18-submodule_15 -> zircon_deq_ResReLU_quant_fp_post_conv4_x_RV_E64_MB",
+
+            # Conv5_1 strided Conv (INPUT ACTIVATION PADDING WORKAROUND)
+            "resnet18-submodule_16 -> zircon_deq_q_relu_fp_post_conv5_1_RV_E64_MB",
+
+            # Conv5_1 pointwise conv (INNER REDUCTION WORKAROUND, INPUT ACTIVATION PADDING WORKAROUND)
+            "resnet18-submodule_17 -> zircon_dequant_fp_post_conv5_1_inner_reduction_workaround_RV_E64_MB",
+
+            # Conv5_x (K-DIM HOST TILING, INPUT ACTIVATION PADDING WORKAROUND)
+            "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+            "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+            "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel2_RV_E64_MB",
+            "resnet18-submodule_18 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel3_RV_E64_MB",
+
+            "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel0_RV_E64_MB",
+            "resnet18-submodule_19 -> zircon_deq_q_relu_fp_post_conv5_x_kernel1_RV_E64_MB",
+
+            "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel0_RV_E64_MB",
+            "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel1_RV_E64_MB",
+            "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel2_RV_E64_MB",
+            "resnet18-submodule_20 -> zircon_deq_ResReLU_fp_post_conv5_x_kernel3_RV_E64_MB",
+            ]
+
+        elif testname == "dense_ml_models":
+            width, height = 28, 16
+            cols_removed, mu_oc_0 = 12, 32
+            dense_ml_models = []
+            dense_ml_unit_tests = Tests.dense_ml_unit_tests  # SSOT!
+
+        # BLANK can be used to return default height, width, and blank test lists
+        elif testname == "BLANK":
+            pass
+
+        # json strings for app util
+        elif self.detect_and_process_json(testname):
+            return
+
+        # yaml strings for app util
+        elif self.detect_and_process_yaml(testname):
+            return
+
+        else: pass
+
+
+        # Export everything named in template
+        vdic = vars().copy()
+        for key in Tests.configs_template():  # Use template to tell what keys are wanted
+            if key in vdic:
+                self.__dict__[key] = vdic[key]
+
+        return
+
+
+    def prefix_lines(lines, prefix):
+        'Attach the indicated prefix to each line in "lines"'
+        return prefix + lines.replace('\n', '\n'+prefix)
+
+     # Json string as config e.g. '{"width":8,"height":8,"glb_tests":["apps/pointwise"]}'
+    def detect_and_process_json(self, config):
+        '''if "config" is a parsable json string, add it to selfdict and return True'''
+        try:    config_dict = json.loads(config)
+        except: return False
+        assert type(config_dict) == dict
+        print(f"Found json string:\n{Tests.prefix_lines(config, '    ')}\n")
+        self.__dict__.update(config_dict)
+        return True
+
+    # Yaml string as config e.g. "width: 8\nheight: 8\nglb_tests:\n- apps/pointwise"
+    def detect_and_process_yaml(self, config):
+        '''if "config" is a parsable yaml string, add it to selfdict and return True'''
+        try:
+            config_dict = yaml.safe_load(config)
+            assert type(config_dict) == dict
+        except: return False
+        # print(f'{config_dict=}')  # Oops this is not supported by python3.7 (works with e.g. 3.11)
+        print(f'config_dict={config_dict}')
+        print(f"Found yaml string:\n{Tests.prefix_lines(config, '    ')}\n")
+        self.__dict__.update(config_dict)
+        return True
+
+    # Get candidates for skip_cgra_map list.
+    # At present, it does NOT look at apps in the "full" config list,
+    # even though there are many candidates there. As a result, the "full"
+    # config unnecessarily runs mapping on apps that could be skipped, right?
+    def get_skip_candidates():
+        # Get list of configs EXCEPT FULL
+        configs = Tests.configs_list.copy()
+        print(configs)
+        configs.remove("full")
+
+        # Only interested in "external_mu_tests_fp" group
+        group = "external_mu_tests_fp"
+
+        sclist = [ Tests(config_name).__dict__[group] for config_name in configs ]
+        return sum(sclist, [])    # E.g. [[1,2],[3,4]] => [1,2,3,4]
+
+    # skip() == True for an app IF it immediately follows an app whose
+    # name is identical except w different kernel number e.g.
+    #
+    #  zircon_2d_psum_projection_kernel1_E64   # => NOT SKIP
+    #  zircon_2d_psum_projection_kernel2_E64   # => SKIP
+    #  zircon_2d_psum_projection_kernel3_E64   # => SKIP
+    def build_skip_cgra_map_list(DBG=False):
+        skiplist = []
+        prev_root = ""
+        for appname in Tests.get_skip_candidates():
+            print(appname) if DBG else True       # E.g. "zircon_2d_psum_projection_kernel1_E64"
+            kstart = appname.find("_kernel")
+            if kstart > 0:
+                rootname = appname[0:kstart]    
+                print(rootname) if DBG else True  # E.g. "zircon_2d_psum_projection"
+                if rootname == prev_root:
+                    skiplist.append(appname)
+                    print("==> SKIP!") if DBG else True
+                else:
+                    # roots_found.append(rootname)
+                    prev_root = rootname
+                    print("==> FIRST!") if DBG else True
+                print("-------------------------") if DBG else True
+
+        return skiplist
+
+    # Return a csv list of all apps in all config c
+    def get_config(config_name='', zircon=True):
+        # Dump regression suite contents in compact form e.g. show_config('fast'):
+        #
+        # fast    sparse_tests   vec_identity             8x8 --removed 4 --mu 8
+        # fast    glb_tests      apps/pointwise           8x8 --removed 4 --mu 8
+        # fast    glb_tests      apps/pointwise_RV_E64    8x8 --removed 4 --mu 8
+        # fast    glb_tests      apps/pointwise_RV_E64_MB 8x8 --removed 4 --mu 8
+        # fast    glb_tests_fp   tests/fp_pointwise       8x8 --removed 4 --mu 8
+
+        # Find config and populate it with default keys from template
+        d = Tests.configs_template()
+        # d.update(Tests.configs[config_name])
+        d.update(Tests(config_name).__dict__)
+
+        (w,h) =  (d['width'], d['height'])
+        (col,mu) = (d["cols_removed"], d["mu_oc_0"])
+
+        # Setup up the format string for parms e.g. "8x8 --removed 4 --mu 8"
+        size = "%sx%s" % (w,h)                       # "8x8"
+        zparms = ",--removed %s,--mu %s" % (col,mu)  # "--removed 4 --mu 8"
+        if zircon: parms = size + zparms
+        else:      parms = size + ',--no-zircon'
+
+        applist = []
+        not_groups = ("width", "height", "cols_removed", "mu_oc_0")
+        for group in d:
+            if not d[group]:               continue  # Dont care about empty sets
+            if group in not_groups:        continue  # Not a group
+            for app in d[group]:
+                fmt = "%s,%s,%s,%-s"
+                appstring = fmt % (config_name, group, app, parms)
+                applist.append(appstring)
+        return applist
+
+    # Return a csv list of all apps in all configs
+    def get_configs(zircon=True):
+        applist = [ Tests.get_config(c) for c in Tests.configs_list ]
+        return sum(applist, [])  # E.g. [[1,2],[3,4]] => [1,2,3,4]
+
+    # Print to stdout, a csv list of all apps in config c
+    def show_config(config_name='', zircon=True):
+        for app in Tests.get_config(config_name, zircon): print(app)
+
+    # Print to stdout, a csv list of all apps in all configs
+    def show_configs(zircon=True):
+        for c in Tests.configs_list: Tests.show_config(c)
+
+# Every time someone tries to import this class, it triggers this quick
+# to make sure that no configs have redundant apps e.g. if someone accidentally
+# puts two copies of 'conv2_x" into the "full" config, this will catch it.
+
+def check_for_dupes(DBG=0):
+    errors = ''
+    if DBG: print("tests.py: Verify no duplicates in any groups")
+    for config_name in Tests.configs_list:
+        if DBG: print('\n', config_name)
+        config = Tests(config_name).__dict__
+        lists = [key for key in config if type(config[key]) is list]
+        for group in lists:
+            apps = config[group]
+            if DBG: print(f'    Config {config_name} has list {group}', end='')
+            dbg_result = ' - no dupes (good)'
+            for app in set(apps):  # Use set to prevent duplicate checks
+                n_app = apps.count(app)
+                if n_app > 1:
+                    errors += f"    ERROR: Config {config_name}[{group}] has {n_app} copies of '{app}'\n"
+                    dbg_result = ' - FOUND DUPES! ERROR!'
+            if DBG: print(dbg_result)
+    assert not errors, 'Found duplicate apps, see ERROR messages above\n\n' + errors
+
+check_for_dupes(DBG=0)
+
+# app utility uses this to do things like e.g.
+#     tests.py --exec "print(*Tests.configs_list)"  # list config names
+#     tests.py --exec "for c in Tests.configs_list: Tests.show_config(c)  # list config contents
+if __name__ == "__main__":
+    import sys
+    if '--exec' in sys.argv: exec(sys.argv[2])

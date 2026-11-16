@@ -1,0 +1,65 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+  \page examples_libm Lib Math benchmarks
+
+  The Lib Math benchmark suite tests the support for each one of the math functions available in the LibM for the single-precision implementation.
+
+  Here is the list of tested functions:
+  \verbatim
+  acosf
+  acoshf
+  asinf
+  asinhf
+  atan2f
+  atanf
+  atanhf
+  cbrtf
+  ceilf
+  cosf
+  coshf
+  erfcf
+  erff
+  expf
+  expm1f
+  floorf
+  fmodf
+  tgammaf
+  hypotf
+  ilogbf
+  ldexpf
+  log10f
+  log1pf
+  logbf
+  logf
+  powf
+  remainderf
+  rintfscalbnf
+  significandf
+  sinf
+  sinhf
+  sqrtf
+  tanf
+  tanhf
+  \endverbatim
+
+
+*/

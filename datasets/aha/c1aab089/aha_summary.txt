@@ -1,0 +1,4 @@
+Stanford AHA SCORE snapshot (StanfordAHA/aha)
+Commit: c1aab089
+Dataset: /home/yongfu/proj/score/datasets/aha/c1aab089
+Snapshot files: 0

@@ -8,6 +8,8 @@ logs/
 *.log
 *.tmp
 *.cache
+lextab.py
+yacctab.py
 scripts/assets/**/*.elf
 scripts/assets/**/*.dump
 
@@ -36,6 +38,22 @@ tools/hero-install/
 tools/*-install/
 tools/*-host-tools/
 
+# Standalone tool working clones (managed via install scripts)
+tools/c906/
+tools/c910/
+tools/cv32e40p/
+tools/femtorv/
+tools/hwacha/
+tools/integrated-matrix-extension/
+tools/nutshell/
+tools/riscv-matrix-extension-spec/
+tools/riscv-p-spec/
+tools/tvm-vta/
+tools/veer-eh1/
+tools/veer-eh2/
+tools/vicuna/
+tools/vortex/
+
 # Local Python/conda installs under datasets (do not commit)
 **/miniconda3/
 **/miniconda/
@@ -45,6 +63,7 @@ tools/*-host-tools/
 **/.venv/
 
 # Compiled simulation binaries and simulator workdirs
+*.vvp
 **/Vchip_sim_tb
 **/Vara_tb_verilator
 **/*.verilator
@@ -62,8 +81,6 @@ out/
 verification_results_*.txt
 
 # Generated build artifacts and environment wrappers
-setup_gemmini_env.sh
-setup_hero_env.sh
 tools/riscv_toolchain_wrapper/
 tools/verilator_wrapper/
 tools/neorv32-verilog/

@@ -1,3 +1,5 @@
+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/opentitan-7d9ffd8b698d2da4/hw/ip/prim/rtl/prim_assert.sv
++incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/softex-d348715a0219983f/rtl
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
 +define+TARGET_CV32E40P_USE_FF_REGFILE
@@ -1028,7 +1030,7 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/core/hci_core_r_valid_filter.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/core/hci_core_r_id_filter.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/core/hci_core_source.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/core/hci_core_split.sv
+/home/yongfu/proj/score/scripts/assets/carfield/hci_core_split.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_dec.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_enc.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_manager.sv
@@ -1039,7 +1041,7 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/interco/hci_router_reorder.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/core/hci_core_sink.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_source.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/interco/hci_router.sv
+/home/yongfu/proj/score/scripts/assets/carfield/hci_router.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_interconnect.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/ecc/hci_ecc_sink.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/hci_interconnect.sv
@@ -1089,9 +1091,6 @@
 +define+ICAHE_USE_FF
 +define+CLUSTER_ALIAS
 +define+TARGET_SIMULATION
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_register_file_latch.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_register_file_ff.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_register_file_fpga.sv
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
 +define+TARGET_CV32E40P_USE_FF_REGFILE
@@ -1110,28 +1109,6 @@
 +define+ICAHE_USE_FF
 +define+CLUSTER_ALIAS
 +define+TARGET_SIMULATION
-+incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl
-+incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/vendor/lowrisc_ip/ip/prim/rtl
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_pkg.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/vendor/lowrisc_ip/ip/prim/rtl/prim_assert.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_alu.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_compressed_decoder.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_controller.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_counter.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_csr.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_decoder.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_fetch_fifo.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_load_store_unit.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_multdiv_fast.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_multdiv_slow.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_pmp.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_wb_stage.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_cs_registers.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_ex_block.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_id_stage.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_prefetch_buffer.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_if_stage.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/ibex-ea749f6618bddf71/rtl/ibex_core.sv
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
 +define+TARGET_CV32E40P_USE_FF_REGFILE
@@ -2319,7 +2296,7 @@
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hci-59bfe29e706e1855/rtl/common
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/register_interface-2fa61c05f1d73e9d/include
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/redmule-6d4297d29fc5da77/rtl/redmule_pkg.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/redmule-6d4297d29fc5da77/rtl/redmule_ctrl.sv
+/home/yongfu/proj/score/scripts/assets/carfield/redmule_ctrl.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/redmule-6d4297d29fc5da77/rtl/redmule_scheduler.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/redmule-6d4297d29fc5da77/rtl/redmule_castin.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/redmule-6d4297d29fc5da77/rtl/redmule_castout.sv
@@ -2663,7 +2640,7 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/cheshire-acb5a5c89450fbac/hw/bootrom/cheshire_bootrom.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/cheshire-acb5a5c89450fbac/hw/regs/cheshire_reg_pkg.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/cheshire-acb5a5c89450fbac/hw/regs/cheshire_reg_top.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/cheshire-acb5a5c89450fbac/hw/cheshire_pkg.sv
+/home/yongfu/proj/score/scripts/assets/carfield/cheshire_pkg.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/cheshire-acb5a5c89450fbac/hw/cheshire_soc.sv
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
@@ -2718,6 +2695,7 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_w2phy.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_phy2r.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_ddr_out.sv
+/home/yongfu/proj/score/scripts/assets/carfield/configurable_delay.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_delay.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_trx.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/hyperbus-358c17d6f73a3e33/src/hyperbus_cfg_regs.sv
@@ -3663,7 +3641,7 @@
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/idma-3c35b23d5aa29e3e/src/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/register_interface-2fa61c05f1d73e9d/include
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/packages/pulp_cluster_package.sv
+/home/yongfu/proj/score/scripts/assets/carfield/pulp_cluster_package.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/axi2mem_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/axi2per_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/cluster_bus_wrap.sv
@@ -3724,7 +3702,7 @@
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/idma-3c35b23d5aa29e3e/src/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/register_interface-2fa61c05f1d73e9d/include
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/hwpe_subsystem.sv
+/home/yongfu/proj/score/scripts/assets/carfield/hwpe_subsystem.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/instr_width_converter.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/per2axi_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/periph_demux.sv
@@ -3732,13 +3710,12 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/periph_FIFO.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/tcdm_banks_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/xbar_pe_wrap.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/cluster_interconnect_wrap.sv
+/home/yongfu/proj/score/scripts/assets/carfield/cluster_interconnect_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/cluster_peripherals.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/data_periph_demux.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/core_demux_wrap.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/core_region.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/pulp_cluster.sv
-/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/pulp_cluster-31f38132e1297a56/rtl/pulp_cluster_wrap.sv
+/home/yongfu/proj/score/scripts/assets/carfield/core_region.sv
+/home/yongfu/proj/score/scripts/assets/carfield/pulp_cluster.sv
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
 +define+TARGET_CV32E40P_USE_FF_REGFILE
@@ -3814,6 +3791,7 @@
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/cv32e40p_fpu_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/safety_core_wrap.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/soc_ctrl/safety_soc_ctrl_reg_top.sv
+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/tb/tb_fs_handler.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/safety_island_top.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/synth/safety_island_synth_pkg.sv
 /home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/safety_island-f408198401cf8b88/rtl/synth/safety_island_synth_wrapper.sv
@@ -3987,14 +3965,15 @@
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/reqrsp_interface/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/snitch/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/tcdm_interface/include
-/home/yongfu/proj/score/tools/carfield/hw/carfield_pkg.sv
+/home/yongfu/proj/score/scripts/assets/carfield/carfield_pkg.sv
 /home/yongfu/proj/score/tools/carfield/hw/regs/carfield_reg_pkg.sv
 /home/yongfu/proj/score/tools/carfield/hw/regs/carfield_reg_top.sv
 /home/yongfu/proj/score/tools/carfield/hw/cheshire_wrap.sv
 /home/yongfu/proj/score/tools/carfield/hw/hyperbus_wrap.sv
 /home/yongfu/proj/score/tools/carfield/hw/l2_wrap.sv
 /home/yongfu/proj/score/tools/carfield/hw/carfield_rstgen.sv
-/home/yongfu/proj/score/tools/carfield/hw/carfield.sv
+/home/yongfu/proj/score/scripts/assets/carfield/spatz_cluster_pkg.sv
+/home/yongfu/proj/score/scripts/assets/carfield/carfield.sv
 
 +define+TARGET_CARFIELD_L2DUAL_SAFE_PULP_PERIPH
 +define+TARGET_CV32E40P_USE_FF_REGFILE
@@ -4029,5 +4008,5 @@
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/reqrsp_interface/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/snitch/include
 +incdir+/home/yongfu/proj/score/tools/carfield/.bender/git/checkouts/spatz-d72d4c3c17553134/hw/ip/tcdm_interface/include
-/home/yongfu/proj/score/tools/carfield/target/synth/src/carfield_synth_wrap.sv
 
+/home/yongfu/proj/score/scripts/assets/carfield/carfield_top_verilator.sv

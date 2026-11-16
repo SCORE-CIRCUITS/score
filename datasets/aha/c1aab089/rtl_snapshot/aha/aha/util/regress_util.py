@@ -1,0 +1,1043 @@
+import sys, os
+import subprocess
+import time
+from collections import defaultdict
+import shutil
+import json
+import re
+from aha.util.regress_tests.tests import Tests
+import copy
+
+global info  # HA!
+info = []
+
+
+
+def _set_deterministic_cpu_env():
+    # Pin CPU ISA and force single-threaded BLAS/OMP so bf16 reductions are
+    # bit-reproducible across x86 microarchitectures.
+    os.environ.setdefault("ATEN_CPU_CAPABILITY", "default")
+    os.environ.setdefault("ONEDNN_MAX_CPU_ISA", "SSE41")
+    os.environ.setdefault("DNNL_MAX_CPU_ISA", "SSE41")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+
+def buildkite_call(command, env={}, return_output=False, out_file=None):
+    print("Command:",' '.join(command), flush=True)
+    env = {**os.environ.copy(), **env}
+    for retry in [1, 2, 3]:  # In case of SIG error, retry up to three times
+        try:
+            if return_output:
+                app = subprocess.run(
+                    command,
+                    check=True,
+                    text=True,
+                    env=env,
+                    stdout=out_file,
+                )
+            else:
+                app = subprocess.run(
+                    command,
+                    check=True,
+                    text=True,
+                    env=env,
+                )
+            break
+        except subprocess.CalledProcessError as e:
+            retry_sigs = [ 'SIGSEGV','SIGBUS','SIGABRT']; found_retry_sig = False
+            for rs in retry_sigs:
+                if rs in str(e): found_retry_sig = True
+
+            if found_retry_sig:
+                print(f'\n\n{e}\n')  # Print the error msg
+                print(f'*** ERROR subprocess died {retry} time(s) with one of {retry_sigs}')
+                print('*** Will retry three times, then give up.\n\n')
+
+                # if retry == 3: raise
+                # - No! Don't raise the error! Higher-level aha.py has similar
+                # - three-retry catchall, resulting in up to nine retries ! (Right?)
+                # - Do this instead:
+                if retry == 3:
+                    assert False, 'ERROR: Three time loser'
+            else:
+                raise
+
+
+def gen_garnet(width, height, dense_only=False, using_matrix_unit=False, mu_datawidth=16, num_fabric_cols_removed=0, mu_oc_0=32):
+    print("--- Generating Garnet", flush=True)
+    start = time.time()
+    if not os.path.exists("/aha/garnet/garnet.v"):
+        # Daemon is no good if/when we build new/different verilog
+        buildkite_call("aha garnet --daemon kill".split())
+
+        # No garnet verilog yet, so build it now.
+        buildkite_args = [
+            "aha",
+            "garnet",
+            "--width", str(width),
+            "--height", str(height),
+            "--verilog",
+            "--use_sim_sram",
+            "--glb_tile_mem_size", str(128),
+        ]
+
+        if dense_only:
+            buildkite_args.append("--dense-only")
+
+        if using_matrix_unit:
+            buildkite_args.append("--using-matrix-unit")
+            buildkite_args.append("--mu-datawidth")
+            buildkite_args.append(str(mu_datawidth))
+            buildkite_args.append("--give-north-io-sbs")
+            buildkite_args.append("--num-fabric-cols-removed")
+            buildkite_args.append(str(num_fabric_cols_removed))
+            buildkite_args.append("--mu-oc-0")
+            buildkite_args.append(str(mu_oc_0))
+            buildkite_args.append("--include-E64-hw")
+            buildkite_args.append("--include-multi-bank-hw")
+            buildkite_args.append("--include-mu-glb-hw")
+            buildkite_args.append("--use-non-split-fifos")
+            buildkite_args.append("--exclude-glb-ring-switch")
+            buildkite_args.append("--pipeline-mu2cgra")
+
+        buildkite_call(buildkite_args)
+
+    return time.time() - start
+
+
+def generate_sparse_bitstreams(sparse_tests, width, height, seed_flow, data_tile_pairs, kernel_name, opal_workaround=False, unroll=1, using_matrix_unit=False, num_fabric_cols_removed=0, mu_oc_0=32):
+    if len(sparse_tests) == 0:
+        return 0
+
+    print(f"--- mapping all tests", flush=True)
+    start = time.time()
+    env_vars = {"PYTHONPATH": "/aha/garnet/", "EXHAUSTIVE_PIPE": "1"}
+    # env_vars = {"PYTHONPATH": "/aha/garnet/"}
+    start = time.time()
+    all_sam_graphs = [f"/aha/sam/compiler/sam-outputs/onyx-dot/{testname}.gv" for testname in sparse_tests]
+
+    if(seed_flow):
+        build_tb_cmd = [
+            "python",
+            "/aha/garnet/tests/test_memory_core/build_tb.py",
+            "--ic_fork",
+            "--sam_graph", *all_sam_graphs,
+            "--seed", f"{0}",
+            "--dump_bitstream",
+            "--add_pond",
+            "--combined",
+            "--pipeline_scanner",
+            "--base_dir",
+            "/aha/garnet/SPARSE_TESTS/",
+            "--just_glb",
+            "--dump_glb",
+            "--fiber_access",
+            "--width", str(width),
+            "--height", str(height),
+        ]
+        if opal_workaround:
+            build_tb_cmd.append("--opal-workaround")
+        if using_matrix_unit:
+            build_tb_cmd.append("--using-matrix-unit")
+            build_tb_cmd.append("--give-north-io-sbs")
+            build_tb_cmd.append("--num-fabric-cols-removed")
+            build_tb_cmd.append(str(num_fabric_cols_removed))
+            build_tb_cmd.append("--include-E64-hw")
+            build_tb_cmd.append("--use-non-split-fifos")
+            build_tb_cmd.append("--mu_oc_0")
+            build_tb_cmd.append(str(mu_oc_0))
+        buildkite_call(
+            build_tb_cmd,
+            env=env_vars,
+        )
+    else:
+        build_tb_cmd = [
+            "python",
+            "/aha/garnet/tests/test_memory_core/build_tb.py",
+            "--ic_fork",
+            "--sam_graph", *all_sam_graphs,
+            "--seed", f"{0}",
+            "--dump_bitstream",
+            "--add_pond",
+            "--combined",
+            "--pipeline_scanner",
+            "--base_dir",
+            "/aha/garnet/SPARSE_TESTS/",
+            "--just_glb",
+            "--dump_glb",
+            "--fiber_access",
+            "--give_tensor",
+            "--tensor_locs",
+            "/aha/garnet/SPARSE_TESTS/MAT_TMP_DIR",
+            "--width", str(width),
+            "--height", str(height),
+            "--kernel_name", kernel_name,
+            "--data_tile_pairs", *data_tile_pairs,
+            "--unroll", str(unroll),
+        ]
+        if opal_workaround:
+            build_tb_cmd.append("--opal-workaround")
+        if using_matrix_unit:
+            build_tb_cmd.append("--using-matrix-unit")
+            build_tb_cmd.append("--give-north-io-sbs")
+            build_tb_cmd.append("--num-fabric-cols-removed")
+            build_tb_cmd.append(str(num_fabric_cols_removed))
+            build_tb_cmd.append("--include-E64-hw")
+            build_tb_cmd.append("--use-non-split-fifos")
+            build_tb_cmd.append("--mu_oc_0")
+            build_tb_cmd.append(str(mu_oc_0))
+        buildkite_call(
+            build_tb_cmd,
+            env=env_vars,
+        )
+    time_map = time.time() - start
+    return time_map
+
+
+def format_concat_tiles(test, data_tile_pairs, kernel_name, pipeline_num=32, unroll=1):
+    script_path = "/aha/garnet/"
+    pairs_cpy = data_tile_pairs.copy()
+    all_tiles = []
+    num_list = []
+    test_l = []
+    tile_format = ""
+    for tile in pairs_cpy:
+        test_l.append(kernel_name + "-" + tile.replace("/", "_"))
+
+    for i in range(0, len(test_l), pipeline_num):
+        test_l_str = f"concat{i}"
+        tile_format_t = f"{kernel_name}-tile_{test_l_str}"
+        all_tiles.append(tile_format_t)
+
+        if i + pipeline_num < len(test_l):
+            test_l_s = test_l[i:i + pipeline_num]
+        else:
+            test_l_s = test_l[i:]
+        true_pipeline_num = len(test_l_s)
+        num_list.append(true_pipeline_num)
+        print(f"CONCATENATING TILES {test_l_s}")
+        subprocess.call(
+            [
+                "python",
+                "/aha/garnet/concat_tiles.py",
+                test,
+                kernel_name,
+                test_l_str,
+                str(unroll),
+                *test_l_s,
+            ],
+            cwd=script_path
+        )
+
+    return all_tiles, num_list
+
+
+def test_sparse_app(testname, seed_flow, data_tile_pairs,
+                    pipeline_num_l=None,
+                    opal_workaround=False,
+                    test="",
+                    test_dataset_runtime_dict=None,
+                    using_matrix_unit=False,
+                    mu_datawidth=16,
+                    num_fabric_cols_removed=0,
+                    mu_oc_0=32,
+                    ):
+    if test == "":
+        test = testname
+
+    print(f"--- {test} - glb testing")
+
+    env_vars = {"PYTHONPATH": "/aha/garnet/"}
+    if using_matrix_unit:
+        if num_fabric_cols_removed == 0:
+            env_vars["WEST_IN_IO_SIDES"] = "1"
+        env_vars["USING_MATRIX_UNIT"] = "1"
+        env_vars["INCLUDE_MU_GLB_HW"] = "1"
+        env_vars["MU_OC_0"] = str(mu_oc_0)
+        env_vars["MU_DATAWIDTH"] = str(mu_datawidth)
+
+    app_path = f"{testname}_0/GLB_DIR/{testname}_combined_seed_0"
+    print(app_path, flush=True)
+
+    try:
+        subprocess.call(["make", "clean"], cwd=app_path)
+    except:
+        pass
+
+    if(seed_flow):
+        print("RUNNING SEED FLOW", flush=True)
+        start = time.time()
+        buildkite_call(
+            ["aha", "test", app_path, "--sparse"], env=env_vars,
+        )
+        time_test = time.time() - start
+    else:
+        print("RUNNING SS FLOW", flush=True)
+        use_pipeline = False
+        if pipeline_num_l is not None:
+            assert len(pipeline_num_l) == len(data_tile_pairs), "Pipeline number list must be the same length as the number of tile pairs"
+            use_pipeline = True
+        else:
+            use_pipeline = False
+        start = time.time()
+        if use_pipeline:
+            data_tile_pairs = [f"{test}_{tile}/GLB_DIR/{test}_combined_seed_{tile}" for tile in data_tile_pairs]
+            # Dictionary grouping tile pairs by pipeline number
+            grouped_dict = defaultdict(list)
+            for tile_pair, pipeline_num in zip(data_tile_pairs, pipeline_num_l):
+                grouped_dict[pipeline_num].append(tile_pair)
+
+            # create cmd_list for each pipeline number
+            cmd_list = []
+            for pipeline_num, tile_pairs in grouped_dict.items():
+                # if list is longer than 64, split into batches of 64
+                tile_pair_batches = [tile_pairs[i:i + 64] for i in range(0, len(tile_pairs), 64)]
+                for tile_pair in tile_pair_batches:
+                    cmd_list.append(["aha", "test"] + tile_pair + ["--sparse", "--multiles", str(pipeline_num)])
+
+            if testname not in test_dataset_runtime_dict:
+                test_dataset_runtime_dict[testname] = defaultdict(float)
+        else:
+            data_tile_pairs = [f"{test}_{tile}/GLB_DIR/{test}_combined_seed_{tile}" for tile in data_tile_pairs]
+            # split into batches of 64
+            tile_pairs = [data_tile_pairs[i:i + 64] for i in range(0, len(data_tile_pairs), 64)]
+            cmd_list = []
+            # for each tile pair construct cmd
+            for tile_pair in tile_pairs:
+                cmd_list.append(["aha", "test"] + tile_pair + ["--sparse", "--multiles", str(1)])
+            if testname not in test_dataset_runtime_dict:
+                test_dataset_runtime_dict[testname] = defaultdict(float)
+
+        print(cmd_list)
+
+        for cmd in cmd_list:
+            if cmd is None:
+                continue
+            buildkite_call(cmd, env=env_vars)
+            command = "grep \"total time\" /aha/garnet/tests/test_app/run.log"
+            results = subprocess.check_output(command, shell=True, encoding='utf-8')
+            for result in results.split("\n"):
+                if testname in result:
+                    test_dataset_runtime_dict[testname][result.split(f"{testname}_")[1].split("-")[0]] += float(result.split("\n")[0].split(" ns")[0].split(" ")[-1])
+
+        time_test = time.time() - start
+    active_app_cycles, total_config_cycles, total_write_data_cycles = track_performance()
+    return 0, 0, time_test, active_app_cycles, total_config_cycles, total_write_data_cycles
+
+###########################################################################
+# "parse" utilities used by test_dense_app() and test_hardcoded_dense_app()
+
+# Dense ready-valid mode
+def parse_RV_mode(testname):
+    dense_ready_valid = False
+    if "_RV" in testname:
+        dense_ready_valid = True
+        testname = testname.replace("_RV", "")
+    return testname, dense_ready_valid
+
+# E64 mode
+def parse_E64_mode(testname):
+    E64_mode_on = False
+    if "_E64" in testname:
+        E64_mode_on = True
+        testname = testname.replace("_E64", "")
+    return testname, E64_mode_on
+
+# E64 MB mode
+def parse_E64_MB_mode(testname):
+    E64_multi_bank_mode_on = False
+    if "_MB" in testname:
+        E64_multi_bank_mode_on = True
+        testname = testname.replace("_MB", "")
+    return testname, E64_multi_bank_mode_on
+
+# External MU test parsing
+def parse_mu_cgra_test(testname):
+    assert " -> " in testname, f"ERROR: External MU test {testname} does not contain ' -> '. Please check the test name format. Format should be 'mu_testname -> cgra_testname'."
+    mu_test, cgra_test = testname.split(" -> ")
+    assert "-" in mu_test, f"ERROR: mu_test portion of {testname} does not contain '-'. Please check the test name format. Format should be 'model-layer', e.g., resnet18-submodule_2."
+    return mu_test, cgra_test
+
+# Voyager CGRA test parsing
+def parse_voyager_cgra_test(testname):
+    assert "::" in testname, f"ERROR: Voyager CGRA test {testname} does not contain '::'. Please check the test name format. Format should be 'voyager_testname::cgra_testname'."
+    voyager_cgra_test, cgra_test = testname.split("::")
+    return voyager_cgra_test, cgra_test
+
+# Parametrized test parsing (for running generic functions on various NN layers with different shapes)
+def parse_layer_parametrized_test(testname, keyword, layer_in=""):
+    layer = layer_in
+    if keyword in testname:
+        layer = testname
+        testname = f"apps/{keyword}"
+    return testname, layer
+
+def track_performance():
+    performance_summary_path = "/aha/garnet/tests/test_app/performance_summary.txt"
+    if not os.path.exists(performance_summary_path):
+        raise FileNotFoundError(f"Performance summary file not found: {performance_summary_path}")
+    with open(performance_summary_path) as f:
+        lines = [line.strip() for line in f]
+        clock_period = int(float(lines[1].split(": ")[1].split(' ns')[0]))
+        active_app_cycles = int(float(lines[2].split(": ")[1].split(' ns')[0]) / clock_period)
+        total_config_cycles = int(float(lines[3].split(": ")[1].split(' ns')[0]) / clock_period)
+        total_write_data_cycles = int(float(lines[4].split(": ")[1].split(' ns')[0]) / clock_period)
+
+    return active_app_cycles, total_config_cycles, total_write_data_cycles
+
+def track_ml_model_performance():
+    # For multi-kernel sims, sum per-kernel active times from run.log since
+    # performance_summary.txt is overwritten by each kernel.
+    _, total_config_cycles, total_write_data_cycles = track_performance()
+    performance_summary_path = "/aha/garnet/tests/test_app/performance_summary.txt"
+    with open(performance_summary_path) as f:
+        clock_period = int(float(f.readlines()[1].split(": ")[1].split(' ns')[0]))
+
+    total_ns = 0.0
+    run_log_path = "/aha/garnet/tests/test_app/run.log"
+    if os.path.exists(run_log_path):
+        with open(run_log_path) as f:
+            for line in f:
+                m = re.search(r"It takes\s+([\d.]+)\s*ns\s+total time to run kernel", line)
+                if m:
+                    total_ns += float(m.group(1))
+    active_app_cycles = int(total_ns / clock_period)
+    return active_app_cycles, total_config_cycles, total_write_data_cycles
+
+########################################################################
+# app tests
+
+def test_dense_app(
+  test, tgroup, width, height, env_parameters, extra_args, dense_only=False,
+  using_matrix_unit=False, mu_datawidth=16, num_fabric_cols_removed=0, mu_oc_0=32):
+
+    print(f"--- BEGIN test_dense_app {test}", flush=True)
+    _set_deterministic_cpu_env()
+    test_orig = test
+
+    # FIXME/TODO the skip_cgra* information below should probably be in tests.py instead of here...?
+
+    # These tests skip CGRA mapping and pnr to save time.  We assume that the collateral
+    # was generated by a prior test. This means certain tests must be run in order.
+    # For details see build_skip_cgra_map_list() in tests.py
+    skip_cgra_map_list = Tests.build_skip_cgra_map_list()
+    assert len(skip_cgra_map_list) > 12
+
+    skip_cgra_pnr_list = copy.deepcopy(skip_cgra_map_list)
+
+    skip_cgra_pnr_list += [
+        "bert-quantize_mx_default_3::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+        "bert-quantize_mx_default_4::get_e8m0_scale_tree_gb_input_bert_shape0_RV_E64_MB", # 128, 768
+    ]
+
+    skip_cgra_map = test in skip_cgra_map_list
+    skip_cgra_pnr = test in skip_cgra_pnr_list
+
+    # These tests skip output regs for easier PnR
+    skip_output_pipeline_regs = test in [
+        "apps/get_apply_e8m0_scale_fp_RV_E64_MB",
+        "apps/maxpooling_dense_rv_fp_RV_E64",
+        "apps/maxpooling_dense_rv_fp_RV_E64_MB",
+        "apps/get_e8m0_scale_accum_gb_input_RV_E64_MB",
+        "apps/apply_e8m0_scale_single_IO_RV_E64_MB",
+        "apps/apply_e8m0_scale_multi_IOs_RV_E64_MB",
+        "apps/stable_softmax_pass1_fp_RV_E64_MB",
+        "apps/stable_softmax_pass2_fp_RV_E64_MB",
+        "apps/stable_softmax_pass3_fp_RV_E64_MB",
+        "apps/layer_norm_pass1_fp_RV_E64_MB",
+        "apps/layer_norm_pass2_fp_RV_E64_MB",
+        "apps/rms_norm_pass1_fp_RV_E64_MB",
+        "apps/rms_norm_pass2_fp_RV_E64_MB",
+        "apps/gelu_pass1_mu_input_fp_RV_E64_MB",
+        "apps/gelu_pass2_fp_RV_E64_MB",
+        "apps/add_gelu_pass1_mu_input_fp_RV_E64_MB",
+        "apps/add_gelu_pass2_fp_RV_E64_MB",
+        "apps/tanh_fp_RV_E64_MB",
+        "apps/rope_fp_RV_E64_MB",
+        "apps/maxpooling_dense_rv_mem_buf_fp_RV_E64_MB",
+        "bert-calculate_mx_qparam_default::get_e8m0_scale_accum_gb_input_bert_RV_E64_MB",
+        "bert-calculate_mx_qparam_default_1::get_e8m0_scale_accum_gb_input_bert_post_transpose_RV_E64_MB",
+        "bert-quantize_default::apply_e8m0_scale_multi_IOs_bert_RV_E64_MB",
+        "bert-quantize_default_1::apply_e8m0_scale_multi_IOs_bert_RV_E64_MB",
+        "apps/apply_e8m0_scale_single_IO_RV_E64_MB",
+        "apps/apply_e8m0_scale_multi_IOs_RV_E64_MB",
+        "apps/stable_softmax_pass1_fp_RV_E64_MB",
+        "apps/stable_softmax_pass2_fp_RV_E64_MB",
+        "apps/stable_softmax_pass3_fp_RV_E64_MB",
+        "bert-softmax_1::stable_softmax_pass1_fp_bert_RV_E64_MB",
+        "bert-softmax_1::stable_softmax_pass2_fp_bert_RV_E64_MB",
+        "bert-softmax_1::stable_softmax_pass3_fp_bert_RV_E64_MB",
+        "apps/layer_norm_pass1_fp_RV_E64_MB",
+        "apps/layer_norm_pass2_fp_RV_E64_MB",
+        "bert-layer_norm::layer_norm_pass1_fp_bert_RV_E64_MB",
+        "bert-layer_norm::layer_norm_pass2_fp_bert_post_attn_RV_E64_MB",
+        "bert-layer_norm_1::layer_norm_pass1_fp_bert_RV_E64_MB",
+        "bert-layer_norm_1::layer_norm_pass2_fp_bert_post_proj_RV_E64_MB",
+        "apps/gelu_pass1_mu_input_fp_RV_E64_MB",
+        "apps/gelu_pass2_fp_RV_E64_MB",
+        "apps/add_gelu_pass1_mu_input_fp_RV_E64_MB",
+        "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel5_RV_E64_MB",
+        "bert-linear_mx_default_4 -> add_gelu_pass1_mu_input_fp_post_bert_up_projection_kernel11_RV_E64_MB",
+        "apps/add_gelu_pass2_fp_RV_E64_MB",
+        "bert-gelu::add_gelu_pass2_fp_bert_kernel0_RV_E64_MB",
+        "bert-gelu::add_gelu_pass2_fp_bert_kernel1_RV_E64_MB",
+        "llama_prefill-silu::add_gelu_pass2_fp_llama_prefill_RV_E64_MB",
+        "apps/tanh_fp_RV_E64_MB",
+        "bert-tanh::tanh_fp_bert_RV_E64_MB",
+        "apps/maxpooling_dense_rv_mem_buf_fp_RV_E64_MB",
+        "bert-quantize_mx_default::apply_e8m0_scale_single_IO_bert_quantize_mx_default_RV_E64_MB",
+        "bert-quantize_mx_default_3::apply_e8m0_scale_single_IO_bert_quantize_mx_default_3_RV_E64_MB",
+        "bert-quantize_mx_default_4::apply_e8m0_scale_single_IO_bert_quantize_mx_default_4_RV_E64_MB",
+        "bert-quantize_mx_default_1::apply_e8m0_scale_single_IO_bert_quantize_mx_default_1_RV_E64_MB",
+        "bert-quantize_mx_default_6::apply_e8m0_scale_single_IO_bert_quantize_mx_default_6_RV_E64_MB",
+        "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel0_RV_E64_MB",
+        "bert-quantize_mx_default_5::apply_e8m0_scale_single_IO_bert_quantize_mx_default_5_kernel1_RV_E64_MB",
+        "llama_prefill-quantize_mx_default::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_RV_E64_MB", # 512, 2048
+        "llama_prefill-quantize_mx_default_1::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_1_RV_E64_MB", # 32, 512, 64
+        "llama_prefill-quantize_mx_default_7::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_7_RV_E64_MB", # 512, 512
+        "llama_prefill-quantize_mx_default_5::apply_e8m0_scale_single_IO_llama_prefill_quantize_mx_default_5_RV_E64_MB", # 512, 8192
+        # "llama_prefill-softmax_1::stable_softmax_pass1_fp_llama_prefill_RV_E64_MB",
+        # "llama_prefill-softmax_1::stable_softmax_pass2_fp_llama_prefill_RV_E64_MB",
+        "llama_prefill-softmax_1::stable_softmax_pass3_fp_llama_prefill_RV_E64_MB",
+        "llama_prefill-layer_norm_default::rms_norm_pass1_fp_llama_prefill_RV_E64_MB",
+        "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel0_RV_E64_MB",
+        "llama_prefill-layer_norm_default::rms_norm_pass2_fp_llama_prefill_kernel1_RV_E64_MB",
+
+    ]
+
+    #------------------------------------------------------------------------
+    if 'external_mu_tests' in tgroup:
+        mu_test, test = parse_mu_cgra_test(test)
+    else:
+        mu_test = ""
+
+    if 'voyager_cgra_tests_fp' in tgroup:
+        voyager_cgra_test, test = parse_voyager_cgra_test(test)
+    else:
+        voyager_cgra_test = ""
+
+    orig_test = test
+    test, dense_ready_valid = parse_RV_mode(test)
+    test, E64_mode_on = parse_E64_mode(test)
+    test, E64_multi_bank_mode_on = parse_E64_MB_mode(test)
+
+    layer = None
+    if tgroup == 'resnet_tests':
+        test = "apps/resnet_residual" if "residual" in test_orig else "apps/resnet_output_stationary"
+        layer = test_orig
+    elif tgroup == 'resnet_tests_fp':
+        test = "apps/conv2D_residual_fp" if "residual" in test_orig else "apps/conv2D_fp"
+        layer = test_orig
+    if tgroup == 'external_mu_tests':
+        test, layer = parse_layer_parametrized_test(test, "zircon_nop")
+        test, layer = parse_layer_parametrized_test(test, "zircon_2d_nop", layer_in=layer)
+    elif tgroup == 'external_mu_tests_fp':
+        test, layer = parse_layer_parametrized_test(test, "zircon_nop")
+        test, layer = parse_layer_parametrized_test(test, "zircon_2d_nop", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_2d_psum_reduction_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_scale_add_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_dequantize_relu_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_residual_relu_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_psum_reduction_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_dequant_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_deq_ResReLU_quant_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_deq_q_relu_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_deq_ResReLU_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "zircon_res_deq_ReLU_quant_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "add_gelu_pass1_mu_input_fp", layer_in=layer)
+    elif tgroup == 'voyager_cgra_tests_fp':
+        test, layer = parse_layer_parametrized_test(test, "zircon_quant_fp")
+        test, layer = parse_layer_parametrized_test(test, "avgpool_layer_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "fully_connected_layer_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "nop_2d", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "add_gelu_pass2_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "tanh_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "get_e8m0_scale_accum_gb_input", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "layer_norm_pass1_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "layer_norm_pass2_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "layer_norm_pass3_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "apply_e8m0_scale_multi_IOs", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "get_e8m0_scale_tree_gb_input", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "apply_e8m0_scale_single_IO", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "stable_softmax_pass1_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "stable_softmax_pass2_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "stable_softmax_pass3_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "rms_norm_pass1_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "rms_norm_pass2_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "elemwise_mul_fp", layer_in=layer)
+        test, layer = parse_layer_parametrized_test(test, "rope_fp", layer_in=layer)
+
+
+
+    use_fp = '_fp' in tgroup
+    behavioral_MU = (tgroup == 'behavioral_mu_tests' or tgroup == 'behavioral_mu_tests_fp')
+    #------------------------------------------------------------------------
+
+    env_parameters = str(env_parameters)
+
+    # Note testname is for logging/display purposes only...!
+    testname = f'{test_orig}/{layer}' if layer is not None else test_orig
+    print(f"--- {testname} - compiling and mapping", flush=True)
+    app_path = "/aha/Halide-to-Hardware/apps/hardware_benchmarks/" + test
+    voyager_collateral_path = "/aha/voyager/compiled_collateral"
+    print(app_path, flush=True)
+
+    layer_array = [] if layer is None else ["--layer", layer]
+
+    if not(skip_cgra_map or skip_cgra_pnr):
+        try:
+            subprocess.call(["make", "clean"], cwd=app_path)
+        except:
+            pass
+
+    if mu_test is not None and mu_test != "":
+        # Clean up old mu_test collateral
+        os.system(f"rm -rf {voyager_collateral_path}/{mu_test}")
+
+    env_vars = {}
+    if dense_ready_valid:
+        env_vars["DENSE_READY_VALID"] = "1"
+        env_vars["PIPELINED"] = "0"
+        env_vars["MATCH_BRANCH_DELAY"] = "0"
+        print(f"\033[92mINFO: Running {test} in dense ready-valid mode\033[0m")
+
+    if E64_mode_on:
+        env_vars["E64_MODE_ON"] = "1"
+        print(f"\033[92mINFO: Running {test} with E64 MODE ON\033[0m")
+
+    if E64_multi_bank_mode_on:
+        print(f"\033[92mINFO: Running {test} with E64 MULTI BANK MODE ON\033[0m")
+        env_vars["E64_MULTI_BANK_MODE_ON"] = "1"
+
+    global info  # HA!
+    start = time.time()
+
+    if skip_cgra_map:
+        print(f"--- {testname} - SKIP CGRA MAP", flush=True)
+        info.append([f"{testname} - SKIP CGRA MAP", 0])
+        buildkite_call(["aha", "map", test, "--chain", "--env-parameters", env_parameters, "--mu-test", mu_test, "--voyager-cgra-test", voyager_cgra_test, "--skip-cgra-map"] + layer_array, env=env_vars)
+    else:
+        buildkite_call(["aha", "map", test, "--chain", "--env-parameters", env_parameters, "--mu-test", mu_test, "--voyager-cgra-test", voyager_cgra_test] + layer_array, env=env_vars)
+    time_compile = time.time() - start
+
+    print(f"--- {testname} - pnr and pipelining", flush=True)
+    start = time.time()
+
+    # To use daemon, call regress.py with args '--daemon auto'
+    # --- extra_args=['--daemon', 'auto']
+    use_daemon = []
+    if (extra_args):
+        if ('--daemon' in extra_args) and ('auto' in extra_args):
+            use_daemon = ["--daemon", "auto"]
+
+    buildkite_args = [
+        "aha",
+        "pnr",
+        test,
+        "--width", str(width),
+        "--height", str(height),
+        "--env-parameters", env_parameters,
+        "--mu-test", mu_test,
+    ] + use_daemon + layer_array
+
+    if dense_only:
+        buildkite_args.append("--dense-only")
+
+    env_vars = {}
+    if dense_ready_valid:
+        print(f"\033[92mINFO: Running {test} in dense ready-valid mode\033[0m")
+        env_vars["DENSE_READY_VALID"] = "1"
+        env_vars["EXHAUSTIVE_PIPE"] = "1"
+
+    if E64_mode_on:
+        print(f"\033[92mINFO: Running {test} with E64 MODE ON\033[0m")
+        env_vars["E64_MODE_ON"] = "1"
+
+    if E64_multi_bank_mode_on:
+        print(f"\033[92mINFO: Running {test} with E64 MULTI BANK MODE ON\033[0m")
+        env_vars["E64_MULTI_BANK_MODE_ON"] = "1"
+
+    if using_matrix_unit:
+        buildkite_args.append("--using-matrix-unit")
+        buildkite_args.append("--mu-datawidth")
+        buildkite_args.append(str(mu_datawidth))
+        buildkite_args.append("--give-north-io-sbs")
+        buildkite_args.append("--num-fabric-cols-removed")
+        buildkite_args.append(str(num_fabric_cols_removed))
+        buildkite_args.append("--mu-oc-0")
+        buildkite_args.append(str(mu_oc_0))
+        buildkite_args.append("--include-E64-hw")
+        buildkite_args.append("--include-multi-bank-hw")
+        buildkite_args.append("--include-mu-glb-hw")
+        buildkite_args.append("--use-non-split-fifos")
+        buildkite_args.append("--pipeline-mu2cgra")
+
+        env_vars["INCLUDE_E64_HW"] = "1"
+        env_vars["INCLUDE_MULTI_BANK_HW"] = "1"
+        env_vars["NUM_FABRIC_COLS_REMOVED"] = str(num_fabric_cols_removed)
+
+        if num_fabric_cols_removed == 0:
+            env_vars["WEST_IN_IO_SIDES"] = "1"
+
+        env_vars["USING_MATRIX_UNIT"] = "1"
+        env_vars["INCLUDE_MU_GLB_HW"] = "1"
+        env_vars["MU_OC_0"] = str(mu_oc_0)
+        env_vars["MU_DATAWIDTH"] = str(mu_datawidth)
+        env_vars["ADD_MU_INPUT_BUBBLES"] = "1"
+
+        if behavioral_MU:
+            env_vars["BEHAVIORAL_MATRIX_UNIT"] = "1"
+
+        if mu_test is not None and mu_test != "":
+            env_vars["VOYAGER_GOLD"] = "1"
+
+    if skip_cgra_pnr:
+        print(f"--- {testname} - SKIP CGRA PNR", flush=True)
+        info.append([f"{testname} - SKIP CGRA PNR", 0])
+        buildkite_args.append("--skip-cgra-pnr")
+
+    if skip_output_pipeline_regs:
+        print(f"--- {testname} - SKIP OUTPUT PIPELINE REGS", flush=True)
+        info.append([f"{testname} - SKIP OUTPUT PIPELINE REGS", 0])
+        buildkite_args.append("--no-output-pipelining")
+
+    buildkite_call(buildkite_args, env=env_vars)
+    time_map = time.time() - start
+
+    # Test visualization tool only for gaussian
+    print(f"--- {testname} - visualizing", flush=True)
+    if testname == "apps/gaussian_RV":
+        buildkite_call(["aha", "sta", test, "-v"], env=env_vars)
+
+    print(f"--- {testname} - glb testing", flush=True)
+    start = time.time()
+
+    if mu_test == "" or mu_test is None:
+        mu_test = "inactive"
+    if use_fp:
+        buildkite_call(["aha", "test", test, "--dense-fp", "--mu-test", mu_test, "--voyager-cgra-test", voyager_cgra_test] + layer_array, env=env_vars)
+    else:
+        buildkite_call(["aha", "test", test, "--mu-test", mu_test, "--voyager-cgra-test", voyager_cgra_test] + layer_array, env=env_vars)
+    time_test = time.time() - start
+
+    active_app_cycles, total_config_cycles, total_write_data_cycles = track_performance()
+    return time_compile, time_map, time_test, active_app_cycles, total_config_cycles, total_write_data_cycles
+
+
+def test_dense_ml_model(
+    model, width, height, env_parameters, extra_args,
+    mu_datawidth=16, num_fabric_cols_removed=0, mu_oc_0=32,
+    is_unit_test=False, gemm_datatype="int8"):
+
+    # Define strait paths and aha halide benchmarks path.
+    strait_path = "/aha/strait"
+    aha_halide_benchmarks_path = "/aha/Halide-to-Hardware/apps/hardware_benchmarks"
+
+    print(f"--- BEGIN test_dense_ml_model {model}", flush=True)
+    _set_deterministic_cpu_env()
+
+    # ======================================
+    # Run voyager and strait compilations.
+    # ======================================
+    print(f"--- Running voyager+strait compilation of full model {model}...", flush=True)
+    start = time.time()
+    strait_cmd = [
+        "aha",
+        "strait",
+        model,
+        "--gemm-datatype",
+        gemm_datatype,
+    ]
+    if is_unit_test:
+        strait_cmd.append("--unit-test")
+    buildkite_call(strait_cmd)
+    time_compile = time.time() - start
+
+    # Get all kernels for CGRA backend.
+    coreir_dir = os.path.join(strait_path, "_generated_coreirs", model, gemm_datatype)
+    if not os.path.isdir(coreir_dir):
+        raise RuntimeError(f"[ERROR] Strait coreir directory not found: {coreir_dir}")
+    # Sort kernel names so numeric parts are ordered numerically (e.g. kernel2 < kernel10),
+    # rather than lexicographically (where "kernel10" < "kernel2").
+    def _natural_sort_key(s):
+        return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', s)]
+
+    kernel_names = sorted(
+        (n for n in os.listdir(coreir_dir)
+         if os.path.isdir(os.path.join(coreir_dir, n))
+         and os.path.isfile(os.path.join(coreir_dir, n, "design_top.json"))),
+        key=_natural_sort_key,
+    )
+    if not kernel_names:
+        raise RuntimeError(f"[ERROR] No strait kernels found under {coreir_dir}")
+
+    # Decide which kernels should use dense-fp comparison in aha test
+    from aha.util.strait import _strait_kernel_fp_output_map
+    kernel_fp_map = _strait_kernel_fp_output_map(model, gemm_datatype, strait_path)
+
+    # Read is_first_pass / is_last_pass from each kernel's scheduled_ops.json to handle decomposed ops
+    pass_metadata = {}  # kernel_name -> {is_first_pass, is_last_pass, app_name}
+    for kernel_name in kernel_names:
+        scheduled_ops_path = os.path.join(coreir_dir, kernel_name, "scheduled_ops.json")
+        is_first_pass = 1
+        is_last_pass = 1
+        if os.path.isfile(scheduled_ops_path):
+            with open(scheduled_ops_path) as f:
+                scheduled_ops = json.load(f)
+            if scheduled_ops:
+                first_output = next(iter(scheduled_ops[0].get("outputs", {}).values()), {})
+                is_first_pass = first_output.get("is_first_pass", 1)
+                is_last_pass = first_output.get("is_last_pass", 1)
+        pass_metadata[kernel_name] = {
+            "is_first_pass": is_first_pass,
+            "is_last_pass": is_last_pass,
+            "app_name": f"apps/{model}_{gemm_datatype}_{kernel_name}",
+        }
+
+    # Group kernels into op groups (consecutive passes of the same decomposed op)
+    kernel_groups = []
+    current_group = []
+    for kernel_name in kernel_names:
+        meta = pass_metadata[kernel_name]
+        if meta["is_first_pass"] == 1 and meta["is_last_pass"] == 1:
+            if current_group:
+                kernel_groups.append(current_group)
+                current_group = []
+            kernel_groups.append([kernel_name])
+        elif meta["is_first_pass"] == 1 and meta["is_last_pass"] == 0:
+            if current_group:
+                kernel_groups.append(current_group)
+            current_group = [kernel_name]
+        else:  # is_first_pass == 0
+            current_group.append(kernel_name)
+            if meta["is_last_pass"] == 1:
+                kernel_groups.append(current_group)
+                current_group = []
+    if current_group:
+        kernel_groups.append(current_group)
+
+    # Define environment variables and parameters for CGRA backend.
+    env_parameters = str(env_parameters)
+    use_daemon = ["--daemon", "auto"] if (extra_args and "--daemon" in extra_args and "auto" in extra_args) else []
+    env_vars = {
+        # Use dense ready-valid and exhaustive pipelining.
+        "DENSE_READY_VALID": "1",
+        "EXHAUSTIVE_PIPE": "1",
+        "PIPELINED": "0",
+        "MATCH_BRANCH_DELAY": "0",
+        # Use matrix unit env vars.
+        "INCLUDE_E64_HW": "1",
+        "INCLUDE_MULTI_BANK_HW": "1",
+        "NUM_FABRIC_COLS_REMOVED": str(num_fabric_cols_removed),
+        "WEST_IN_IO_SIDES": "1" if num_fabric_cols_removed == 0 else "0",
+        "USING_MATRIX_UNIT": "1",
+        "INCLUDE_MU_GLB_HW": "1",
+        "MU_OC_0": str(mu_oc_0),
+        "MU_DATAWIDTH": str(mu_datawidth),
+        "ADD_MU_INPUT_BUBBLES": "1",
+        # Always use E64 MB with IO-level mode control
+        "E64_MODE_ON": "1",
+        "E64_MULTI_BANK_MODE_ON": "1",
+        # Skip GLB DMA stride adjustment for easier configuration (use relative stride rather than absolute stride)
+        "SKIP_GLB_DMA_STRIDE_ADJUSTMENT": "1",
+        "VOYAGER_STANDALONE_CGRA_APP": "1",
+    }
+    print(f"\033[92mINFO: test_dense_ml_model always uses dense ready-valid and exhaustive pipelining\033[0m")
+
+    pnr_mu_extra_args = [
+        "--using-matrix-unit",
+        "--mu-datawidth", str(mu_datawidth),
+        "--give-north-io-sbs",
+        "--num-fabric-cols-removed", str(num_fabric_cols_removed),
+        "--mu-oc-0", str(mu_oc_0),
+        "--include-E64-hw",
+        "--include-multi-bank-hw",
+        "--include-mu-glb-hw",
+        "--use-non-split-fifos",
+        "--pipeline-mu2cgra",
+    ]
+
+    # Create symlinks for each kernel from strait to halide benchmarks paths for reusing existing aha pnr and test flows.
+    strait_headers_dir = os.path.join(strait_path, "coreir_backend", "utils", "headers")
+    header_jsons = sorted(
+        f for f in os.listdir(strait_headers_dir)
+        if f.endswith(".json")
+    ) if os.path.isdir(strait_headers_dir) else []
+
+    # ==============================================
+    # Create symlinks and run PnR for all kernels.
+    # ==============================================
+    start = time.time()
+    for kernel_name in kernel_names:
+        kernel_dir = os.path.abspath(os.path.join(coreir_dir, kernel_name))
+        app_name = pass_metadata[kernel_name]["app_name"]
+        app_dir = os.path.join(aha_halide_benchmarks_path, app_name)
+        bin_link = os.path.join(app_dir, "bin")
+        os.makedirs(app_dir, exist_ok=True)
+        try:
+            if not os.path.lexists(bin_link):
+                os.symlink(kernel_dir, bin_link)
+            for h in header_jsons:
+                dest = os.path.join(bin_link, h)
+                if not os.path.lexists(dest):
+                    os.symlink(os.path.join(strait_headers_dir, h), dest)
+        except OSError as e:
+            raise RuntimeError(f"[ERROR] Failed to create symlink for {kernel_name}: {e}")
+
+        print(f"--- {app_name} - pnr and pipelining", flush=True)
+        buildkite_call([
+            "aha", "pnr", app_name,
+            "--width", str(width),
+            "--height", str(height),
+            "--env-parameters", env_parameters,
+        ] + pnr_mu_extra_args + use_daemon, env=env_vars)
+    time_map = time.time() - start
+
+    # =============================================================================
+    # Run RTL simulation testing grouped by op decomposition.
+    # Decomposed multi-pass ops run as one aha test invocation so that
+    # GLB state written by pass N is available to pass N+1 in the same sim session.
+    # =============================================================================
+    start = time.time()
+    active_app_cycles = 0
+    total_config_cycles = 0
+    total_write_data_cycles = 0
+    for group in kernel_groups:
+        app_names = [pass_metadata[k]["app_name"] for k in group]
+        print(f"--- {app_names} - glb testing", flush=True)
+        print(app_names)
+        test_cmd = ["aha", "test"] + app_names
+        # Use fp comparison mode determined by the last pass of the op group
+        if kernel_fp_map.get(group[-1], False):
+            test_cmd.append("--dense-fp")
+        buildkite_call(test_cmd, env=env_vars)
+        a, c, w = track_ml_model_performance()
+        active_app_cycles += a
+        total_config_cycles += c
+        total_write_data_cycles += w
+    time_test = time.time() - start
+
+    return time_compile, time_map, time_test, active_app_cycles, total_config_cycles, total_write_data_cycles
+
+def test_hardcoded_dense_app(
+        test, width, height, env_parameters, extra_args,
+        using_matrix_unit=False, mu_datawidth=16,
+        num_fabric_cols_removed=0, mu_oc_0=32):
+
+    print(f"--- BEGIN test_dense_app {test}", flush=True)
+    #------------------------------------------------------------------------
+    test, dense_ready_valid = parse_RV_mode(test)
+    test, E64_mode_on = parse_E64_mode(test)
+    test, E64_multi_bank_mode_on = parse_E64_MB_mode(test)
+    #------------------------------------------------------------------------
+
+    env_parameters = str(env_parameters)
+    testname = test
+    print(f"--- {testname}")
+    print(f"--- {testname} - skip compiling and mapping")
+    app_path = "/aha/Halide-to-Hardware/apps/hardware_benchmarks/" + test
+    print(app_path, flush=True)
+
+    layer_array = []
+
+    start = time.time()
+    time_compile = time.time() - start
+
+    print(f"--- {testname} - pnr and pipelining", flush=True)
+    start = time.time()
+    try:
+        subprocess.call(["make", "clean"], cwd=app_path)
+    except:
+        pass
+
+    try:
+        print(f"copying hardcoded bin folder", flush=True)
+        shutil.copytree(f"{app_path}/bin_hardcoded", f"{app_path}/bin")
+    except:
+        raise RuntimeError(f"[ERROR] Please don't delete hardcoded bin folder")
+
+    # To use daemon, call regress.py with args '--daemon auto'
+    # --- extra_args=['--daemon', 'auto']
+    use_daemon = []
+    if (extra_args):
+        if ('--daemon' in extra_args) and ('auto' in extra_args):
+            use_daemon = ["--daemon", "auto"]
+
+    print(f"--- {testname} - pnr and pipelining", flush=True)
+    start = time.time()
+
+    # To use daemon, call regress.py with args '--daemon auto'
+    # --- extra_args=['--daemon', 'auto']
+    use_daemon = []
+    if (extra_args):
+        if ('--daemon' in extra_args) and ('auto' in extra_args):
+            use_daemon = ["--daemon", "auto"]
+
+    buildkite_args = [
+        "aha",
+        "pnr",
+        test,
+        "--width", str(width),
+        "--height", str(height),
+        "--env-parameters", env_parameters,
+    ] + use_daemon + layer_array
+
+    # hardcoded tests don't use dense_only
+    # if dense_only:
+    #     buildkite_args.append("--dense-only")
+
+    env_vars = {}
+    if dense_ready_valid:
+        print(f"\033[92mINFO: Running {test} in dense ready-valid mode\033[0m")
+        env_vars["DENSE_READY_VALID"] = "1"
+        env_vars["EXHAUSTIVE_PIPE"] = "1"
+
+    if E64_mode_on:
+        print(f"\033[92mINFO: Running {test} with E64 MODE ON\033[0m")
+        env_vars["E64_MODE_ON"] = "1"
+
+    if E64_multi_bank_mode_on:
+        print(f"\033[92mINFO: Running {test} with E64 MULTI BANK MODE ON\033[0m")
+        env_vars["E64_MULTI_BANK_MODE_ON"] = "1"
+
+    if using_matrix_unit:
+        #TODO: Make these all env vars?
+        buildkite_args.append("--using-matrix-unit")
+        buildkite_args.append("--mu-datawidth")
+        buildkite_args.append(str(mu_datawidth))
+        buildkite_args.append("--give-north-io-sbs")
+        buildkite_args.append("--num-fabric-cols-removed")
+        buildkite_args.append(str(num_fabric_cols_removed))
+        buildkite_args.append("--mu-oc-0")
+        buildkite_args.append(str(mu_oc_0))
+        buildkite_args.append("--include-E64-hw")
+        buildkite_args.append("--include-multi-bank-hw")
+        buildkite_args.append("--include-mu-glb-hw")
+        buildkite_args.append("--use-non-split-fifos")
+        buildkite_args.append("--pipeline-mu2cgra")
+
+        env_vars["INCLUDE_E64_HW"] = "1"
+        env_vars["INCLUDE_MULTI_BANK_HW"] = "1"
+        env_vars["NUM_FABRIC_COLS_REMOVED"] = str(num_fabric_cols_removed)
+
+        if num_fabric_cols_removed == 0:
+            env_vars["WEST_IN_IO_SIDES"] = "1"
+
+        env_vars["USING_MATRIX_UNIT"] = "1"
+        env_vars["INCLUDE_MU_GLB_HW"] = "1"
+        env_vars["MU_OC_0"] = str(mu_oc_0)
+        env_vars["MU_DATAWIDTH"] = str(mu_datawidth)
+        env_vars["ADD_MU_INPUT_BUBBLES"] = "1"
+
+    buildkite_call(buildkite_args, env=env_vars)
+    time_map = time.time() - start
+
+    print(f"--- {testname} - glb testing", flush=True)
+    start = time.time()
+    buildkite_call(["aha", "test", test], env=env_vars)
+
+    time_test = time.time() - start
+    active_app_cycles, total_config_cycles, total_write_data_cycles = track_performance()
+    return time_compile, time_map, time_test, active_app_cycles, total_config_cycles, total_write_data_cycles

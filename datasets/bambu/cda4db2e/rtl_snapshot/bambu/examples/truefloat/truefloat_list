@@ -1,0 +1,15 @@
+div/div.c   --benchmark-name=in_f64div  --top-fname=double_prec_division       --generate-tb=BENCHMARKS_ROOT/div/local_support.c  --tb-arg=BENCHMARKS_ROOT/div/input.data
+mul/mul.c   --benchmark-name=in_f64mul  --top-fname=double_prec_multiplication --generate-tb=BENCHMARKS_ROOT/mul/local_support.c  --tb-arg=BENCHMARKS_ROOT/mul/input.data
+sub/sub.c   --benchmark-name=in_f64sub  --top-fname=double_prec_subtraction    --generate-tb=BENCHMARKS_ROOT/sub/local_support.c  --tb-arg=BENCHMARKS_ROOT/sub/input.data
+add/add.c   --benchmark-name=in_f64add  --top-fname=double_prec_addition       --generate-tb=BENCHMARKS_ROOT/add/local_support.c  --tb-arg=BENCHMARKS_ROOT/add/input.data
+pow/pow.c   --benchmark-name=in_f64pow  --top-fname=double_prec_pow  -lm       --generate-tb=BENCHMARKS_ROOT/pow/local_support.c  --tb-arg=BENCHMARKS_ROOT/pow/input.data
+sqrt/sqrt.c --benchmark-name=in_f64sqrt --top-fname=double_prec_sqrt -lm       --generate-tb=BENCHMARKS_ROOT/sqrt/local_support.c --tb-arg=BENCHMARKS_ROOT/sqrt/input.data
+exp/exp.c   --benchmark-name=in_f64exp  --top-fname=double_prec_exp  -lm       --generate-tb=BENCHMARKS_ROOT/exp/local_support.c  --tb-arg=BENCHMARKS_ROOT/exp/input.data
+
+div/div.c   --benchmark-name=tf_f64div  --top-fname=double_prec_division       --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/div/local_support.c  --tb-arg=BENCHMARKS_ROOT/div/input.data
+mul/mul.c   --benchmark-name=tf_f64mul  --top-fname=double_prec_multiplication --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/mul/local_support.c  --tb-arg=BENCHMARKS_ROOT/mul/input.data
+sub/sub.c   --benchmark-name=tf_f64sub  --top-fname=double_prec_subtraction    --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/sub/local_support.c  --tb-arg=BENCHMARKS_ROOT/sub/input.data
+add/add.c   --benchmark-name=tf_f64add  --top-fname=double_prec_addition       --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/add/local_support.c  --tb-arg=BENCHMARKS_ROOT/add/input.data
+pow/pow.c   --benchmark-name=tf_f64pow  --top-fname=double_prec_pow  -lm       --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/pow/local_support.c  --tb-arg=BENCHMARKS_ROOT/pow/input.data
+sqrt/sqrt.c --benchmark-name=tf_f64sqrt --top-fname=double_prec_sqrt -lm       --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/sqrt/local_support.c --tb-arg=BENCHMARKS_ROOT/sqrt/input.data
+exp/exp.c   --benchmark-name=tf_f64exp  --top-fname=double_prec_exp  -lm       --fp-format-interface -DCUSTOM_INTERFACE --generate-tb=BENCHMARKS_ROOT/exp/local_support.c  --tb-arg=BENCHMARKS_ROOT/exp/input.data

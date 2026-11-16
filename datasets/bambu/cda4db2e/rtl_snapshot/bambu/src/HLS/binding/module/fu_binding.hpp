@@ -1,0 +1,454 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/**
+ * @file fu_binding.hpp
+ * @brief Data structure used to store the functional-unit binding of the vertexes.
+ *
+ *
+ * @author Fabrizio Ferrandi <fabrizio.ferrandi@polimi.it>
+ * @author Christian Pilato <pilato@elet.polimi.it>
+ *
+ */
+#ifndef FU_BINDING_HPP
+#define FU_BINDING_HPP
+
+#include "custom_set.hpp"
+#include "graph.hpp"
+#include "op_graph.hpp"
+#include "refcount.hpp"
+#include "structural_objects.hpp"
+#include "utility.hpp"
+
+#include <iosfwd>
+#include <limits>
+#include <list>
+#include <map>
+#include <utility>
+
+class funit_obj;
+class memory;
+class module_o;
+REF_FORWARD_DECL(AllocationInformation);
+REF_FORWARD_DECL(fu_binding);
+REF_FORWARD_DECL(generic_obj);
+REF_FORWARD_DECL(hls);
+REF_FORWARD_DECL(HLS_manager);
+REF_FORWARD_DECL(OMPInfo);
+REF_FORWARD_DECL(structural_manager);
+REF_FORWARD_DECL(structural_object);
+REF_FORWARD_DECL(technology_node);
+REF_FORWARD_DECL(ir_node);
+CONSTREF_FORWARD_DECL(AllocationInformation);
+CONSTREF_FORWARD_DECL(HLS_manager);
+CONSTREF_FORWARD_DECL(Parameter);
+CONSTREF_FORWARD_DECL(ir_manager);
+
+struct jms_sorter
+{
+   bool operator()(const structural_objectRef& a, const structural_objectRef& b) const;
+};
+
+/**
+ * Class managing the functional-unit binding.
+ * It stores the functional-unit binding, that is, the mapping of operations in the behavioral description onto the set
+ * of allocated functional units.
+ */
+class fu_binding
+{
+ protected:
+   /// map between functional unit id and number of units allocated
+   std::map<unsigned int, unsigned int> allocation_map;
+
+   /// map between unit and allocated objects
+   std::map<std::pair<unsigned int, unsigned int>, generic_objRef> unique_table;
+
+   /// reverse map that associated each functional unit with the set of operations that are executed
+   std::map<std::pair<unsigned int, unsigned int>, OpVertexSet> operations;
+
+   /// operation binding
+   std::map<unsigned int, generic_objRef> op_binding;
+
+   /// allocation manager. Used to retrieve the string name of the functional units.
+   AllocationInformationRef allocation_information;
+
+   /// information about the IR data-structure
+   const ir_managerConstRef IRM;
+
+   /// The operation graph
+   const OpGraph op_graph;
+
+   /// port assignment: ports are swapped predicate
+   CustomOrderedSet<OpGraph::vertex_descriptor> ports_are_swapped;
+
+   /// The set of input parameters
+   const ParameterConstRef parameters;
+
+   /// The debug level
+   int debug_level;
+
+   /// useful to know for automatic pipelining
+   bool has_resource_sharing_p;
+
+   /**
+    * Update number of allocated units. It takes effect only if new number is greather than stored one
+    * @param unit is the identifier associated to functional unit
+    * @param number is the new number of allocated units
+    */
+   void update_allocation(unsigned int unit, unsigned int number);
+
+   /**
+    * Add an instance of the current port
+    */
+   structural_objectRef add_gate(const HLS_managerRef HLSMgr, const hlsRef HLS, const technology_nodeRef fu,
+                                 const std::string& name, const OpVertexSet& ops, structural_objectRef clock_port,
+                                 structural_objectRef reset_port) const;
+
+   /**
+    * check the module parametrization
+    */
+   void check_parametrization(structural_objectRef curr_gate);
+
+   /**
+    * fix port properties for proxy memory ports
+    * @param memory_units is the list o memory ports
+    * @param curr_gate is the current gate
+    * @param var_call_sites_rel put into relation proxied variables and modules referring to such variables
+    * @param reverse_memory_units maps proxied variables back to the functional unit serving them
+    */
+   void kill_proxy_memory_units(std::map<unsigned int, unsigned int>& memory_units, structural_objectRef curr_gate,
+                                std::map<unsigned int, std::list<structural_objectRef>>& var_call_sites_rel,
+                                std::map<unsigned int, unsigned int>& reverse_memory_units);
+
+   void kill_proxy_function_units(std::map<unsigned int, std::string>& wrapped_units, structural_objectRef curr_gate,
+                                  std::map<std::string, std::list<structural_objectRef>>& fun_call_sites_rel,
+                                  std::map<std::string, unsigned int>& reverse_wrapped_units);
+
+   void kill_s_memory_ports(structural_objectRef curr_gate);
+
+   /**
+    * connect proxies with storage components
+    * @param mem_obj is the relation between fu_id and structural objects
+    * @param reverse_memory_units is the relation between var and functional units
+    * @param var_call_sites_rel is the relation between var and call sites having a proxy as module parameter
+    * @param SM is the structural manager
+    * @param HLS is the HLS data structure used to specialize the proxy connections
+    * @param _unique_id is the running identifier used while creating fresh structural objects
+    */
+   void manage_killing_memory_proxies(std::map<unsigned int, structural_objectRef>& mem_obj,
+                                      std::map<unsigned int, unsigned int>& reverse_memory_units,
+                                      std::map<unsigned int, std::list<structural_objectRef>>& var_call_sites_rel,
+                                      const structural_managerRef SM, const hlsRef HLS, unsigned int& _unique_id);
+
+   void manage_killing_function_proxies(std::map<unsigned int, structural_objectRef>& fun_obj,
+                                        std::map<std::string, unsigned int>& reverse_function_units,
+                                        std::map<std::string, std::list<structural_objectRef>>& fun_call_sites_rel,
+                                        const structural_managerRef SM, const hlsRef HLS, unsigned int& _unique_id);
+
+ public:
+   /// The value used to identified unknown functional unit
+   static const unsigned int UNKNOWN;
+
+   /**
+    * Constructor.
+    * @param _HLSMgr is the HLS manager
+    * @param function_id is the index of the function
+    * @param parameters is the set of input parameters
+    */
+   fu_binding(const HLS_managerConstRef _HLSMgr, const unsigned int function_id, const ParameterConstRef parameters);
+
+   fu_binding(const fu_binding& original);
+
+   fu_binding& operator=(const fu_binding&) = delete;
+
+   virtual ~fu_binding() = default;
+
+   /**
+    * @brief create_fu_binding: factory method for fu_binding
+    * @param _HLSMgr
+    * @param _function_id
+    * @param _parameters
+    * @return the correct class of fu_binding
+    */
+   static fu_bindingRef create_fu_binding(const HLS_managerConstRef _HLSMgr, const unsigned int _function_id,
+                                          const ParameterConstRef _parameters);
+
+   /**
+    * @brief reset_allocation initialize the allocated resources to 0
+    * @param unit is the resource unit id
+    */
+   void reset_allocation(unsigned int unit);
+
+   /**
+    * Binds an operation vertex to a functional unit. The functional unit is identified by an id and
+    * its index
+    * @param v is operation vertex
+    * @param unit is the identifier of the functional unit
+    * @param index is the functional unit index
+    */
+   void bind(OpGraph::vertex_descriptor v, unsigned int unit,
+             unsigned int index = std::numeric_limits<unsigned int>::max());
+
+   /**
+    * Returns the functional unit assigned to the vertex.
+    * @param v is the considered vertex.
+    * @return the functional unit assigned with the vertex.
+    */
+   unsigned int get_assign(OpGraph::vertex_descriptor v) const;
+
+   /**
+    * Returns the functional unit assigned to the operation.
+    * @param statement_index is the considered operation.
+    * @return the functional unit assigned to the operation
+    */
+   unsigned int get_assign(const unsigned int statement_index) const;
+
+   /**
+    * Returns the index of functional unit assigned to the vertex.
+    * @param v is the considered vertex.
+    * @return the index of the functional unit assigned to the vertex.
+    */
+   unsigned int get_index(OpGraph::vertex_descriptor v) const;
+
+   /**
+    * Returns the name of the functional unit
+    * @param v is the considered vertex.
+    * @return the name of the functional unit assigned to the vertex.
+    */
+   std::string get_fu_name(OpGraph::vertex_descriptor v) const;
+
+   /**
+    * Returns number of functional unit allocated
+    * @param unit is the identifier associated to functional unit
+    * @return the number of functional units allocated.
+    */
+   unsigned int get_number(unsigned int unit) const
+   {
+      auto it = allocation_map.find(unit);
+      if(it != allocation_map.end())
+      {
+         return it->second;
+      }
+      else
+      {
+         return 0;
+      }
+   }
+
+   /**
+    * Redefinition of the [] operator. It is necessary because segfaults happen when the vertex is not into the map
+    * and so the object has not been created yet. This operator can be used only to read information since it returns
+    * a constant object. It's necessary because a direct manipulation of the object can create non-consistent data
+    * objects.
+    * @param v is the vertex you want to get the object
+    * @return the constant object related to vertex
+    */
+   const funit_obj& operator[](OpGraph::vertex_descriptor v);
+
+   /**
+    * Returns reference to funit object associated with this vertex
+    * @param v is the given vertex
+    * @return the associated reference
+    */
+   generic_objRef get(OpGraph::vertex_descriptor v) const;
+
+   generic_objRef get(unsigned int name, unsigned int index)
+   {
+      return (unique_table.count(std::make_pair(name, index))) ? unique_table[std::make_pair(name, index)] :
+                                                                 generic_objRef();
+   }
+
+   /**
+    * Returns the set of allocated unit
+    * @return the set of allocated unit
+    */
+   std::list<unsigned int> get_allocation_list() const;
+
+   /**
+    * return true in case the vertex has been previously assigned
+    * @param v
+    * @return true in case v has been previously assigned
+    */
+   bool is_assigned(OpGraph::vertex_descriptor v) const;
+
+   /**
+    * return true in case the operation has been previously assigned
+    * @param statement_index
+    * @return true in case operation has been previously assigned
+    */
+   bool is_assigned(const unsigned int statement_index) const;
+
+   /**
+    * Instance the functional unit inside the structural representation of the datapath
+    */
+   virtual void add_to_SM(const HLS_managerRef HLSMgr, const hlsRef HLS, structural_objectRef clock_port,
+                          structural_objectRef reset_port);
+
+   virtual void manage_extern_global_port(const HLS_managerRef HLSMgr, const hlsRef HLS, const structural_managerRef SM,
+                                          structural_objectRef port_in, unsigned int dir, structural_objectRef circuit,
+                                          unsigned int num);
+
+   /**
+    * Manage the connections between memory ports
+    */
+   static void manage_memory_ports_chained(const structural_managerRef SM,
+                                           const std::list<structural_objectRef>& memory_modules,
+                                           const structural_objectRef circuit);
+   virtual void manage_memory_ports_parallel_chained(const HLS_managerRef HLSMgr, const structural_managerRef SM,
+                                                     const std::list<structural_objectRef>& memory_modules,
+                                                     const structural_objectRef circuit, const hlsRef HLS,
+                                                     unsigned int& unique_id);
+
+   /**
+    * Return the operations that are executed by the given functional unit
+    */
+   OpVertexSet get_operations(unsigned int unit, unsigned int index) const;
+
+   /**
+    * Specialize the functional unit based on variables associated with the corresponding operations
+    */
+   void specialise_fu(const HLS_managerRef HLSMgr, const hlsRef HLS, structural_objectRef fu_obj, unsigned int fu,
+                      const OpVertexSet& operations, unsigned int ar);
+
+   /**
+    * Specialize a memory unit
+    */
+   void specialize_memory_unit(const HLS_managerRef HLSMgr, const hlsRef HLS, structural_objectRef fu_obj,
+                               unsigned int ar, const std::string& base_address, unsigned long long rangesize,
+                               bool is_memory_splitted, bool is_sparse_memory, bool is_sds, OMPInfoRef fork_info);
+
+   virtual bool manage_module_ports(const HLS_managerRef HLSMgr, const hlsRef HLS, const structural_managerRef SM,
+                                    const structural_objectRef curr_gate, unsigned int num);
+
+   /**
+    * specify if vertex v have or not its ports swapped
+    * @param v is the vertex
+    * @param condition is true when ports are swapped, false otherwise
+    */
+   void set_ports_are_swapped(OpGraph::vertex_descriptor v, bool condition);
+
+   /**
+    * Check if vertex v has its ports swapped or not
+    * @param v is the vertex
+    * @return true when ports of v are swapped, false otherwise
+    */
+   bool get_ports_are_swapped(OpGraph::vertex_descriptor v) const
+   {
+      return ports_are_swapped.find(v) != ports_are_swapped.end();
+   }
+
+   /// return true in case at least one resource is shared
+   bool has_resource_sharing() const
+   {
+      return has_resource_sharing_p;
+   }
+
+   static void
+   join_merge_split(const structural_managerRef SM, const hlsRef HLS,
+                    std::map<structural_objectRef, std::list<structural_objectRef>, jms_sorter>& primary_outs,
+                    const structural_objectRef circuit, unsigned int& unique_id);
+
+   /**
+    * Adds a new port to the specified component copyng the proprieties of an old one.
+    * The type of the port (scalar or vector) is automatically determined looking at the size:
+    * in this context size is equal to the number of elements belonging to the port;
+    * the bitsize of each element of the port has to be specified after this operation.
+    * @param new_port the reference to the new port
+    * @param old_port the reference to the old port
+    * @param size the size of the new port (it can be different from the old one)
+    * @param pname the name of the new port
+    * @param direction the direction of the new port
+    * @param circuit the component to which the new port is added
+    * @param SM the structural manager that perfroms the operation
+    */
+   static void add_smart_port(structural_objectRef& new_port, const structural_objectRef old_port, unsigned int size,
+                              const std::string pname, port_o::port_direction direction,
+                              const structural_objectRef& circuit, const structural_managerRef& SM);
+
+   /**
+    * Adds a new connection between the two specified ports.
+    * The connection is direct (without a signal) if one of the two elements contains the other,
+    * otherwise the connection is created using a local signal.
+    * The size and type of the signal is determined looking at the information of the src_port.
+    * @param src_port the reference to the source port
+    * @param dst_port the reference to the destination port
+    * @param _unique_id the unique identifier of the signal if needed
+    * @param circuit the component to which the new port is added
+    * @param SM the structural manager that perfroms the operation
+    */
+   static void add_smart_connection(const structural_objectRef src_port, const structural_objectRef dst_port,
+                                    unsigned int _unique_id, const structural_objectRef& circuit,
+                                    const structural_managerRef& SM);
+
+   /**
+    * Creates a new signals compatible with the specified port: the two elements are NOT connected
+    * The type and bitsize of the signal are copied from the source port.
+    * @param src_port the reference to the source port
+    * @param _unique_id the unique identifier of the signal
+    * @param circuit the component to which the new port is added
+    * @param SM the structural manager that perfroms the operation
+    * @return A reference to the signal.
+    */
+   static structural_objectRef add_smart_signal(const structural_objectRef src_port, unsigned int _unique_id,
+                                                const structural_objectRef& circuit, const structural_managerRef& SM);
+
+   /**
+    * Tries to find a specific port of a specific type in a component
+    * Return true if the operation is succesfull and puts a reference to the port in port_obj
+    * @param port_name the name of the searched port
+    * @param id_module the component on which the research is performed
+    * @param port_type the type of the port searched
+    * @param port_obj the reference to the searched port. It is equal to null if the search fails.
+    * @return The result of the operation.
+    */
+   static bool try_find_port(const std::string& port_name, const structural_objectRef& id_module, so_kind port_type,
+                             structural_objectRef& port_obj);
+
+   /**
+    * fill the memory of an array
+    * @param init_file_a is the file where the data is written (all data stored in this file in case is_memory_splitted
+    * is false
+    * @param init_file_b is the file where the data is written (only the odd elements are store in this file and only
+    * if is open)
+    * @param ar is the array ref variable declaration
+    * @param vec_size is the number of the element of the array
+    * @param elts_size is the element size in bits
+    * @param mem is the memory reference
+    * @param TM is the IR manager reference
+    * @param is_sds is true if SDS memory alignment is required
+    * @param bitsize_align is the memory alignment bitsize
+    */
+   static void fill_array_memory(std::ostream& init_file_a, std::ostream& init_file_b, unsigned int ar,
+                                 unsigned long long& vec_size, unsigned long long& elts_size,
+                                 const std::unique_ptr<memory>& mem, ir_managerConstRef TM, bool is_sds,
+                                 unsigned long long bitsize_align);
+
+   static void write_init(const ir_managerConstRef IRM, ir_nodeRef var_node, ir_nodeRef init_node,
+                          std::vector<std::string>& init_file, const std::unique_ptr<memory>& mem,
+                          unsigned long long element_precision);
+};
+
+/**
+ * RefCount type definition of the fu_binding class structure
+ */
+using fu_bindingRef = refcount<fu_binding>;
+using fu_bindingConstRef = refcount<const fu_binding>;
+
+#endif

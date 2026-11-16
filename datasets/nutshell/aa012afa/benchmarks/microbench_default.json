@@ -1,0 +1,30 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "nutshell",
+  "upstream_commit": "aa012afa",
+  "profile": "app_verilator",
+  "workload": "microbench",
+  "config": "nutshell_inorder_sim",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64imac",
+    "configuration": "nutshell_inorder_sim",
+    "total_simulation_cycles": 2000001,
+    "benchmark_cycles": 2000001,
+    "instructions_retired": 783388,
+    "ipc": 0.3917,
+    "branch_predictor_accuracy_pct": 95.45,
+    "wall_clock_seconds": 5.202
+  },
+  "generated_utc": "2026-11-16T20:49:46Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "unknown"
+  }
+}

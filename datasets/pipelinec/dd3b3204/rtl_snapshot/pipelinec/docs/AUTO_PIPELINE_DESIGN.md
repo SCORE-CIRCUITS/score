@@ -1,0 +1,1179 @@
+# AUTO_PIPELINE: automatic pipelining
+
+How PypelineC represents pipelines, decides their stages, and turns
+`AUTO_PIPELINE(func)` call sites into a known, readable `.latency`.
+
+`make_auto_pipeline_ram` uses a separate [RAM implementation search](AUTO_PIPELINE_DESIGN.md#ram-compiler-sweep-and-simulation)
+around this build flow. Each candidate is an immutable synchronous pipeline with
+at least one clock of latency; the existing fixed-latency mapper aligns its callers.
+Memory banks are never treated as zero-cycle combinational operators.
+
+- Implementation: [`src/AUTO_PIPELINE.py`](../src/AUTO_PIPELINE.py); the tag
+  class in [`src/pypeline.py`](../src/pypeline.py); the elaborator hook in
+  [`src/PY_TO_LOGIC.py`](../src/PY_TO_LOGIC.py) (see its
+  [AUTO_PIPELINE section](PY_TO_LOGIC_DESIGN.md#auto_pipelinefunc-latency-start_latency-max_latency--forced-submodule-pipelining)).
+- *Where* registers go -- the throughput sweep that iterates synthesis toward a
+  timing goal -- is [`SWEEP_DESIGN.md`](SWEEP_DESIGN.md). The synthesis runs,
+  reports and delay model it relies on are [`SYN_DESIGN.md`](SYN_DESIGN.md).
+  Entity/architecture emission, including the pipelined architecture text, is
+  [`VHDL_DESIGN.md`](VHDL_DESIGN.md).
+
+> **Reference, not a logbook.** Describe the system as it is now, in the present
+> tense. No dated entries, no session write-ups — `git log` is the change record.
+> When behavior changes, edit the affected section in place; when the *reason* is
+> worth keeping, revise the matching entry in this file's `History` section rather
+> than appending a new one. See
+> [documentation conventions](pypeline_DESIGN.md#documentation-conventions).
+
+## Table of Contents
+
+- [1. Who does what](#1-who-does-what)
+- [2. How pipelines physically form](#2-how-pipelines-physically-form)
+  - [Fixed user pipelines](#fixed-user-pipelines)
+  - [Functions that take no added latency](#functions-that-take-no-added-latency)
+- [3. Pipeline stages and register lifetimes](#3-pipeline-stages-and-register-lifetimes)
+  - [Global wires in pipelines](#global-wires-in-pipelines)
+- [4. Build entry points](#4-build-entry-points)
+- [5. `.latency` pin-and-confirm loop (Pypeline designs only)](#5-latency-pin-and-confirm-loop-pypeline-designs-only)
+- [6. Constrained AUTO_PIPELINE regions (`latency=` / `start_latency=` / `max_latency=`)](#6-constrained-auto_pipeline-regions-latency--start_latency--max_latency)
+- [7. Tests](#7-tests)
+- [8. Auto-pipelined RAM](#8-auto-pipelined-ram)
+  - [RAM API and ordering](#ram-api-and-ordering)
+  - [RAM register placement and splitting](#ram-register-placement-and-splitting)
+  - [RAM compiler, sweep, and simulation](#ram-compiler-sweep-and-simulation)
+  - [RAM stream wrapper and verification](#ram-stream-wrapper-and-verification)
+- [History](#history)
+  - [Why `AUTO_PIPELINE(func, depth=N)` became `latency=N`](#why-auto_pipelinefunc-depthn-became-latencyn)
+
+---
+
+## 1. Who does what
+
+| piece of `src/AUTO_PIPELINE.py` | role |
+|---|---|
+| `TimingParams`, `MultiMainTimingParams` | the pipeline representation: each instance's leaf slices (`_slices`) and IO-register flags, its total latency, and the timing hash that names its VHDL entity; one lookup table per build (plus per-key AUTO_MULTI_CYCLE overrides) |
+| `GET_PIPELINE_MAP`, `PipelineMap` | assigns every wire and submodule of a hierarchical function to a stage from data dependencies and child latencies (§2, §3) |
+| `GET_ZERO_ADDED_CLKS_*`, `WRITE_ALL_ZERO_CLK_VHDL`, `WRITE_ALL_NON_ZERO_CLK_VHDL_FILES` | the zero-added-latency table every build starts from, and writing the VHDL for a table |
+| `WRITE_0_ADDED_CLKS_INIT_FILES` | the first output after either front end parses: the zero-added-latency VHDL for every function, the struct/enum and global-wire packages, the float/integer instance reports (`SYN.py`), a copy of `src/vhdl` as `built_in/`, and for Pypeline the crossing report (`PY_TO_LOGIC.WRITE_CLOCK_CROSSING_REPORT`) |
+| `SLICE_DOWN_HIERARCHY_WRITE_VHDL_PACKAGES`, `ADD_SLICES_DOWN_HIERARCHY_...`, `BUILD_AND_WRITE_COARSE_SLICED_TIMING_PARAMS`, `GET_BEST_GUESS_IDEAL_SLICES` | fractional (coarse/compatibility) slicing down the hierarchy |
+| `PiplineHDLParams`, `GLOBAL_WIRE_TIMING`, `ALIGNED_GLOBAL_READS`, `ALIGNED_GLOBAL_WRITES` | each wire's register lifetime and the aligned global wires carried in the IO registers, from which `VHDL.py` renders the pipelined architecture (§3) |
+| `DO_PIPELINED_BUILD`, `DO_SWEEP_AND_AUTO_PIPELINE`, `DO_AUTO_PIPELINE_LATENCY_PASSES`, `HARVEST_AUTO_PIPELINE_LATENCIES`, `SEED_TIMING_PARAMS_FROM_PREVIOUS` | the build entry point and the `.latency` pin-and-confirm loop (§4, §5) |
+| `WRITE_COMB_FINAL_FILES`, `SWITCH_TO_FIXED_ONLY_BUILD` | the final files of a `--comb` / `--no_synth` build, and the switch to one when the part has no synthesis tool (§4) |
+| `CAPTURE_CONCRETE_PIPELINE`, `CONCRETE_PIPELINE_COMPATIBLE`, `CONCRETE_PIPELINE_CONTAINS`, `RESTORE_CONCRETE_PIPELINE` | a subtree's timing params as data, keyed by path relative to its root (function, wire types, slices, exact bit boundaries, IO-register and fixed flags) and holding no reference to a parse's `Logic`; replayed exactly across re-elaboration (§5) and by the sweep's [hotspot locks](SWEEP_DESIGN.md#concrete-hotspot-locks) |
+| `BUILD_FIXED_AUTO_PIPELINE_TIMING_PARAMS`, `COLLECT_AUTO_PIPELINE_REGIONS`, `ENFORCE_AUTO_PIPELINE_REGIONS`, `REENFORCE_AUTO_PIPELINE_REGIONS`, `AUTO_PIPELINE_REGION_FEEDBACK`, ... | constrained call sites: `latency=` / `start_latency=` / `max_latency=` (§6) |
+| `FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL`, `FUNC_SUBTREE_HAS_AUTO_PIPELINE` | "can registers be added below here?" predicates, used by slicing, the sweep and SYN's delay collection |
+| `ADDED_LATENCY_BLOCKER`, `DESCRIBE_ADDED_LATENCY_BLOCKER`, `CHECK_ADDED_LATENCY_CONTEXT`, `CHECK_ADDED_LATENCY_CONTEXTS` | caller-context eligibility, source-located diagnostics, lowering guards, and the pre-write whole-table check (§2) |
+| `DEL_PIPELINE_CACHES`, `DEL_ZERO_ADDED_CLKS_TIMING_PARAMS_CACHE` | this module's per-parse caches, called from `SYN.DEL_ALL_CACHES`; the zero-added-clocks table cache is cleared separately on every Pypeline re-parse (`PY_TO_LOGIC`), because its `TimingParams` hold the previous parse's `Logic` |
+
+Vocabulary shared with [`SWEEP_DESIGN.md`](SWEEP_DESIGN.md#1-who-does-what):
+a **slice** is one serial register boundary inserted by pipelining; a
+**cut** is a requested stage boundary on a cut subtree's delay axis; a
+**placement** is one typed physical register location.
+
+## 2. How pipelines physically form
+
+Registers physically exist in two forms:
+
+1. **Leaf slices** — a raw HDL leaf (no submodules, e.g. `BIN_OP_PLUS`) with
+   `TimingParams._slices = [0.5]` becomes a 2-stage adder, carry chain broken
+   at 50% of its delay (a slice value is a fraction 0.0–1.0 of that module's
+   *own* delay, but what that fraction turns into differs by leaf kind). Leaf
+   latency = `len(_slices)`:
+
+   ```
+   4 ns ADD, _slices = [0.5]:
+   in --[ low 2 ns of carry chain ]--REG--[ high 2 ns ]-- out   (1 clk latency)
+   ```
+
+   `RAW_VHDL.GET_LEAF_SPLIT_KIND` puts every raw HDL leaf into one of four
+   kinds, which each generator's own code (not the sweep/landscape layer)
+   decides how to honor:
+   - `SPLIT_KIND_BITS` (PLUS/MINUS/EQ/NEQ/GT/GTE/LT/LTE/accum): the operand
+     bit range is what gets split. `RAW_VHDL.GET_BITS_PER_STAGE_DICT` divides
+     the width as **evenly as possible across the requested chunk COUNT**
+     (`len(_slices) + 1` stages). Compatibility/coarse fractional requests
+     therefore set the count rather than arbitrary bit boundaries. Typed
+     bit placements normally carry the canonical equal-width boundary,
+     ordinal, and count all the way through lowering, so the trace describes
+     the exact emitted split. Typed `exact` placements may instead carry a
+     strictly increasing integer boundary group; that group is validated,
+     hashed, and emitted without changing the compatibility path. The normal
+     equal-width conversion looks like it throws away information, but it
+     doesn't: once a boundary is registered, each stage computes its own
+     chunk from scratch off a registered 1-bit carry-in, so that stage's
+     delay depends only on its own chunk width, not on where along the
+     leaf's *unregistered* delay axis the cut nominally sits. Since real
+     per-width delay is monotonic (and concave — sky130 measured
+     `D(10)=2.607ns`, `D(34)=3.851ns` for a 34-bit `MINUS`, nowhere near
+     linear), minimizing the worst stage's delay for a given stage count
+     means equal-width chunks, full stop — an uneven, delay-fraction-derived
+     boundary measurably misses real sky130 timing goals that the plain
+     equal-width split meets, even when it looks better for one isolated
+     leaf in isolation. Locally optimal per-leaf boundaries do not reliably
+     predict whole-design QoR after real lowering (fanout and
+     max-capacitance effects dominate there instead), so exact per-leaf
+     boundaries remain available as an internal placement mechanism
+     (`exact_bit_boundaries`) rather than the default allocation policy.
+   - `SPLIT_KIND_MUX_BITS` (every built-in MUX): the initial landscape deliberately
+     exposes only the normal operation-output boundary. A typed physical
+     placement may split the packed output bits, however, making each stage's
+     select drive only that chunk. Aggregate data uses the generated
+     `c_structs_pkg` SLV conversion functions around the stage-local selection.
+     A selected bank at least `SWEEP.DEFAULT_MUX_CHUNK_MIN_WIDTH` (32) bits
+     wide is chunked this way by default when the plan is built
+     (`SWEEP.CHUNK_SELECTED_MUX_OUTPUT_BANKS`) — same latency contribution,
+     same cut count, half the select fanout, so `--no_sweep` gets it too.
+     The bounded same-depth-neighbor refinement below (`BUILD_CHUNKED_MUX_
+     REFINEMENT`) only adds the terminal, deliberately unregistered MUX on
+     top of that, after a real measurement fails.
+
+   A single mux select bus registered *on top of* an already-registered,
+   wider parallel sibling can materialize a real register while adding
+   **zero pipeline depth**: `GET_PIPELINE_MAP` schedules a shared
+   downstream consumer by the *max* of its inputs' readiness, so a short
+   branch's register is free once a slower sibling already bounds that max —
+   a mismatch between requested cuts and actually-built slices is the tell.
+   `SWEEP.DROP_NON_DEEPENING_PLACEMENTS` drops any `INSTANCE_INPUT`/
+   `INSTANCE_OUTPUT` placement, or a complete synchronized boundary-register
+   group, whose removal leaves the subtree's
+   real post-lowering `GET_TOTAL_LATENCY` exactly where it started — ground
+   truth after real lowering, not a landscape estimate, since only the real
+   synchronous schedule can see this. The comparison also folds in each
+   AUTO_PIPELINE-tagged descendant region's own latency: such a region
+   reports 0 latency to its immediate container by convention (so
+   balanced-latency reporting doesn't double-count an already-decoupled
+   region), so a monolithic-only comparison would misread every one of that
+   region's real registers as adding no depth and drop them all.
+   `DROP_NON_DEEPENING_PLACEMENTS` mirrors `SUMMARIZE_SUBTREE_PIPELINE`'s own
+   `monolithic + sum(regions)` formula exactly to avoid this.
+   Group members are tested and removed atomically: testing one parallel bank
+   at a time would make every member appear redundant and leave an arbitrary
+   incomplete frontier behind.
+   - `SPLIT_KIND_1LL` ("one logic level" — AND/OR/XOR/NOT/NEGATE/MULT):
+     these generators (`stage_for_1ll`) always place the *whole* operation in
+     exactly one stage no matter the latency — only the register *boundary*
+     moves. Latency 1 puts the op in stage 0 or 1 depending on which side of
+     0.5 the slice falls; latency 2 puts registers on both sides with the op
+     untouched in the middle. A 3rd slice is provably wasted (a bare register
+     around logic that never shrinks), so `RAW_VHDL.LEAF_MAX_SPLIT_SLICES`
+     caps these at 2 — enforced primarily in the landscape ([`SWEEP_DESIGN.md`](SWEEP_DESIGN.md#landscape-segments-and-typed-candidates): only a
+     `SPLIT_KIND_1LL` segment's own two boundary units are ever legal cut
+     positions) and backstopped by a hard error in
+     `SLICE_DOWN_HIERARCHY_WRITE_VHDL_PACKAGES` if anything else ever
+     requests a 3rd.
+   - `SPLIT_KIND_NONE` (bit-manip/cast/const-shift/const-ref): no
+     stage-dependent behavior at all; in practice unreachable since
+     `LOGIC_IS_ZERO_DELAY` already excludes these from ever getting cuts.
+     That includes a stateless user function with no submodules, such as a
+     helper whose body is only a cast: it is a leaf of this kind too, and is
+     never timed.
+2. **IO regs** — `_has_input_regs/_has_output_regs` add boundary registers.
+   Typed `instance_input` and `instance_output` placements lower directly to
+   the selected child boundary. They do not manufacture fractional cuts in
+   every primitive below that child.
+
+Everything else is *emergent*: a hierarchical module's latency is rebuilt
+bottom-up from its children by `GET_PIPELINE_MAP`, and the VHDL writer
+registers wires crossing stage boundaries (`REG_STAGEn_<wire>`).
+
+The planned sweep preserves a concrete `PipelinePlacement` through selection
+and lowering rather than immediately projecting a fractional cut through
+every descendant. `instance_input`/`instance_output` set one entity boundary
+flag; `bit_internal` adds a local slice only to a genuinely bit-splittable
+raw leaf. An older recursive fraction mechanism remains for the coarse
+sweep and compatibility paths:
+
+```
+        MAIN  cut at 30% of 100ns
+          |
+         foo  -> cut lands at 25% of foo's 40ns
+          |
+       adder  -> cut lands at 50% of adder's 5ns   <- real register here
+```
+
+**Cuts != latency.** The two are related but distinct numbers, always
+reported separately. Latency can exceed the cut count (children of one cut
+sliced at misaligned positions, IO regs, `make_stream_auto_pipeline`-style
+factories with internal `AUTO_PIPELINE` call sites). A mini-swept WireGuard
+`block_step` accepts one internal half-way slice, with its external banks
+then chosen over direct parent-dataflow edges: a ten-instance serial chain
+needs the ten internal slices plus nine shared boundaries, not both banks on
+every instance — three clocks per instance is only the final fallback when
+compact boundary policies miss timing. An **auto-pipeline-tagged call site
+reports latency 0 to its container** (so FSMs keep their cycle accounting) —
+a stateful MAIN prints `main_latency=0` while a deep pipeline runs inside
+it. That is expected, not a bug.
+
+An **untagged** callee under a stateful caller must keep zero compiler-added
+latency. `CALC_TOTAL_LATENCY` returns zero for that caller and VHDL renders
+only stage 0; adding a register below it would move a child output to a stage
+that is never emitted. `ADDED_LATENCY_BLOCKER` walks callers until a direct
+tag or MAIN, rejecting any non-sliceable step. A deeper tag only authorizes
+traversal toward itself. MCP wrappers therefore keep their untagged logic
+combinational even when the same helper is pipelined at another call site.
+`CHECK_ADDED_LATENCY_CONTEXTS` checks physical registers across the table
+before `WRITE_ALL_NON_ZERO_CLK_VHDL_FILES` emits anything, including restored,
+seeded, fixed-only, and final builds; non-leaf bookkeeping slices are ignored.
+
+Delay characterization uses the same caller rules. `COLLECT_CUT_SUBTREES`
+serves both sweep planning and `COLLECT_PIPELINE_DELAY_REQUIREMENTS`, which
+collects geometry dependencies, eligible combinational hierarchy and its
+measurement frontier. Stateful surroundings and blocked-only helpers use
+primitive-derived estimates. Shared helpers can contribute one valid measured
+through-delay without receiving registers at blocked call sites. Independent
+fixed-latency roots are collected explicitly; automatic MCP endpoint evidence
+is recorded separately from placement geometry. Opaque `vhdl()` text remains
+a dependency with zero initial estimated width, without descending into its
+hidden implementation. Only path-directed sweep fallback can measure that width.
+Unconstrained roots require an active MAIN clock goal; explicit latency regions
+and seeds also contribute roots when their MAIN has no clock goal.
+During post-met trimming, `zero_cut_probe` gives optional regions an infinite
+stage budget and no optional cuts. Fixed latency regions retain their exact
+counts; the sweep confirms the smaller implementation before keeping it.
+The probe does not change the tuned `global_scale`. Timing feedback clears the
+probe along with `trim_pending`, so an MCP count repair cannot strand later
+replans at zero cuts. Region-count nudges are suppressed only while probing.
+
+
+**A module's latency is not its slice count.** A module's total latency is
+its own leaf slices *plus* the summed latencies of its submodule instances,
+so an entity named `foo_25CLK` can legitimately carry only 8 slices of its
+own (the other 17 register delays live in submodules). `latency == slice count` holds
+*only* for a pure-comb, fully-sliceable region (nothing below it to add
+depth) — which is exactly the region `CHECK_CUTS_VS_LATENCY` marks `strict`.
+
+**Reporting how deep the design got pipelined.** Because a stream MAIN reads
+`main_latency=0` and the deepest single instance (one block_step) is far
+shallower than the whole pipeline, neither alone answers "how many stages did
+auto-pipelining build?". So `GET_SUBTREE_PIPELINE_STAGES`/`SUMMARIZE_SUBTREE_
+PIPELINE` compute the **total slices in a main's cut subtrees**:
+
+```
+total = (slices inserted directly into the cut-subtree roots)
+      + (latency of every decoupled auto-pipeline region instance in them)
+```
+
+The two parts never overlap: a subtree root's own latency already zeroes its
+decoupled children (they report 0 to it), and the second term adds exactly
+those back. This equals the input-to-output register count when the regions
+sit in series, as in a stream pipeline — a topology-aware lock records its
+shared boundary cover and reports the realized total (a WireGuard-shaped
+design's `block_step` repeated ten times reports its true shared-boundary
+total, not a naive per-instance sum). The `Pipeline depth summary` at
+*Writing Results* prints this figure as "N slice(s) total (N+1 pipeline
+stages)" (computed at *Writing Results* on the final, actually-emitted
+table, so it reflects any extra depth the AUTO_PIPELINE pin-and-confirm
+re-elaboration (§5) added).
+
+**Slices vs. pipeline stages — `stages = slices + 1`.** A slice
+count is not the same number as "how many pipeline stages". 0 slices (comb
+logic) is 1 stage; 1 slice splits it into 2 stages; N slices in series
+give N+1 stages. So the `pipeline_stages=` field printed per sweep iteration
+and written to `sweep_history.json` is always **realized deepest slices + 1**,
+not the requested `cuts` count. The requested cut count and realized slice
+count are often equal for one pure-comb subtree (so `pipeline_stages` is then
+`cuts + 1`), but those two counts can differ after boundary lowering or with
+decoupled regions — a print like `cuts=0 main_latency=0 pipeline_stages=20`
+can look like no registers were added at all when in fact locked slices
+distributed across decoupled regions account for all 20 stages.
+
+Entity naming is also unchanged: each distinct (IO regs + leaf slices)
+combination hashes to its own VHDL entity `funcname_<latency>CLK_<hash>`.
+
+### Fixed user pipelines
+
+Pypeline's `@pipeline_latency(N)` and C's `FUNC_LATENCY` populate the same
+`parser_state.func_fixed_latency` table. `TimingParams.CALC_TOTAL_LATENCY` reports
+N for the tagged function; `GET_PIPELINE_LOGIC_ADDED_LATENCY` subtracts that user
+latency when emitting its body, so the user registers are not duplicated.
+`CAN_HAVE_ADDED_LATENCY` rejects further stages on the tagged implementation,
+and the planner treats it as an atomic fixed-latency building block. Caller
+pipeline maps consume its N-cycle output timing and add alignment on other paths.
+
+A tagged leaf consisting only of wire assignments and registers has zero
+combinational delay. `LOGIC_IS_ZERO_DELAY` recognizes that case directly, avoiding
+a meaningless zero-delay frequency calculation in the PYRTL timing model.
+Pypeline elaboration rejects internal AUTO_PIPELINE requests that would alter the
+fixed implementation.
+Both typed placements and legacy fractional slicing call
+`CHECK_FIXED_LATENCY_BOUNDARY`, rejecting registers at the tagged instance or any
+of its descendants. Python stateful/fixed bodies mark pipeline calls as
+`submodule_latencies_are_self_timed`; `GET_SUBMODULE_LATENCY` exposes their physical
+outputs to that body's stage-zero logic. Sliceable callers continue to see N.
+The sibling `CHECK_ADDED_LATENCY_CONTEXT` guard enforces caller absorption for
+compiler-added registers. Self-timed user pipelines do not bypass that guard:
+their stage-zero consumption does not authorize extra compiler latency.
+
+The native simulator uses these same placements only for affected user-pipeline
+regions. Its architecture and compatibility gate are documented in
+[pypeline_sim_DESIGN.md](pypeline_sim_DESIGN.md#fixed-user-pipelines).
+
+### Functions that take no added latency
+
+`parser_state.func_no_added_latency` maps a function name to the reason it must never
+get compiler-added registers, for reasons that are not visible in its `Logic`. Its
+entries are refused by `Logic.CAN_HAVE_ADDED_LATENCY`, right after
+`func_fixed_latency`. Every placement path goes through that method, and
+`ADDED_LATENCY_BLOCKER` therefore also keeps the function's descendants unpipelined,
+except below a direct `AUTO_PIPELINE` call. `SWEEP.WHY_NOT_SLICEABLE` reports the
+stored reason, so landscapes and blame messages name it. The reasons are hard floors,
+not in `SOFT_FLOOR_REASONS`.
+
+Pypeline global instances and FIFOs fill it
+([PY_TO_LOGIC_DESIGN.md](PY_TO_LOGIC_DESIGN.md#pipelines-func_no_added_latency)):
+
+| Reason | Function | Why |
+|---|---|---|
+| `"global instance"` | each instance MAIN `<key>_INST` | an instance adds no registers: its users see its outputs as a call's; an AUTO_PIPELINE call inside it still gets its region's stages |
+| `"global instance handshake"` | a user that both drives and reads one interface port of an instance | the port's reads would be sampled at its first stage and its writes published at its last |
+| `"global FIFO"` | each FIFO MAIN `<key>_FIFO` | its users see the FIFO's handshake in the same cycle |
+| `"global FIFO handshake"` | a user that both drives and reads one FIFO end | its end reads would be sampled at its first stage and its writes published at its last |
+
+A sweep-unpipelined handshake user meets its goal as written or fails timing with the
+reason above. `AUTO_PIPELINE` of a handshake user is an elaboration error.
+
+## 3. Pipeline stages and register lifetimes
+
+This module decides a pipelined entity's stages and register lifetimes; `VHDL.py`
+renders its architecture from them (see
+[Building a pipelined architecture](VHDL_DESIGN.md#building-a-pipelined-architecture)).
+
+For hierarchical logic, `GET_PIPELINE_MAP` assigns each wire and submodule
+connection to a stage from data dependencies and child latencies, and
+`PiplineHDLParams` turns that map into each wire's register lifetime
+(`wire_to_reg_stage_start_end`: the stages its `REG_STAGE<n>` registers start and
+end in). Names containing `REG_STAGE<n>` are rendered alignment/storage wires, not
+evidence that each source-level variable owns an independent physical delay chain;
+synthesis may merge equivalent registers.
+
+Registers named by `Logic.mcp_tuples` are preserved in the rendered VHDL. The
+recursive timing identity includes the MCP implementation version and sorted
+tuples at each holder, invalidating its ancestors without invalidating unrelated
+leaves. See [MCP constraints](AUTO_MULTI_CYCLE_DESIGN.md#2-constraints).
+
+Reconvergent branches and bypass inputs are aligned to the stage at which
+their consumer runs. An operation-output placement creates a register at that
+instance boundary; values which remain live across it are delayed through the
+same pipeline map. A genuine bit-internal placement delegates the split to
+the raw leaf generator. Exact placements carry their integer boundary group
+through `TimingParams`; every built-in MUX can therefore render a different
+packed output bit chunk in each local stage while the pipeline map aligns its
+condition, data inputs, and partial output. Integer/signed/vector MUXes select
+their native vectors directly. Composite MUXes use the generated
+`<type>_to_slv` functions at stage 0 and `slv_to_<type>` after the final
+chunk, so structs, arrays, enums, floats, and nested combinations use the same
+canonical packed layout as all other VHDL connections. These cases remain
+distinct through lowering, so an output boundary does not get recursively
+pushed into every descendant.
+
+One logical delay-axis cut may lower to a synchronized placement group when a
+parallel or reconvergent frontier needs more than one physical register bank.
+Each member remains an ordinary instance-output or bit-internal placement in
+`TimingParams`; the shared group identity says that the banks form one stage
+boundary and must be materialized or removed atomically. PipelineMap then
+aligns their consumers exactly as it does for an ungrouped boundary. This is
+different from multiple serial slices: the group adds one unit of latency even
+though it contains several physical banks.
+
+The SLV alternatives and partial result are fields of the raw leaf's pipeline
+record. They consequently participate in the same register transfer and live
+wire alignment as native typed values. Slice coordinates, exact packed-bit
+boundaries, and the composite type all remain part of entity hashing; two
+typed entities may share a width-keyed timing-cache result without becoming
+the same VHDL entity or losing their type-specific conversion functions.
+The two-stage two-bit unsigned-adder specialization uses the same mechanism:
+its propagate/generate prefix fields cross the leaf's internal register, then
+the final stage reconstructs the upper sum and carry without leaving another
+complete full-adder path after that register.
+
+`TimingParams._has_input_regs` and `_has_output_regs` implement independent
+entity-boundary registers. They participate in latency, hashing,
+clock/clock-enable requirements, and wire alignment just like internal
+stages. The sweep may therefore put a shared direct connection's register on
+the producer output *or* the consumer input; it must not render both merely
+because adjacent helper instances were independently mini-swept. PipelineMap
+still aligns every other input and bypass at the selected consumer stage. A
+design with `N` serial register slices has `N + 1` combinational pipeline
+stages. The fresh WireGuard shared build validates this lowering on ten
+serial `chacha20_block_step` instances: one internal slice per helper plus
+nine producer-output banks rendered as 19 slices / 20 stages, with no
+redundant output-to-input register pairs.
+
+### Global wires in pipelines
+
+An entity's global wires reach it through its `global_to_module`/`module_to_global`
+records. Those records are connected directly through the hierarchy: a child
+instance's record is port-mapped from its parent's live record, with no stage
+registers, wherever the child sits in the parent's pipeline. Timing is
+therefore decided per entity, inside that entity's own pipeline, by
+`GLOBAL_WIRE_TIMING(var_info)`, which reads `VariableInfo.pipeline_timing`:
+
+| Timing | Set by | Read | Write |
+|---|---|---|---|
+| `"aligned"` | Pypeline `Wire`/`Input`/`Output` | sampled at stage 0 with the arguments | published at the last stage with the return value |
+| `"volatile"` | Pypeline `Wire[T, VOLATILE]` and `Wire[T, ASYNC]` etc. | each consumer reads the live wire at its own stage | driven when its final value is ready |
+| `"legacy"` | C frontend (default) | sampled at the network's earliest use; skipped for C `volatile` globals | driven when ready |
+
+How `PiplineHDLParams` implements it:
+- **Reads.** The read-only global network (`GET_PIPELINE_MAP`) carries wires
+  derived from a global up to the submodule inputs that consume them. The
+  network's register lifetimes start at the base global's stage: 0 for aligned,
+  the earliest use for legacy, each wire's own first read for volatile. The
+  prologue `VAR_g := global_to_module.g` reads the live record before the stage
+  loop; the lifetime registers carry that sample to later stages.
+- **Writes.** `ALIGNED_GLOBAL_WRITES` (shared, aligned write-only globals) are
+  added to the final stage's driver wires, next to `Logic.outputs`. So
+  `VAR_w` is registered from its drive stage to the last stage. The post-loop
+  `module_to_global.w <= VAR_w` then emits the last-stage value. Volatile and
+  legacy writes have an empty lifetime and leave as soon as they are driven.
+- **IO banks.** `ALIGNED_GLOBAL_READS` (declared variables only) join
+  `input_registers_t`, captured from `global_to_module` as
+  `global_<name>`. `ALIGNED_GLOBAL_WRITES` join `output_registers_t`, and
+  `module_to_global` is driven from `io_registers_r`. `VHDL.IO_REG_BANKS` is the one
+  definition of whether a bank exists: the sweep placed it, and it holds
+  arguments, clock enable, aligned reads, return or aligned writes. A function
+  whose only IO is global wires used to declare `io_registers_t` signals without
+  the type (issue #175).
+- **Trimmed reads.** The prologue skips a read whose variable trimming
+  removed (for example an unused `_PYPELINE_READBACK`), instead of naming an
+  undeclared variable.
+- **Clock enable.** When the entity needs one, global writes are still gated by
+  the live stage-0 `clk_en_internal` (see
+  [#122](https://github.com/JulianKemmerer/PipelineC/issues/122)).
+- **Compound wires.** One writer's owned regions are assembled into one record
+  and leave together, aligned or not. Other writers of the same wire keep their own
+  timing (`VHDL.BUILD_MULTI_WRITER_REGIONS`).
+
+Zero-latency entities render identical text under every policy (all lifetimes
+are empty). That is why entity names need no policy term: a pipelined entity's
+text changes, `VHDL.WRITE_TEXT_IF_CHANGED` rewrites it, and synthesis logs are
+reused only for identical inputs. User-facing contract:
+[Global wires in pipelined code](pypeline_guide.md#global-wires-in-pipelined-code).
+
+## 4. Build entry points
+
+`src/pipelinec` calls `AUTO_PIPELINE.DO_PIPELINED_BUILD` for every build without
+`--no_synth`; a `--comb` build runs it too, as one combinational synthesis. It dispatches to `AUTO_FSM.DO_SCHEDULE_PASSES` when the design has
+AUTO_FSM call sites (which wraps the flow below, see
+[`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md#34-the-driver-loop)) and otherwise to
+`DO_SWEEP_AND_AUTO_PIPELINE`:
+
+```
+DO_SWEEP_AND_AUTO_PIPELINE
+    AUTO_MULTI_CYCLE.CHECK_AUTO_MULTI_CYCLE_TAGS_READ
+    SWEEP.DO_THROUGHPUT_SWEEP                 <- pass 1: the full sweep
+    DO_AUTO_PIPELINE_LATENCY_PASSES           <- §5: harvest, and if needed
+        AUTO_FSM.REPARSE with .latency pinned,
+        SEED_TIMING_PARAMS_FROM_PREVIOUS,
+        SWEEP.DO_SEEDED_CONFIRM_OR_SWEEP      <- one confirmation synthesis
+```
+
+Builds that run no sweep (`--comb`, `--no_synth`, `--yosys_json`) use
+`BUILD_FIXED_AUTO_PIPELINE_TIMING_PARAMS` instead (§6). A `--comb` or `--no_synth`
+build writes its final files with it through `WRITE_COMB_FINAL_FILES`, then runs
+the syn `@final` hooks. A `--no_synth` build with no fixed call sites keeps the
+zero-added-clocks files as its final VHDL. With no synthesis tool for the part,
+the driver continues as `--comb --no_synth`, and `SWITCH_TO_FIXED_ONLY_BUILD`
+switches the build mode to `"fixed_only"` and drops the starting latencies. It
+re-elaborates the design if its Python already read a `start_latency=` or a
+starting latency.
+
+## 5. `.latency` pin-and-confirm loop (Pypeline designs only)
+
+Pypeline's `AUTO_PIPELINE(func)` tag exposes the sweep's discovered stage count back to
+the design's Python as `.latency` (e.g. `make_stream_auto_pipeline` sizes its output FIFO
+from it). The stage count only exists *after* the sweep, so `DO_SWEEP_AND_AUTO_PIPELINE`
+wraps the parse+sweep sequence in an outer loop — a **pin-and-confirm** loop, not a
+repeat-the-sweep one:
+
+1. **Pass 1 (bootstrap, identical to a normal build):** `PARSE_FILE` with an empty
+   latency cache (`.latency` reads 0, or a call site's fixed `latency=N` /
+   `start_latency=S`, or a starting latency from the
+   [latency memory or `--latency_hints`](SWEEP_DESIGN.md#5-latency-memory)) → path delays → full throughput
+   sweep → `HARVEST_AUTO_PIPELINE_LATENCIES` walks the finished
+   TimingParamsLookupTable and groups each AUTO_PIPELINE-tagged instance's
+   `GET_TOTAL_LATENCY` by binding (`AUTO.AUTO_PIPELINE_BINDING`: the tag's canonical
+   key, or that key at the instance's MAIN's clock goal when the key is used at
+   several goals, so each goal gets its own depth; see
+   [AUTO_DESIGN.md](AUTO_DESIGN.md#7-clock-goals-of-auto-objects)) (a pure in-memory
+   walk; no synthesis, no file I/O). Instances of one binding with different depths
+   stop the build (`AUTO_PIPELINE_DIVERGENCE_EXIT`). The harvest invalidates every entry's memoized
+   latency/hash first (same rationale as `WRITE_FINAL_FILES`): the planner
+   mutates submodule `_slices` after container totals were first memoized,
+   and a stale memo here would feed `.latency` (and the native simulator's
+   delay lines) a number contradicting the entities actually written.
+   Pinned AUTO_FSM units (§6) are not harvested: their latency is part of
+   their FSM's schedule, not a bottom-up value.
+2. **Early exits (the zero-added-cost invariant):** if there are no AUTO_PIPELINE call
+   sites, or the design's Python never *read* any `.latency`
+   (`pypeline.AUTO_PIPELINE_LATENCY_WAS_READ()`, a read-tracked property flag), or every
+   value it read already equals the stage count harvested for its binding, the
+   loop ends here. The second check compares `pypeline.AUTO_PIPELINE_SERVED_LATENCIES()`
+   with the harvest using `AUTO_PIPELINE_SERVED_VALUES_MATCH`, and holds for fixed
+   `latency=` call sites, a correct `start_latency=` guess or remembered latency, or a
+   discovered 0. It
+   prints "skipping pin-and-confirm pass 2". Either way the loop ends here — the cache couldn't have influenced the elaborated design, so
+   pass 1's result is final. Cost is exactly the classic single parse + single
+   sweep. `.c` designs never enter the loop at all (`AUTO_PIPELINE` is
+   Pypeline-only syntax).
+3. **Pass 2 (pin + confirm):** install the harvested latencies
+   (`pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE`), re-run `PARSE_FILE` through
+   `AUTO_FSM.REPARSE` (re-executes the whole design import graph; `.latency` reads now
+   resolve). When the new values change an AUTO_FSM's function, for example compute
+   sized from a depth, the call site is new to the build, and `REPARSE` schedules it
+   before the confirmation
+   ([`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md#34-the-driver-loop)). Then rewrite the zero-clk
+   VHDL (a struct sized from `.latency` can change layout under an unchanged VHDL type
+   name, and `c_structs_pkg` then starts over from pass 2's types instead of declaring
+   that name twice, see
+   [VHDL_DESIGN.md](VHDL_DESIGN.md#generated-vhdl-is-the-same-in-every-pass-of-a-run)),
+   re-run path delays (mostly disk-cached), then
+   `SEED_TIMING_PARAMS_FROM_PREVIOUS` carries the concrete solution into the
+   fresh zero-clk table (`CAPTURE_CONCRETE_PIPELINE` /
+   `CONCRETE_PIPELINE_COMPATIBLE`). AUTO_PIPELINE regions match by owning MAIN
+   and canonical call-site key; descendants match by relative instance path
+   within that region.
+   This survives a renamed FIFO or factory wrapper without confusing repeated
+   calls of the same helper. Empty placements are preserved alongside slices,
+   exact bit boundaries, IO banks and fixed flags. A region prefers its exact
+   previous path, then previous replicas with the same local call-site name.
+   Same-key replicas share one harvested depth, so when their placements
+   differ the most common one (ties: first path) is replayed and printed; any
+   choice keeps `.latency` true, and confirmation checks timing. A region whose
+   interior instances, functions or types match no previous replica breaks the
+   rule that an AUTO_PIPELINE'd function must not depend on `.latency`, and
+   fails (`SeedReplayError`) before confirmation synthesis. Pinned AUTO_FSM
+   units are not replayed as regions: region enforcement restores them from
+   their FSM's schedule (§6), and a newly scheduled FSM brings units no
+   previous pass had. An exact full-path match is used outside replayed regions. A function-name fallback there
+   requires all previous occurrences in that MAIN to agree, including empty
+   occurrences.
+   Matching checks function and wire types. Every nonempty placement also obeys
+   the new caller's added-latency eligibility; an MCP holder cannot inherit
+   registers from a pipelined occurrence elsewhere. Seeding ends by
+   invalidating EVERY entry's cached hash/latency strings — cached hash
+   chains embed child func names, and any cache carried across the
+   re-elaboration boundary may reference since-renamed entities (the class
+   of bug behind a "unit not found" GHDL failure on a shared-across-instances
+   design). Then `SWEEP.DO_SEEDED_CONFIRM_OR_SWEEP` runs **one** full-design
+   synthesis. The loop stops only when the post-confirmation harvest
+   **equals** the values this pass's Python consumed — meeting timing alone
+   is not sufficient: a changed implementation from constrained-region enforcement
+   or fallback can alter a discovered latency, and MCP counts can grow after a
+   real shape change. Concrete replay alone must preserve an unchanged region's
+   entity hash and depth. If confirmed depths or MCP counts change, the loop
+   re-elaborates with those numbers; on exit the
+   `.latency` values the design consumed provably equal the stage counts built. The
+   confirmation uses the current HDL/constraint/recipe identity: an exact match
+   may reuse a complete cached report, while changed inputs require synthesis.
+   Timing hashes (`RECURSIVE_GET_IO_REGS_AND_NO_SUBMODULE_SLICES`)
+   record each child's func name alongside its subtree, so a design whose
+   descendants renamed (resized FIFO) hashes differently from pass 1 even
+   with identical slices — both the multimain top log name and every entity
+   filename are content-aware, which also keeps the skip-if-exists entity
+   write sound ("same filename ⇒ same rendered content"). The module's own
+   name is deliberately not in its tuple (it's already in every filename),
+   so leaf tuples — and therefore previously cached leaf synthesis logs —
+   are unaffected. An instance with a `RESET` port
+   (`VHDL.LOGIC_NEEDS_RESET`) adds `("reset", RESET_IMPLEMENTATION_VERSION,
+   policy)`, since its text holds that reset policy's logic; reset-free
+   instances add nothing, so their names do not change
+   ([VHDL design](VHDL_DESIGN.md#resets)). The zero-added-clocks hash cache
+   (`GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP`) is keyed by function name and
+   the instance's reset policy for the same reason. The confirmation's verdict feeds the driver's
+   TIMING-NOT-MET exit gate via `sweep_timing_failures` (empty on met; a
+   failed confirmation falls back to the full sweep, whose own result then
+   governs). The confirmation also records its measurements in
+   `sweep_history.json` (`SWEEP.RECORD_CONFIRMATION_RESULTS`). A pass makes
+   each goal main's `final.source` `confirmation_run`: a passing confirmation
+   runs no sweep, so otherwise the file would still describe the previous
+   pass's sweep ([`SWEEP_DESIGN.md` *Plan*](SWEEP_DESIGN.md#plan)). `SYN.WRITE_FINAL_FILES` additionally invalidates the entire
+   final table before writing (final files computed 100% against current
+   state) and runs `CHECK_VHDL_FILES_CONSISTENCY`: every `entity work.X`
+   referenced inside a listed file must be defined by a listed file, turning
+   any stale/mixed entity references into an immediate build error instead
+   of a downstream GHDL/Vivado analysis failure.
+4. **Repair or fallback:** endpoint-qualified isolated MCP measurements seed counts
+   before confirmation. If a seed changes a count this elaboration consumed, the
+   handshake's compare constant changes, so no confirmation is synthesized: the
+   pass re-elaborates with the seeded counts at once. Such passes don't count
+   against the pass limit below; more than `AUTO_PIPELINE_MAX_LATENCY_PASSES` of
+   them in a row fail the build, advising `latency=N` on the AUTO_MULTI_CYCLE.
+   If only MCP paths fail, update their constraints and re-confirm with every
+   pipeline pinned. If pipelined logic fails, replan only implicated MAINs;
+   replay unaffected MAIN placements and compatible concrete hotspot locks.
+   Harvest again and return to step 3 with the new numbers. Earlier timing
+   passes are provisional while `.latency` changes the hardware. Bounded by
+   `AUTO_PIPELINE_MAX_LATENCY_PASSES` (3 total passes); at
+   the cap the build fails loudly, advising an explicit `latency=N` pin at the
+   unstable call site.
+
+Hard errors (instead of silently-wrong hardware):
+- **Divergent `.latency`:** one binding's instances (one key at one clock goal) given
+  *different* discovered stage counts — legal per-instance in the framework,
+  unrepresentable as the single `.latency` int the design's Python read. Fix: pin
+  `latency=N`.
+- **`.latency` of an object used at several clock goals:** each of its instances is
+  pipelined for its own MAIN's goal, so no one value matches; `PY_TO_LOGIC.PARSE_FILE`
+  raises (`AUTO.AUTO_GOAL_READ_PROBLEMS`) naming the object's construction line, its
+  goals and the read sites. Fix: construct one object per clock domain (a separate
+  `AUTO_PIPELINE(...)` or factory call each); unread, one object at several goals is
+  fine.
+- **Call-site set changed between passes:** an AUTO_PIPELINE-tagged instance on pass
+  2 whose func didn't exist in pass 1 (detected as unseedable) — i.e. Python control
+  flow, or closure-captured values encoded in a tagged function's identity, depended
+  on `.latency`'s own value. Only sizing *outside* AUTO_PIPELINE'd functions may
+  depend on it.
+- **No settling within the pass cap:** a `.latency`-derived change keeps perturbing
+  timing enough to change the discovered stage counts themselves.
+
+**The pass report.** Each pass prints what its elaboration read, what was then built,
+and where in the source each value was read. This makes a re-elaboration
+explainable, and so makes clear which source line turned a bottom-up value into
+hardware.
+- **Recording reads.** `AUTO_PIPELINE.latency` (in sweep/fixed builds) and
+  `AUTO_MULTI_CYCLE.latency`/`.ncycles` record a site per read, beside the served value
+  (`pypeline.AUTO_PIPELINE_READ_SITES`, `AUTO_MULTI_CYCLE_READ_SITES`). The site is the
+  first frame outside `pypeline.py`. When that frame is in `include/pypeline` (a
+  factory sizing its own FIFO), it also names the nearest design frame:
+  `stream_auto_pipeline.py:111 (via top.py:20)`. A read inside a hardware body
+  happens while the elaborator folds a constant, in code compiled under a pseudo
+  file name (`<const_eval>`) that keeps the body's line numbers. Its site is the
+  elaborated function's own file at that line (the nearest frame whose `self` has a
+  `src_file`), for example `stream_multi_cycle.py:161`, the multi-cycle wrapper's
+  handshake compare.
+- **Recording each pass.** `AUTO_PIPELINE.RECORD_LATENCY_PASS` runs after pass 1's
+  skip-or-loop decision, and after each later pass's harvest. It records
+  `{pass, outcome, reads: [{kind, key, read, built, matches, read_at}]}` in
+  `LATENCY_PASS_RECORDS` and prints them. A pass whose elaboration read nothing
+  records nothing.
+- **sweep_history.json.** `SWEEP.WRITE_SWEEP_HISTORY` writes the records as
+  `latency_passes` (schema 4; see [SWEEP_DESIGN.md](SWEEP_DESIGN.md#plan)).
+- **Tests.** `bottom_up_report_test.py` (unit) covers the sites and rows.
+  `design_params_build_test.py` covers a re-elaborating sky130 build.
+
+Repeated-`PARSE_FILE` support (sys.modules eviction of the design import graph,
+per-parse compiler-cache cleanup via `DEL_ALL_CACHES`) lives in `PY_TO_LOGIC.py` —
+see `PY_TO_LOGIC_DESIGN.md`'s AUTO_PIPELINE section. Design parameters (`param()`,
+`-D`) resolve once per process and are identical in every pass (see
+[pypeline_DESIGN.md](pypeline_DESIGN.md#design-parameters-param--d)).
+
+The converged harvest has one more consumer: a non-`--comb` `--sim` run hands it
+(plus the final per-MAIN latencies) to the native simulator at the end of the build,
+which re-imports the design with the cache installed and emulates every latency —
+see [`pypeline_sim_DESIGN.md`](pypeline_sim_DESIGN.md)'s "Pipelined native sim" section.
+
+## 6. Constrained AUTO_PIPELINE regions (`latency=` / `start_latency=` / `max_latency=`)
+
+`AUTO_PIPELINE(func, latency=N)`, `start_latency=S` and `max_latency=M` record a
+`LOGIC.AutoPipelineLatency` for each tagged instance, in
+`Logic.sub_inst_to_auto_pipeline_latency`. C's `#pragma AUTOPIPELINE N` records a fixed
+N the same way. Eligible unconstrained tags under a MAIN with a clock goal also
+use the independent region planner below, without a prescribed starting count.
+An unconstrained callee is eligible when it can absorb added latency and contains
+no further AUTO_PIPELINE tags. Otherwise traversal continues toward eligible
+inner tags. Unseeded unconstrained tags under goal-less MAINs need no planning.
+
+AUTO_FSM's internal unit tags additionally carry `_auto_fsm_implementation`,
+copied into `LOGIC.AutoPipelineLatency.fsm_implementation`. These are fixed
+regions whose concrete recipe belongs to the FSM schedule. Enforcement restores
+their relative instance slices, boundary registers and exact bit boundaries,
+then checks the placement digest and realized latency. It does this even when
+the register count already matches. Hotspot feedback cannot rebalance or grow
+such a region; a changed placement is an internal error. The FSM's schedule
+repair owns implementation changes. This marker adds no public tag argument.
+For the same reason the pin-and-confirm loop neither harvests these regions
+as `.latency` values nor replays them from the previous pass (§5,
+`_PINNED_AUTO_FSM_UNIT`).
+
+Some library wrappers own exactly one core AUTO_PIPELINE and accept the same keyword-only
+arguments:
+- `make_stream_auto_pipeline`;
+- the DSP factories `make_fir`, `make_fir_decim`, `make_fir_interp`, `make_dc_block`,
+  `make_moving_avg` and `make_magnitude`.
+
+They pass the arguments unchanged into that core's tag through
+`pypeline._auto_pipeline_with_io_regs`, so the core becomes an ordinary constrained
+region. Its boundary registers stay outside the count. A stream wrapper exposes no
+`.latency` of its own, since valid/ready is not a fixed latency. It sizes its FIFO from the
+core tag's `.latency`. That is S during a sweep build's bootstrap with
+`start_latency=S`, so a correct seed lets the served-value skip below drop pass 2.
+
+**Planned sweep (`ENFORCE_AUTO_PIPELINE_REGIONS`).** A tagged instance is
+latency-decoupled from its container (`GET_SUBMODULE_LATENCY` reports it as 0), so each
+eligible instance is treated as its own *region*, with or without a starting hint.
+This keeps surrounding stateful delays out of the tag's placement geometry. Every
+iteration, right after
+`SWEEP.APPLY_LOCKS` and before any cut-subtree landscape is built, each region goes through:
+1. its own `SWEEP.BUILD_SLICE_LANDSCAPE`;
+2. choosing a register count K;
+3. count-targeted placements;
+4. real lowering (`SWEEP.APPLY_PIPELINE_PLACEMENTS` → `SWEEP.CHECK_PIPELINE_PLACEMENTS_REALIZED` →
+   `SWEEP.DROP_NON_DEEPENING_PLACEMENTS`);
+5. verification against its real `GET_TOTAL_LATENCY`;
+6. `params_are_fixed`.
+
+A mini-sweep lock covers the eligible instances in the blamed MAIN, and
+`SWEEP.SHARE_LOCK` then puts it into every eligible instance in the MAINs at
+the same clock goal (the plan's `peers`). `MINISWEEP_LOCK_TARGETS` bounds
+each plan's region-conflict checks to its own MAIN. If no in-MAIN instance
+can absorb latency, the helper is unpipelinable in that plan.
+
+Containing landscapes then see an ordinary `Segment.LOCKED`, the mini-sweep lock path. A
+region that is itself a cut-subtree root (its caller cannot absorb latency) takes the
+existing locked-root branch, and a mini-sweep may still lock its root, as for any
+uncapped region root. Clamping
+cuts inside a shared landscape instead would not work: parallel branches share one
+delay axis, and the container can't count the region's latency.
+
+- **Register count K.**
+  - Fixed: K = N.
+  - A start on its first iteration: K = S, where S is `constraint.start()`, the
+    tag's seed from the latency memory or a hints file, else its `start_latency`. A
+    capped region with a seed starts there too. The region's private budget divisor
+    `region.scale` is calibrated so that unchanged knobs keep reproducing S. A
+    region whose landscape already holds mini-sweep locks (`Segment.LOCKED`,
+    e.g. carried into a later pass) skips this bootstrap: S more cuts on top
+    of the locks would over-pipeline it. A seed gives an unconstrained tag a
+    starting count (`AutoPipelineLatency.is_region` reports constraints or seeds),
+    as if it had that `start_latency=`. Clock-driven eligible tags are collected
+    even when this predicate is false, so a hint changes the initial count rather
+    than whether the tag has its own landscape. A callee that holds another
+    AUTO_PIPELINE or can't take added latency remains outside the independent
+    region planner. `SWEEP.APPLY_LATENCY_MEMORY` selects matching callee-subtree digests,
+    part and tool at the current goal or highest lower goal before the final parse
+    ([SWEEP_DESIGN.md §5](SWEEP_DESIGN.md#5-latency-memory)). In pass 2 and later
+    the harvested cache supersedes the seed (`constraint.seed` is `None`), so every
+    region again starts from its source constraint.
+  - A floor from a lower goal: a depth remembered at a lower clock goal is the
+    start unless a hint is deeper, and it is also the least the region realizes at
+    this one (`SWEEP.LATENCY_MEMORY_AP_FLOORS`, applied
+    by `_ENFORCE_ONE_AUTO_PIPELINE_REGION` in every pass, capped at M), so the sweep
+    doesn't probe below it. Only a region takes a floor: the seeded tags
+    `COLLECT_AUTO_PIPELINE_REGIONS` leaves unconstrained never get one, since nothing
+    would enforce it. The cost: a lower-goal result that was itself deeper than
+    necessary (the post-met trim is limited) carries that depth upward.
+  - Otherwise: the planner's own count for the plan's clock period, with the budget
+    divided by `global_scale * region.scale` and in-region weights including
+    `func_delay_scale`, capped at M.
+
+  Instances that share a binding (one canonical key at one clock goal,
+  `AUTO.AUTO_PIPELINE_BINDING`; `region.key` is the binding) form one group and are
+  planned to one K, so the harvested `.latency` can't diverge between them. Members at
+  another goal are another group, with a depth of their own. When the members lie in
+  several MAINs at one clock goal, a decision for the group is made for every member: growth,
+  rebalancing and post-lock recalibration (`_REGION_GROUP_PLANS`) as well as interior
+  locks (`SWEEP.SHARE_LOCK`). The other MAIN takes no decision of its own for that
+  hotspot in the same iteration. `AUTO_PIPELINE(func, name=)` gives
+  a group its own key, so two names on one function are two groups planned
+  independently. Their instances retain callee-derived call-site labels; `name=` never changes
+  emitted hierarchy or path attribution. Duplicate-call collapse never merges two groups.
+- **Count-targeted placement (`COUNT_TARGETED_PLACEMENTS`).** Bisect the budget given to
+  `SWEEP.PLAN_PIPELINE_PLACEMENTS` until it yields K; cut count never increases as the budget
+  grows. The result is the planner's own tightest-stage placement for exactly K
+  registers. When the count jumps past K, the nearest larger plan is trimmed down
+  (`_TRIM_PLACEMENT_PLAN_TO_COUNT`). When no budget reaches K, the plan short of it
+  comes with the largest budget giving its cut count. The bisection's last budget
+  would be about 1e-6, and calibrating `region.scale` from it gave scales of 10⁸. Asking a fixed region for more registers than it
+  has legal positions is an error.
+- **Verify and retry.** The realized latency can differ from the cut count, because of
+  built-in operator stage granularity or non-deepening drops. A fixed region that
+  realizes anything but N, or a capped region that realizes more than M, is reset to
+  zero clocks and re-planned with a corrected count (`AUTO_PIPELINE_REGION_RETRIES`). If
+  that still fails, the build exits and names the call site, the constraint and the
+  realized value.
+- **Growth and shrinking.**
+  - Region landscapes feed `SWEEP.RANK_PATH_FUNC_CANDIDATES`, and a region root counts as a
+    valid attribution. A root is also found by its instance's exact label path
+    (`SYN.INSTANCE_LABEL_POSITION`) when no function name matched: the tagged call is
+    labeled with the wrapped function's bare name, and an imported function's name is
+    module-prefixed. When `REGION_FOR_HOTSPOT` places a critical path inside a region,
+    that group's `region.scale` is multiplied (the `grow_auto_pipeline` action).
+    In an uncapped region, the second consecutive attribution to the same hotspot, an
+    interior helper or the root itself, runs the mini-sweep instead, as for an
+    untagged call site (`SWEEP.TRY_HOTSPOT_MINISWEEP`). After the lock,
+    `RESET_REGION_CALIBRATION_AFTER_LOCK` resets the group's `region.scale` to
+    1.0, so the rest of the region is planned from the clock period. A locked root
+    holds the whole region: `_ENFORCE_ONE_AUTO_PIPELINE_REGION` realizes it from the
+    lock (`params_are_fixed` after `SWEEP.APPLY_LOCKS`), with no planned cuts, no
+    landscape and no growth.
+  - Global replans grow regions too.
+  - If nothing else in the plan can change and no region count moved, the region with
+    the worst predicted stage gets one more register.
+  - Trimming after timing is met counts non-fixed region cuts and can shrink them,
+    including below `start_latency`.
+- **At the cap.** A hotspot in a region at its limit (fixed, or realized = M) first gets
+  one same-count rebalance, with the hotspot's weight raised. If that doesn't help, the
+  plan stops with `stopped_reason = "auto_pipeline_latency_limit"` and prints
+  `[sweep] WARNING: ... limited by AUTO_PIPELINE latency constraint(s) ...`, followed by
+  the usual TIMING NOT MET exit. Two cases stop the same way without an attributed
+  hotspot:
+  - no attribution is available (PyRTL) and every register the plan can place is
+    inside capped regions;
+  - an iteration's physical schedule fingerprint (region placements included) repeats
+    one already tried while a region is at its cap. This stops before re-synthesizing.
+- **Mini-sweeps** never lock a hotspot that contains a region, or that is the root of
+  or lies inside a fixed (`latency=`) or capped (`max_latency=`) region: those own their
+  count, and a recount resets the interior. In an uncapped region they lock the root or
+  an interior helper (`SWEEP.REGION_LOCK_BLOCKER`): every member of the region's group
+  is in the blamed MAIN or a MAIN at its clock goal, and the lock goes into every
+  member. A `start_latency=` hint is a starting count only, and region-wide growth over
+  a serial-layout delay model can need twice the registers. See
+  [`SWEEP_DESIGN.md` History](SWEEP_DESIGN.md#start_latency-regions-and-mini-sweeps).
+- **Everything else includes regions:**
+  - snapshots;
+  - `sweep_history.json` and placement traces (`auto_pipeline_regions`);
+  - the final summary (`[sweep] AUTO_PIPELINE <key> (<constraint>): N clk(s) built at <inst>`);
+  - `AUTO_PIPELINE_CONSTRAINTS_REALIZED_PROBLEMS`, which lists violated source caps
+    and fixed counts without exiting, plus the lower-goal memory floors when asked
+    (`memory_floors=True`). MAIN replay asks before confirmation, since a constraint
+    edit need not change zero-clock VHDL;
+  - `CHECK_AUTO_PIPELINE_CONSTRAINTS_REALIZED`, the safety net run on every final
+    table and after every harvest. It checks source constraints only: a remembered
+    floor is a reuse policy, never a reason a build fails.
+
+**Coarse sweep.** `BUILD_AND_WRITE_COARSE_SLICED_TIMING_PARAMS` enforces fixed regions
+before slicing the main's even fractions; slicing skips locked children. Afterwards it
+re-plans any region that those fractions pushed over `max_latency` back down to its cap
+(`REENFORCE_AUTO_PIPELINE_REGIONS`). Under a coarse sweep, `start_latency` only
+sets the bootstrap `.latency`, and a NOTE says so.
+
+**Builds without a sweep.** `--comb`, `--no_synth` and `--yosys_json` still build every
+fixed latency. `BUILD_FIXED_AUTO_PIPELINE_TIMING_PARAMS`:
+1. measures delays for just those regions' subtrees
+   (`SYN.ADD_PATH_DELAY_TO_LOOKUP(parser_state, root_func_names=...)`);
+2. enforces the regions on a zero-clock table;
+3. hands that table to `SYN.WRITE_FINAL_FILES`, the `--comb` characterization synthesis,
+   and a cocotb/GHDL comb-stage sim.
+
+Without a timing-capable tool, the PyRTL delay model is borrowed for the measurement.
+The latency is still exact; only the stage balance is estimated. The path-delay cache
+is keyed per tool, so the borrowed numbers don't pollute another tool's cache. Designs
+with no fixed latency above 0 keep the historical zero-clock path.
+`pypeline.SET_AUTO_PIPELINE_BUILD_MODE` (`"sweep"` / `"fixed_only"`, set by `pypelinec`
+before parsing) decides whether `start_latency` feeds the bootstrap `.latency`. If the
+no-tool fallback downgrades a sweep build after start values were already read, the
+design is re-elaborated.
+
+**Pin-and-confirm.** Seeding by function name can copy another call site's slices onto a
+constrained region, so the seeded table goes through `REENFORCE_AUTO_PIPELINE_REGIONS`
+before the confirmation synthesis. The served-value skip in step 2 means fixed latencies
+and correct `start_latency` guesses cost no second elaboration.
+
+## 7. Tests
+
+Tests live in `src/tests/pypeline_tests/inst/`; see
+[`pypeline_TESTS.md`](pypeline_TESTS.md#auto_pipeline-latency-constraint-coverage)
+for the full coverage list. The ones that exercise this module end to end
+(all under `--syn_tool device_models` unless marked):
+
+| test | proves |
+|---|---|
+| `auto_pipeline_latency_test.py` | end-to-end factory design (`make_stream_auto_pipeline`) at 100 MHz, above its unpipelined speed, through the full sweep **plus** the §5 pin-and-confirm loop: pass 2 runs, harvested `.latency` > 0, the seeded confirmation synthesis passes with no fallback sweep, the loop settles within the pass cap, and `sweep_history.json` `final` records come from the confirmation run |
+| `auto_fsm_latency_sized_test.py` | the same core sizing an AUTO_FSM's function (lanes = depth + 2): the AUTO_FSM call site pass 2 creates is scheduled by `AUTO_FSM.REPARSE` before the one seeded confirmation synthesis, and the build exits 0 |
+| `auto_pipeline_constraints_test.py` | §6 constrained regions: `latency=2` / `start_latency=1` call sites built with exactly 2 / 1 registers and pass 2 skipped; a `max_latency=1` cap stops an unreachable goal promptly, naming the cap, then `TIMING NOT MET`; `make_stream_auto_pipeline(..., start_latency=1)` sizes its bootstrap FIFO from the hint, settles in one sweep iteration and skips pass 2 when the hint matches, and grows past a too-small hint (pass 2 resizes the FIFO) |
+| `auto_pipeline_region_minisweep_test.py` | `start_latency=1` is only a starting guess: a ChaCha-shaped chain of a repeated helper (quarter rounds written in series on a shared state) takes the same mini-sweep lock and reaches the same depth (11) in at most five whole-design checks including two optional trim probes, with and without the hint; final history retains six locks and measured passing timing (before the fix the hinted build reached 22 in five) |
+| `region_root_minisweep_test.py` | an imported function tagged directly is its region's root (#387): its critical path is found by the root instance's label path, the root itself is mini-swept and locked, and the build reaches the same depth as tagging a one-line wrapper, which mini-sweeps the function inside it |
+| `auto_pipeline_c_pragma_test.py` | C `#pragma AUTOPIPELINE 2` is a fixed latency, built with exactly 2 clocks even by a `--comb` build |
+| `sweep_fsm_auto_pipeline_test.py` | Reg-FSM main + AUTO_PIPELINE region: the cut subtree is the tagged child, the FSM's latency stays 0 |
+| `sweep_float32_test.py` (registered once per backend, **every** `--syn_tool`) | a plain auto-pipelined float32 adder MAIN sweeps to its goal on every synthesis backend, not just sky130 -- see [pypeline_TESTS.md](pypeline_TESTS.md#per-syn_tool-sweep-coverage) |
+
+In-process: [`added_latency_context_test.py`](../src/tests/pypeline_tests/inst/added_latency_context_test.py)
+checks the shared caller rule, pre-write rejection, seeding eligibility, per-MAIN
+locks, and bridge gaps with an elaborated fixed/auto MCP design and synthetic
+delays. `auto_pipeline_harvest_test.py` (harvest grouping and divergence,
+concrete region replay, guarded fallback matching, call-site-change detection, pinned AUTO_FSM
+units skipped by harvest and replay, latency cache/read flag, constructor validation), `auto_pipeline_region_planning_test.py` (region
+planning), `pipeline_latency_test.py` (fixed user pipelines),
+`typed_pipeline_placement_test.py` and `mux_fanout_planning_test.py`
+(placement lowering through `TimingParams` and the pipeline map).
+
+## 8. Auto-pipelined RAM
+
+`ram.make_auto_pipeline_ram` and
+`stream.stream_ram.make_stream_auto_pipeline_ram` use the existing RAM port
+types and initialization conventions, with a synchronous memory access at
+every implementation point. Their minimum latency is **one enabled clock**.
+They never use a zero-cycle asynchronous-read memory as a timing baseline.
+
+One plan serves a configuration (its key) wherever it is used: `RAM_SEARCH` accepts a
+plan only when every clock meets timing, so identical RAM configurations under MAINs at
+different clock goals share a plan sized for the fastest. Separate per-goal plans for one
+configuration are not supported yet.
+
+Supported synthesis targets are Vivado (validated on `xc7a200tffg1156-2`) and
+ECP5 with `OPEN_TOOLS` (GHDL, Yosys, nextpnr-ecp5), tested on
+`LFE5U-85F-6BG381C`. A synthesis build using another backend is rejected.
+Native simulation and VHDL emission do not
+require an FPGA tool. The manual `make_ram` and `make_stream_ram` factories
+retain their existing implementations and semantics.
+
+### RAM API and ordering
+
+Both RAM factories return the callable itself, with the complete multi-port
+result type at `.return_t`. Existing `.out_t` aliases that same type; request,
+response and per-port metadata retain their individual meanings. Manual RAM
+caches store the callable, so cached construction retains its attached types.
+
+```python
+from pypeline import uint32_t
+from ram import make_auto_pipeline_ram
+from stream.stream_ram import make_stream_auto_pipeline_ram
+
+ram = make_auto_pipeline_ram(
+    uint32_t, 65536, ports=("w", "r"), max_latency=9,
+)
+stream_ram = make_stream_auto_pipeline_ram(
+    uint32_t, 65536, ports=("w", "r"), max_latency=9,
+)
+```
+
+Both factories take `elem_t, size, ports=("rw",), init=None,
+byte_write_enables=False`, then keyword-only `latency=None,
+start_latency=None, max_latency=None`. These constraints count **total** RAM
+latency, including the synchronous read. Every supplied value must be an
+integer at least one; fixed `latency` cannot be combined with the other two.
+`start_latency` is a synthesis bootstrap guess, which can subsequently be
+trimmed; `max_latency` is a hard ceiling. Fixed latency is exact in native
+simulation, HDL-only builds, and synthesis. Without a fixed latency, plain
+native simulation and builds without a sweep use one cycle.
+
+Port structures, request-field echoes, signed/compound element packing,
+initialization, and byte-write-enable types match `make_ram`. All raw RAM ports
+have the same fixed response latency, available as `.latency`. Each physical
+instance owns independent memory. The `.plan` value describes the chosen
+implementation for inspection; build reports include its fields as well.
+
+`.read_after_write_gap` is a conservative guaranteed separation between
+accepting a write and accepting a dependent read to the same address. It is
+`1 + input_regs + request_levels`, counted in **enabled clocks**, not in
+transactions. Waiting that many clocks guarantees that the write has reached
+memory before the dependent read, unless another write intervenes. Waiting
+for the corresponding stream write response before issuing the read is also
+sufficient. Balanced paths can work with a smaller separation, but callers
+must not depend on that stronger behavior.
+
+The new factories do not promise read-first collision behavior or a
+highest-port write priority. Native simulation and simulation-only VHDL
+assertions diagnose early dependent reads and simultaneous writes to
+overlapping bits. Ordinary `rw` writes are legal: their echoed request is
+valid, but their `rd_data` is unspecified. Disjoint byte writes do not
+constitute overlapping writes. Invalid requests do not write memory.
+
+Non-power-of-two sizes preserve the manual factory's convention: simulation
+wraps addresses modulo size; out-of-range hardware addresses are undefined.
+`CLOCK_ENABLE` freezes memory updates and every pipeline stage, including the
+simulation hazard history. There is no new reset or flush port.
+
+### RAM register placement and splitting
+
+The unsplit candidates are tried first:
+
+```text
+1 cycle:   request --------------------> [BRAM read: 1] ----------> response
+2 cycles:  request --> [input register] > [BRAM read: 1] ----------> response
+     or:   request --------------------> [BRAM read: 1] --> [out] > response
+3 cycles:  request --> [input register] > [BRAM read: 1] --> [out] > response
+```
+
+Splitting partitions the address space into contiguous depth banks. High
+address bits select a bank; low bits address a word inside that bank. Write
+data and byte enables accompany the request. Each routing node distributes
+to only two children, registering the bundle and bank-specific valid. Only
+the selected bank writes. Read results travel back through a binary tree;
+each result carries its own valid bit, so selection does not require a
+single global bank-select signal with large fanout.
+
+Here is a fully registered **four-bank** implementation (`split_depth=2`):
+
+```text
+                         REQUEST TREE        MEMORY LEAVES        RETURN TREE
+
+                         /--[R]--------> [BRAM 0] -->[O]--\
+              /--[R]----<                                [M]--\
+             /           \--[R]--------> [BRAM 1] -->[O]--/     \
+request->[I]<                                                  [M]-->response
+             \           /--[R]--------> [BRAM 2] -->[O]--\     /
+              \--[R]----<                                [M]--/
+                         \--[R]--------> [BRAM 3] -->[O]--/
+
+stage:    1       2           3               4        5    6     7
+
+[I]    input register
+[R]    registered request routing (address, data, enables, valid)
+[BRAM] one-cycle synchronous read; writes commit at this memory stage
+[O]    local output register, directly after each BRAM and before any mux
+[M]    registered two-input read selection, with accompanying valid
+```
+
+The extra output register is local to each leaf, so the slow BRAM output
+does not pass through a selection LUT before reaching a register. Request
+echo fields are delayed alongside this structure to the same final cycle.
+
+This example has latency seven and `read_after_write_gap=4`. In general a
+fully registered tree of depth `d` takes `3 + 2*d` clocks. At intermediate
+latencies, the newly introduced request level or return level can remain
+combinational; both alternatives are measured. Automatic splitting always
+retains the input and local output registers first.
+
+For a write accepted at enabled cycle `t`, the four-bank example guarantees
+a dependent read can be accepted at `t+4`; its response arrives at `t+11`.
+Disabled clocks do not count toward either interval. The tree pads the
+address space to a power of two, so non-power-of-two sizes can leave unused
+capacity in the last banks.
+
+Leaf depth is bounded by the resolved target's BRAM geometry: the search stops subdividing
+when a leaf no longer needs serial depth cascading. Width packing remains
+the synthesis tool's responsibility. A fixed latency beyond useful
+subdivision adds output delay registers to satisfy the exact contract;
+automatic timing search does not treat padding as a way to improve timing.
+
+ECP5 uses DP16KD aspect ratios; Vivado uses RAMB36 aspect ratios, with depths
+32768/16384/8192/4096/2048/1024 for widths 1/2/4/9/18/36. The 512×72 mode
+is available to simple dual-port memory, while true dual-port memory stops
+at width 36. Byte enables reserve nine physical bits per eight data bits.
+Wider words span primitives. CLI and source `PART`/tool settings are resolved
+before the initial physical plan is finalized: a fixed-latency build must
+also re-elaborate if its initial target-independent import used different geometry.
+
+One writer with any number of readers is supported by BRAM replication.
+Two writable ports are supported when the logical ports fit the two physical
+ports. Additional independent read ports in a two-writer configuration, or
+more than two writers, are rejected. Arbitrary multiwriter emulation and
+arbitration are outside this implementation. The `ram_style=block` and
+`no_rw_check` attributes survive the GHDL import into Yosys, even with GHDL's
+unhandled-attribute warning. Live storage must map to block RAM; it must not
+silently become a register array.
+
+Two-writer memories follow [AMD's dual-port inference template](https://docs.amd.com/r/2023.1-English/ug901-vivado-synthesis/Dual-Port-Block-RAM-with-Two-Write-Ports-in-Read-First-Mode-VHDL):
+one shared variable for each bank, with a separate clocked process per port.
+ROMs and single-writer memories retain signal storage. All processes share
+the same clock enable. This changes inference, not the collision contract:
+cross-port read/write collisions and overlapping writes remain unspecified.
+GHDL needs `-frelaxed` for the shared-variable form; the open-tools flow and
+`--cocotb --ghdl` supply it automatically when needed.
+
+### RAM compiler, sweep, and simulation
+
+`src/AUTO_PIPELINE.py` owns immutable `RamPlan` values, candidate enumeration, and
+the measured search. The library generates ordinary `@pipeline_latency(L)`
+raw VHDL for each candidate. The elaborator records its logical key, complete
+plan, and constraints in `ParserState.auto_pipeline_rams`. The shared
+backend's existing fixed-latency mapper then aligns surrounding logic.
+
+The outer RAM search invokes the ordinary throughput sweep on each
+candidate. Thus a RAM remains stateful, and normal operator pipelining still
+works elsewhere in the same design. All instances sharing a factory key
+use one plan, evaluated against the entire design's clock requirements.
+The search advances a bounded frontier across RAM groups. Once timing passes,
+it measures the groups' lowest latencies together; a passing joint trim reaches
+the minimum possible total RAM latency in one build. If that probe fails, the
+search retains per-group latency reductions and same-latency alternatives. This avoids
+stalling when several RAMs tie for the worst path. It does not claim an
+exhaustive search over every combination of several independent RAMs.
+
+Passing candidates are ranked by total RAM latency and then BRAM/LUT/FF
+usage. Vivado's RAMB36 count is normalized to two RAMB18 units; the Block RAM
+Tile subtotal is not counted again. Reports retain physical RAMB18/RAMB36,
+LUT, FF and DSP counts. ECP5 retains DP16KD/LUT4/DFF reporting. If no candidate meets timing, the best measured frequency-to-goal
+ratio is retained and the build fails with a latency-limit/subdivision
+diagnostic. More stages need not be faster: placement, BRAM timing, and
+routing eventually dominate.
+
+Each candidate is re-elaborated with its complete plan installed in
+`pypeline` runtime state. Its generated function identity and emitted name
+include the physical-plan fingerprint, distinguishing equal-latency input
+and output register placements. Caller pipelines and response FIFOs are
+rebuilt against that graph, and the winning graph is restored after losing
+probes. `sweep_history.json` includes selected RAM plans; the companion
+`auto_pipeline_ram_history.json` records candidates, frequencies, resources,
+and the winner.
+
+The simulator receives the final plans before importing the design. The
+native source-only path also reconciles source/CLI targets after import: if a
+bootstrap fixed-latency plan used different geometry, it re-imports before
+running hooks or clocks. Explicit/replayed plans are preserved. This handles
+a late `PART` declaration without requiring an installed synthesis tool. The
+existing RAM model implements the equal-depth tree as a logical memory with
+the same write stage and output delay. Writes commit once per enabled clock,
+including during delta-cycle convergence. Pure callers use the existing
+selective pipeline evaluator; the stream controller is an explicit native
+clock boundary because its interface has handshake-dependent latency.
+
+### RAM stream wrapper and verification
+
+```text
+request valid/data --> admission --> freely advancing RAM --> response FIFO --> response
+                          ^                                      |
+                          |                                      v
+                   registered ready <--- outstanding credits <--- retired
+```
+
+There is one FIFO and credit counter per port. A request is admitted only
+when its response has reserved storage. Downstream stalls stop admissions,
+while accepted writes and reads continue through memory exactly once.
+Credits are returned when responses are consumed, not when the RAM produces
+them. This differs from manual `make_stream_ram`, which stalls its pipeline
+using each port's ready as a clock enable.
+
+For core latency `L`, each port reserves `ceil_pow2(L + 3)` entries, including
+the existing FIFO's two-cycle presentation delay and registered admission
+control. This sustains one request per enabled clock after filling, while
+also surviving an arbitrarily long downstream stall. `.latency` describes
+the core; `.min_response_latency=L+2` describes the unstalled wrapper.
+
+Coverage includes native contract/random-stall tests, native/GHDL cycle
+comparison (including two writers and clock-enable pauses), real Vivado and
+ECP5 BRAM mapping, constraint/search tests, and the ECP5 QoR
+frontier benchmark:
+
+```sh
+python3 src/tests/pypeline_tests/auto_pipeline_ram_qor_bench.py \
+  --out_dir /media/1TB/tmp/auto_pipeline_ram_qor --require_improvement
+python3 src/tests/pypeline_tests/run_all.py -j 5 --no_timeout
+```
+
+The benchmark compares 16K/64K x 32 memories at latencies 1, 3, 5, 7, and 9
+over placement seeds 1–3. It retains mapped-cell counts and per-seed results
+in `ram_qor.json`. `PIPELINEC_OPEN_TOOLS_SEED` selects the nextpnr seed and is
+included in the synthesis log cache name; the default remains one.
+
+Historical seed-1 measurements on `LFE5U-85F-6BG381C`, with one write
+port and one read port, are retained with plans, mapped-cell counts, tool
+versions, and a reproduction command in
+[`auto_pipeline_ram_ecp5.json`](../src/tests/pypeline_tests/qor/auto_pipeline_ram_ecp5.json):
+
+| Total latency | Banks | 16K x 32 Fmax | 64K x 32 Fmax |
+|---:|---:|---:|---:|
+| 1 | 1 | 149.10 MHz | 94.99 MHz |
+| 3 | 1 | 138.52 MHz | 86.52 MHz |
+| 5 | 2 | 149.10 MHz | 103.21 MHz |
+| 7 | 4 | 145.84 MHz | 138.27 MHz |
+
+All four points use 32 BRAMs for 16K words and 128 BRAMs for 64K words.
+The 64K four-bank implementation improves Fmax by about 60% over the
+three-cycle unsplit implementation, while the smaller memory already
+approaches its timing limit without splitting. Placement seeds and register
+overhead matter; the search measures candidates instead of assuming that
+adding stages always helps.
+
+The current regression fixture uses dense irregular initialization. Its 64K x 32 seed-1 results are **81.87, 84.83,
+and 80.44 MHz** at latencies 3, 7, and 9, with **128 DP16KD** at every point.
+The seven-cycle candidate improves timing by 3.6% over three cycles; adding
+another two cycles loses that gain. The historical fixture used sparse
+initialization and different instance names, so its timing is retained as
+historical evidence rather than relabeled as the new result. The fresh plans,
+counts, tool versions and reproduction command are in
+[`auto_pipeline_ram_ecp5_regression.json`](../src/tests/pypeline_tests/qor/auto_pipeline_ram_ecp5_regression.json).
+
+## History
+
+### FSM-owned pipeline placement
+
+An FSM records and owns its exact internal pipeline recipe. Region enforcement restores it and verifies the digest, rather than independently moving or growing it during the outer sweep. Only complete FSM rescheduling changes that implementation.
+
+### Why `AUTO_PIPELINE(func, depth=N)` became `latency=N`
+
+`depth=N` was stored and never read, so a user asking for N registers silently
+got whatever the sweep chose. It was replaced by `latency=N` (with
+`start_latency=` / `max_latency=`), which every build enforces (§6).

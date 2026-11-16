@@ -1,0 +1,4 @@
+Google XLS SCORE snapshot (google/xls)
+Commit: cf337d11
+Dataset: /home/yongfu/proj/score/datasets/xls/cf337d11
+Snapshot files: 19

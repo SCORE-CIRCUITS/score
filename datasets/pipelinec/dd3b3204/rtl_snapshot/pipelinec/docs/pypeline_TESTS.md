@@ -1,0 +1,2146 @@
+# Pypeline test suite
+
+`src/tests/pypeline_tests/` exercises the Pypeline compiler end to end against real
+`.py` design files in `inst/`. There is no test-discovery mechanism -- every test is a
+hand-written entry in one of nine category modules, run together via `run_all.py`.
+Two of those modules, `synth_tests.py` and `build_report_tests.py`, each feed one
+category per synthesis tool -- one pair for every backend `pypelinec` can select
+(see [Choosing a synthesis tool](#choosing-a-synthesis-tool)).
+
+> **Reference, not a logbook.** Describe the system as it is now, in the present
+> tense. No dated entries, no session write-ups — `git log` is the change record.
+> When behavior changes, edit the affected section in place; when the *reason* is
+> worth keeping, revise the matching entry in this file's `History` section rather
+> than appending a new one. See
+> [documentation conventions](pypeline_DESIGN.md#documentation-conventions).
+
+## Categories
+
+| Category | What it checks | Verdict |
+|---|---|---|
+| `native_sim` | Python golden-model checks (`sim_call`) and `pypeline_sim.py` multi-MAIN runs; fixed user pipelines selectively prepare alignment | exit code, plus in-process `assert`s |
+| `native_vs_vhdl_sim` | Runs a design's native (Python) sim and its real cocotb+GHDL sim via `pypeline_sim_debug.py`, and diffs their `sim_print(..., debug=True)` output cycle by cycle | exit code (MATCH/MISMATCH) |
+| `elab` | `pypelinec --no_synth` -- does it elaborate | exit code only |
+| `elab_introspect` | Calls `PY_TO_LOGIC.PARSE_FILE` in-process and asserts on `parser_state` / `FuncLogicLookupTable` / a raised `ElaborationError`'s type and message | in-process `assert`s |
+| `unit` | Pure compiler-helper tests against hand-built fixtures -- no design build | in-process `assert`s |
+| `synth_<tool>` | Full elaboration + auto-pipelining + synthesis (no `--no_synth`), with the tool the category names (`synth_tests.py`). One per backend: `device_models`, `vivado`, `pyrtl`, `quartus`, `open_tools`, `diamond`, `efinity`, `gowin`, `cc_tools` | exit code, plus the tool check |
+| `build_report_<tool>` | Wrapper scripts that run `pypelinec` themselves and assert on its build log or generated artifacts (mapped cell counts, `TIMING NOT MET` text, `sweep_history.json`), with the tool the category names (`build_report_tests.py`). Wrappers that run no synthesis at all live in `build_report_device_models` | in-process `assert`s over subprocess output, plus the tool check |
+| `multi_clock` | Wrapper scripts that build designs on more than one clock and check the crossing report, the top level, the constraints and timing results, or the design's behavior in GHDL (`multi_clock_tests.py`). Each test names its synthesis tool in `Test.syn_tool` (open_tools, Vivado, or none), since sky130 and PyRTL cannot time several clocks | in-process `assert`s over subprocess output, plus the tool check against `Test.syn_tool` |
+| `known_issues` | Reproducers for known, unfixed compiler bugs. **Excluded from `run_all.py`'s default set** -- run explicitly with `--category known_issues`. Every entry has `expect_fail=True`: a passing run means the bug is still present (XFAIL); a clean run means it got fixed without the test being updated (XPASS, reported as a *failure* -- promote the test out of this category) | inverted exit code (or, where exit code doesn't capture the issue, an explicit log-content assertion -- see that entry's own docstring) |
+
+Every backend gets both categories even when it has nothing tool-specific to
+check, so the [per-SYN_TOOL sweep matrix](#per-syn_tool-sweep-coverage) has
+somewhere to land and a new backend test has an obvious home. Several of those
+categories are empty; an empty category costs nothing to run.
+
+`elab_introspect` vs `unit` is decided by the file's *purpose*, not by whether
+`PARSE_FILE` happens to appear in it: a 600-line scheduler/codegen test that calls
+`PARSE_FILE` incidentally is `unit`; a test whose whole point is parsing a design and
+inspecting the resulting `parser_state` is `elab_introspect`.
+
+## Naming convention in `inst/`
+
+- `*_test.py` -- a registered test file. Every one **must** appear in some category
+  module's list (enforced by `registration_audit_test.py`, in `unit`).
+- `*_design.py` -- a fixture another test builds or imports. Never registered directly.
+- `_test_main.py` -- shared `__main__` harness (leading underscore, not a test).
+
+A fixture that another test builds as a subprocess may instead live one level up, in
+`src/tests/pypeline_tests/` itself, keeping its original `*_test.py` name -- e.g.
+`auto_fsm_resources_test.py`, `auto_fsm_div_share_test.py`, `auto_fsm_tighten_test.py`,
+each built by a corresponding wrapper in `inst/`. Being outside `inst/` is what keeps
+them out of the registration audit; they are not part of the `run_all.py` suite.
+
+`self_check_auto_fsm_constants_test.py` checks constant multiplication,
+truncation and signed extension through both the passthrough and scheduled FSM
+in GHDL. The typed cleanup and scope-refusal unit checks live in
+`auto_fsm_unit_test.py`. `self_check_auto_fsm_pipelined_unit_test.py` checks
+launch/completion timing, busy requests, backpressure and pinned unit arithmetic.
+`self_check_auto_fsm_select_share_test.py` covers compound indexed reads,
+balanced selection, width adapters and pair emission. These run in passthrough
+and scheduled GHDL modes. `auto_fsm_transforms_test.py` checks transformation
+proofs and refusals, and that generated measurement roots are already trimmed
+when parsing ends; `auto_fsm_cache_test.py` checks source/target invalidation,
+deterministic source and restoration of sparse pinned recipes. It also checks
+`AUTO_FSM.REPARSE`: a call site new to the build (an AUTO_FSM sized from an
+AUTO_PIPELINE depth) is scheduled, and a refused schedule still raises. A
+stubbed driver run schedules, blames and tightens a call site created during a
+pass. `auto_fsm_latency_sized_test.py` builds that shape under sky130: the call
+site pin-and-confirm pass 2 creates is scheduled before its one confirmation
+synthesis.
+`auto_fsm_attribution_test.py` checks ordered Vivado arcs and authenticated
+sky130 endpoint aliases. It reads a Vivado arc's coordinate only after the FSM
+instance's own label (which carries the caller's line), places boundaries from
+cell arcs only, and never separates an edge that runs against unit emission
+order. Pinned unit stages are measured from netlist endpoint names of the
+elaborated FSM instance, including a unit's launch from the state register,
+and the measurement replaces the placement's predicted stage. A chosen
+placement measured over budget on its own is rescheduled before any build, and
+a miss the search cannot avoid ends those rounds.
+`auto_fsm_cache_test.py` also checks that width merges reuse the cleaned
+graph instead of cleaning it again. The synthesis-iteration test also requires real failing
+sky130 end-register attribution to the writer chain.
+`auto_fsm_owner_goal_test.py` (unit, fake 3 ns adders, no synthesis) checks that a call
+site's budget comes from the clock goals of the MAINs that instantiate it: an unrelated
+200 MHz MAIN leaves a 50 MHz FSM's budget at 180 du and its search digest unchanged, a
+goal-less MAIN leaves it unconstrained, two goals give the tightest with one NOTE, and a
+synthesis-only tool uses the clock's `syn_mhz`.
+
+`self_check_auto_fsm_poly1305_test.py` checks the unchanged arithmetic at reduced
+capacity in GHDL. Its epilogue takes 2,165–2,501 s and its prologue 721–906 s;
+both use `long_pole=True` and fit the category's 7,200 s timeout. Manual
+full-capacity Vivado fixtures live in `qor/poly1305/` outside the regular suite.
+
+## Adding a test
+
+Prefer adding a `test_*` function to an **existing** file over creating a new one --
+each registration pays its own elaboration/synthesis/GHDL start cost, so fewer, larger
+files are the goal, not more files. A file's `__main__` block should read:
+
+```python
+if __name__ == "__main__":
+    from _test_main import run_module_tests
+    run_module_tests()
+```
+
+`run_module_tests()` auto-discovers every `test_*` callable defined at module scope
+and runs it, so adding a function is enough -- no separate `__main__` call list to
+remember to update. It only fires under `python3 inst/X.py` (`__name__ ==
+"__main__"`); `pypelinec` imports the same file as module `"pypeline_design"`
+(`PY_TO_LOGIC.PARSE_FILE`), so `elab`/`synth_*`-category registrations of a file never
+run its `test_*` functions -- those categories check elaboration/build only.
+
+## Choosing a synthesis tool
+
+Synthesis is nearly all of the suite's runtime, so every synthesizing test uses the
+fastest tool that can check what it tests. The exception is the
+[per-SYN_TOOL sweep matrix](#per-syn_tool-sweep-coverage), whose whole purpose
+is to run one design on *every* backend.
+
+- **`device_models` (sky130, the default).** Real sky130 liberty STA
+  ([`DEVICE_MODELS_DESIGN.md`](DEVICE_MODELS_DESIGN.md)), selected with
+  `--syn_tool device_models` or `PART("sky130...")`. Every sky130 spelling shares
+  the one committed `cache/delay/device_models_sky130_fd_sc_hvl_tt_025C_3v30_v4`
+  cache: the library and corner are fixed, and the part string is not part of
+  the cache key. Note this tool can no longer be forced onto a design whose
+  `PART` selects another backend -- a part and a tool that disagree are a hard
+  error ([`SYN_DESIGN.md` §2](SYN_DESIGN.md#2-choosing-a-tool)), so a design
+  meant to be built under several tools simply sets no `PART`.
+- **`vivado`, for Vivado-specific behavior and target checks.** This covers
+  MULTI_CYCLE path constraints (`AUTO_MULTI_CYCLE.GET_MCP_PATH_CONSTRAINTS`
+  supports only Vivado), automatic RAM inference and selected-plan replay,
+  and Xilinx board examples. Use a part with a committed cache
+  (`xc7a35ticsg324-1l`, `xc7a100tcsg324-1`, `xc7a200tffg1156-2`); a part without
+  one re-characterizes every leaf on every run.
+- **`pyrtl`, only for PyRTL-specific behavior.** Two tests use it:
+  - `pyrtl_no_timing_paths_build_report_test.py` guards a fix inside
+    `PYRTL.py`: a netlist with no timing paths used to divide by zero there.
+    sky130 has its own equivalent error, which passes the same assertions,
+    but running the test under sky130 would leave the PyRTL fix untested.
+  - `auto_fsm_ctl_compare_test.py` makes two claims, both calibrated to
+    PyRTL, and both fail as stated under sky130:
+    - ctl v3 is no bigger than v2 in generic yosys cells. Under sky130
+      mapping, the same schedule's v3 comes out 1.9% larger in both cells and
+      µm².
+    - The donut's v3 FSM meets 40 MHz on its first schedule. Under sky130 it
+      reaches 39.26 MHz and passes only after one tightening.
+
+  Each *feature* test runs under exactly one tool. `sweep_floor_detect_test.py`
+  runs under sky130 (100 MHz goal) and checks the prediction-independent
+  `plateau` stop (`SWEEP.AT_PLATEAU`). Its `--syn_tool pyrtl` mode (50 MHz,
+  `empirical_floor` stop) is kept for manual runs but not registered. The
+  sweep matrix below is the deliberate exception: there, running the same
+  design on every tool *is* the test.
+
+How a test picks its tool:
+
+- **`synth_tests.py`** entries carry the tool as their last field. The
+  registration appends `common.SYN_TOOL_ARGS[tool]`, which is uniformly
+  `--syn_tool <tool>` now that the flag accepts every backend, so design files
+  stay tool-neutral. A design may still set its own `PART` (board examples keep
+  their board part) as long as that part selects the
+  same tool the entry names.
+- **`native_vs_vhdl_sim_tests.py`** builds its non-`--comb` entries under
+  sky130 (`NON_COMB_SYN_TOOL`, passed as `--syn_tool device_models`). `--comb`
+  entries never reach synthesis.
+  - **Warm copies:** `pypeline_sim_debug.py` builds once into
+    `<out_dir>/build`, then runs its native and VHDL invocations concurrently,
+    each in its own copy of that directory (`<out_dir>/native`,
+    `<out_dir>/vhdl`).
+  - **Why they stay warm:** DEVICE_MODELS records VHDL inputs relative to the
+    output directory, and generated VHDL is the same in every parse pass of a
+    run (`c_structs_pkg` only grows; shared built-in entities name no call
+    site). Before these fixes, each copy re-synthesized most leaves.
+  - **History:** these entries once ran under PyRTL. The two sims shared one
+    out_dir, and sky130 synthesis of the same leaf from both processes
+    collided at random (composition, AUTO_FSM and RAM tests).
+- **`build_report` wrappers** pass `--syn_tool device_models` (or their design sets the
+  `PART`) in the `pypelinec` command they build.
+  - The sky130 AUTO_FSM cell-count comparisons (resources, area search,
+    minimum area) read the mapped sky130 cell count (`N cells:`) from the
+    DEVICE_MODELS STA report under `<out_dir>/top/`.
+  - The two that check AUTO_FSM's abstract area model
+    (`auto_fsm_area_sweep_compare_test.py`, `auto_fsm_min_area_verify_test.py`)
+    also pass `--auto_fsm_abstract_area`. Under DEVICE_MODELS the search would
+    otherwise rank by real sky130 area, which
+    `auto_fsm_real_area_compare_test.py` covers.
+
+**The tool check.** After a `synth_*` or `build_report_*` test runs,
+`common.run_test` reads which tools actually synthesized, from the log's
+`Running: .../<tool>_....log` lines. The test fails if any other tool ran.
+`synth_*` tests must also show at least one run of their own tool. SYN's
+`Using <TOOL> synthesizing` line is ignored: it reports only tool selection,
+which `--no_synth` builds print too.
+`build_report_*` wrappers may not echo their child builds, so only the
+wrong-tool half applies to them.
+
+**Whole-design synthesis cost.** sky130 is not faster for every design.
+`vga_donut.py` stays on its board's Vivado part: sky130's whole-design yosys
+run sat in `opt -full` for over an hour on its flattened wide multipliers,
+while Vivado takes about 30 minutes.
+
+**Clock goals.** Keep a sweep test's MHz goal low enough that it settles in a
+few synthesis iterations, unless pushing the sweep is the point of the test
+(`sweep_floor_detect_test.py`, `auto_fsm_timing_iter_test.py`,
+`auto_fsm_tighten_stall_test.py`, the unreachable
+half of `auto_pipeline_constraints_test.py`). Keep it above the design's
+unpipelined fmax wherever the test needs a real pipeline cut.
+
+## Per-SYN_TOOL sweep coverage
+
+`inst/sweep_float32_test.py` -- a single float32 adder `@MAIN`, the Pypeline
+twin of `examples/pipeline.c` -- is registered once per backend in
+`synth_tests.py`, giving every synthesis tool one real planned throughput
+sweep. `OPEN_TOOLS` has a second registration for XC7 because its default
+part exercises ECP5; `sweep_float32_openxc7` passes an explicit Artix-7 part
+and lives in the same `synth_open_tools` category. Before this matrix, six of
+the nine backends had no test at all: `quartus`, `open_tools`, `diamond`,
+`efinity`, `gowin` and `cc_tools` could break and nothing would notice.
+
+**One design file, not per-target copies.** The design sets no `PART`. Each
+generic registration passes only `--syn_tool <tool>`, and the tool's own
+`DEFAULT_PART` (`src/<TOOL>.py`) supplies the part -- so every backend builds
+*the same* design and a failure is about the backend, nothing else. The
+OpenXC7 sibling uses that same source but adds `--part xc7a35tcpg236-1`, since
+selecting `open_tools` alone intentionally retains the established ECP5
+default.
+
+**Per-tool clock goals** come from `synth_tests.SWEEP_FLOAT32_MHZ`, passed on each
+registration's command line as `-D SWEEP_FLOAT32_MHZ=<goal>` (the design reads it with
+`param()`). A float32 adder's unpipelined fmax differs
+by an order of magnitude between an ASIC standard-cell model and an FPGA, so
+one shared goal would either cut nothing on the fast tools or churn on the
+slow ones. Each goal sits above the design's comb fmax (so the sweep must
+place real cuts) and low enough to settle in a few iterations.
+
+**Cost.** `quartus`, `open_tools`, `efinity` and `cc_tools` return `True` from
+`SYN.TOOL_DOES_PNR()`, so every uncached leaf is a full place-and-route run,
+and no committed cache holds this design's `float_8_23_t` leaves. The first
+run on those tools is slow; afterwards the cache carries it.
+
+**Measured comb fmax**, which is what each goal is set from:
+
+| backend | part | comb fmax | goal | settles at |
+|---|---|---|---|---|
+| `pyrtl` | *(none -- tech node, not a part)* | 12.80 MHz | 40 | 46.0 MHz @ 5 stages |
+| `device_models` | `sky130` | 28.06 MHz | 60 | 80.5 MHz @ 4 stages |
+| `quartus` | `5CEBA4F23C8` | 41.58 MHz | 60 | 71.7 MHz @ 2 stages |
+| `open_tools` | `LFE5U-85F-6BG381C` | 28.84 MHz | 60 | 61.0 MHz @ 4 stages |
+| `open_tools` (OpenXC7) | `xc7a35tcpg236-1` | 43.64 MHz | 200 | 213.2 MHz @ 19 stages |
+| `vivado` | `xc7a35ticsg324-1l` | 47.84 MHz | 130 | 167.3 MHz @ 5 stages |
+| `efinity` | `Ti60F225` | 286.17 MHz | 500 | 510.4 MHz @ 11 stages |
+
+**Comb fmax is only meaningful next to the goal it was measured under, and
+only for Quartus.** Measured with a deliberately slack 1 MHz goal instead of
+the real one, `quartus` reports 28.21 MHz rather than 41.58 -- its fitter
+works to the constraint. Every other backend here returned an identical number
+under both (`pyrtl` 12.804, `device_models` 28.056, `open_tools` 28.840,
+`vivado` 47.9, `efinity` 286.171), so this is a Quartus behavior, not a
+place-and-route-versus-estimate split. `sweep_float32_tool_compare.py` always
+builds its comb reference point under the same goal as the sweep, so each
+tool's curve is internally consistent.
+
+Three backends are in `known_issues` instead, none for a PipelineC bug:
+
+| backend | why |
+|---|---|
+| `gowin` | `gw_sh`: "License verification failed  License hostid not match" |
+| `diamond` | `diamondc`: "License checkout failed. FlexNet Licensing error:-10,32" |
+| `cc_tools` | yosys synthesis succeeds, then CologneChip `p_r` crashes inside itself ("Exception Handler called. ExitCode: 112, Exception Class: ERangeError"). It is fed 357 inputs / 480 outputs, far past a CCGM1A1's real I/O count |
+
+`efinity` is registered with `-j 1` (`SWEEP_FLOAT32_EXTRA_ARGS` in
+`synth_tests.py`). Its `efx_pnr` builds a whole Titanium routing graph per leaf
+and peaks near 3.7GB resident, so the default four parallel jobs exhaust a 16GB
+machine; the build then fails with a missing `.timing.rpt` while the OOM killer
+takes whatever had the worst `oom_score` -- usually an editor, not the build.
+It is the only backend here that needs the cap.
+
+`efinity` reporting 128.84 MHz comb -- roughly four times every other backend
+for the same logic -- is expected, not suspicious: `Ti60F225` is a 16nm
+Titanium part, against 28nm for the Cyclone V and Artix-7, 40nm for the ECP5
+and 130nm for the sky130 standard cells. Its goal is scaled to match.
+
+A large part is also *required* here, not a choice. Efinity has no
+out-of-context synthesis mode, so every leaf is built as a real top level with
+real I/O pins; the float32 adder's internal leaves (ex. `int25_t + int25_t`)
+need far more pins than a small Trion device such as `T8F49` physically has.
+That is also why each run is expensive -- `efx_pnr` builds the routing graph
+for the whole 218x322 Titanium fabric every time.
+
+The three blocked backends are registered in `known_issues_tests.py`
+(`SWEEP_FLOAT32_BLOCKED`) with `expect_fail=True`, not in their `synth_<tool>`
+category: none of the three failures is a PipelineC bug, so a default run
+should not pay for them. A fixed license, or a part/tool combination `p_r`
+accepts, turns the entry into an XPASS -- which is the signal to move it back
+into `synth_<tool>`.
+
+**Cross-tool comparison.** `sweep_float32_tool_compare.py` (opt-in, outside
+`run_all.py`) builds the same design on every backend -- `--comb` first for the
+unpipelined reference point, then the sweep -- and overlays every backend's
+iterations on one plot: total pipeline latency (stages / fmax) on X, achieved
+fmax on Y, one curve per tool labelled with the part it used. Each point is one
+real synthesis run annotated with its pipeline stage count, so the curve shows
+what added stages actually bought on that tool.
+
+![float32 adder: fmax vs total pipeline latency, per SYN_TOOL](images/sweep_float32_tool_compare.png)
+
+```
+python3 src/tests/pypeline_tests/sweep_float32_tool_compare.py --out_root DIR
+```
+
+The curves are not all monotonic, and that is the measurement rather than a
+bug. On `quartus` the 3-stage result came out slower than the 2-stage one, and
+on `vivado` the 4-stage result is slower than the 3-stage. `efinity` is the
+clearest case: its first two cuts made the design *worse* than unpipelined
+(286 -> 230 -> 217 MHz) before it climbed to 510 MHz at 11 stages. Added stages
+only help when the tool can place and route the shorter segments, and a deeper
+pipeline brings its own placement pressure.
+
+Two reads worth taking from the plot:
+
+- `pyrtl`'s 4-stage and 5-stage points sit at the same 108.7 ns total latency
+  while fmax goes 36.8 -> 46.0 MHz. That step is free.
+- `efinity` needs 11 stages to reach 510 MHz, against `quartus` reaching
+  71.7 MHz at 2. Comparing tools on fmax alone hides that the deeper pipeline
+  costs proportionally more latency to get there.
+
+## Sweep evidence and cross-pass replay coverage
+
+`sweep_evidence_test.py` (`unit`, no synthesis tool) exercises concrete lock
+replay across model refresh, input-content cache identity, capacity warnings,
+endpoint-bank deduplication, raw MCP seeding, and rejection of incomplete
+logs. Its `scripted_sweep_backend.py` drives the actual sweep loop:
+unimplicated MAINs stay unchanged, ineffective feedback triggers no synthesis,
+locks survive another parse, MAIN-order reversal gives identical
+implementations, and multiple paths reach the same result with fewer backend
+calls. Further cases cover a real two-pass re-elaboration (locks carried to new
+lane instances, never to another MAIN), failing-before-passing evidence,
+bounded MCP confirmation repair, confirm-down reuse, pipelined confirmation
+failures that preserve unaffected MAINs, optional-report Tcl robustness and
+header-based utilization parsing, and the untimed-region warning (a region whose own
+measured delay rules out its built depth in a MAIN that met timing; never for a failing
+MAIN, an estimated delay or a `--comb` build). The suite registers it under two pinned
+`PYTHONHASHSEED` values (`sweep_evidence_test`, `sweep_evidence_test_seed777`),
+so no decision may depend on set iteration order. Real Vivado MCP tests
+additionally check the report recipe, endpoint constraints, stream handshake
+and re-elaboration.
+
+The same file exercises bounded trim probes with independently specified
+stage delays: a smaller pipeline can pass despite little timing margin when
+stages are uneven or the worst path is in an unchanged subtree. The tests also
+verify the probe budget, zero-effort behavior, and restoration of the actual
+passing implementation after a failed probe. A cut-count ratio is not a
+frequency bound. The tests include removing the last optional cut, restoring
+the passing registers after a failed zero-cut probe, retaining required
+placements and fixed region counts during explicit zero-cut probes, and clearing obsolete
+failure bounds when helper locks or boundary policies change. Zero-cut probes
+also remain unchanged while independent MCP feedback repairs cycle counts.
+It also reparses a real latency-sized hierarchy with renamed
+callers and additional replicas: every core must keep the same concrete timing
+parameters, entity hash and depth. Its reporting cases keep estimated ceilings
+distinct from timing verdicts and aggregate confirmation paths once per MAIN.
+The capacity case includes the verbatim WireGuard warning: 960 DSPs requested,
+740 available, while the mapped table caps at 740.
+`floor_and_bits_cap_unit_test.py` requires path evidence before a hard-floor
+stop.
+
+`synthesis_scope_test.py` (`unit`) elaborates `synthesis_scope_design.py` with a
+cold mocked backend and runs no vendor tools. It checks required primitive
+dependencies, zero initial opaque-text delays without cached scalar lookups,
+path-directed opaque fallback, estimated generated bank helpers and stateful
+surroundings, shared eligible/blocked callers, combinational MAIN frontiers,
+goal-less combinational MAINs and unseeded tags without jobs, goal-less fixed
+latency consumers, independent unseeded clock-driven tag regions, actual tag
+placements unchanged when surrounding stateful estimates change,
+scoped fallback and no-op fallback, estimated atomic floors, separate automatic
+MCP endpoint evidence, and explicit primitive-only/full-hierarchy modes.
+It also checks declared scope initialization, an error before initialization,
+rooted fixed-latency characterization preserving full-parse scope, and independent
+scope collections in a copied ParserState. A scheduled (stateful) AUTO_FSM
+without an installed schedule is measured once as a whole; with one, its delay
+is the schedule's worst state and nothing is synthesized. Nothing inside it is
+collected either way. With a primitive delay model, modeled widths get estimated
+delays and their error bounds instead of synthesis runs.
+
+`primitive_delay_model_test.py` (`unit`) checks `SYN.PrimitiveDelayModel`:
+- entity-name parsing;
+- exact linear, log2 and constant fits;
+- refusals outside the measured widths, for too few widths, or an unseen
+  signedness;
+- the committed xc7a200tffg1156-2 Vivado cache's leave-one-out bounds;
+- AUTO_FSM measuring only an estimate near its state budget.
+
+`build_phase_timer_test.py` (`unit`) checks `SYN.PHASE`'s exclusive
+nested-phase accounting and the end-of-build `Time by build phase` line.
+
+`sweep_refinement_recovery_test.py` (`unit`) uses the real sweep feedback and
+fallback loop with scripted timing. A failed zero-cut trim concurrent with MCP
+count repair must return to positive cuts without repeating the zero-cut
+implementation. A later opaque failing path must be measured after combinational
+fallback, before a floor/plateau or iteration-limit stop can discard that refinement.
+A newly measured helper lock discovered during a failed trim must reach whole-design
+synthesis before restoration. Flattened sky130 endpoints must still implicate MAINs;
+an unmatched cell name must not silently turn a measured timing failure into success.
+
+`sweep_planless_test.py` and `sweep_unpipelinable_test.py` (`build_report`) check
+met and unmet goals on stateful MAINs with nothing to pipeline. Both require
+one full-design synthesis and no redundant standalone as-written job. Their
+final history records agree with the full-design timing and exit status;
+`standalone_mhz` remains null by default.
+
+`isolated_top_name_test.py` (`unit`) checks that the backend's selected
+isolated top, emitted filename and actual entity declaration agree after
+emission naming, including when appending `_top` exceeds the body-name budget.
+It uses `isolated_top_name_design.py` and writes a real wrapper without vendor
+tools. The wrapper suffix is normalized before choosing either the file or
+synthesis top, preventing `Synth 8-439: module ... not found` on long bank
+helpers and enum comparators.
+
+`sweep_cross_main_test.py` (`unit`) covers multi-MAIN feedback. Its evidence is
+the real clock-worst path of the WireGuard shared 70 MHz build: a testbench
+handshake whose Vivado names cross the ChaCha wrapper and both dataflows'
+FSMs.
+- **Path roles** (`SWEEP.PATH_MAIN_ROLES` over `SYN.PATH_CELLS_BY_MAIN`):
+  - the testbench owns the path;
+  - the other three only cross it, each blocked by its own stateful instance;
+  - an unrecognized deeper hierarchy counts as reachable;
+  - no-hierarchy names and a goal-less owner keep the old behavior.
+- **Attribution:** scoped to the encrypt plan, it no longer blames the
+  decrypt instance's `prep_auth_data_fsm`. The basis labels (inside /
+  endpoint / cells) are checked too.
+- **Scripted sweeps** (scripted sweep backend):
+  - a crossing path never re-pipelines the plans it crosses, and fails only
+    under its owner;
+  - best-result ties go to met own paths, then fewer stages (this case fails
+    under the old highest-ratio rule);
+  - the pass-2 confirmation keeps crossed MAINs and skips a fallback sweep
+    when only MAINs with nothing cuttable failed.
+- **Regions:**
+  - mini-sweep locks are allowed inside an uncapped `start_latency=` region;
+    `latency=`, `max_latency=` and cross-MAIN groups refuse them;
+  - the streak and budget rules hold;
+  - the start bootstrap is skipped over existing locks;
+  - a scripted start-only region grows once, then mini-sweeps, while a
+    capped one never locks inside.
+
+`added_latency_context_test.py` also runs path-delay characterization on two
+real parses at different AUTO_MULTI_CYCLE counts: the rebuilt holder keeps its
+`MCP_SHAPE` and reuses isolated evidence instead of being synthesized, while a
+holder without matching endpoint evidence is synthesized. Fixed-count holders receive
+no isolated count-selection job. The same characterization, with a
+fake backend that counts concurrent runs, checks the `-j` cap: automatic endpoint evidence
+and the AUTO_PIPELINE side go through one pool, `-j 1` never runs two
+at once and `-j 3` does overlap. It also requires every compiler `ThreadPool`
+to be sized by `SYN.GET_NUM_PROCESSES()`, and `--jobs 0` / `--jobs -2` to exit
+before parsing or creating the output directory.
+
+`sweep_history_record_unit_test.py` checks which observation
+`sweep_history.json` retains for the final implementation. It is the newest one
+whose `IMPLEMENTATION_SIGNATURE` matches, and that signature changes with the
+entity hash, the clock and the AUTO_MULTI_CYCLE counts. A newer log of
+another implementation (same HDL with other MCP counts, or an over-capacity
+netlist) never supplies the winner's observation or its `fit_status`, and a
+provisional write says `build_complete: false`. When the retained
+implementation is itself over capacity, a met MAIN's final record is
+`met: false` (`device_over_capacity`), and `ADD_OVER_CAPACITY_FAILURES` puts
+it in the exit code's failure list.
+
+`double_parse_file_test.py`'s source-freeze case edits design files between
+two parses of one run. The second parse sees the first-read bytes, and
+`source_provenance.json` records each frozen file's first-read SHA-256, byte
+count and `disk_drift`. Compiler, stdlib, site-packages and output-directory
+sources are never frozen.
+
+`c_structs_pkg_relayout_test.py` also checks that an isolated synthesis reads a
+type package holding only its own types: a function that doesn't use the resized
+lane type keeps identical package bytes across the relayout, one that does gets a
+new package, and GHDL analyzes both file lists.
+
+`auto_pipeline_harvest_test.py` covers MAIN ownership, differing same-key
+replicas (majority replay; an error without a shared key), changed region
+interiors, empty placements, fixed flags and exact bit boundaries during
+re-elaboration. It also scripts the latency-pass driver: a pass ended by
+isolated MCP seeding runs no synthesis and does not use the pass budget.
+Pinned AUTO_FSM units are neither harvested nor required to have a
+previous-pass counterpart.
+
+`sweep_failed_trim_design.py` (`known_issues`, `device_models`, about 75 seconds)
+meets timing, then trims to a failing trial whose path ends at an output port, and
+ends TIMING NOT MET instead of restoring the passing implementation
+([#381](https://github.com/JulianKemmerer/PipelineC/issues/381)).
+
+## OpenXC7 `--pins` bitstream coverage
+
+`inst/openxc7_bitstream_test.py` (`synth_open_tools`) builds
+`examples/pypeline/blink.py` for a Basys 3 (`xc7a35tcpg236-1`) with
+`constraints/openxc7_basys3_blink.xdc`, three times:
+
+- a full build: the sweep times `-noiopad` characterization tops, then
+  `GENERATE_BITSTREAM` implements the board-facing top;
+- a `--comb` build, timed on a characterization top the same way;
+- the full build again, into the first build's out_dir once it has finished.
+
+Each build must implement the board-facing top exactly once, and its
+`open_tools_final.log` must hold that one nextpnr run: the log is appended to,
+so a re-run in the same out_dir must start it over. Each build must also leave
+a `top/top.bit` whose IDCODE write matches the part's Project X-Ray
+`part.yaml`. Every XDC `PACKAGE_PIN`'s IOB tile (looked up in
+`package_pins.csv`) must also be configured in `top/top.fasm`, because exit
+code 0 alone does not show the pins were honored. Each of these mutations
+fails the test:
+- dropping `--xdc` (nextpnr-xilinx rejects the unconstrained pad);
+- skipping `xc7frames2bit`;
+- handing nextpnr an XDC with the LED moved to E19;
+- having `--comb` time the board-facing top again, which puts two board
+  implementations in one run;
+- not clearing `open_tools_final.log` first, which leaves two nextpnr runs in
+  the re-run's log.
+
+Like the rest of `synth_open_tools` it needs its tools installed: here the
+OpenXC7 bundle, found through `OPENXC7` or the `OPENXC7_PATH` default in
+`src/OPEN_TOOLS.py` (see the OpenXC7 entry in [README.md](README.md)).
+
+## Fixed user pipeline coverage
+
+`pipeline_latency_test.py` covers `@pipeline_latency` validation and stacking,
+factory specialization, fixed-latency metadata across repeated elaboration, serial
+and parallel composition, bypass alignment, conditional enables, dynamic array
+reads/writes, initialization, reset and convergence. Its subprocess gate tests
+forbid preparing the pipeline model (`PY_TO_LOGIC.PREPARE_PIPELINE_LATENCY_SIM`) in
+untagged `--comb` CLI builds and forbid importing the elaborator at all in direct native
+runs, covering arithmetic, registers,
+AUTO_PIPELINE and AUTO_FSM. Unrelated roots, zero-cycle declarations and
+direct calls to tagged bodies also forbid model preparation.
+Alternating live roots check that shared helper models retain separate state.
+Explicit placement tests reject cuts both at and inside a fixed boundary.
+
+`pipeline_latency_sim_test.py` runs in both native-versus-VHDL categories, with
+and without `--comb`. It checks independently calculated data, sequence order and
+constant observed latency for unequal fixed pipelines in both a naturally
+pipelined MAIN and an AUTO_PIPELINE region. Valid-gated debug probes compare exact
+clock timing against GHDL, including draining the pipeline, register initialization,
+synchronous reset and clock enables within a stateful caller.
+
+`factory_arg_port_annotation_test.py` (`native_sim` and `native_vs_vhdl_sim --comb`)
+covers port annotations that reach a factory-local `@struct` through a factory argument
+used only in the annotation, so the argument is never a closure cell. Its `sim_call` test
+calls a stateful ROM caller (`p: pair_src.pair_t`), which elaborates the caller as a live
+root. The MAIN also calls two more consumers: one annotated `p: src.pair_t`, where `src`
+matches an unrelated module global with a different `pair_t`, and one annotated
+`p: hw_return_type(pair_src)`. Re-evaluating the annotations used to fail these three in
+three ways:
+- the first port got the bare name `'pair_t'`, failing both `sim_call` and the build with
+  `KeyError: 'pair_t'`;
+- the second port got the global's record, which GHDL rejects at the port map;
+- the third raised `NotImplementedError: Unsupported type annotation`.
+
+See [Port types](PY_TO_LOGIC_DESIGN.md#specialised-functions) in PY_TO_LOGIC_DESIGN.md.
+
+`live_root_default_ops_test.py` (`native_sim`) runs plain `sim_call` on ROM callers
+that contain an integer compare. It runs as a plain Python process, because
+`pypelinec` and `pypeline_sim.py` register the default soft operators before the
+design loads and so never showed the bug. Before the fix, the live-root elaboration had
+no lowering for `>`, fell through to the C front end's C-code-generation path, and crashed on the unset
+`SYN_OUTPUT_DIRECTORY`. The test covers:
+- a stateful caller, and a pure caller whose compare runs inside the aligned graph,
+  both with a signed operand only a signed compare gets right;
+- the operator registries and native-sim gate sets being unchanged after the
+  `sim_call`, checked first so no earlier elaboration can mask a change;
+- a design's own matcher registration outranking the defaults;
+- an operator pinned to `INFERRED` hitting the armed `PYPELINE_NO_SW_LIB_GUARD`.
+
+See [Default replacements for C-generated operators](pypeline_DESIGN.md#default-replacements-for-c-generated-operators).
+
+**Known issue: a wire-only `@pipeline_latency` body.**
+`pipeline_latency_wire_body_design.py` (known_issues) declares `@pipeline_latency(1)`
+on `return x`. Its entity's sensitivity list ends in a dangling comment, which GHDL
+rejects. The cocotb/GHDL run fails while that happens, and passes once the VHDL is
+legal. Tracked as bug [#371](https://github.com/JulianKemmerer/PipelineC/issues/371).
+
+**Known issue: extra cuts in a fixed AUTO_PIPELINE.**
+`fixed_auto_pipeline_extra_cuts_test.py` (known_issues) builds
+`AUTO_PIPELINE(core, latency=2)`, where two `@pipeline_latency(1)` calls already
+supply the latency and `x + 1` runs in parallel. It fails while the built core
+instantiates a pipelined adder, and passes once the adder stays combinational.
+Tracked as bug [#372](https://github.com/JulianKemmerer/PipelineC/issues/372).
+
+**Known issue: a variable multiply in a fixed AUTO_PIPELINE.**
+`fixed_latency_variable_multiply_design.py` (known_issues) builds
+`AUTO_PIPELINE(scale, latency=2)`, where `scale` multiplies two variables
+(`--comb --no_synth`). The build stops with "cannot build the requested latency --
+realized 1 clock(s)"; the same body with a constant multiply builds. It passes
+once the planner can place the cuts. Tracked as bug
+[#391](https://github.com/JulianKemmerer/PipelineC/issues/391).
+
+## AUTO_PIPELINE latency constraint coverage
+
+Each test below covers `AUTO_PIPELINE(func, latency= / start_latency= / max_latency=)`
+from a different angle:
+- `auto_pipeline_harvest_test.py` (unit):
+  - constructor validation;
+  - identity suffixes (an unconstrained tag's key and naming identity are
+    unchanged);
+  - `.latency` per build mode and cache;
+  - the served-value predicate behind the pin-and-confirm pass-2 skip;
+  - `AUTO_PIPELINE.CHECK_AUTO_PIPELINE_CONSTRAINTS_REALIZED`;
+  - named keys (`name=`):
+    - the key is the name plus a fixed/max suffix, never `start_latency`;
+    - identity covers the name;
+    - two names on one function are two groups, harvested to independent
+      latencies, and identical tags share one;
+    - a same-name conflict is a `TypeError` naming both sites;
+  - one key under MAINs at two clock goals harvests to one depth per goal
+    (`key@50p0mhz`), and a divergence within one goal is still one;
+  - starting latencies (`SET_LATENCY_SEEDS`):
+    - the served value and a region's `start()`;
+    - clamping to `max_latency`;
+    - an unconstrained tag becomes a start-only region (`is_region()`) while its
+      source constraint stays unconstrained;
+    - fixed tags are never seeded;
+    - equality, hashing, `key_suffix()` and pickling (including a pre-seed
+      3-tuple) ignore the seed;
+    - a harvested value supersedes it;
+    - no seed outside sweep builds.
+- `stream_auto_pipeline_latency_args_test.py` (unit): `make_stream_auto_pipeline` and the
+  DSP factories pass `latency=` / `start_latency=` / `max_latency=` to their single core
+  AUTO_PIPELINE, in every handshake mode. It checks:
+  - `.latency` served per build mode;
+  - errors from bad combinations;
+  - key and repr stability across constructions;
+  - plain native sim, where a hint is cycle-identical to none and a fixed `latency=2`
+    delays every result by exactly 2 cycles.
+- `auto_pipeline_region_planning_test.py` (unit): `AUTO_PIPELINE.COUNT_TARGETED_PLACEMENTS`,
+  plan trimming, cap bookkeeping, and hotspot-to-region attribution on synthetic
+  landscapes.
+- `auto_pipeline_fixed_latency_sim_test.py` (native_sim): plain native sim emulates a
+  fixed latency and ignores start/max. A named fixed tag works the same, keyed by its
+  name. `pipeline_latency_test.py`'s gate test also runs it, both directly and through
+  `pypelinec --sim --comb`, with the compiler import forbidden.
+- `auto_pipeline_constraints_test.py` (build_report_device_models):
+  - fixed and start regions are built exactly and pass 2 is skipped;
+  - a `max_latency` cap stops an unreachable goal promptly;
+  - `make_stream_auto_pipeline(..., start_latency=1)`
+    (`stream_auto_pipeline_seeded_design.py`) serves 1 to the bootstrap FIFO sizing,
+    settles in one sweep iteration and skips pass 2;
+  - the same hint under a harder goal (`stream_auto_pipeline_grow_design.py`) still
+    grows the core, and pass 2 resizes the FIFO.
+- `auto_pipeline_region_minisweep_test.py` (build_report_device_models): `start_latency=`
+  is only a starting guess. A ChaCha-shaped chain
+  (`auto_pipeline_region_minisweep_design.py`: quarter rounds written in series on a
+  shared state, each word through only two of them) is built untagged and with
+  `start_latency=1`. Both must mini-sweep and lock the repeated `step` helper and
+  build the same depth in at most five whole-design checks, including two optional
+  trim probes. Final history must retain all six locks and a measured passing
+  frequency. Before the fix, the hinted build reached twice the depth in five.
+- `region_root_minisweep_test.py` (build_report_device_models): the same chain as an
+  imported function tagged directly (`region_root_minisweep_design.py`), so the
+  critical path is found only by the region root's label path and nothing inside it
+  matches by name. The root itself must be mini-swept and locked, and reach the same
+  depth as tagging the one-line wrapper of `-D REGION_ROOT_WRAPPER=1`, which
+  mini-sweeps the function inside it (two builds).
+- `auto_pipeline_c_pragma_test.py` (build_report_device_models): C `#pragma AUTOPIPELINE N` under
+  `--comb`.
+- `self_check_fixed_auto_pipeline_test.py` (both native_vs_vhdl categories): compares
+  the native delay line against the `--comb` VHDL's fixed registers, and against the
+  planned sweep's enforced region.
+
+## Latency memory coverage
+
+The latency memory and `--latency_hints` (see
+[SWEEP_DESIGN.md](SWEEP_DESIGN.md#5-latency-memory)):
+
+- **`latency_memory_unit_test.py` (unit):**
+  - every hints file shape, and every rejection;
+  - profile verdicts per owning MAIN, and determinism;
+  - a seeded tag is a start-only region, unless its function holds another
+    AUTO_PIPELINE;
+  - zero-clock subtree digests: the same for two parses, and an edit changes only
+    the edited function's ancestors;
+  - piece selection: the current goal first, then the highest lower goal; a higher
+    goal, another part or tool, or another digest never matches;
+  - recording per piece (a failing MAIN records nothing, a met one its pieces),
+    bounded variants, the store layout and its prune, v1 files ignored;
+  - an untimed region is not recorded, nor is the whole-MAIN piece containing it, while
+    a timed region in that MAIN is;
+  - a mini-sweep lock survives a JSON round trip (`NORMALIZE_CONCRETE_PIPELINE`),
+    and malformed parameters are rejected;
+  - `latency_memory_constraints_design.py`:
+    - a lowered cap rejects MAIN replay before synthesis, and an unchanged cap
+      still replays with a declared-clock `@wires` MAIN present;
+    - real placement and lowering enforce a lower-goal floor even when the
+      proposed count is zero, and replay rejects an implementation below it;
+      the floor's region retry keeps every instance's own `Logic`;
+    - an entity's VHDL is the same whether or not the planner marked it fixed;
+  - a lower-goal floor goes only to a region: a seeded tag holding another
+    AUTO_PIPELINE gets none, and the final-table check never reports floors;
+  - a hint deeper than a lower-goal depth starts the tag above that floor, one
+    shallower starts at the floor, and same-goal memory still beats a hint;
+  - an AUTO_MULTI_CYCLE whose datapath size depends on an AUTO_PIPELINE depth
+    resolves in two memory re-parses;
+  - an AUTO_PIPELINE key used at two clock goals is one piece per goal, and a depth
+    remembered at 50 MHz starts only the 50 MHz objects.
+- **`latency_memory_build_test.py` (build_report_device_models, sky130):**
+  the stream fixture uses 100 and 110 MHz goals so the cold build must pipeline
+  the core and resize its latency-dependent FIFO. Measured runtime is about
+  14 minutes warm, 25 minutes alongside concurrent cold-cache builds;
+  1. a same-goal rebuild (`--rebuild`, since the same command alone is up to date)
+     replays every MAIN in one confirmation, with no new syntheses and no pass 2;
+  2. a lower-goal piece from the store starts a higher-goal build in another output
+     directory, never builds below that depth, and takes fewer full syntheses than
+     a cold build;
+  3. a store holding only a higher goal's pieces seeds nothing;
+  4. `--no_latency_memory` neither seeds nor rewrites the memory;
+  5. a hints file is a start, and an unused hint is reported;
+  6. an edited callee's stale piece is rejected, and the build matches a memory-less
+     one;
+  7. of two MAINs, a failing one keeps its old pieces while the met one records its
+     own.
+- **`auto_pipeline_region_minisweep_test.py` (build_report_device_models):** after
+  its two start-latency builds, four latency-memory builds:
+  - a same-goal rebuild in a fresh output directory replays the MAIN, `step` lock
+    included, in one confirmation with no new synthesis run: the locked winner's
+    VHDL matches what its mini-sweep wrote;
+  - an edit outside the `step` helper rejects the MAIN replay but reuses the `step`
+    lock, in fewer full syntheses;
+  - a raised goal turns the lock into a mini-sweep hint, which skips the streak wait
+    and starts the isolated sweep at the old depth.
+- **`auto_multi_cycle_sweep_test.py` (build_report_vivado), case (d):**
+  - a rebuild (`--rebuild`, since the same command alone is up to date) starts from the
+    remembered count and skips pass 2;
+  - a same-goal count three cycles too high is still confirmed down;
+  - at a raised goal, the lower goal's count is a floor.
+- **`auto_multi_cycle_unit_test.py` (unit):** a remembered count is elaborated, then
+  registered as a provisional seed.
+- **`imported_auto_pipeline_attribution_test.py` (unit):** tagging an imported function
+  directly. It builds a register path from the real emitted hierarchy
+  (`SYN._VHDL_INSTANCE_TRIE`), in Vivado's `/` form and sky130 STA's flattened form,
+  and expects the region root to be blamed, found by its instance's label path, with
+  an `inside` basis.
+- **`imported_helper_attribution_test.py` (known_issues):** the same path inside an
+  imported helper the region root calls is blamed on the root, not the helper
+  ([#389](https://github.com/JulianKemmerer/PipelineC/issues/389)); XFAIL until
+  helpers are found by label path too. The in-process harness gives every function a
+  nonzero delay first: the landscape holds only functions with a delay, and only
+  landscape functions are candidates. With the helper defined in the root's own
+  module the same check attributes the path to the helper.
+
+The harness sets `PIPELINEC_INTERNAL_NO_LATENCY_MEMORY=1` for every test (see
+[Running](#running)); the memory build tests turn it back off for their own builds.
+
+## Stream wrapper throughput coverage
+
+`make_stream_auto_pipeline` must accept one word per cycle (II=1) while its consumer is
+ready. Every elastic DSP factory sits on top of it. The data-only tests above pass at
+any rate, so these tests check the rate itself.
+- `stream_ii1_throughput_test.py` (native_sim, `sim_call`), with an always-valid
+  producer and an always-ready consumer:
+  - `make_stream_auto_pipeline(..., latency=L)` for L = 0-5 and 8: inputs are accepted on
+    consecutive cycles, and results come out on consecutive cycles starting exactly
+    L+4 cycles after the first accept;
+  - a consumer stalled for 40 cycles: exactly L+5 words are admitted, and all of them
+    come out in order. Fewer means too few credits; more means credits the FIFO cannot
+    hold;
+  - the elastic `make_fir`, `make_fir_decim` (D = 1, 2, 3), `make_fir_interp`
+    (I = 2, 4), `make_dc_block`, `make_moving_avg` and `make_magnitude` at core
+    latencies 0 and 2: inputs and results at their nominal rates.
+
+  Mutation-checked: the old in-flight limit of `max(2, L+2)` fails all three tests.
+- `self_check_stream_auto_pipeline_ii1_test.py` (`native_vs_vhdl_sim --comb`, plus
+  `native_sim`): two wrappers with fixed core latencies 0 and 3. `sim_assert`s check
+  that ready stays high after the first accept and that result k arrives on cycle
+  first accept + L + 4 + k. Its debug probes are cycle-diffed between native sim and
+  cocotb+GHDL.
+- `self_check_stream_auto_pipeline_test.py` (`native_pipelined_sim_test`,
+  synth_device_models): the same no-stall and no-bubble asserts at the latency a full
+  build discovers.
+- `built_hardware_current_test.py` (unit): records written as `WRITE_BUILT_HARDWARE` writes
+  them, in-process. The design source, the `-D` values, a build setting (one the record
+  does not know included), a `--latency_hints` file's contents, the compiler hash, a
+  `PIPELINEC_*` environment variable and a record without build inputs each make the run
+  build, naming what changed. `-j`, `--out_dir`, `--syn_cache`, `--syn_cache_prune`,
+  simulation options, `-D` order and other environment variables don't. A `--sim` or
+  `--rebuild` run, another top and a C top are never up to date.
+- `built_hardware_sim_test.py` (build_report_device_models): one sky130 build of
+  `built_hardware_top_design.py`, whose real ports keep all of
+  `built_hardware_core_design.py` (an AUTO_PIPELINE region, an AUTO_FSM, and an
+  AUTO_PIPELINE whose `.latency` is read but which is never instantiated), then native
+  `--sim` runs of `built_hardware_tb_design.py` in that output directory. The fixtures are
+  built from a copy, so one case can edit a source. It checks that:
+  - the testbench run parses and synthesizes nothing and leaves the directory unchanged,
+    and results arrive after the recorded AUTO_PIPELINE depth and AUTO_FSM latency;
+  - the testbench reads the value the build read for the unbuilt tag, which a
+    `--latency_hints` file seeds to a nonzero depth;
+  - a tag the build never decided (`-D EXTRA_TAG=1`), a call of the tag the build only
+    read (`-D CALL_SPARE=1`), a changed design parameter and an edited source are each
+    refused;
+  - the same build command again is up to date: it builds nothing and leaves the
+    directory unchanged;
+  - in a copy of the directory, a record from another compiler version, or one with no
+    build inputs, is refused;
+  - `--rebuild` builds again (warm) and rewrites the record with the same build inputs;
+  - a `--no_synth` build in the directory removes `built_hardware.json`.
+
+  The build passes `--pipeline_min_effort 0`: a trim trial of this design hits
+  [#381](https://github.com/JulianKemmerer/PipelineC/issues/381) (see the [issues inventory](issues_inventory.md)).
+
+## Stream performance measurement coverage
+
+The library is in `include/pypeline/stream/stream_perf*.py` and `stream_bottleneck.py`;
+see [its guide](../include/pypeline/stream/pypeline_stream_perf_guide.md). Its metric
+definitions are what measured designs get compared on, so each one is checked against
+hand-worked numbers.
+- `stream_perf_test.py` (native_sim, plain Python plus `sim_call`):
+  - boundary metrics and per-packet latencies on a hand-worked beat trace;
+  - each tap's cycle partition, the epoch keeping only a cycle's last sample, buffer
+    conservation and underflow, the arbiter's four-way split, and registry matching;
+  - the bottleneck walk past a relaying block and a fork, the idle-label and no-tap
+    cases, headline and report formatting, and `buffer_tap_errors`;
+  - a probed FIFO between `ConvergedAxisSimSource` and a backpressuring
+    `ConvergedAxisSimSink`, measured by a `PhaseRunner`.
+- `stream_perf_probe_test.py` (native_sim via `pypelinec --sim --comb`, and
+  synth_device_models `--comb`): two MAINs run the same probed producer → FIFO →
+  consumer chain, closed through `Feedback[T]`. Its `@final(sim=True)` hook checks:
+  - MAIN-labelled tap names and one count per cycle;
+  - each consumer's service period (3 and 2);
+  - the verdict landing on the consumer, past the relaying FIFO.
+
+  The synth entry proves the probes elaborate away. Mutation-checked: a wrong expected
+  period fails.
+- `stream_perf_tb_test.py` (same two categories): the guide's complete testbench. A
+  `PhaseRunner`, converged AXIS source/sink and a probed FIFO plus skid buffer, with the
+  consumer ready every other cycle. Its `@final` hook checks:
+  - every packet checked, with exact byte accounting;
+  - 2.0 B/cycle sustained;
+  - consistent taps, buffer conservation and the verdict.
+
+## AUTO_MULTI_CYCLE coverage
+
+`AUTO_MULTI_CYCLE(latency= / start_latency= / max_latency=)` and the multi-cycle stream wrappers:
+- [`added_latency_context_test.py`](../src/tests/pypeline_tests/inst/added_latency_context_test.py)
+  (unit): two MAINs share a helper across AUTO_PIPELINE, fixed/auto MCP, FSM-direct,
+  and untagged-bridge contexts. Checks per-MAIN lock targets, all boundary strategies,
+  wrapper stage-zero scheduling, guards before mutation/emission, both seeding tiers,
+  and planner/coarse-slicer agreement using synthetic leaf delays. Also checks
+  endpoint-only RTL attributes, selective MCP cache identities, setup/hold XDC,
+  DSP-origin/wrong-requirement diagnostics, and control/explicit-pipeline exclusions.
+- `auto_multi_cycle_unit_test.py` (unit):
+  - constructor validation and `.latency` resolution;
+  - construction-site keys and the inline-construction guard;
+  - design-read vs. compiler-read tracking;
+  - identity that follows the resolved count;
+  - `AUTO_MULTI_CYCLE` constraint overrides and the timing-params hash;
+  - `AUTO_MULTI_CYCLE` report matching and grow-only sweep feedback on a synthetic Vivado report;
+  - elaboration into `Logic.auto_multi_cycle_tuples`, where a cache re-parse changes the count and
+    renames the holding entity;
+  - an unread tag refused by `AUTO_MULTI_CYCLE.CHECK_AUTO_MULTI_CYCLE_TAGS_READ`;
+  - endpoint selection on the elaborated stream wrappers. The XDC, group
+    matching and isolated evidence take only `launch` -> `capture` D paths.
+    They reject the `cycles_since_launch` controller, look-alike names
+    (`not_launch_reg`) and CE pins. The isolated seed rounds raw delay up to
+    whole cycles, never below 1 or the elaborated count, never above
+    `max_latency`, and leaves `latency=` tags alone;
+  - named tags:
+    - the key is the name plus a fixed/max suffix;
+    - a named tag consumes no site ordinal;
+    - a second tag with one name joins its group; one with other constraints is a
+      `TypeError` naming both sites;
+    - identity ignores a named tag's `start_latency`, but not the count;
+  - repeated stream wrappers: two calls of one uncached service factory
+    ([`auto_multi_cycle_repeated_design.py`](../src/tests/pypeline_tests/inst/auto_multi_cycle_repeated_design.py))
+    elaborate, unnamed (keyed by the wrapped function) and under a shared `name=`, to one
+    group each, held by one function. A shared name over another function is refused;
+  - replaying built hardware: a tag that build read but never built reads the recorded
+    count, and any other undecided tag raises `BuiltHardwareError`;
+  - a starting count from the latency memory is elaborated, then registered as
+    a provisional seed with the source floor. Evidence that raises it keeps
+    that floor.
+- `stream_auto_multi_cycle_test.py` (native_sim and synth_vivado `--comb`): the handshake waits
+  `.latency + 1` cycles for `start_latency=` and fixed `latency=`, and the Xilinx-part
+  `--comb` build emits setup/hold exceptions for both wrappers.
+- `stream_multi_cycle_test.py` (native_sim and synth_vivado `--comb`): the fixed
+  `make_stream_multi_cycle`.
+- `auto_multi_cycle_sweep_test.py` (build_report_vivado, **real Vivado**, `auto_multi_cycle_sweep_design.py`):
+  - from the default start, the sweep raises the count until the path meets timing;
+    pass 2 re-elaborates, the final XDC carries the count, and the pipelined native
+    `--sim`'s `sim_assert` checks the handshake;
+  - restarting at that count settles immediately, with pass 2 skipped;
+  - `max_latency=1` fails the build naming the cap.
+
+- `mcp_dsp_packing_test.py` (build_report_vivado, requires GHDL): variable-input
+  DSP multiplication shared by fixed/automatic MCPs and AUTO_PIPELINE, on
+  `xc7a200tffg1156-2` at 80 MHz. Checks every launch/capture bit (including
+  struct/array fields), DONT_TOUCH, DSP register settings, actual setup/hold
+  requirements, unchanged control/neighbor timing, routed preservation,
+  automatic count growth and confirmation, native/GHDL data/latency/backpressure,
+  and warm log reuse. Negative audit checks reject a nonempty collection missing
+  one bit, a wrong setup requirement, and a relaxed launch-control path. Control
+  timing is checked from controller registers to each launch register's CE or D
+  pin, covering both hardware enables and data-input feedback muxes. The routed
+  fixed-count fixture uses `--comb`: its unpipelined body can fail timing, so this
+  audit verifies MCP preservation/requirements without asserting whole-design
+  closure. The automatic fixture checks synthesis timing confirmation with body
+  pipelining enabled and does not run place-and-route.
+  `--prepare-only --out_dir DIR` runs
+  native simulation, HDL emission and GHDL protocol checks without Vivado
+  synthesis. These focused checks do not replace application timing validation.
+
+## AUTO_COMB_AREA_OPT coverage
+
+The companion `AUTO_COMB_DELAY_OPT` suite adds `auto_comb_delay_opt_test.py`
+(native isolation, dependency timing, exact candidates, casts, arithmetic
+families, purity, nesting and repeat-parse pinning),
+`auto_comb_delay_opt_build_test.py` (Yosys SAT equivalence, register-free core,
+separate original/optimized sky130 timing builds), and stream/composition
+native-versus-GHDL fixtures. The stream asserts latency 2, II=1 and stable
+data/valid under stalls; composition covers pipeline and FSM.
+
+The FSM unit suite includes a counted diamond-DAG regression against
+exponential input-storage traversal. `auto_fsm_var_index_read_test.py`
+(elab_introspect) schedules AUTO_FSMs around variable-index array reads in the
+tagged function and a called helper. Both regenerate typed indexed source;
+compound struct elements and multidimensional arrays are covered in GHDL.
+`auto_fsm_prefix_tree_test.py` (unit) gives a soft comparator prefix tree the
+delays a cold delay scope derives and checks that the scheduler asks for a
+measurement of the helper an estimate would split, keeps it whole once
+measured, and reuses the carried measurement on a later pass. It also renders
+stored array input elements as indexes, and checks that a MAIN with no
+registers of its own drives its scheduled FSM's clock enable after the
+re-parse (a memo kept from the passthrough parse once left it undriven). A
+helper kept whole as a pipelined unit must not be reported as a blocked
+descent.
+`qor_multiplier_auto_fsm_test` keeps its
+1800-second timeout; `auto_fsm_min_area_verify_test` keeps 2700 seconds, all four
+real builds and the 3% area tolerance. The latter saves each variant's complete
+live output in `build.log`, with elapsed/status summaries. Retaining the
+original area incumbent is valid; a search move is not required. See
+[`AUTO_COMB_OPT_DESIGN.md`](AUTO_COMB_OPT_DESIGN.md).
+
+`AUTO_COMB_AREA_OPT` is exercised at the callable, graph, RTL and stream boundaries:
+
+- `auto_comb_area_opt_test.py` (`elab_introspect`): metadata/native forwarding,
+  generated candidate equivalence, exclusive predicates, multiple consumers,
+  signed casts, modular factoring, constant arithmetic, demanded/known bits,
+  custom narrow-width operators, scoped fallback, purity and repeat parsing.
+- `auto_comb_area_opt_build_test.py` (`build_report_device_models`, Yosys + GHDL): SAT proves
+  bit-exact equivalence for all inputs of the two-multiplier/output-mux example;
+  independent mapped-cell builds require a strict area reduction and no
+  flip-flops/latches in the combinational replacement.
+- `self_check_stream_auto_comb_area_opt_test.py` (`synth_device_models`, native-vs-VHDL `--comb`):
+  two-cycle registered boundaries, unstalled II=1, bubbles, backpressure and
+  stable output while stalled.
+- `self_check_auto_comb_area_opt_composition_test.py` (both native-vs-VHDL modes):
+  fixed/discovered pipelines, default raw-function FSM and explicit-AUTO_COMB_AREA_OPT FSM. It
+  sets no `PART`; the pipelined build runs under `--syn_tool device_models` (see
+  `NON_COMB_SYN_TOOL`). There is
+  no multi-cycle member: MULTI_CYCLE constraints are Vivado-only, and one used to
+  force the whole design onto a slow Vivado sweep. Multi-cycle streams are
+  covered by the `synth_vivado`/`build_report_vivado` tests above.
+
+Run the full suite with `python3 src/tests/pypeline_tests/run_all.py -j 5 --no_timeout`.
+Use `-k auto_comb_area_opt` to select the feature tests. See
+[`AUTO_COMB_OPT_DESIGN.md`](AUTO_COMB_OPT_DESIGN.md) for the contract and limits.
+
+## Global wire name coverage
+
+`local_binds_global_wire_test.py` (`elab_introspect`) covers which names mean a global
+wire. Each case writes a small design module to a temp dir and imports it, because
+native sim's check fires at decoration time. Elaboration's own check is reached by
+stubbing out `pypeline._check_no_local_binds_wire_name`.
+
+- **Local bindings of a wire's name are rejected by both layers.** The forms are an
+  annotated local, a `Reg` declaration, a parameter, a for-loop variable and a
+  comprehension variable. Sim raises `GlobalWireNameError` with the file and line, and
+  `ELABORATE_LIVE_ROOTS` and `PARSE_FILE` raise `ElaborationError`.
+- **The same holds for the alias of a wire-declaring module** (`def g(file_a: ...)`),
+  and for a sub-file's bare wire name, which is registered as `<module>_arr`.
+- **A local in a module that does not declare the wire stays a local.** This covers a
+  helper module local `valid` next to a top-file `valid: Wire`, and a local spelled
+  like a sub-file wire key (`file_a_o`). The test asserts the helpers have no global
+  wires or readback inputs and that the only writer is the real one. Both elaboration
+  paths are checked.
+- **Positive control:** an ordinary same-module `acc = x` still writes the wire.
+- **Unpacking into wires** (`acc, b = ...`, `b, acc2 = acc, b`) writes the wires in sim.
+  The RHS is evaluated first, a typed local leaf is still truncated, and the claim reset
+  zeroes the wires on the next invocation. Elaboration registers both wires as written.
+
+All cases except the positive control fail on the tree before the fix.
+
+## Global wire semantics and pipeline timing coverage
+
+**Combinational semantics.** These run native sim and the `--comb` native-vs-VHDL
+cycle diff:
+
+| Test | What it covers |
+|---|---|
+| `global_wire_partial_field_test` | partial struct writer: the unwritten field reads zero |
+| `global_wire_read_write_test` | own read-before-write reads zero; write/read/augmented-assignment order |
+| `global_wire_split_driver_test`, `global_wire_array_split_test` | several writers own disjoint fields/elements |
+| `global_wire_readback_test` | foreign fields live, own fields zero (`_PYPELINE_READBACK`) |
+| `global_wire_hier_writer_test` | a writer below a `@MAIN` |
+| `global_wire_cond_driver_test` | conditional writes, with a zero alternative |
+| `global_wire_dynamic_index_write_test` | one dynamic element driven, the others zero |
+
+The remaining global wire tests:
+- `global_wire_nested_split_test` runs in `synth_tests.py` (`--comb`) and native sim.
+  It is not in the cycle diff; see the comment in `native_vs_vhdl_sim_tests.py`.
+  `top_level_reader_order_test.py` (`known_issues`) builds it with two
+  `PYTHONHASHSEED`s: its `top.vhd` orders the readers' connection blocks by set order
+  ([#380](https://github.com/JulianKemmerer/PipelineC/issues/380)).
+- `global_wire_errors_test` (`elab_introspect`) covers the ownership, direction,
+  overlap and dynamic-index errors.
+- `global_wire_unshared_readback_known_issue` (`known_issues`, needs GHDL) is the
+  cycle diff of `global_wire_unshared_readback_design.py`: a readback in a design
+  with no shared wire, where `global_wires_pkg` is not written but `top.vhd` uses
+  its types, so GHDL rejects the VHDL
+  ([#384](https://github.com/JulianKemmerer/PipelineC/issues/384)).
+- `native_invert_compare_wire_known_issue` (`known_issues`, native sim only): `~q`,
+  where `q: Wire[uint1_t]` is written from a comparison, is truthy in every cycle
+  because the wire holds a Python `bool` (`native_invert_compare_wire_test.py`
+  asserts the hardware's answer,
+  [#392](https://github.com/JulianKemmerer/PipelineC/issues/392)).
+
+**Pipeline timing.** See the guide's
+[Global wires in pipelined code](pypeline_guide.md#global-wires-in-pipelined-code).
+
+- `global_wire_pipeline_aligned_test` (`native_vs_vhdl_sim`, `--comb`): ten
+  `AUTO_PIPELINE` cores, nine with fixed `latency=2`, using globals in their own
+  bodies:
+  - a late read, early and late uses of one struct wire, two separate wires;
+  - shallow, partial, array, split and readback writes;
+  - an unused readback (it used to emit an undeclared VHDL variable);
+  - a `VOLATILE` read and write through an unconstrained call (zero latency).
+
+  The checker asserts every value against its counter in both sims. On the tree
+  before this change, 9 of the 13 underlying cases mismatched.
+- `global_wire_pipelined_main_test` (`native_vs_vhdl_sim`, non-`--comb`): a
+  sweep-pipelined pure `@MAIN` writes a shallow wire and a deep wire, and reads its
+  own wire before and after writing it. Native sim used to refuse two written wires,
+  and its write collector read stale values.
+- `global_wire_pipeline_instance_test` (`build_report_device_models`, needs GHDL):
+  - Fixed-latency placement selects `device_models` explicitly. The cocotb/GHDL
+    self-check of `global_wire_pipeline_instance_design.py` shows
+    per-instance timing: a helper at stage 0 and at stage 2 sees `g` from different
+    cycles, a `VOLATILE` read happens at its consumer's stage, and a `VOLATILE` write
+    is driven immediately.
+  - Native sim must refuse `global_wire_pipeline_refusal_design.py` (nested read,
+    then `VOLATILE` read) with `SimPipelineModelError`.
+- `native_pipeline_region_test` (`unit`, no build): a pipelined region's own-read
+  overlay returns (0, 3) where the collector used to return (9, 9). It also covers
+  `AUTO_PIPELINE` writes delayed with the return value over Layer-1 `sim_call`
+  cycles, and the nested-read refusal.
+- `auto_fsm_purity_test` (`elab_introspect`): `BUILD_SCHEDULE` rejects a callee
+  reading a global and a callee holding `Reg` state; both used to be kept as opaque
+  units. It also rejects a direct global read and still schedules a pure core. The
+  two callee cases fail on the tree before the change.
+
+## Global FIFO coverage
+
+`Fifo[T]` on one clock ([guide](pypeline_guide.md#fifot--global-fifos)) and native
+simulation's multi-clock refusal; FIFOs across clocks are under
+[Multi-clock coverage](#multi-clock-coverage):
+
+| Test | Category | What it covers |
+|---|---|---|
+| `global_fifo_api_unit_test` | `unit` | `Fifo[T]`'s wire type and its errors (extra arguments, an interface or port half, a non-hardware `T`); `global_fifo`/`global_sync_fifo` argument errors and the depth each `n` builds; the stream-module port helper's errors; the FIFO MAIN generator avoiding the module's names |
+| `global_fifo_elab_test` | `elab_introspect` | realization: the FIFO MAIN's clock, protected name and `func_no_added_latency` entry, the handshake users, the access records and their lines, a FIFO in an imported module. Errors: an unused end, two users of one end, a user with two instances, driving `wr.ready` or `rd.stream`, a missing initializer, a module whose ports don't carry `T`, `global_sync_fifo` ends on two clocks (with the bare-MAIN hint), `Fifo[T]` in a function, `AUTO_PIPELINE` of a handshake user, a function already named `rx_FIFO` |
+| `global_fifo_sim_test` | `native_sim` | order and backpressure through `global_fifo`, `global_sync_fifo`, `make_stream_fifo` and `make_skid_buffer` initializers, and a FIFO declared in an imported module (`global_fifo_sim_sub_design.py`). Two of its FIFOs build the same `make_stream_fifo(uint8_t, 4)`, which checks that FIFO MAINs keep separate model state |
+| `multi_rate_sim_refusal_test` | `native_sim` | `pypeline_sim.py` and `pypelinec --sim --comb` exit non-zero on two rates and on two named clocks of one rate, naming the clocks with their `@MAIN`s; one rate beside a bare `@MAIN` still simulates |
+| `self_check_global_fifo_test` | `native_vs_vhdl_sim` (`--comb`), `synth_device_models` (`--comb`) | a struct-typed FIFO between two `@MAIN`s with backpressure: native sim and GHDL match cycle by cycle, and sky130 synthesizes it |
+| `global_fifo_path_unit_test` | `unit` | the sweep's view of a FIFO MAIN: Vivado-style and sky130-flattened paths inside it go to it alone, a path out of it to the user `@MAIN`, unattributable paths to the user `@MAIN`s; `WHY_NOT_SLICEABLE`; the `TIMING NOT MET` line names `global FIFO rx [...]` |
+| `global_fifo_pipeline_latency_test` | `elab_introspect` | the FIFO MAIN is added after trimming (`_add_late_mains`), which re-checks only the new functions: a design with a `pipeline_latency` function and two collapsing `AUTO_PIPELINE` calls (stale tags) parses, and its stateful MAIN's self-timed submodules equal those without the FIFO |
+
+## Multi-clock coverage
+
+Clocks, async wires and global FIFOs across clocks
+([guide Part IV](pypeline_guide.md#part-iv--multiple-clock-domains)):
+
+| Test | Category | What it covers |
+|---|---|---|
+| `clock_api_unit_test` | `unit` | `make_clock`: identity and hashing, port names agreeing with `VHDL.CLK_MHZ_GROUP_TEXT`, argument errors, `syn_mhz` and case conflicts; `MAIN`'s clock forms and naming a clock twice; wire marker combinations, and markers on `Inst`/`Fifo` refused; `global_async_fifo` and `impl=` errors |
+| `clock_domains_elab_test` | `elab_introspect` | named clocks of one rate and `syn_mhz` in the parser state; clock assignment through a wire, a helper, a stated pin and an `Inst[f]`; a bare MAIN on two clocks (both paths) and an instance used on two; the default clock with its warning; notes printed once; the crossing error text; a legal per-leaf split; `ASYNC` rows and the never-crossed warning; stated clocks on writers and pin readers; a pin read on two clocks; the Arty `clk100` binding of `CLK100MHZ` |
+| `clock_mhz_pragma_test` | `elab_introspect` | clock bindings: `clk_mhz`/`clk_group` filled, two named clocks of one rate on two pins, a non-`uint1_t` or `Output` binding, two pins for one clock, a bound clock no `@MAIN` runs on |
+| `async_fifo_elab_test` | `elab_introspect` | async realization: the `ClkCrossVarInfo`, the stubs' tags, the side MAINs and their clocks, `main_names`, the depth and `impl="builtin"`; `global_sync_fifo` across clocks, `global_async_fifo` on one clock and a module initializer across clocks rejected; crossing report rows |
+| `async_fifo_path_unit_test` | `unit` | the sweep's view of an async FIFO: paths inside its `clk_cross` instance go to the side MAIN of their clock, a path with one end on a net to the FIFO, a path out of it to the consumer; `GLOBAL_INST_MAINS`, `WHY_NOT_SLICEABLE` and `TIMING NOT MET` for the side MAINs; `VHDL.CLK_CROSS_USES_XPM` on Vivado, other tools and no tool |
+| `multi_clock_ghdl_test` | `multi_clock` (no synthesis) | the guide's Part IV design (`multi_clock_design.py`), `--comb --no_synth`: the crossing report, the top's clock ports and pin, and a two-clock GHDL testbench in which bytes cross the built-in async FIFO in order and the synchronized flag rises |
+| `multi_clock_open_tools_test` | `multi_clock` (open_tools) | `multi_clock_synth_design.py` on ECP5: `--comb` with a PASS line per clock; `multi_clock_design.py --comb`, whose pin clock nextpnr reports by the pin's name, still with a PASS line under `clk_125p0_eth_rx`; a sweep at `CRUNCH_MHZ=80` that cuts `crunch` and not the side MAINs; `multi_clock_fifo_timing_design.py`, whose read clock misses 900 MHz inside the FIFO, ending `TIMING NOT MET: global FIFO mon [...]` |
+| `multi_clock_vivado_test` | `multi_clock` (Vivado) | the same design on the Arty's xc7a35ti: `xpm_fifo_async` at depth 16, the built-in FIFO with `FIFO_IMPL=builtin`, every clock and the asynchronous clock groups in `clocks.xdc`, a PASS line per clock |
+| `auto_goal_vivado_test` | `multi_clock` (Vivado) | AUTO objects at two clock goals, three sweeps at once: two factory calls of one AUTO_PIPELINE factory at 25 and 100 MHz, and the same in a comprehension, record one depth per goal in `built_hardware.json`, the faster one deeper, and their factory-time `.latency` reads match what was built; one AUTO_MULTI_CYCLE object under 50 and 100 MHz gets one count that meets both clocks |
+| `self_check_named_clock_pin_test` | `native_vs_vhdl_sim` (`--comb`) | two `@MAIN`s and a global FIFO on a named clock bound to the pin `SYS_CLK`: the cocotb testbench clocks the pin, its one clock, and native sim and GHDL match |
+| `clock_domain_inference_test` | `elab` | a bare MAIN reading a wire that a helper one call deep under another MAIN writes takes that MAIN's clock |
+
+## Global instance coverage
+
+`Inst[f]` ([guide](pypeline_guide.md#instf--global-instances)), and the zero-init
+constants of a function writing two compound wires:
+
+| Test | Category | What it covers |
+|---|---|---|
+| `global_inst_api_unit_test` | `unit` | `Inst[f]`'s ports and wire type: plain arguments and `out` (scalar and struct), interface ports as one `wire_t` field, a port bundle with a plain field, a one-directional interface port, an `AUTO_PIPELINE` tag; one wire type per hardware and distinct names for two factory calls. Errors: `Inst[a, b]`, a non-hw_func, a `@MAIN`, no ports, an array of interface halves, an argument `out`, a field sharing an argument's name. The MAIN generator's source and its names avoiding the module's; an initializer; native sim's MAIN names; `MAIN()` checking a user's `name=` while `_register_main` takes an instance's long name verbatim |
+| `global_inst_elab_test` | `elab_introspect` | the `<key>_INST` MAIN: a bare MAIN that clock inference gives a user's rate, with bare users taking it through the instance; protected name; `"global instance"` in `func_no_added_latency`; its access records (`out` recorded as `out_v`); an unused instance stays bare; handshake users of a skid buffer instance; an imported module's instance; a constrained `AUTO_PIPELINE` call site inside an instance is validated. Errors: driving an output, users on two rates, an initializer, `Inst[f]` in a function, `AUTO_PIPELINE` of a handshake user, a function already named `adder_INST` |
+| `global_inst_sim_test` | `native_sim` | a combinational instance driven from two `@MAIN`s and read by two; two instances of one `Reg` counter keep their own state; a skid buffer instance under backpressure; `Inst[AUTO_PIPELINE(f, latency=2)]` delays by two; an imported module's instance (`global_inst_sim_sub_design.py`) |
+| `self_check_global_inst_test` | `native_vs_vhdl_sim` (`--comb`), `synth_device_models` (`--comb`) | those shapes plus a `make_ram` instance (a `pipeline_latency` function inside an instance's MAIN): native sim and GHDL match cycle by cycle, and sky130 synthesizes it |
+| `global_inst_path_unit_test` | `unit` | the sweep's view of instance MAINs: a path inside one goes to it alone; a path out of a stateful instance to the user `@MAIN`; a path into an `AUTO_PIPELINE` instance to both; paths without register names leave out only the stateful instance; `WHY_NOT_SLICEABLE`; the `TIMING NOT MET` line names `global instance cnt [...]` |
+| `self_check_two_struct_wire_writes_test` | `native_vs_vhdl_sim` (`--comb`) | one function writing fields of two compound `Wire[T]`s of different struct types: each wire's implicit zero-init constant has its own name, so the VHDL builds and matches native sim |
+
+The global FIFO tests above also cover the generic instance code on its FIFO kind.
+
+## Reset coverage
+
+Synchronous resets ([guide](pypeline_guide.md#resets)):
+
+| Test | Category | What it covers |
+|---|---|---|
+| `reset_api_unit_test` | `unit` | `make_reset` styles and their `NotImplementedError`s; `Reg[T, RESET/NO_RESET]` with a `MULTI_CYCLE` role in any order and the `TypeError`s; `make_clock(reset=)`, its read-only `.reset` outside the identity, two primary resets of one clock; `MAIN(reset=, reset_registers=)` argument errors; `_resolve_main_reset` and `_global_inst_main_reset`; the `reset` rename |
+| `reset_elab_test` | `elab_introspect` | `main_resets`; `RESET` on exactly the entities that reset, per-policy entities of one function and the reset-free one keeping its plain-design name; `NO_RESET` kept out; `"requested"` resetting only marked registers; raw `vhdl(..., reset="sync")` with the port or the constant; the notes for raw VHDL without `reset=` and for an unused reset pin (dropped); global instances and same-clock FIFOs on their clock's reset, unreset and unrenamed without one; every reset error (no reset, own reset, unbound, binding forms, a pin on two clocks, a `Wire` on another clock, `vhdl(reset=)` values, a raw argument named `reset`, an `"all"` user with another reset, an `"all"` async FIFO end); the ASIC initializer rule case by case and its `SYN.RESOLVE_BUILD_TARGET` hook |
+| `reset_sim_timeline_test` | `native_sim` | the cycle-0 pulse of a reset pin and `--run N`, an unchanged reset-free timeline, no pulse for a pin a `@sim_input` drives, a reset `Wire` from its logic, `sim_call` with resets inactive |
+| `self_check_reset_regs_test` | `native_vs_vhdl_sim` (`--comb`) | a pin reset pulsed in cycle 0 and a generator's reset `Wire`: scalar, signed, array, struct and enum initializers, `"all"` and `"requested"`, `NO_RESET`, one function reset in one MAIN and not another, a reset in a cycle a clock-enabled call is skipped, mirrored by manual `if rst:` logic |
+| `self_check_reset_pipeline_test` | `native_vs_vhdl_sim` (`--comb`, and sky130) | a fixed-latency `AUTO_PIPELINE`'s stage and raw operator registers: no stale valid after a reset |
+| `self_check_reset_pipelined_main_test` | `native_vs_vhdl_sim` (sky130) | a pure MAIN the sweep slices, reset in cycle 0 and mid-run: the reset cycle's word never comes out and nothing stale follows (native sim's delayed MAIN writes become zeros) |
+| `self_check_reset_fsm_test` | `native_vs_vhdl_sim` (`--comb`, and sky130) | a scheduled `AUTO_FSM` reset mid-request returns to idle and restarts; no result of the cancelled case |
+| `self_check_reset_global_inst_test` | `native_vs_vhdl_sim` (`--comb`) | `Inst[f]` of a counter and of an `AUTO_PIPELINE`, and a same-clock `Fifo[T]`, reset with their clock's reset |
+| `self_check_reset_ram_test` | `native_vs_vhdl_sim` (`--comb`) | a `make_ram` and a `make_auto_pipeline_ram` reset keeps its contents, cancels a read in flight and the write at the reset edge; only valid bits reset (`make_ram`'s `addr`/`rd_data` keep their values) |
+| `ram_reset_inference_open_tools_test`, `ram_reset_inference_vivado_test` | `build_report_open_tools`, `build_report_vivado` | a 4096 x 32 `make_ram` and `make_auto_pipeline_ram` under `reset_registers="all"` (`--comb`): the RAM entity has the reset, and ECP5 and Artix-7 still use block RAM, not flip-flops |
+| `reset_sweep_path_test` | `unit` | `SWEEP.RESET_DISTRIBUTION_PATH` on a parsed design (a reset `Wire`'s and a pin's fanout, the pin also as the `start_port_name` sky130 STA reports; not a path inside one MAIN, into a MAIN without that reset, or from a source that also drives data the reset MAIN reads, directly or through another MAIN); a scripted sweep stops at a reset path without pipelining and names the reset, pipelines the same path unclassified, and does not stop at a reset path in an iteration worse than an earlier one (`RESET_PATH_STOPS_PLAN`) |
+| `self_check_reset_stream_lib_test` | `native_vs_vhdl_sim` (`--comb`) | reset equivalence of a stream FIFO and two skid buffers: a chain reset mid-traffic matches one held in reset until then |
+| `self_check_reset_dsp_test` | `native_vs_vhdl_sim` (`--comb`) | the same reset equivalence for the DSP blocks: the ROM NCO, log/dB and atan2 (requests in flight, own `rst=0`), CORDIC atan2, an elastic FIR (fixed latency 2), a valid-only FIR decimator, moving average and DC blocker, and magnitude |
+| `multi_clock_reset_ghdl_test` | `multi_clock` (no synthesis) | `multi_clock_reset_design.py`: each domain's MAINs, global instance and FIFO map their domain's reset; GHDL resets each domain in turn while the other keeps counting |
+| `multi_clock_reset_synth_open_tools_test`, `multi_clock_reset_synth_vivado_test` | `multi_clock` (open_tools, Vivado) | the same design `--comb` on ECP5 and Artix-7: both clocks meet timing, both per-policy entities are built |
+| `vhdl_submodule_port_map_test` | `unit` | `RESET` after `CLOCK_ENABLE` in each stateful child's port map |
+| `double_parse_file_test` | `elab_introspect` | two parses give the same `main_resets` and per-policy entity names |
+
+Every fixture with state also runs with a default reset: a reset pin (`rst:
+Input[uint1_t] = make_reset()`, pulsed in cycle 0 by both simulators) and
+`reset_registers="all"` on its `@MAIN`s, or the pin as its clock's reset
+(`make_clock(rate, reset=rst)`) where global instances or FIFOs need it, one pin per
+clock in a design on several clocks. So each registration also checks the reset of what
+it builds, and expectations that count cycles from power-up start after the cycle-0
+reset. The examples do too: the board tops (a PLL-lock synchronizer driving a reset
+`Wire`), `stream_pipeline.py`, `auto_pipeline_ram.py`, `vga_test_pattern.py`,
+`vga_donut.py`, `dsp/fm_radio_decim.py` and the PDW project (its own reset test,
+`examples/pypeline/dsp/pdw/pdw_reset_test.py`, run by hand, as the PDW README says).
+
+These stay reset-free on purpose, and they are what keeps reset-free generated VHDL
+covered:
+
+- `known_issues` reproducers, which must reproduce their bug as filed;
+- the language and simulator semantics fixtures: global wires (`global_wire_*`,
+  `global_wires_sim_test`), variable references (`var_ref_*`), register update rules
+  (`reg_aug_assign_test`, `reg_bitwise_mask_test`, `reg_undefined_width_test`,
+  `sim_loop_reg_state_test`), casts, widths and types (`call_arg_width_test`,
+  `nested_truncate_test`, `struct_ctor_positional_test`, `cast_interface_test`,
+  `char_array_test`, `enum_test`, `bit_math_test`), the `sim_*` APIs (`sim_input_test`,
+  `sim_output_direct_wire_test`, `sim_print_test`, `sim_assert_finish_test`,
+  `main_args_sim_test`);
+- elaboration-rule, error and API tests, whose designs are rejected or whose subject is a
+  call form or a naming or clock rule (`interface_type_error_test`,
+  `global_wire_errors_test`, `wires_contract_test`, `multi_rate_sim_refusal_test`,
+  `clock_domains_elab_test`, `clock_api_unit_test`, `global_inst_api_unit_test`,
+  `factory_main_api_unit_test`, `factory_main_elab_test`, `global_inst_elab_test`,
+  `global_fifo_elab_test`, `auto_fsm_owner_goal_test`); `reset_elab_test` covers their
+  reset rules;
+- async clock-crossing designs (`async_fifo_*`, `multi_clock_*_design.py`): an async
+  global FIFO is not reset, and a `reset_registers="all"` `@MAIN` at its end is an error
+  (`multi_clock_reset_design.py` covers resets on several clocks);
+- tests of a library block's own `rst` input, which exists for designs without resets
+  (`self_check_dsp_rom_test`, `valid_join_test`);
+- fixtures with no state, where a reset changes nothing (`auto_comb_*_opt_test`,
+  `loop_iter_naming_test`);
+- QoR references whose numbers the docs quote (`auto_pipeline_ram_design.py` for the RAM
+  QoR bench, `float_sine_auto_fsm.py`'s FSM table, `vga_donut_auto_fsm_next_state.py`,
+  `auto_fsm_ctl_compare_test`'s FSM area);
+- `sweep_floor_detect_design.py`, whose subject is the sweep's stop on the plateau it
+  measures: with a reset pin, the pin's fanout to the registers the sweep adds becomes
+  the critical path past its best iteration, and fmax falls as the cuts grow, so the
+  sweep never sees a plateau and ends on `no_realized_change` instead;
+- `region_root_minisweep_design.py`, whose subject is the mini-sweep lock of a whole
+  region: with a reset pin, the pin's fanout to the lock's thousands of registers is
+  the critical path in the full design, so a lock that meets the goal in isolation
+  never does in context;
+- `sim_call` scripts and C designs;
+- the getting-started examples `counter.py`, `fsm.py`, `blink.py` and `pipeline.py`, whose
+  printed output, waveforms and simulator drivers the README walks through.
+
+## Factory-made MAIN coverage
+
+`@MAIN`s made in code with `MAIN(fn, name=...)` ([guide](pypeline_guide.md#mains-made-in-code-mainfn-name)):
+
+| Test | Category | What it covers |
+|---|---|---|
+| `factory_main_api_unit_test` | `unit` | `MAIN`'s six forms and the record each leaves (`_pypeline_main`); `mhz` with the call form; `name=` checks; default names (top file, module prefix, `@hw_func(name=)`); one function registered twice; `MAIN()` during a simulation run; a non-function; the duplicate-name message; the name helpers `PY_TO_LOGIC` aliases; native sim's name map for build results; an `ELABORATE_LIVE_ROOTS` MAIN root keyed by its name |
+| `factory_main_elab_test` | `elab_introspect` | four lanes made in a loop (keys, rates, ports, source description, wire users); a bare made MAIN's rate through a wire; an imported module's factory MAIN; a pure-factory library's function registered by the design; a renamed top-level MAIN; a plain def passed to `MAIN()`, with and without `name=`; a factory closure's wire users under its key; re-parse names. Errors: two MAINs with one name, a MAIN named like a function, a MAIN whose module holds hardware but was imported in a function |
+| `factory_main_sim_test` | `native_sim` | under `pypeline_sim.py`: counter lanes from one factory keep their own registers, stateless lanes their own wire elements, two stateless MAINs their own `make_stream_fifo` model state; duplicate names stop the run; the multi-rate refusal names made MAINs; `MAIN()` in an `@initial(sim)` hook is an error |
+| `factory_main_pipeline_latency_test` | `native_sim` | two lanes reaching one `@pipeline_latency` helper from one source line, with build timing that differs per lane, each dispatch to their own stage graph |
+| `self_check_factory_main_test` | `native_vs_vhdl_sim` (`--comb`), `synth_device_models` (`--comb`) | counter lanes on one wire's elements, two FIFO lanes from one `make_stream_fifo`, and a factory closure writing a wire: native sim and GHDL match cycle by cycle, and sky130 synthesizes it |
+| `stateless_caller_sim_state_known_issue` | `known_issues` | the case root frames do not cover: inside one `@MAIN`, a stateless wrapper called twice and two `make_stream_fifo` FIFOs each share one native-sim state (`stateless_caller_sim_state_design.py`, cycle diff, needs GHDL, [#382](https://github.com/JulianKemmerer/PipelineC/issues/382)) |
+| `live_root_submodule_labels_known_issue` | `known_issues` | native sim after a build: a sub-module MAIN's call to a same-module function is labeled without the build's module prefix, so its pipeline placement is not found (`live_root_submodule_labels_test.py`, [#379](https://github.com/JulianKemmerer/PipelineC/issues/379)) |
+
+## Augmented assignment coverage
+
+`reg_aug_assign_test.py` covers `t op= rhs` in native simulation (see
+[Rule 5](pypeline_sim_DESIGN.md#_typedannassignrewriter--truncation-at-every-typed-assignment)).
+It is registered three times:
+
+- in `native_sim` as a plain Python test;
+- as `reg_aug_assign_convergence_test`, through `pypeline_sim.py --run all`;
+- in `native_vs_vhdl_sim`, which compares its `@MAIN` against GHDL cycle by cycle.
+
+The direct tests use a `_clock()` helper that evaluates a body several times inside one
+buffered clock, the way `pypeline_sim` does, and asserts that every evaluation agrees.
+
+- **The WireGuard repro.** `counters[0] += 1` on a `Reg[uint32_t[2]]` matches the plain
+  `counters[0] = counters[0] + 1`, at 1, 2 and 3 evaluations per clock.
+- **Width truncation.** Scalar `Reg[uint8_t]` `+=` and `Reg[int8_t]` `-=` wrap, and so do
+  array-element, struct-field and nested leaves.
+- **Struct field and nested variable index.** `s.a += 1` (which used to crash) and
+  `s.arr[idx] += 3`.
+- **Read-after-write.** Two `+=` writes in one body.
+- **Every operator.** `+= -= *= <<= >>= &= |= ^=` against a plain-assignment oracle, on
+  register array elements and on a scalar local chain.
+- **Feedback convergence.** A body that converges over several passes advances its
+  register once per call.
+- **State isolation.** The power-on value survives `sim_reset()`, and two instances don't
+  share cycle-0 state.
+- **Values, not aliases.** A typed local copy (`snap: T = reg`) and writes to array,
+  struct and scalar parameters never reach the caller's register.
+
+The `@MAIN` covers the same shapes on registers (scalar, signed, array element, struct
+field, variable-index nested path) and asserts that augmented and plain forms agree every
+cycle. Every direct case except the typed-local copy fails on the tree before the fix.
+
+## `@wires` contract coverage
+
+`wires_contract_test.py` (`elab_introspect`) parses small temp designs in-process. It
+checks that a `@wires` function is literally just wires (see
+[Validation](PY_TO_LOGIC_DESIGN.md#validation--_validate_wires_funcs)).
+
+**Rejected,** each with an `ElaborationError` naming the function, the offending
+register or operator, and its line:
+- a testbench-shaped `@MAIN @wires` with a `Reg` counter (the WireGuard `encrypt_syn_tb`
+  bug, which left a measured MAIN without a timing verdict);
+- an adder;
+- a stateful callee;
+- a variable index;
+- an AND that feeds both the output and `sim_print`;
+- an auto-`@wires` `@cast` that adds;
+- an untagged raw-VHDL callee.
+
+**Accepted** in one design: struct rewiring, bit slices, concat, a constant shift, a
+cast, a constant index, `Wire`/`Input`/`Output` connections, nested `@wires`, a raw-VHDL
+`@wires` body, and `if flag: sim_finish()`, whose enable mux only feeds the builtin.
+
+With the check disabled, all seven rejection cases fail.
+
+## Wiring-only leaf coverage
+
+`wiring_only_leaf_zero_delay_test.py` (`elab_introspect`) parses one small temp design
+in-process and calls `SYN.LOGIC_IS_ZERO_DELAY` on its untagged functions:
+- **Zero delay:** a sign-extension helper whose body is only a cast, and a function that
+  only returns a constant (issue #288). Neither has a submodule. Timing the first on
+  Gowin measured the register-to-register floor and let the planned sweep put a
+  bit-internal cut inside it (issue #373).
+- **Still timed:** a function with a `Reg` and no submodules, and a function with an
+  adder, along with the adder's own built-in leaf.
+
+Without the rule, both zero-delay cases fail.
+
+**Known issue: C float-format conversions are inline logic, not wires.**
+`float_format_cast_test.py` (known_issues) builds `float_format_cast_design.c`, where
+`to_half` only converts `float` to `float_5_10_t` and `select_half` converts inside an
+`if`. The C front end treats the conversion as a connection, and VHDL wraps it in
+`resize_float_e_m_t`, which has an exponent adder and a zero-detect mux. So `to_half`
+has no submodules and the rule above treats it as wiring. It is registered twice, one
+behavior each:
+- `float_format_cast_inline_logic_known_issue` fails while either function's own body
+  calls `resize_float_e_m_t`, where no delay measurement or estimate sees it.
+- `float_format_cast_wraps_known_issue` (needs GHDL) simulates `to_half` and fails while
+  1e10 and 1.5e5 come out as about 2.3 instead of infinity or 65504, and 1e-10 as
+  about 0.43 instead of 0.
+
+Tracked as bug [#376](https://github.com/JulianKemmerer/PipelineC/issues/376).
+
+## Conditional import coverage
+
+`conditional_import_test.py` (`elab_introspect`) covers design modules chosen by
+module-level `if`/`try` imports (see
+[Conditional imports](PY_TO_LOGIC_DESIGN.md#conditional-imports-module-level-if--try)). Each
+case writes small modules to a temp dir under fresh names. Design parameters installed
+with `pypeline.SET_DESIGN_PARAMS` before each in-process `PARSE_FILE` pick the branch
+(the generated modules read them with `param()`). The parse's `sys.modules` eviction
+re-executes the modules. Most choosable modules own a `@MAIN` that drives their wire.
+Every module that must stay out declares a wire nothing writes, so discovering it by
+mistake fails the "written by at least 1 function" check.
+
+- **Minimal repro and control.** A module-qualified wire write and call through a
+  module imported in an `if`, through `PARSE_FILE`, `ELABORATE_LIVE_ROOTS` and a
+  `pypelinec --no_synth` subprocess (source freezing included). The same design with
+  the import unconditional is the control. With the branch untaken, the unbound
+  module name is an `ElaborationError` ("Unknown reference base"), not a raw `KeyError`.
+- **Both choices.** `if: import A as impl / else: import B as impl` (same wire and
+  function names), parsed as a, b, a. Only the chosen prefix's wires, functions and
+  MAIN exist, and `module_alias_to_actual['impl']` is the chosen module.
+- **Other forms.** `elif` from-imports, and an `except ImportError:` handler that ran.
+- **Selected callable into a factory** (the WireGuard `chacha20_encrypt_shared` shape).
+  The chosen module's function is passed to another module's factory. The closure's
+  callee reads its own module's wire by bare name.
+- **Diamond and re-parse.** Two direction modules each conditionally import one shared
+  resource or their own private one. The shared module is discovered once, under its
+  own prefix, with one copy of its MAIN and one instance of each submit function.
+  `CAPACITY` (2, then 5) sizes a shared array wire across re-parses. Choosing private
+  removes the shared module entirely.
+- **Untaken but loaded.** One module is loaded before any parse, so eviction never
+  removes it. Another is loaded by the design via `importlib.import_module` under
+  another name. Neither is discovered from the untaken branch. That branch includes a
+  from-import that also names `uint8_t`, a shared object that alone proves nothing.
+- **Lost MAIN.** A `@MAIN` module imported only inside a function makes `PARSE_FILE`
+  raise, naming the MAIN and its module.
+
+Every case fails on the tree before the fix. Two wrong fixes are caught as well.
+Treating every nested import as taken fails "both choices" and "untaken". Treating a
+from-import as taken when its module is merely in `sys.modules` fails "untaken".
+
+## Design parameter coverage
+
+`param()` and `-D NAME=VALUE` (see
+[Build Parameters](pypeline_guide.md#build-parameters-param-and--d)). Every test design
+that varies per registration reads its settings through `param()`, and each
+registration passes `-D` on the command line. Examples are the
+`SWEEP_FLOAT32_MHZ` matrix, the `AUTO_PIPELINE_RAM_*` builds and the `MCP_DSP_START`
+packing runs.
+
+- **`design_params_test.py`** (unit, in-process):
+  - precedence: `-D`, then `env=` (only when set and non-empty), then the default;
+  - conversion per type, including errors that name the source and the declaration line;
+  - `choices`, matching and conflicting duplicate declarations, and a bare `-D NAME`;
+  - invalid names (a builtin, a keyword, a dunder);
+  - one resolution per process, which a new table resets;
+  - builtins injection and its restore;
+  - the post-import checks: an unused name (with its suggestion), a module-level shadow,
+    and a declared name read as a bare global, while a real injected read passes;
+  - per-parse re-registration in `PARSE_FILE`;
+  - the report, banner, `--list_params` text and `source_provenance.json`.
+- **`design_params_build_test.py`** (build_report_device_models), through the drivers:
+  - `-D` changes a port width and a constant in `--comb --no_synth` VHDL;
+  - the printed and recorded parameter tables;
+  - `--list_params` lists declarations without elaborating;
+  - a value outside `choices` and a misspelled name fail with one line;
+  - injected globals reach module code and a hardware body;
+  - native sim sees the values from `pypeline_sim.py` and from `pypelinec --sim --comb`.
+
+  Its last case is a re-elaborating sky130 build
+  (`design_params_pass2_design.py`, about 5 minutes). It must import the design with
+  identical values in every pass, and print and record the bottom-up value report.
+- **`bottom_up_report_test.py`** (unit): `.latency` read sites, both a direct design read
+  and a read inside `make_stream_auto_pipeline` that names the calling design line. Also
+  AUTO_MULTI_CYCLE `.latency`/`.ncycles` sites, and `AUTO_PIPELINE.RECORD_LATENCY_PASS`
+  rows (read vs built, match, sites) and their printed table. An in-process parse of
+  `stream_auto_multi_cycle_test.py` checks that the multi-cycle wrapper's hardware-body
+  read names `stream_multi_cycle.py` at that line, never the elaborator's `<const_eval>`.
+
+## Synthesis cache coverage
+
+`syn_cache_test.py` covers synthesis result reuse
+(see [SYN_DESIGN.md §6](SYN_DESIGN.md#6-caches)). `run_all` registers it twice, since
+every synthesis run in a `build_report_<tool>` test must use that tool:
+`syn_cache_test` (`--cases pyrtl`, build_report_pyrtl, about a minute) and
+`syn_cache_netlist_test` (`--cases netlist`, build_report_open_tools: the netlist export
+is a yosys run). A direct run does both.
+- **In-process:**
+  - `SYN.SYNTHESIS_INPUT_MANIFEST` is path-independent and changes with HDL bytes,
+    constraints, part, tool installation, recipe module and run settings;
+  - `SYN.REUSE_SYNTHESIS_LOG` reads only a log whose record matches. A log with no record, or a
+    different one, is moved aside (`.stale`, `.stale2`, ...), and so is any log
+    before a requested fresh run;
+  - the store round-trips under another directory's log name, ignores unreadable and
+    foreign entries, replaces a damaged entry on the next insert, and prunes by age,
+    half-written entries from an interrupted insert included.
+- **PyRTL builds:**
+  - **Stale inputs.** Swapping a subtraction's operands keeps every log name. The
+    rebuild in the same `--out_dir` must set every log aside, naming the changed
+    HDL, and re-synthesize.
+  - **Final VHDL.** The same kind of edit on a pipelined design keeps the pipelined
+    entity's file name, and that file must be rewritten.
+  - **Only what an edit changed.** After a `--full_hier_syn` build that synthesizes `f`
+    and `g` on their own, rewiring `f` on its own line reuses `g`'s run and re-runs only
+    `f` and the top that contains it.
+  - **Shared store.** A second fresh directory sharing `--syn_cache` synthesizes
+    nothing and ends with the same final record.
+  - **Simulation-only parameter.** A `-D` value only simulation code reads reuses
+    every result.
+- **Netlist export** (`syn_cache_netlist_test`). Two `--yosys_json` runs into fresh
+  directories sharing one store must both run yosys and write the netlist. A store hit
+  restores only a log, so before this rule the second run wrote no netlist.
+
+The stale-input and final-VHDL cases fail on the tree before this change. The old
+log was read, nothing was re-synthesized, and the same-named pipelined entity kept
+its earlier VHDL.
+
+## Design diagram coverage
+
+The design diagram (`diagram.html`, [DIAGRAM_DESIGN.md](DIAGRAM_DESIGN.md)):
+
+| Test | Category | What it covers |
+|---|---|---|
+| `diagram_test` | `elab_introspect` | the page's data, written in-process after `PARSE_FILE` as a `--no_synth` build would: the import tree and library files, MAIN files and clocks (with Python clock names), field-level wire links in the direction each field flows (a FIFO's `ready` against its data) and ASYNC wires, the `@wires` MAIN marked as wiring, a function graph's edges with widths and the variables on the way (the driving one first), a Feedback edge marked `fb`, the type table (`diagram_interfaces_design.py`: interface roles of `.fwd_t`/`.fb_t`, of their plain copies a generated interface function types its Feedbacks with, and of plain `{data, valid}` streams; readable type names, same-named classes told apart by their factory arguments; Feedback edges of both roles), wiring call sites (a `@wires` function and constant field selects, not an adder or a user function that only routes fields), call-site kinds (AUTO_PIPELINE and AUTO_FSM keys, the walk stopping at an AUTO_FSM site, raw VHDL leaves, operators), an async FIFO's two side MAINs grouped, a `@pipeline_latency` latency without synthesis, two parses writing byte-identical pages, no external reference in the page, and a C design (`examples/shared_globals.c`) with instance-level whole-wire links |
+| `diagram_build_test` | `build_report_device_models` | one sky130 build of `built_hardware_top_design.py`: MAIN latencies and the AUTO_PIPELINE site's depth equal `built_hardware.json`'s, measured delays are recorded and each zero-clock offset spans its callee's delay; the divider's operators the pipelining put registers into have their latencies; a `--no_synth` build of the same top writes the same MAINs and links with no delays; a failing build in the first directory removes its old page |
+| `diagram_render_test` | `unit` (needs `google-chrome`) | headless Chrome loads the pages of three Pypeline designs (one of them `diagram_interfaces_design.py`) and one C design: `#selftest` draws every view with the default filters, everything shown and everything hidden, and checks what each draws ([self-test](DIAGRAM_DESIGN.md#self-test)) without a script error; the default view draws blocks |
+
+## `@initial` / `@final` hook coverage
+
+One design, `inst/hooks_design.py`, serves every hook test. Each hook appends its name to
+`EVENTS` and prints `HOOK: <name>`. The `HOOKS_TEST_MODE` design parameter picks the
+variant: `finish`, `cutoff`, `assert`, `final_raises`, `hook_finish` or `call_from_hw`.
+Subprocess runs pass it as `-D HOOKS_TEST_MODE=...`, and `hooks_test` installs it with
+`pypeline.SET_DESIGN_PARAMS`.
+
+- **`hooks_test`** (`native_sim`, plain `python3`) runs the design in-process through
+  `pypeline_sim.run_sim` and reads `EVENTS` through a hook's `__globals__`. Checks:
+  - sim initials run before the first `@sim_input`, which also asserts this itself;
+  - sim finals run after the last `@sim_output` for a `sim_finish()` end, a `--run N`
+    cutoff, a mid-run assert, and a failing final hook — in the last two the original
+    error is still the one raised;
+  - syn-only hooks never run;
+  - `sim_finish()` inside a hook, a hook with a parameter, and `sim=False, syn=False`
+    are errors.
+- **`inst/hooks_order_test.py --variant V`** runs `pypelinec` as a subprocess. It checks
+  where the `HOOK:` lines land relative to the driver's own output: `PY_TO_LOGIC
+  parsing:`, `elaborating func:`, the final-files lines and `Clock:`.
+  - `hooks_order_native_comb` (`native_sim`): no syn hooks.
+  - `hooks_order_no_synth` (`elab`): syn hooks only, once each.
+  - `hooks_order_call_from_hw` (`elab`): a MAIN calling a hook is an `ElaborationError`.
+  - `hooks_order_native_pipelined` (`build_report_device_models`): sky130 build, then
+    native sim.
+  - `hooks_order_vhdl_comb` (`build_report_device_models`): cocotb+GHDL, where the
+    `--comb` build writes its final files twice and syn `@final` must still run once.
+
+## RAM coverage
+
+Automatic RAM coverage (`make_auto_pipeline_ram` and `make_stream_auto_pipeline_ram`):
+
+- `auto_pipeline_ram_test` (`unit`): target resolution before fixed-plan emission,
+  ECP5/Vivado geometry boundaries, consecutive native-run target isolation,
+  latency constraints, resource parsing and ranking
+  without BRAM subtotal double-counting, byte enables, two writers, replicated readers,
+  native memory ordering, randomized stream stalls and sustained throughput.
+  Measured-search tests cover joint trimming, per-group fallback and restoration
+  of the selected graph and reports after losing probes.
+- `self_check_auto_pipeline_ram_test` (`native_vs_vhdl_sim`): cycle parity for banked
+  RAM, a pure caller's bypass alignment, two byte-enabled writers, clock-enable
+  pauses and stream backpressure. The `selected_plan` and `selected_plan_vivado`
+  variants repeat parity after a full synthesis sweep installs the winning plans.
+- `self_check_auto_pipeline_ram_target_test` and its CLI-target variant
+  (`native_vs_vhdl_sim`): fixed-latency banking and write visibility agree with
+  Vivado geometry even when `PART` is declared after the RAM factory, or only
+  supplied by `--part`. Native target reconciliation requires no FPGA tools.
+- `auto_pipeline_ram_build_test` (`build_report_open_tools`) and
+  `auto_pipeline_ram_build_vivado_test` (`build_report_vivado`): actual BRAM mapping
+  for ROMs, single and dual writers, replicated readers, initialization and byte
+  enables; register-array fallback is a failure. They check fixed/flexible latencies,
+  trimming a start guess, and a capped timing failure.
+- `auto_pipeline_ram_qor_test` (`build_report_open_tools`): the 64K memory's
+  splitting gains. The [RAM benchmark](AUTO_PIPELINE_DESIGN.md#ram-stream-wrapper-and-verification)
+  supports the full three-seed 16K/64K frequency/resource frontier.
+
+The two-writer VHDL uses shared variables; the simulator driver supplies GHDL's
+`-frelaxed` option. ROMs and single-writer RAM use signals.
+
+`make_ram` (`include/pypeline/ram.py`) and `make_stream_ram` (`stream/stream_ram.py`) share one
+VHDL generator and one simulation model. Coverage:
+
+- **`ram_test.py`** (`native_sim` and `synth_device_models --comb`).
+  - Six `@MAIN` shapes, each with its own generated raw VHDL: single port, struct elements
+    with a non-power-of-two size, two ports with input/output registers, an array register
+    file, byte write enables, and a string ROM.
+  - `sim_call` tests: latency and pass-through fields, read-first reads, write collisions,
+    init forms and validation, instance independence and `sim_reset`, same-cycle
+    re-evaluation, stateful versus pure (aligned) callers.
+  - Seeded soaks against a reference with no stage bookkeeping: a request's read sees
+    exactly the writes of earlier requests.
+  - A `PARSE_FILE` check that every generated RAM carries its `func_fixed_latency`.
+- **`stream_ram_test.py`** (`native_sim` and `synth_device_models --comb`): ready-as-clock-enable stall
+  hold, bubble fill, exactly one write per accepted request, independent ports, latency 0,
+  and a random-backpressure replay.
+- **`ram_sim_model_test.py`** (`native_sim` via `pypeline_sim.py --run 30`): convergence
+  safety of the shared-memory model. RAM accumulators are closed through wires, so every
+  cycle re-evaluates them with stale inputs. Mutation-checked: a model that writes from
+  re-run evaluations never converges.
+- **`self_check_ram_test.py`** (both `native_vs_vhdl_sim` modes, plus `native_sim`):
+  - init readback across element types (`uint1_t`, `int1_t`, 64-bit signed, enum, struct,
+    2-D array, `char_t[8]`, fixed, float);
+  - latency-3 traffic and byte write enables;
+  - a pure `@MAIN(100.0)` aligned around the RAM;
+  - a stream RAM under backpressure.
+
+  The checker MAIN returns a value on purpose. A design with no top-level outputs synthesizes
+  to nothing, and a pipelined build then fails with a clear "no timing paths" error (see
+  `pyrtl_no_timing_paths_build_report_test.py` below). The pure MAIN is no longer needed to
+  keep the build off the coarse sweep: a single stateful MAIN with no target MHz is now
+  characterized as written (see `single_stateful_main_fixed_latency_test.py`).
+- **`single_stateful_main_fixed_latency_test.py`** (both `native_vs_vhdl_sim` modes): the only
+  `@MAIN` is stateful, has no target MHz, and calls `@pipeline_latency(3)` with a narrower
+  argument expression (`delay3(c + 100)`). A pipelined build used to force it into the coarse
+  sweep, which crashed with `Trying to slice into ... for no reason`, for ANY single stateful
+  goal-less MAIN, fixed-latency child or not. It now takes the planned sweep's one-synthesis
+  characterization with zero added latency.
+- **`call_arg_width_test.py`** (`native_vs_vhdl_sim --comb`): scalar int call arguments whose
+  type differs from the parameter's: a uint9 expression into `uint16_t`, sign extension, a
+  truncation into a narrower parameter, uint into int, and keyword-bound arguments. The call's
+  port wire used to take the argument's type, and GHDL rejected the port map
+  (`actual constraints don't match formal ones`).
+- **`pyrtl_no_timing_paths_build_report_test.py`** (`build_report_pyrtl`): the no-output
+  `no_outputs_design.py` must FAIL its pipelined build, and fail with the PYRTL no-timing-paths
+  error text (naming `@wires` as the intentional-wiring escape). The old
+  `ZeroDivisionError` / `could not convert string to float` text and the coarse-sweep crash
+  must not appear. A circuit with no paths has no Fmax; that is never a passing measurement.
+
+## Generated-name regression coverage
+
+`factory_api_test.py` (unit) checks single-object factory returns: `.return_t`
+on original and wrapped functions in strict/raw and stateful/stateless modes,
+void returns, decorator stacking, input/output interface direction, RAM and
+generated-interface cache identity, named arithmetic bundles, widened fixed-point
+results, unsigned negation, metadata on an undecorated HDL factory callable, and
+the internal pipeline constructor's callable and `.auto_pipeline` metadata.
+`factory_api_design.py` verifies operation bundles and nested callable attributes
+in hardware ports and calls; `factory_api_shadow_design.py` checks that a hardware
+input cannot resolve to a same-named Python-global bundle. Existing native/VHDL
+designs use `.return_t` in port and state annotations.
+
+`interface_factory_two_widths_test.py` is a normal synthesis test: the same design
+instantiates broadcasts and skid buffers at four and eight byte lanes using their
+original interface objects. `generated_naming_test.py` checks structural identity,
+interface pairing and direction, typed parameter distinctions, returned-factory
+closure identity, readable record names, overflow, case-insensitive collisions and
+VHDL lexer/idempotence behavior.
+
+`generated_naming_build_test.py` builds that design in two fresh processes with
+separate output directories and different `PYTHONHASHSEED` values. It compares all
+VHDL paths and bytes, checks name length and source/index coverage, and imports and
+elaborates the real top with GHDL. `name_index_test.py` covers source tracing,
+same-spelling definitions that must coexist, and a deliberately forced identity
+collision that must fail clearly. Existing AUTO_FSM and native-versus-VHDL tests
+exercise generated helpers and specialization reuse in real hardware builds.
+
+**User names (`name=`).**
+- **`generated_naming_test.py` (unit):** a user-named base renders verbatim, and
+  `_h<digest>` is added for each collision kind (another name, a natural key, a
+  protected name). It also checks every validation error and the automatic
+  description kept for `-- Specialization:` comments.
+- **`factory_closure_naming_test.py` (unit):**
+  - a factory's `name=None` is not captured, on both capture paths;
+  - named function, struct and enum keys are `<name>_s<digest of the unnamed key>`;
+  - the decorator errors;
+  - `make_stream_auto_pipeline` / `make_stream_auto_multi_cycle` products keep the
+    names they had before `name=` existed. An unnamed stream AUTO_MULTI_CYCLE key is
+    the wrapped function's key plus `_mcp`, not the library line that builds it.
+- **`name_index_test.py` (elab_introspect):**
+  - the `USER NAMES` section;
+  - two named groups on one function stay two instances with callee-derived call-site labels;
+  - direct and stream-factory AUTO_PIPELINE names preserve emitted instance hierarchy;
+  - a conflicting name fails, naming both sites.
+- **`double_parse_file_test.py` (elab_introspect):** `user_names_design.py`, with
+  every form of `name=`, parses to the same keys twice; `auto_goal_split_design.py`,
+  whose objects from one comprehension are used at two clock goals, and
+  `auto_multi_cycle_repeated_design.py`, whose repeated stream AUTO_MULTI_CYCLE
+  wrappers share keys, too.
+
+**AUTO objects at several clock goals.**
+- **`auto_construction_site_unit_test.py` (unit, no parse):** construction sites tell
+  apart objects from separate calls, a comprehension, a `for` loop, a helper called
+  from two lines and a library factory, restart with each design execution, and are
+  one per body line for an object built while a body is elaborated; an object resolves
+  through its site's installed binding; a native replay of per-goal results takes its
+  own clock's goal (also for reads at import), keeps a one-goal record unchanged, and
+  raises `BuiltHardwareError` at a goal the build lacks.
+- **`auto_goal_split_test.py` (elab_introspect):** identical factory products holding
+  objects used at different goals elaborate as separate functions: two calls, a
+  comprehension (named by goal, so reordering renames nothing), a dict, a bundle's
+  attribute, a factory argument, a body loop, MAINs made in a loop, a bare MAIN
+  inferred onto a clock and two AUTO_FSM objects; objects at one goal still share; one
+  object at two goals parses unless its `.latency` is read; names are the same under
+  two hash seeds.
+- **`factory_closure_naming_test.py` (unit):** the split component joins a tag's
+  identity only when its key is split, as its site and then its goals, and reaches a
+  product through a closure, a list, a dict, a bundle and a factory argument.
+
+**Known issue: large numpy arguments.** `numpy_factory_arg_identity_test.py`
+(known_issues) builds two specializations of one factory whose only difference is
+the middle of a 2000-element numpy array. Their identities are equal today, because
+`_stable_key` falls back to the array's repr and numpy elides the middle of any array
+over 1000 elements. The second specialization therefore elaborates as a duplicate of
+the first. The test fails while the two share one logical key, and passes once
+they are two functions. Tracked as bug
+[#370](https://github.com/JulianKemmerer/PipelineC/issues/370).
+
+**Known issue: a `.latency` constant in a top-level function.**
+`latency_constant_entity_reuse_test.py` (known_issues) elaborates
+`latency_constant_entity_reuse_design.py` twice in one process, the way the
+pin-and-confirm loop does: first with `.latency` 2, then with 3. Each time it gives
+the function `folds_latency` the same slice and writes the pipelined entities.
+`folds_latency` adds a module-level value read from that `.latency`.
+- **Why the name doesn't change.** A top-level function's key is its module and name,
+  and its timing hash covers child names and slices. The constants 2 and 3 have the
+  same width, so the entity name is the same in both passes.
+- **What goes wrong.** `WRITE_ALL_NON_ZERO_CLK_VHDL_FILES` renders each name once per
+  process, so pass 2 keeps pass 1's file, constant 2 and all.
+- **The test.** It fails while that happens, and passes once pass 2's file holds 3.
+  Tracked as bug [#369](https://github.com/JulianKemmerer/PipelineC/issues/369).
+
+**Tool-side file names.** Generated entity names can also overflow file names
+that a synthesis backend builds from them. Two tests cover this:
+
+- **`device_models_sta_test.py` (unit):** `test_artifact_paths_fit_filename_limit`
+  checks that every DEVICE_MODELS synthesis artifact name stays within 255
+  bytes, including its temporary-netlist tail. It checks every recipe, and uses
+  both real soft_cmp leaf names and oversized names.
+- **`self_check_stream_auto_fsm_test` (synth_device_models):** builds the
+  AUTO_FSM design under `--syn_tool device_models`, whose soft_cmp leaves first exposed
+  the overflow. Every `synth_device_models` build with long factory names
+  (stream AUTO_PIPELINE, soft_div) exercises the same path. See
+  `DEVICE_MODELS_DESIGN.md` §2.
+
+**Warm output directories.** A copy of a warm output directory, or a warm
+rerun, must reuse its cached leaf results. `pypeline_sim_debug.py` depends on
+this, and the non-`--comb` `native_vs_vhdl_sim` entries exercise it end to
+end. Three tests cover it:
+
+- **`warm_copy_no_resynth_test.py` (build_report_device_models):** builds
+  `self_check_auto_fsm_test.py` under sky130, copies the output directory,
+  and rebuilds in the copy with `--rebuild` (the copy's build is up to date). The rebuild
+  must re-synthesize no DEVICE_MODELS leaf and print
+  no cache-mismatch line. It fails if any of the three fixes below is
+  reverted.
+  - The design matters: its AUTO_FSM passes differ in `c_structs_pkg` types
+    and in which call site first elaborates a shared built-in.
+  - `auto_fsm_test.py` has neither flip. It only catches the absolute-path
+    regression.
+- **`device_models_sta_test.py` (unit):**
+  `test_synthesis_identity_survives_copying_the_output_directory` checks that
+  a copied output directory keeps the same synthesis identity. VHDL inputs are
+  recorded relative to the output root, and the mapped netlist relative to its
+  log.
+- **`generated_vhdl_stability_test.py` (unit):** checks that generated VHDL
+  doesn't change between parse passes:
+  - `c_structs_pkg` only grows: a pass with no new types leaves the file
+    untouched, new types are appended after the existing ones, and a
+    redefined type or a changed preamble starts the package over;
+  - the package is merged by emitted VHDL type name, rendered by real
+    `EmissionNames`:
+    - a type whose layout changes under one name (lanes 2 to 5 and 2 to 7,
+      with a dependent record) starts the package over, and each name is
+      declared once;
+    - a repeated pass then leaves the file untouched;
+    - an identical declaration from a new C type is kept;
+    - names differing only in case count as one name;
+    - a pre-format index holding a duplicate declaration is replaced;
+    - two types of one pass with one VHDL name are an error;
+  - a shared C built-in operator entity gets no call-site `-- Source:`
+    comment;
+  - an identical re-render doesn't rewrite the file (`WRITE_TEXT_IF_CHANGED`),
+    so a thread reading it never sees it truncated.
+
+**One VHDL type name, two layouts.**
+`c_structs_pkg_relayout_test.py` (elab_introspect, needs GHDL) is the
+real-parse counterpart of the package-merge cases above.
+
+- **What it does.** It parses `c_structs_pkg_relayout_design.py` twice into one
+  output directory, the way the AUTO_PIPELINE pin-and-confirm loop does, with no
+  synthesis. Pass 1 has an empty latency cache (2 lanes). Pass 2 uses latencies 3
+  and 5 (5 and 7 lanes).
+- **The design.** It is shaped like WireGuard's Poly1305 MAC: `powers_t` is sized
+  by `body_ap.latency + 2`, so its C type changes between passes while its
+  emitted VHDL name doesn't.
+- **What it asserts.**
+  - That shape holds. If the names ever diverge, the test fails rather than
+    passing without exercising the case.
+  - GHDL analyzes the package after each pass.
+  - After pass 2, each `powers_t` is declared once, with pass 2's lane count.
+  - A third identical pass rewrites nothing.
+- **What it catches.** With the previous merge, keyed by C type, pass 2's GHDL
+  analysis fails with "already used for a declaration". That is the WireGuard
+  shared build's Vivado `[Synth 8-989]` failure.
+- **Every depth, both directions.** A second case walks the encrypt body
+  through harvested depths 0, 1, 3, 6 and back to 1 (2, 3, 5, 8, 3 lanes) in one
+  output directory, with decrypt held at 3. Each pass must elaborate one body
+  call per lane. `powers_t` and `lane_sel_t` must each be declared once with the
+  current layout. `lane_sel_t`'s lane-index width follows the lane count
+  (1, 2, 3, 3, 2 bits). Decrypt's declarations must stay byte-identical. GHDL
+  must analyze the package and the isolated `pick` (dynamic lane mux) file
+  list.
+
+## Karatsuba leaf coverage
+
+`make_soft_mult_karatsuba`'s `leaf=` policy and the opt-in hybrid with inferred leaves
+(`make_mult_karatsuba_inferred_leaves`, threshold 34) are covered at four levels:
+
+- **`soft_ops_test.py` (native_sim).** Values only. Both leaf policies, called directly:
+  - exhaustive 5×5 and unequal 6×3 at thresholds 3 and 4;
+  - widths 8 and 9 around threshold 8;
+  - zero/maximal/half-boundary edges and seeded random products at 64, 65, 66, 130,
+    130×67 and 37×20 bits.
+
+  The registrations are checked by their captured factory arguments:
+  - `register_soft_mult_karatsuba()` is still threshold 16 with shift-and-add leaves;
+  - `register_soft_mult()` and `register_soft_ops()` still give carry-save with
+    `max_width=2`;
+  - `register_mult_karatsuba_inferred_leaves()` is threshold 34 with `make_inferred_mult`,
+    and it is unsigned-only.
+
+  Native sim's `*` is always a Python product and never dispatches a registered
+  `INFERRED_MULT`. That is why redispatch is checked on the hierarchy instead.
+- **`soft_mult_karatsuba_leaves_test.py` (elab_introspect).** Each
+  `soft_mult_karatsuba_leaves_design.py` `-D CASE` is parsed in its own subprocess, and the
+  test counts what every leaf elaborated to, with multiplicity:
+  - 130 bits gives two uint32, four uint33 and three uint34 built-in multiplies;
+  - 64 bits gives uint32, uint32 and uint33;
+  - 37×20 gives uint18, uint19 and uint20;
+  - leaves stay built-in under the hybrid's own global registration and under a global
+    soft multiplier plus an exact uint34 soft registration;
+  - default soft Karatsuba keeps shift-and-add leaves;
+  - three 40-bit configurations (two leaf policies, two thresholds) are three entities.
+
+  Mutation-checked: without the leaf's scoped `INFERRED` pin, the global case recurses
+  (`RecursionError`) and the exact-registration case elaborates the soft multiplier.
+- **`self_check_mult_karatsuba_test.py` (native_vs_vhdl_sim, `--comb`).** A registered
+  130-bit `*`, direct 64×64 and 37×20 hybrids, and a 12-bit soft-leaf Karatsuba, each
+  `sim_assert`ed against `make_inferred_mult`. Probes print 16-bit product slices, because
+  the VHDL `sim_print` formats values through a 32-bit integer, so a wider value overflows
+  in GHDL.
+- **`self_check_mult_karatsuba_pipelined_test.py` (native_vs_vhdl_sim, sky130).** A 16×16
+  hybrid at threshold 6 under `@MAIN(60.0)`. The sweep builds 3 slices (4 stages); the
+  operands ride along with the product, and the checker compares against
+  `make_inferred_mult`. The goal sits below the ~73 MHz ceiling set by the path from a
+  checker register through the pipe's input fanout, which pipe cuts cannot shorten.
+
+The area of the 130- and 64-bit hybrid is a manual Vivado probe,
+`qor/multiplier/karatsuba_inferred_leaves.py`. It is not registered in `run_all`; see
+[`SYN_DESIGN.md`](SYN_DESIGN.md#karatsuba-with-inferred-leaves).
+
+## Operator-cost regression coverage
+
+The `include/pypeline/` libraries are audited for operations built out of
+primitives heavier than the operation needs — a two's-complement negate
+emitted as an HDL multiply, a one-bit inversion emitted as a subtract. These
+are correctness-neutral in principle and value-wrong in practice if the
+replacement is written even slightly wrong, so each one is pinned by a native-sim
+golden rather than by a build.
+
+- **`soft_ops_test.test_soft_cmp` / `test_soft_cmp_mixed_width` (native_sim):**
+  all six comparator flavors `soft_cmp.py` exposes (`sub`, `sub_swapped`,
+  `borrow`, `bitwise`, `prefix`, `chunked`) × `GT`/`GTE`/`LT`/`LTE` × signed and
+  unsigned, plus mismatched widths and mixed signedness, against Python
+  comparison as golden.
+
+  All six flavors are covered, not just the default one: most of the library's
+  one-bit inversion logic lives in the five non-`sub` flavors. Mutation-checked —
+  breaking one sign-bit term in the prefix flavor produces 76 failures, all in
+  `soft_cmp_prefix_s_*`. `make_soft_cmp_chunked` is
+  instantiated with `chunk_bits=3` against 6-bit operands on purpose, so both
+  the leaf scan and the cross-chunk select tree run; `chunk_bits=8` would
+  collapse it to one chunk and never reach `_make_prefix_tree`.
+- **`soft_ops_test.test_soft_negate` (native_sim):** signed *and* unsigned
+  operands. The unsigned case is the one that matters — negating an unsigned
+  value is where a same-width two's-complement negate silently returns the
+  unsigned wrap instead of a negative number.
+- **`float_ops_test.test_negate_primitive` (native_sim):** `_make_negate` at all
+  three width shapes the float library instantiates — widening
+  (`uint24_t → int25_t`), narrowing (`int26_t → uint25_t`) and same-width signed
+  (`int32_t → int32_t`) — against `(-a) % 2**out_width`. Pinned separately from
+  the float adders because those only ever feed it values whose negation is in
+  range; a negate wrong at the edges would still pass them.
+- **`fixed_point_test.test_unary_negate` (native_sim):** sweeps the whole
+  representable range, not two spot values, plus the documented
+  most-negative-wraps-to-itself case.
+- **`fir_test` (native_sim):** `test_symmetry_fold_bit_identical`,
+  `test_antisymmetric_fold` and `test_halfband_zero_tap_skip` between them cover
+  all three `SGN[j]` values, so they pin the elaboration-time branch that
+  replaced `SGN[j] * window[B[j]].val`.
+
+## `native_vs_vhdl_sim` probe rules
+
+A design registered in `native_vs_vhdl_sim_tests.py` must:
+
+- Emit at least one `sim_print(..., debug=True)` probe covering the values its
+  `sim_assert`s already check.
+- **Never** emit a `debug=True` print on the same cycle `sim_finish()` is called.
+  Whether a same-cycle VHDL write flushes before `std.env.finish` kills GHDL is a
+  process-ordering race the diff must not depend on -- the print is silently DROPPED
+  from the VHDL/cocotb log entirely if this rule is broken (present in native sim,
+  absent in VHDL -- not a text-visible failure, just a missing line the cycle diff
+  will flag as a mismatch). It is tracked as bug [#361](https://github.com/JulianKemmerer/PipelineC/issues/361) --
+  see `known_issues_tests.py`'s `sim_finish_debug_print_race_test` for a
+  direct reproduction of what happens if it's broken, and e.g.
+  `self_check_counter_test.py` for the standard one-cycle gate
+  (`if n < NUM_COUNTS - 1: sim_print(...)`).
+- For a non-`--comb` (pipelined) entry: put every probe inside a stateful (0-latency)
+  MAIN, and valid-/count-gate it, since VHDL's undefined (`'U'`) warm-up registers
+  can't be compared against native's typed zeros.
+
+- Keep every probed value under 2**31 if it is a `uint32_t`. `sim_print` lowers to
+  `integer'image(to_integer(x))` and VHDL's `integer` is 32-bit *signed*, so GHDL
+  aborts with `overflow detected` on a larger value while native sim prints it
+  happily -- a VHDL-only failure by construction. `self_check_type_axis_test.py`
+  carries a comment marking where it deliberately stays under the limit.
+
+For a pipelined entry, use global wires only in the body of the pipelined `@MAIN` or
+`AUTO_PIPELINE` function itself, and no `VOLATILE` ones. Native sim refuses anything else
+(`SimPipelineModelError`).
+
+See `docs/pypeline_sim_DESIGN.md`'s Limitations section for the full contract
+(including the hard-error cases enforced by the simulator directly).
+
+## Testing generated host code
+
+The standalone host module a build writes to `<out_dir>/host/` (see
+[Host Type Export Declarations](pypeline_guide.md#host-type-export-declarations)) is tested in a
+way worth copying whenever "this artifact must work somewhere else" is the claim:
+
+- `inst/host_types_test.py` (`native_sim`) checks the GENERATOR. It runs the generated
+  text in a **subprocess whose `sys.path` cannot reach this repo** — and which asserts
+  `import pypeline` fails before doing anything else — then compares what that process
+  decodes and encodes against `pypeline.type_to_bytes`/`type_from_bytes`, over random
+  frames in both endians.
+- `inst/host_types_build_test.py` (`build_report_device_models`) checks the BUILD: it runs `pypelinec`
+  for real, lifts the file out of the output directory, and repeats that comparison on it.
+
+Two rules make those tests mean something, both learned by mutation-testing them:
+
+- Drive them with **raw random bytes, not bytes canonicalized through pypeline first**. A
+  canonicalized frame already has every ragged leaf (`uint3_t`) reduced to fit, so a
+  generator that masked such a leaf to a whole byte decodes it identically and the bug
+  walks straight through. Raw bytes force each leaf's mask to discard something.
+- Compare the DECODED value field by field, not just the re-encoded bytes. Round-tripping
+  inside the generated module alone passes for any self-consistent layout, including a
+  wrong one — which is the exact failure mode (a well-formed frame of the right length,
+  loading the wrong values) that generating the host's copy exists to prevent.
+
+## Running
+
+```
+python3 src/tests/pypeline_tests/run_all.py                       # default categories, parallel
+python3 src/tests/pypeline_tests/run_all.py -j 5 --no_timeout     # full suite, five workers, no timeout
+python3 src/tests/pypeline_tests/run_all.py --category native_sim
+python3 src/tests/pypeline_tests/run_all.py --category synth_device_models --category build_report_device_models
+python3 src/tests/pypeline_tests/run_all.py --category synth_vivado build_report_vivado  # needs Vivado; several at once also works
+python3 src/tests/pypeline_tests/run_all.py --category synth_quartus   # needs Quartus; likewise synth_<any backend>
+python3 src/tests/pypeline_tests/run_all.py -k sweep_float32           # the per-SYN_TOOL sweep matrix, every backend
+python3 src/tests/pypeline_tests/run_all.py --category known_issues   # opt-in
+python3 src/tests/pypeline_tests/run_all.py -t <name>              # one test, by name or list index
+python3 src/tests/pypeline_tests/run_all.py -k <substring>          # tests whose name contains SUBSTRING
+python3 src/tests/pypeline_tests/run_all.py --list                  # print the numbered list, don't run
+python3 src/tests/pypeline_tests/run_all.py --timeout 60             # override every test's timeout
+```
+
+A `synth_<tool>` / `build_report_<tool>` category needs that tool installed.
+The backends are found by `PATH` first and then a hardcoded fallback path in
+`src/<TOOL>.py`, so a tool that is installed but not on `PATH` still works --
+which also means `Test.requires=` (a `shutil.which` check) cannot gate these
+categories, and a missing backend shows up as a failure rather than a skip.
+
+```
+python3 src/tests/pypeline_tests/sweep_float32_tool_compare.py --out_root DIR
+```
+
+builds the float32 adder on every backend and plots fmax against total
+pipeline latency, one curve per tool. Opt-in, outside `run_all.py`.
+
+Each test gets an isolated `--out_dir` under a fresh tmp root (`common.py`'s
+`make_tmp_root()` / `run_test()`), so tests run in parallel safely; a per-category
+default timeout (`common.DEFAULT_CATEGORY_TIMEOUT_S`, overridable per `Test` or via
+`--timeout`/`--no_timeout`) kills a hung subprocess instead of blocking the whole
+suite. A summary table reports PASS/FAIL/XFAIL/XPASS/SKIP/TIMEOUT per test, with
+output directories of any failed test printed for inspection (and, for a tool-check
+failure, which tool the log named). `run_test` also sets
+`PIPELINEC_INTERNAL_NO_LATENCY_MEMORY=1`, which keeps each test's sweeps
+independent of what an earlier run of the same test remembered in its reused
+output directory or a shared store. Tests of the latency memory set it back to
+`0` (see [Latency memory coverage](#latency-memory-coverage)).
+
+**Longest tests start first.** Every test is submitted to the pool up front and
+the pool dispatches FIFO, so submission order is start order: a long test
+submitted late cannot overlap with much and lands in the tail.
+`run_all.py`'s `_DEFAULT_CATEGORY_ORDER` puts the heaviest *categories* first,
+and `Test(long_pole=True)` handles a long test inside an otherwise quick
+category by submitting it ahead of everything, including the Vivado entries
+(`common.run_tests`). Tests setting it include `pdw_tb` (`native_sim`, the longest in
+the suite: ~523 ms/cycle over 7323 cycles alone since native sim executes
+matcher-registered soft operators by default, ~9000 s projected under `-j 5`,
+so it has no timeout, `common.NO_TIMEOUT_S`; it ends itself), `auto_fsm_unit_test` (`unit`,
+358 s, in the category submitted last), and the Poly1305 GHDL checks described
+above. Set it from a measured duration and record that
+duration at the registration; the sort is stable, so nothing else moves.
+
+Each category module can also run standalone, e.g.
+`python3 src/tests/pypeline_tests/native_sim_tests.py [-j N]`. Run standalone,
+`synth_tests.py` and `build_report_tests.py` run all three of their tool
+categories.
+
+## Related
+
+- `src/tests/pypeline_tests/op_qor_bench.py` -- QoR benchmark (not a correctness test,
+  not part of `run_all.py`), driving `pypelinec --coarse --sweep` and comparing yosys
+  cell-count estimates against synthesized results across the operator library.
+
+- Carry-save multiplier first-candidate QoR probe -- a manual, opt-in sky130
+  acceptance check using the external latchup `solution.py`. Variants change
+  only `CLK_RATE_MHZ`; the latchup-equivalent command is:
+
+  ```text
+  pypelinec <solution.py> --no_sweep --no_hier_syn --out_dir <out>
+  ```
+
+  Accepted model-V4/`early_flatten_noabc` results, with timing inputs held
+  fixed, are:
+
+  | requested MHz | added-clock latency | comb stages | measured fmax |
+  |---:|---:|---:|---:|
+  | 700 | 30 | 31 | 700.640825 MHz |
+  | 701 | 59 | 60 | 909.794952 MHz |
+  | 720 | 60 | 61 | 909.794952 MHz |
+  | 905 | 60 | 61 | 909.794952 MHz |
+
+  The 700 MHz result is the preserved baseline; the first deeper family at a
+  701 MHz request is 29.852% faster and remains below 64 stages. The accepted
+  mapped candidate has 7,164 cells, 4,605 sequential cells, and zero unmapped
+  cells. The exact 720 MHz final VHDL passes 51 products with continuous data,
+  bubbles, ordering, and exact 60-clock latency.
+
+- `src/tests/pypeline_tests/divider_qor_bench.py` -- opt-in sky130 auto-pipelining
+  benchmark and correctness gate, also excluded from `run_all.py` because a full gate
+  Divider sweep can take about an hour. It has unchanged-logic arithmetic and gate-level
+  143 MHz fixtures under `qor/divider/`. A normal run records a machine-readable
+  `manifest.json` containing source/compiler/tool/liberty hashes, placement trace,
+  exact final VHDL hashes, mapped-cell histogram/DFF count, timing components, runtime,
+  and the acceptance verdict:
+
+  ```text
+  python3 src/tests/pypeline_tests/divider_qor_bench.py \
+    --variant gate --out_dir /tmp/divider_gate
+  ```
+
+  The gate verdict requires correct final-VHDL output, fmax strictly above 143 MHz,
+  and no more than 48 slices (49 combinational pipeline stages). The arithmetic
+  regression requires the same correctness/fmax checks and at most 63 slices.
+  The harness first copies the exact ordered `vhdl_files.txt` bytes into an
+  evidence snapshot. Simulation compiles that snapshot with the pinned GHDL,
+  and the accepted timing/cell result comes from remapping the same immutable
+  snapshot rather than whichever netlist happened to be produced by the last
+  sweep probe. It checks
+  continuous-valid traffic, bubbles, edge cases, divide-by-zero, ordering, valid
+  latency, input readiness, and pipeline flush. The fixture has no output-ready port,
+  so this test intentionally makes no output-backpressure claim.
+
+  `qor/divider_qor_acceptance.json` holds the acceptance record, taken under the
+  V3 production recipe (`early_flatten_opt`, full decision in
+  `qor/synthesis_recipe_forced32_matrix.json`): the automatic gate result is
+  160.43 MHz at 31 slices / 32 combinational stages, and the arithmetic result is
+  180.05 MHz at 32 slices / 33 stages. Both exact final-VHDL runs pass 141
+  ordered vectors, have zero unmapped cells, and satisfy their slice limits.
+  The corresponding clean-commit baselines required 66 and 64 slices. The
+  current production recipe is `early_flatten_noabc` (see
+  [`DEVICE_MODELS_DESIGN.md`](DEVICE_MODELS_DESIGN.md#history)'s History
+  section) — this V3-era acceptance record has not been re-taken against it.
+  Full sky130 runs remain opt-in.
+
+  Controlled physical and recipe experiments remain internal to this harness. Use
+  `--placement step-boundaries` to force every gate `step_gates` output boundary, or
+  `--placement step-boundaries-div0` for the divide-zero-select output followed by
+  the first 31 repeated-step outputs (32 slices / 33 combinational regions);
+  `--elaborate-only --diagnostic` to emit/check that placement without a timing sweep;
+  or `--frozen-vhdl-source <run>` with one of the fixed recipe IDs to remap byte-identical
+  VHDL without re-planning. There is no arbitrary synthesis-flags or public slice-cap
+  interface. A timing-miss compiler exit does not suppress exact-VHDL simulation when
+  the final artifacts were still written. To import an already-completed run whose
+  stdout was not redirected, use `--existing-build --existing-latency N` and optionally
+  `--existing-runtime-seconds S --existing-returncode RC`; the return code is
+  required for a non-diagnostic acceptance import. The manifest marks any pre-existing `build.log` as
+  incomplete/unverified rather than presenting an injected depth line as full stdout.
+  `--compiler-commit` and `--source-sha256` attach the compiler/source snapshot which
+  actually launched that completed build; the manifest records the current worktree
+  separately so later documentation changes cannot be misattributed to the old run.
+  Normal and frozen runs reject nonempty destination directories, liberty
+  overrides, source drift during the run, mismatched recipe/model identities,
+  unmapped cells, incomplete topology, or a timing report whose VHDL/mapped
+  hashes do not match the immutable snapshot. A nonzero simulator return code
+  cannot be overridden by a stale `functional_results.json` pass marker.
+- `src/tests/pypeline_tests/divider_continuity_bench.py` -- opt-in arithmetic-
+  only model-V4 continuity benchmark, also excluded from `run_all.py`. It
+  requires the unchanged latchup source SHA-256
+  `cfde3ad82985716544df580bb9415c6cbc4efa03ed4687b14a774e1bda56f70f`,
+  derives temporary variants by changing only `CLK_RATE_MHZ`, and rejects any
+  change to `DEVICE_MODELS.py` or the `early_flatten_noabc` identity. A full
+  run is:
+
+  ```text
+  python3 src/tests/pypeline_tests/divider_continuity_bench.py \
+    --out_dir /media/1TB/tmp/divider_continuity
+  ```
+
+  It scans the requested-frequency/first-plan frontier, deduplicates physical
+  placement fingerprints, maps and exact-simulates every useful initial shape,
+  then runs ordinary sweeps at 135.5, 180, and 210 MHz. Acceptance is based on
+  the immutable final artifacts those normal sweeps actually return; rejected
+  first guesses remain in `initial_plan_diagnostic_points`. Returned depths
+  must be target-monotonic, each deeper returned schedule must gain more than
+  the 1% noise band, the endpoints must remain within 1%, and the 45--53-stage
+  point must be at least 10% faster than the 33-stage point. Every accepted
+  artifact must pass the same 141-vector protocol/latency test and mapping
+  checks as the main Divider harness.
+
+  The accepted midpoint mechanism first measures the 48-slice/49-stage control
+  at 164.69 MHz, then tries one generic chunked-MUX neighbor and returns
+  49 slices / 50 stages at 194.22 MHz. Negative A/B evidence is retained for
+  all exact subtract boundaries, periodic phase variants (see
+  [`SWEEP_DESIGN.md`'s Divider acceptance entry](SWEEP_DESIGN.md#divider-acceptance-and-the-48-slice-intermediate-level)
+  for what distinguishes a phase variant from a real level), stage-local
+  ripple borrow, and chunking without the terminal MUX. `--plans-only`, `--continue`,
+  and the exact-boundary options support diagnosis; none is a public compiler
+  interface.
+
+  The harness normalizes the trailing per-build content hash out of
+  `_DUPLICATE_<hash>` names for placement deduplication (it is unrelated to
+  physical placement identity); the source-coordinate fragment itself is
+  compiler-sorted and does not need canonicalizing. Actual VHDL hashes and
+  immutable mapped bytes are never canonicalized.
+- `src/tests/pypeline_tests/divider_struct_mux_bench.py` -- focused opt-in
+  verification of generic packed-MUX lowering and canonical delay caching. Its
+  arithmetic fixture wraps `left_eff` and the loop-carried `remainder` in a
+  one-field 32-bit struct while leaving ports, arithmetic, quotient behavior,
+  and the 180 MHz goal unchanged. Run it with an empty caller-selected output
+  directory (the harness creates an isolated empty path-delay cache inside):
+
+  ```text
+  python3 src/tests/pypeline_tests/divider_struct_mux_bench.py \
+    --out_dir /media/1TB/tmp/divider_struct_mux
+  ```
+
+  The acceptance requires 49 slices / 50 stages, timing met within 1% of the
+  194.22 MHz plain-integer result, schema-5 trace evidence for 32-bit midpoint
+  splitting including the terminal wrapper MUX, all 141 functional vectors,
+  complete mapped topology, and only the canonical `MUX_uint32_t.delay` plus
+  timing sidecar in the cache. The accepted run measured 194.2227 MHz and
+  recorded 17 wrapper-MUX chunk placements. `--continue` reuses completed
+  evidence and `--diagnostic` prints failures without changing the verdict.
+
+  Fast unit tests separately cover recursive packed widths, aggregate SLV
+  rendering/reconstruction, scalar and aggregate cache-key equivalence,
+  collapsed-mode compatibility, and the exception that makes built-in typed
+  MUXes cacheable while leaving unrelated user functions non-cacheable.
+
+- `src/tests/pypeline_tests/inst/typed_pipeline_placement_test.py` -- fast
+  unit coverage for typed placement lowering and mini-sweep boundary
+  coalescing. It builds synthetic serial, fanout, fanin, alias, and
+  intervening-operation graphs without an external synthesis tool, proving
+  that a repeated helper chain uses one input-or-output bank per direct edge,
+  respects `FUNC_NO_ADD_IO_REGS`, and fingerprints the selected lock banks.
+  Its `run_module_tests()` entrypoint discovers all boundary/mini-sweep cases;
+  the zero-cut probe uses real hierarchy paths to exercise target selection.
+  It also covers synchronized parallel-output and bit-internal frontiers,
+  rejects serial peers, proves a provisional bit frontier may move together
+  to one equal-width physical unit, and preserves a cheaper coherent ancestor
+  boundary. The floor/bit-cap tests cover grouped physical fingerprints and
+  atomic removal of a non-deepening boundary group. A dedicated case covers
+  two peer leaves each collecting two crossing bit requests -- the shape
+  that once crashed a real build
+  (`src/tests/pypeline_tests/inst/typed_placement_alignment_test.py`, run
+  under `native_vs_vhdl_sim_tests.py`): both leaves' realized boundaries
+  move together off the one-cut
+  prediction their groups were stamped with when formed, and
+  `SUMMARIZE_PLACEMENT_GROUPS` must accept that coherent move while still
+  rejecting a genuine split (members realizing on different units) or a lost
+  member. Two more cases confirm `CHUNK_SELECTED_MUX_OUTPUT_BANKS` carries a
+  group's identity through its same-depth lowering and leaves a group alone
+  when only some of its members clear the chunking width gate.
+  Full WireGuard synthesis remains the integration/physical QoR gate.
+
+- WireGuard integration (opt-in, long-running) -- from a generated-output-free
+  copy of `wireguard-fpga/3.build/pypeline_build`, run
+  `PYPELINEC=<repo>/src/pypelinec ./build.py --shared --sim --syn_tb`.
+  The accepted result passes cocotb/GHDL and Vivado confirmation at
+  84.45 MHz against an 80 MHz goal, with 19 slices / 20 stages. Its schema-5 trace
+  records ten half-sliced block steps and nine shared producer-output banks. A
+  superseded baseline from before topology-aware boundary-lock selection (the
+  older per-instance input-plus-output lock policy) is kept as a regression
+  floor, not a target: that policy met 80 MHz only at 30 slices / 31 stages,
+  against a failing 62.3 MHz at 40 slices / 41 stages -- the current result
+  must never regress past this older, strictly worse shape.
+- `src/tests/c_tests/test_builds.sh` -- legacy smoke-build script for the C frontend
+  (`.c` designs under `examples/`), independent of this Python suite.
+
+## History
+
+Why things are the way they are. Entries are keyed by **topic, not date** — when
+something changes, revise the entry that owns that topic rather than adding a new
+one. Keep a fact here only if it still changes a decision today: an alternative
+someone would otherwise retry, or a measurement that is still a live regression
+reference.
+
+### Why synthesis tests default to sky130, not PyRTL
+
+PyRTL used to be the default for any design without a `PART`, and several
+designs without a Vivado-specific feature ran on Vivado. Together that made
+synthesis nearly all of a multi-hour suite. One PyRTL whole-design timing run of
+`float_ops_div_test.py` took 6,392 s on its own.
+
+Each design below was built with `--syn_tool pyrtl` and `--syn_tool device_models` at
+the same time on an idle 4-core machine, each run with its own warm copy of the
+committed caches:
+
+| design | kind | PyRTL | sky130 |
+|---|---|---|---|
+| `pypeline_test.py` | `--comb`, 1 synth run | 140 s | 39 s |
+| `serdes_test.py` | `--comb`, 1 run | 601 s | 108 s |
+| `float_ops_div_test.py` | `--comb`, 1 run | unfinished at 1,604 s | 476 s |
+| `sweep_comb_test.py` | sweep, 50 MHz | 473 s / 5 runs | 43 s / 6 runs |
+| `sweep_two_mains_test.py` | sweep, 2×30 MHz | stopped at 270 s / 3 runs | 86 s / 7 runs |
+
+sky130 was faster on every design, per synthesis run and in total. The sweeps
+met the same goals in a similar number of iterations. Don't move tests back to
+PyRTL for speed.
+
+Suite totals, summed per-test time:
+
+- **Before:** about 59,900 test-seconds. Every earlier full run used `-j 4`.
+- **After:** 17,960 test-seconds for 294 tests. This was the first `-j 5` run,
+  and it took 76 minutes of wall time.
+  - Most sky130 builds finish in seconds to a few minutes.
+  - The remaining long poles are the Vivado tests, `pdw_tb`'s native sim, and
+  the four PyRTL-pinned `build_report_pyrtl` tests.
+
+These totals predate the [per-SYN_TOOL sweep matrix](#per-syn_tool-sweep-coverage),
+which added nine tests across the vendor backends. Those are the new long poles
+on a cold cache -- four of them place-and-route every uncached leaf -- so the
+comparison above is still the right one for the sky130-vs-PyRTL question it
+answers, but it is no longer the suite's total.
+
+### Why there is no `vhdl_sim` category
+
+A `vhdl_sim` category once existed: self-checking designs run through `--cocotb
+--ghdl`, proving each sim self-checks on its own. It was removed rather than kept
+alongside `native_sim`, because every one of its entries turned out to be the same
+source file as a `native_sim` entry with `--cocotb --ghdl` added -- so all 14
+collapsed into one `native_vs_vhdl_sim` cycle-diff test each. That merge is
+strictly stronger, not just smaller: a cycle-diff test proves the native and VHDL
+sims *agree*, where the two separate tests it replaced only proved each one
+passed on its own (which two independently-buggy-but-matching sims could still
+do). Adding a new `vhdl_sim`-style test today would be a step backward for the
+same reason -- fold it into `native_vs_vhdl_sim_tests.py` instead.

@@ -1,0 +1,4 @@
+RgGen SCORE snapshot (rggen/rggen)
+Commit: 2b0b8fe5
+Dataset: /home/yongfu/proj/score/datasets/rggen/2b0b8fe5
+Snapshot files: 0

@@ -1,0 +1,5 @@
+PeakRDL SCORE snapshot (SystemRDL/PeakRDL)
+Commit: 80e9bacf
+Dataset: /home/yongfu/proj/score/datasets/peakrdl/80e9bacf
+Generated SystemVerilog register files: 3
+Snapshot files: 3

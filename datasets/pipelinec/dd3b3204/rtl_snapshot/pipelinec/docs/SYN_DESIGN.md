@@ -1,0 +1,1317 @@
+# Synthesis API
+
+How the PypelineC compiler talks to synthesis tools: which tool a build uses,
+what runs it can launch, what it expects back, and what it keeps between
+builds. Everything that *uses* those runs to reach a goal — the throughput
+sweep, the AUTO_PIPELINE / AUTO_MULTI_CYCLE / AUTO_FSM loops — is documented
+elsewhere and only calls into this layer.
+
+- Implementation: [`src/SYN.py`](../src/SYN.py), plus one backend module per
+  tool (table in §2).
+- Iterating these runs toward a timing goal:
+  [`SWEEP_DESIGN.md`](SWEEP_DESIGN.md).
+- The real sky130 liberty STA backend:
+  [`DEVICE_MODELS_DESIGN.md`](DEVICE_MODELS_DESIGN.md).
+
+> **Reference, not a logbook.** Describe the system as it is now, in the present
+> tense. No dated entries, no session write-ups — `git log` is the change record.
+> When behavior changes, edit the affected section in place; when the *reason* is
+> worth keeping, revise the matching entry in this file's `History` section rather
+> than appending a new one. See
+> [documentation conventions](pypeline_DESIGN.md#documentation-conventions).
+
+## Table of Contents
+
+- [1. Who does what](#1-who-does-what)
+- [2. Choosing a tool](#2-choosing-a-tool)
+- [3. The backend contract](#3-the-backend-contract)
+- [4. Kinds of synthesis runs](#4-kinds-of-synthesis-runs)
+- [5. Scoped synthesis and delay estimates](#5-scoped-synthesis-and-delay-estimates)
+  - [Consumers and caller context](#consumers-and-caller-context)
+  - [Measurements and estimates](#measurements-and-estimates)
+  - [Fallback and explicit modes](#fallback-and-explicit-modes)
+- [6. Caches](#6-caches)
+  - [Shared operator cache (`cache/`)](#shared-operator-cache-cache)
+  - [Synthesis logs in the output directory](#synthesis-logs-in-the-output-directory)
+  - [Shared synthesis store (`--syn_cache DIR`)](#shared-synthesis-store---syn_cache-dir)
+  - [Stored measurements](#stored-measurements)
+- [7. Constraints and output files](#7-constraints-and-output-files)
+  - [Build output: `name_index.log`](#build-output-name_indexlog)
+  - [Also produced: source locations on stdout/`[sweep]` messages](#also-produced-source-locations-on-stdoutsweep-messages)
+  - [Also produced: elapsed time on stdout](#also-produced-elapsed-time-on-stdout)
+- [8. Command line](#8-command-line)
+  - [The build driver (`src/pipelinec`)](#the-build-driver-srcpipelinec)
+- [9. Operator QoR benchmark](#9-operator-qor-benchmark)
+  - [Harness](#harness)
+- [10. Limitations and future work](#10-limitations-and-future-work)
+- [History](#history)
+  - [Comparator implementation selection](#comparator-implementation-selection)
+  - [Barrel shifter shape](#barrel-shifter-shape)
+  - [Karatsuba base-case threshold](#karatsuba-base-case-threshold)
+  - [Karatsuba with inferred leaves](#karatsuba-with-inferred-leaves)
+  - [Carry-save multiplier: default, and why it replaced shift-and-add](#carry-save-multiplier-default-and-why-it-replaced-shift-and-add)
+
+---
+
+## 1. Who does what
+
+| file | role |
+|---|---|
+| `src/SYN.py` | The synthesis API: tool selection, the run kinds of §4, report handling, delay/area caches, constraint and final output files, pre-synthesis area/register estimates. |
+| backend modules (§2) | Run one tool and parse its output into the report objects of §3. |
+| `src/SWEEP.py` | Throughput sweeps: plan registers, run synthesis, react to reports ([`SWEEP_DESIGN.md`](SWEEP_DESIGN.md)). |
+| `src/AUTO_PIPELINE.py` | Pipeline representation (`TimingParams`), stage map and register lifetimes, and the AUTO_PIPELINE build loop, including measured BRAM register/bank-tree search ([`AUTO_PIPELINE_DESIGN.md`](AUTO_PIPELINE_DESIGN.md)). |
+| `src/AUTO_MULTI_CYCLE.py` | Multi-cycle path constraints and AUTO_MULTI_CYCLE counts ([`AUTO_MULTI_CYCLE_DESIGN.md`](AUTO_MULTI_CYCLE_DESIGN.md)). |
+| `src/AUTO_FSM.py`, `src/AUTO_COMB_OPT.py`, `src/AUTO.py` | The other AUTO features and their shared machinery ([`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md), [`AUTO_COMB_OPT_DESIGN.md`](AUTO_COMB_OPT_DESIGN.md), [`AUTO_DESIGN.md`](AUTO_DESIGN.md)). |
+
+`SYN.py` imports every backend at module level and never imports `SWEEP`.
+Where one of its functions needs the pipeline representation
+(`AUTO_PIPELINE`) or multi-cycle constraints (`AUTO_MULTI_CYCLE`), it imports
+that module inside the function, so importing `SYN` does not load them. `SYN`,
+`VHDL` and the backends still import each other at module level; that works
+because none of them reads another's attributes while it is being imported
+(`src_module_import_test.py` imports every src module first in a fresh
+interpreter).
+
+## 2. Choosing a tool
+
+The backend is one decision with **two axes and four spellings**. The part can
+come from `PART("...")` in the source or `--part` on the command line; the tool
+from `SYN_TOOL("...")` in the source or `--syn_tool`. `RESOLVE_PART_AND_TOOL()`
+settles all four in one place, right after the design is parsed.
+
+A build calls it through `RESOLVE_BUILD_TARGET`, before any file is written.
+That function first clears the `SYN_TOOL` that `src/pipelinec` set from
+`--syn_tool` or `--part` alone before parsing (so in-parse `PART_SET_TOOL` calls
+see the right tool), so the resolver has the final say. It then plans a `.py`
+design's RAMs for the resolved target (`AUTO_PIPELINE.RAM_PREPARE_TARGET`). For an
+OpenXC7 `--pins` build, it checks the Project X-Ray bitstream conversion tools
+before any time goes into a sweep.
+
+**Register power-up values.** `TARGET_HAS_REGISTER_POWER_UP_VALUES(part, tool_name)`
+says whether a declared target gives registers power-up values: `False` for an ASIC
+(the part selects `DEVICE_MODELS`, or the tool is `device_models` or `pyrtl`), `None`
+when neither part nor tool is declared, `True` for an FPGA. It reads names only, so a
+declared ASIC target counts where its tool is not installed. For `False`,
+`RESOLVE_BUILD_TARGET` runs `PY_TO_LOGIC.CHECK_ASIC_REGISTER_INITS` on a `.py` design:
+an initialized register there must reset
+([guide](pypeline_guide.md#asic-targets)). The later `PART_SET_TOOL` fallback to PyRTL
+for a build with no part is no declaration, so such builds are not checked.
+
+| part prefix | `SYN_TOOL` | `--syn_tool` name | `DEFAULT_PART` | runs |
+|---|---|---|---|---|
+| none | `PYRTL` | `pyrtl` | *(none)* | PyRTL's software gate-delay model (no FPGA part) |
+| `xc` | `VIVADO` or `OPEN_TOOLS` | `vivado` / `open_tools` | `xc7a35ticsg324-1l` | Vivado, or open tools when selected |
+| `ep`, `10c`, `5c` | `QUARTUS` | `quartus` | `5CEBA4F23C8` | Quartus |
+| `lfe5u` (ECP5) / `ice` | `OPEN_TOOLS` (yosys + nextpnr); ice40 uses `DIAMOND` when installed | `open_tools` / `diamond` | `LFE5U-85F-6BG381C` / `ICE40UP5K-SG48` | |
+| `T8` / `Ti` | `EFINITY` | `efinity` | `Ti60F225` | Efinity |
+| `GW` | `GOWIN` | `gowin` | `GW2AR-LV18QN88PC8:C` | Gowin |
+| `CCGM` | `CC_TOOLS` | `cc_tools` | `CCGM1A1` | CologneChip toolchain |
+| `sky130` | `DEVICE_MODELS` | `device_models` | `sky130` | yosys + ghdl mapping to a sky130 liberty library, then the compiler's own STA ([`DEVICE_MODELS_DESIGN.md`](DEVICE_MODELS_DESIGN.md)) |
+
+A Gowin part may end in `:<version>` (`GW2AR-LV18QN88PC8:C`). That is a
+PipelineC suffix, not part of Gowin's part number: `GOWIN.py` splits it off and
+passes it to gw_sh as `set_device --device_version <version>`. Without it, a
+part with several known versions gets the last one listed in `GOWIN.py`.
+
+**The two axes cannot contradict.** A part and a tool that disagree is a hard
+error, not an override — they are one decision spelled two ways, so there is no
+"which wins" rule to remember:
+
+- `--part` vs `PART(...)` set to different parts: error.
+- `--syn_tool` vs `SYN_TOOL(...)` set to different tools: error.
+- a named tool the part does not select (`--syn_tool quartus` on an `xc...`
+  part): error, naming the part, the tool it implies and the tool asked for.
+
+**A tool named on its own supplies its part** from its `DEFAULT_PART`
+(`src/<TOOL>.py`, the table above). This is what lets one part-neutral source
+file be built on any backend — the per-SYN_TOOL sweep matrix in
+[`pypeline_TESTS.md`](pypeline_TESTS.md#per-syn_tool-sweep-coverage) is exactly
+that, one design registered once per tool.
+
+`PART_TO_TOOL(part)` is the pure part-prefix lookup above; `PART_SET_TOOL(part)`
+is the thin back-compat wrapper that sets the `SYN_TOOL` global from a part
+alone, and still respects a tool already chosen. **ice40 is the one family two
+backends serve** — Diamond when installed, open tools otherwise — so
+`TOOL_MATCHES_PART()` accepts either for an ice40 part, and the same command
+line does not succeed on one machine and fail on another.
+
+Xilinx 7-series also accepts `OPEN_TOOLS`; Vivado remains the default and
+`--syn_tool open_tools` selects OpenXC7. Supported devices depend on matching
+nextpnr-Xilinx/Project X-Ray data; hardware validation is currently Artix-7
+(`xc7a35tcpg236-1`, Basys 3).
+
+OpenXC7 times characterization tops -- `--comb` included -- synthesized with
+`synth_xilinx -noiopad` and their ports removed (`delete -port`), so
+nextpnr-xilinx makes no package PADs for them. A `--pins` build then implements
+the board-facing `top` that `WRITE_FINAL_FILES` wrote, once, with the XDC, and
+converts its FASM with Project X-Ray.
+
+nextpnr does not always report a clock by the name `clocks.py` constrained.
+nextpnr-xilinx times the net past the clock buffer, and nextpnr-ecp5 merges a clock
+bound to a pin (`clk_125p0_eth_rx <= ETH_RX_CLK(0)`) into the pin's net and reports it
+by the pin's name. `OPEN_TOOLS.ParsedTimingReport` keys such a report under the
+constrained clock when exactly one constrained clock matches it: the one a "derived ...
+MHz for net" line names, or the one clock nextpnr does not report whose goal equals the
+reported clock's target, to 0.1%. Otherwise the report keeps nextpnr's name, and a
+`--comb` build prints that clock's line without PASS or FAIL.
+
+`--yosys_json` (`OPEN_TOOLS.YOSYS_JSON_ONLY`) turns synthesis into netlist
+export only. `TOOL_DOES_PNR()` says whether a tool's timing is
+post-place-and-route (Vivado/Gowin with PnR enabled, Quartus, open tools,
+Efinity, CologneChip) or a synthesis estimate (Diamond, PyRTL, DEVICE_MODELS);
+the answer is part of the delay-cache directory (§6).
+
+`SYN_TOOL` and the other build options (`SYN_OUTPUT_DIRECTORY`,
+`TOP_LEVEL_MODULE`, `HIER_SYN_MODE`, `MUX_DELAY_KEY_BY_WIDTH`, ...) are module
+globals set by `src/pipelinec`. Other modules always read them as `SYN.NAME`,
+never through a copied name, so a later assignment is seen everywhere.
+
+## 3. The backend contract
+
+The backend modules (`src/VIVADO.py`, `src/QUARTUS.py`, `src/DIAMOND.py`,
+`src/GOWIN.py`, `src/EFINITY.py`, `src/OPEN_TOOLS.py`, `src/CC_TOOLS.py`,
+`src/PYRTL.py`) have no design documents of their own: §2 and this section are
+their design documentation. `src/DEVICE_MODELS.py` has
+[`DEVICE_MODELS_DESIGN.md`](DEVICE_MODELS_DESIGN.md).
+
+A backend module provides these module-level names:
+
+- `TOOL_EXE` and its resolved install path — looked up on `PATH` first
+  (`utilities.GET_TOOL_PATH`), then a hardcoded fallback. A tool installed but
+  not on `PATH` still works, which is why an install check cannot be a
+  `shutil.which` call.
+- `DEFAULT_PART` — the part used when this tool is selected without one
+  (`--syn_tool`/`SYN_TOOL()` with no `--part`/`PART()`); see §2's table.
+  `None` only for PYRTL, which models a tech node rather than a part — a
+  non-`None` value there would add a part directory to its delay-cache path
+  (§6) and orphan the committed cache.
+
+and these functions:
+
+- `SYN_AND_REPORT_TIMING(inst_name, Logic, parser_state, TimingParamsLookupTable, total_latency=None, hash_ext=None, use_existing_log_file=True, is_final_top=False)`
+  — synthesize one instance (or, with `is_final_top`, build the final design);
+- `SYN_AND_REPORT_TIMING_MULTIMAIN(parser_state, multimain_timing_params)` —
+  synthesize the whole multi-MAIN top;
+- (most backends) `SYN_AND_REPORT_TIMING_NEW`, the shared implementation of
+  both;
+- optionally `GENERATE_BITSTREAM(parser_state, multimain_timing_params)`, for
+  backends such as OpenXC7 whose final implementation artifact needs a separate
+  bitstream-format conversion step;
+- optionally `FUNC_IS_PRIMITIVE` / `GET_PRIMITIVE_MODULE_TEXT`, for tools with
+  vendor primitives that `VHDL.py` instantiates directly. Callers ask through
+  `SYN.FUNC_IS_PRIMITIVE(func_name, parser_state)`, which selects the part's tool
+  and answers False for a backend without the hook. `OPEN_TOOLS.py` holds the
+  Lattice ECP5 `MULT{n}X{n}D` DSP primitive text for the `ECP5_MUL*` functions of
+  `include/primitives/ecp5.c`, and `DIAMOND.py` forwards both hooks to it.
+  `QUARTUS.py` provides `LPM_MULT`; `GOWIN.py`'s hooks match nothing.
+
+A per-function run decides on reuse through `SYN.REUSE_SYNTHESIS_LOG` or
+`SYN.SYNTHESIS_STORE_FETCH`, and calls `SYN.REUSE_ONLY_MISS()` before any other
+path to a run. That is what lets a lookup ask the backend for an earlier result
+without running it ([§6 Stored measurements](#stored-measurements)).
+
+Each returns a `ParsedTimingReport`: `orig_text` (the tool log) and
+`path_reports`, a dict from path group (clock) to that group's worst
+`PathReport`. The compiler reads these `PathReport` fields:
+
+| field | meaning |
+|---|---|
+| `path_delay_ns` | the worst path's delay; per cycle for a multi-cycle path |
+| `path_group`, `source_ns_per_clock` | the clock group and its launch-edge period |
+| `start_reg_name`, `end_reg_name`, `netlist_resources` | endpoint and resource names, for attribution (approximate, see [`SWEEP_DESIGN.md`](SWEEP_DESIGN.md#3-the-refinement-loop)) |
+| `start_port_name` (optional) | the top-level input port a path starts at, when `start_reg_name` is None — DEVICE_MODELS only; other tools name such a port in `start_reg_name` |
+| `launch_clock_to_q_ns`, `combinational_delay_ns`, `setup_ns` (optional) | a decomposition of `path_delay_ns`; DEVICE_MODELS provides it, and it becomes the timing-components sidecar of §6 |
+| area fields (optional) | measured cell area (`total_cell_area`, `area_unit`, ...) — DEVICE_MODELS only |
+
+To write their project files and constraints, backends call back into a small
+part of `SYN.py`: `SYN_OUTPUT_DIRECTORY`, `TOP_LEVEL_MODULE`,
+`GET_OUTPUT_DIRECTORY`, `GET_VHDL_FILES_TCL_TEXT_AND_TOP` (the file list, in
+the tool's syntax), `GET_CLK_TO_MHZ_AND_CONSTRAINTS_PATH` and
+`WRITE_CLK_CONSTRAINTS_FILE` (§7). A single-instance run wraps its table in an
+`AUTO_PIPELINE.MultiMainTimingParams`, imported inside the function.
+
+Vivado and DEVICE_MODELS also return `input_signature`, `log_path`, and
+`cache_hit`, which sweep observations keep; AUTO_FSM reopens a retained
+DEVICE_MODELS log's mapped netlist to name flattened sky130 endpoints. Vivado
+additionally returns optional `extra_paths`, `coverage` and `utilization`.
+Extra reports never replace the
+base one-worst-path-per-clock contract: `SYN.TIMING_REPORT_PATHS(report)` returns
+the base paths followed by any extra ones, for every backend. `SYN.DISTINCT_PATHS`
+groups them by clock and start/end register bank, so the same bit reported for
+the clock, a MAIN and an MCP pair counts once. A bank (`SYN.PATH_REGISTER_BANK`)
+collapses payload indices but keeps hierarchy, fields and `raw_hdl_pipeline`
+stage numbers. `SYN.SERIALIZE_PATH_REPORT` is the row `sweep_history.json`
+keeps per path. The same synthesis queries the worst
+path into each MAIN's sequential cells, each registered MCP launch/capture
+pair, and at most 4096 failing endpoint paths. These are report filters, not
+`group_path` constraints. Compact rows retain slack, requirement, data delay,
+logic levels, clock period, endpoint pins and cell types. The failing-path
+query records its limit and truncation; absent optional sections mean unknown
+coverage. The optional queries run between `PYPELINEC_OPTIONAL_BEGIN` and
+`PYPELINEC_OPTIONAL_END` inside a Tcl `catch`. A failure there prints
+`PYPELINEC_OPTIONAL_ERROR`, makes that evidence unavailable, and does not make
+the log errored: the completeness check ignores output between the markers.
+When a log is rejected as errored or incomplete (for example a place-and-route
+failure on an over-capacity design), the error names any requested-resource
+overflow found in it.
+MCP pairs are queried on the same `/C` → `/D` pins as the
+`set_multicycle_path` exception, so a CE/R endpoint is never mistaken for MCP
+evidence. Paths whose requirement minus slack is not positive are ignored. See [Vivado timing-path properties](https://docs.amd.com/r/en-US/ug912-vivado-properties/TIMING_PATH).
+
+`VIVADO.PARSE_UTILIZATION` retains `Synth 8-3323` requested-resource overflow
+even when Vivado spills arithmetic into LUTs and the final utilization table
+falls to the device limit. Every resource type is checked. Final utilization tables are read by
+their `Site Type` header columns, so releases that add a `Prohibited` column
+still parse. Whole-design observations record final
+counts, requested overflow and changes in MAIN/AUTO_PIPELINE latency since
+the last observation within reported capacity. The default is a prominent
+warning, and the sweep continues; `--stop_on_over_capacity` exits nonzero before timing feedback or a
+confirmation fallback. Either way an over-capacity final netlist is never a
+pass (see §8). Backends without capacity evidence report `unknown`.
+Synthesis timing and reported capacity do not establish routed timing or fit.
+
+## 4. Kinds of synthesis runs
+
+| run | entry point | used by |
+|---|---|---|
+| per-function delay measurement | `ADD_PATH_DELAY_TO_LOOKUP` (the pre-synthesis wave), `MEASURE_DELAYS` (re-measure named functions), `ESTIMATE_HIER_PATH_DELAYS` (no synthesis: pipeline-map estimates), `STORED_MEASUREMENT` (no synthesis: an earlier run of the same inputs, §6) | every build; the sweep's measured-delay fallback; `AUTO.TimingModel` reads the results |
+| one instance at a given latency | `RUN_INST_SYN_AND_UPDATE_CACHE` | the coarse sweep and hotspot mini-sweeps |
+| the whole multi-MAIN design | `SYN_TOOL.SYN_AND_REPORT_TIMING_MULTIMAIN`, always called through `SYN.RUN_MULTIMAIN_SYN` (which times it) | each planned-sweep iteration, the pin-and-confirm confirmation, `--comb` characterization |
+| the final bitstream | `GENERATE_FINAL_BITSTREAM`, dispatching to a backend `GENERATE_BITSTREAM` hook when present | `--pins` builds (after the design's `@final(syn)` hooks, which run right after the final VHDL is written -- see `PY_TO_LOGIC_DESIGN.md`) |
+
+**Parallelism is a memory budget.** Per-function delay measurement and the
+coarse sweep run several synthesis jobs at once through a `ThreadPool` sized
+by `GET_NUM_PROCESSES()` — `-j/--jobs` if given, else
+`config/num_processes.cfg`, else 4. Every job is a whole vendor tool process,
+so the peak is N x that tool's per-run footprint. Most backends are small
+enough that the default is fine; Efinity is not. `efx_pnr` builds a complete
+Titanium routing graph for each leaf and peaks near 3.7GB resident doing it,
+so four at once exhausts a 16GB machine. Worse, the kernel's OOM killer picks
+by `oom_score_adj`, so what dies is typically a browser or editor rather than
+the build, and the build fails later with a confusing missing-`.timing.rpt`
+error. `-j 1` is the fix there. The same count sizes the forked workers of an
+AUTO_FSM area search step ([`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md#the-search-itself)).
+A worker shares the compiler's pages copy-on-write; on the Poly1305 epilogue
+fixture (`qor/poly1305/auto_fsm.py`, Vivado xc7a200tffg1156-2, 80 MHz) each of
+three added about 570 MB of private memory to a 1.65 GB compiler. A worker
+killed for memory stops the build with an error that names `-j`; it does not
+hang it.
+
+`SET_MEASURED_DELAY_FROM_REPORT` turns a per-function report into
+`Logic.delay` (integer tenths of a nanosecond, `DELAY_UNIT_MULT`), records its
+timing components and measured area (`Logic.measured_area`, DEVICE_MODELS),
+and writes the disk cache for non-user code
+(`LOGIC_PATH_DELAY_IS_CACHEABLE`). `GET_MAIN_INSTS_FROM_PATH_REPORT` maps a
+whole-design report back to MAIN instances by entity-name prefix.
+`PATH_CELLS_BY_MAIN` goes one level further for Vivado-style hierarchical
+names. It places each endpoint and netlist cell in its MAIN (exact
+`<entity>/` prefix) and in the deepest instance whose VHDL labels prefix the
+name, using a trie of `VHDL.WIRE_TO_VHDL_NAME` local names cached per
+instance table. A name that continues into unknown hierarchy gets no owner.
+Names in other tools' formats match no MAIN, an empty result. The sweep
+uses this to tell a MAIN that owns a path from one it only crosses
+([`SWEEP_DESIGN.md` §3](SWEEP_DESIGN.md#3-the-refinement-loop)).
+
+Four helpers place a path or a name inside one instance, in any case and through a
+flattening tool's `$flatten\` prefix (`_PATH_HIERARCHY` normalizes a name for all of
+them): `PATH_ENDS_IN_MAIN` (both ends inside a MAIN's entity, for global instance and
+FIFO MAINs) and `NAME_IN_MAIN(name, main_inst, ...)` (one end),
+`PATH_ENDS_IN_INSTANCE(path_report, label)` (both ends inside the top-level instance
+`label`, such as an async global FIFO's `clk_cross` instance `rx_FIFO`) and
+`NAME_IN_INSTANCE(name, label)` (one end). A name is inside `label` only when a hierarchy
+separator follows it, so the MAIN `rx_FIFO_wr` is not inside the crossing `rx_FIFO`. The
+sweep uses them in `GET_MAIN_INSTS_FOR_PATH_REPORT` and `RESET_DISTRIBUTION_PATH`
+([`SWEEP_DESIGN.md` §4](SWEEP_DESIGN.md#4-feature-specific-feedback-in-the-loop),
+[§3](SWEEP_DESIGN.md#3-the-refinement-loop)).
+
+
+## 5. Scoped synthesis and delay estimates
+
+`ADD_PATH_DELAY_TO_LOOKUP` resolves delays for actual planning consumers.
+The default (`HIER_SYN_MODE == "leaf"`) measures required primitives and
+combinational pipeline frontiers, then estimates inspectable surrounding
+hierarchy from its children. It does not characterize every used function.
+
+### Consumers and caller context
+
+`AUTO_PIPELINE.COLLECT_CUT_SUBTREES` is shared with the sweep.
+`COLLECT_PIPELINE_DELAY_REQUIREMENTS` follows those roots with the same
+absorbing-caller rules as landscape construction: a direct AUTO_PIPELINE tag
+starts an eligible region, while an untagged helper inside a stateful caller
+cannot acquire added latency. A deeper tag permits traversal toward itself,
+not registers in intervening callers.
+Only MAINs with an active clock goal contribute unconstrained sweep roots.
+Explicit latency regions and seeds remain geometry consumers under goal-less MAINs.
+Eligible terminal AUTO_PIPELINE tags with a clock goal have their own placement
+regions even without hints. Those regions are planned and locked before their
+containing landscapes, keeping stateful surroundings out of their internal geometry.
+
+`SYN.COLLECT_PATH_DELAY_REQUIREMENTS` returns three collections:
+`path_delay_funcs` (bottom-up dependencies), `path_delay_measure_funcs`
+(eligible combinational hierarchy), and `path_delay_frontier_funcs`
+(the outermost eligible fully combinational subtrees). `ParserState` declares
+them as `None`; only unrooted `ADD_PATH_DELAY_TO_LOOKUP` stores the full scope.
+Rooted fixed-latency characterization keeps its collections local. Measurement
+and refinement raise if the full scope is uninitialized. Collection memoizes
+instance/caller contexts, unions independent consumers, then orders dependencies
+once. The legacy recursive walk serves only explicit `--full_hier_syn`.
+These collections also
+bound fallback and hotspot delay measurements. Shared functions need one delay
+measurement when at least one call is eligible; that does not authorize added
+registers at their blocked call sites.
+
+A landscape needs widths for atomic surroundings as well as cuttable logic.
+Their inspectable children are collected recursively for estimates, down to
+true primitives. Entirely unrelated MAINs and controller subtrees outside
+these dependencies receive no geometry jobs. Explicit `root_func_names`
+select independent consumers for fixed-latency placement. AUTO_FSM operation
+roots, constant-specialized wrappers and registered operand muxes are also
+independent consumers, even if no
+pipeline landscape enters their stateful caller. After scheduling, the generated
+stateful FSM is one atomic span and nothing inside it is collected, so
+rescheduling keeps the operation delays carried from the bootstrap pass. Its
+delay is its installed schedule's worst state, or a longer measured stage of one
+of its pinned units (`SYN.SCHEDULED_FSM_DELAYS`, `AUTO_FSM.SCHEDULED_FSM_DELAY_DU`),
+marked as an estimate. A whole-module run reports an input-to-output figure, not a
+state's register-to-register delay, and took about 8 minutes per FSM on the 256-bit
+WireGuard build. The sweep cannot pipeline an FSM, and AUTO_FSM's loop attributes
+in-context paths itself. An FSM with no installed schedule is measured by one
+whole-module run, as the frontier. In `--no_hier_syn` mode it is estimated instead.
+
+### Measurements and estimates
+
+The default synthesis jobs are:
+
+- **Required true primitives:** leaf operators such as adds and muxes emitted
+  by `RAW_VHDL.py`, including the operators inside generated array helpers.
+  Missing primitive measurements are collected on a cold cache.
+- **Combinational pipeline frontiers:** the largest eligible subtrees without
+  Reg/Feedback state anywhere below. Their measured through-delays calibrate
+  the relative geometry derived from children. A fully combinational MAIN can
+  itself be such a frontier.
+- **AUTO_MULTI_CYCLE endpoint evidence:** automatic holders with missing
+  evidence for their current datapath shape get a targeted report for count
+  selection. This is separate from geometry and never assigns the holder's
+  internal critical path or cycle-normalized delay to `Logic.delay`.
+- **Scheduled AUTO_FSM spans:** none when the FSM's schedule is installed (its
+  worst state is the delay, see above), otherwise one whole-module run; plus its
+  registered operand muxes.
+- **Pinned AUTO_FSM unit placements:** before a whole-design build, each newly
+  chosen pipelined unit runs once with its pinned recipe, through the
+  backend's ordinary per-instance `SYN_AND_REPORT_TIMING`. Its worst
+  register-to-register stage replaces the planner's prediction for that
+  placement ([`AUTO_FSM_DESIGN.md`](AUTO_FSM_DESIGN.md) §3.2).
+
+Other inspectable hierarchy with state anywhere below stays **estimated**,
+whether or not a pipeline tag lies inside it. Its standalone report can describe an
+internal register path rather than the input-to-output span placement needs.
+Combinational helpers blocked by their callers also stay estimated. Generated
+`VAR_REF_RD` and `VAR_REF_ASSIGN` helpers with children are hierarchy, not
+primitives: their geometry comes from their underlying muxes and operators.
+
+Opaque user `vhdl()` text, including raw-text FIFOs, starts at **zero estimated
+delay**. It gets no standalone geometry job during initial characterization,
+even in explicit full-hierarchy mode or with an earlier cached measurement.
+This is an unknown placement width, not a claim about physical timing or
+declared pipeline latency. Its HDL and state remain in whole-design synthesis.
+
+`ESTIMATE_HIER_PATH_DELAYS` composes zero-clock pipeline-map critical paths
+bottom-up and marks `delay_is_estimated`. It never writes estimates to the
+measured delay cache. It skips raw text and primitives (no submodules): a primitive's
+estimate is modeled from measured widths (`PrimitiveDelayModel`), and it has no
+pipeline map to compose, so re-estimating after a `MEASURE_DELAYS` keeps it. A zero-only wrapper around an estimated child remains
+estimated too, so a later opaque-text measurement propagates through it.
+Usable existing measurements can replace estimates
+without new synthesis ([stored measurements](#stored-measurements)), but an
+inspectable stateful report is not usable through-delay evidence.
+
+Stateful surroundings can have pessimistic estimated widths. Those widths
+guide placement; they do not establish hard timing floors. Whole-design
+synthesis checks actual state and control paths, and remains the authority
+for timing, capacity, and stopping decisions. Planless MAINs use that same
+full-design evidence instead of redundant standalone as-written checks.
+
+### Fallback and explicit modes
+
+If a default sweep stalls with eligible combinational estimates still in play,
+`MEASURE_DELAYS` replaces those estimates with real measurements, invalidates
+pipeline maps, and re-estimates their dependants. It refuses stateful hierarchy,
+blocked-only helpers, and functions outside the collected consumers. It returns
+the changed function set; only an actual model change warrants another plan.
+Hotspot characterization obeys the same eligibility rules. Opaque text is
+excluded from broad fallback and hotspot descendant calibration. A stalled
+default sweep may refine it only when a failing path's endpoint or cell names
+identify that text within the plan's geometry dependencies
+(`OPAQUE_PATH_DELAY_REFINEMENTS`). `MEASURE_DELAYS(..., refine_opaque=True)`
+then replaces its zero estimate and re-estimates ancestors. Other opaque text
+stays at zero. An internal path measured this way remains placement guidance;
+whole-design evidence still determines physical timing and stopping decisions.
+Fallback records attempted functions, so a later failing path can request a new
+opaque refinement after combinational fallback has run. Untried opaque candidates
+on the current scoped path postpone soft-floor and plateau stops until refinement
+is attempted; a no-op attempt does not add iterations.
+
+`--no_hier_syn` (`"prim"`) uses the same consumers and primitive dependencies,
+but skips combinational frontier measurements and hierarchical fallback.
+Required AUTO_MCP endpoint evidence and AUTO_FSM calibration remain independent
+consumers. A stalled estimate-based sweep stops at its best measured result.
+
+`--full_hier_syn` (`"full"`) retains the broad legacy hierarchy characterization
+and standalone as-written diagnostics, with opaque text still initially zero.
+It is an explicit diagnostic mode;
+its internal-path measurements are not the default geometry policy.
+
+**Area rides the same primitive-synthesis path, sky130 only.** DEVICE_MODELS
+measures combinational area from the mapped netlist and caches it separately
+from delay. `WRITE_AREA_ESTIMATE_FILE` composes estimates from these results;
+whole-design synthesis prints actual mapped area. See
+[DEVICE_MODELS_DESIGN.md](DEVICE_MODELS_DESIGN.md) for the area model and limits.
+
+
+## 6. Caches
+
+Three places hold measurements:
+- **The shared operator cache (`cache/`).** Built-in operator delay and area, keyed by
+  name.
+- **The output directory.** Every synthesis log a build wrote, reused for exactly the
+  same inputs.
+- **An optional synthesis store (`--syn_cache DIR`).** Shares those logs between output
+  directories.
+
+When nothing changed, nothing runs: an output directory's `built_hardware.json`
+records its last timing-met build with that build's inputs, and the same build again
+is up to date and does nothing
+([Simulating built hardware](SIM_DESIGN.md#simulating-built-hardware)). Results that
+depend on the compiler's own code record `COMPILER_SOURCE_HASH`, a hash of `src/` and
+`include/pypeline/`: that record, and AUTO_FSM search results
+([AUTO_FSM_DESIGN.md](AUTO_FSM_DESIGN.md#search-results-persist-across-builds)).
+
+A result kept for reuse must be checked against every cache file it rests on.
+`RECORDED_READS()` opens a scope that records, as `(kind, key) -> value`, each
+read made inside it: SYN records the cache files it reads (`CACHE_FILE_KINDS`:
+`.delay` and `.timing.json` files by `GET_CACHED_PATH_DELAY` and
+`GET_CACHED_PATH_DELAY_COMPONENTS`, `.area` files by `_READ_CACHED_AREA_FILE`,
+each with `CACHE_FILE_SIGNATURE`, `None` for no file), and another module
+records kinds of its own (`RECORD_READ`) and checks them itself. Scopes nest, a
+read goes to every active one, and each thread has its own (synthesis runs in
+thread pools). A memo of a value derived from reads keeps them and replays them
+on a hit (`REPLAY_READS`), so a scope holds every read its result rests on,
+whatever ran first. `CACHE_FILES_UNCHANGED` checks the cache files of a record
+again: a changed, removed or newly created file is a difference. AUTO_FSM keeps
+one search's reads with its result
+([AUTO_FSM_DESIGN.md](AUTO_FSM_DESIGN.md#search-results-persist-across-builds)).
+
+### Shared operator cache (`cache/`)
+
+Measurements outlive a build in one committed `cache/` tree next to `src/`,
+holding two subtrees. `PYPELINEC_CACHE_DIR` relocates the whole root
+(`GET_CACHE_ROOT_DIR`) -- there is no per-subtree override, so a build can never
+read delay from one tree and area from another. `GET_PATH_DELAY_CACHE_DIR` /
+`GET_AREA_CACHE_DIR` take the subtree name as `dir_name`, so a non-default name
+(`"pipeline_min_period"`) is a sibling under the same root rather than a
+separate one:
+
+- **`cache/delay/`**. The
+  directory is keyed by tool, the tool's model identity (PyRTL tech node and
+  flip-flop overhead; DEVICE_MODELS library, corner, `MODEL_VERSION` and
+  synthesis recipe), the planner-weight suffix
+  (`GET_PLANNER_DELAY_CACHE_SUFFIX`), the part (except for DEVICE_MODELS, whose
+  part only selects the tool), and `pnr` / `syn` (`TOOL_DOES_PNR`). The part's
+  directory name goes through `PART_CACHE_DIR_NAME`, which maps characters
+  Windows forbids in a path (`:`, `/`, ...) to `_`, so the committed tree checks
+  out on Windows: `GW2AR-LV18QN88PC8:C` is cached under `GW2AR-LV18QN88PC8_C`.
+  The part string itself keeps its spelling everywhere else. Each entry is
+  `<key>.delay` (total ns) with an optional `<key>.timing.json` sidecar (schema 1:
+  `launch_clock_to_q_ns`, `combinational_delay_ns`, `setup_ns`, `path_delay_ns`).
+  `GET_CACHED_LOGIC_FILE_KEY` makes the key: the function name plus input types,
+  capped at 235 bytes; a built-in MUX is keyed by packed width
+  (`GET_MUX_CACHE_KEY`), or collapsed to one entry where the tool does not
+  distinguish widths (`MUX_DELAY_KEY_BY_WIDTH` overrides that).
+- **`cache/area/`**, DEVICE_MODELS only, keyed by
+  `AREA_MODEL_VERSION` rather than `MODEL_VERSION` so an STA-only change keeps it.
+
+Only non-user code is disk-cached (`IS_USER_CODE`), plus built-in MUXes of any
+type. `USE_COMBINATIONAL_PLANNER_WEIGHTS` selects whether the planner weighs
+the combinational component or the full register-to-register delay
+(`GET_PLANNER_DELAY`); it is part of the cache directory so the two never mix.
+
+**Estimated primitive widths (`PrimitiveDelayModel`).** A built-in integer add,
+subtract, equality or bitwise operator at a width with no `.delay` entry gets an
+estimate before it gets a synthesis run of its own.
+- **Fit.** `ADD_PATH_DELAY_TO_LOOKUP` fits the current tool/part directory once
+  per call, one least-squares line per (operator, signedness) family. The delay
+  is linear in width for PLUS and MINUS, linear in log2 width for EQ and NEQ, and
+  constant for AND, OR, XOR and NOT (`PRIMITIVE_DELAY_MODEL_SHAPES`).
+- **Limits.** A family predicts only inside its measured width range and only
+  from at least `PRIMITIVE_DELAY_MODEL_MIN_WIDTHS` (3) widths. Multiplies,
+  comparators (soft operators) and composite functions are never modeled.
+- **Precedence.** An exact `.delay` entry, a known zero delay, and an earlier
+  run of the same exact inputs (`SET_STORED_DELAY`) all come first.
+- **Marking.** An estimate sets `delay_is_estimated`, never enters the cache,
+  and records its error bound, the fit's largest leave-one-out error, in
+  `Logic.delay_model_error`. AUTO_FSM measures an estimate only when a decision
+  could turn on it ([AUTO_FSM_DESIGN.md](AUTO_FSM_DESIGN.md#35-delay-measurement)).
+- **Evidence.** Leave-one-out on the WireGuard Vivado logs (xc7a200tffg1156-2) gave
+  median errors of 0.04 ns for PLUS (max 0.58 ns, at 1 bit), 0.15 ns for MINUS
+  and 0.20 ns for EQ. Seventy-six cold primitive runs, about 1.3 minutes each
+  and mostly Vivado start-up, took 1.6 hours of that build's wall time.
+- **Off switch.** `--no_primitive_delay_model` sets
+  `USE_PRIMITIVE_DELAY_MODEL = False`.
+
+### Synthesis logs in the output directory
+
+**Every backend reuses a log only for identical inputs.** A log's name comes from the
+entity name and its timing hash. That hash covers function names, I/O registers, MCP
+constraints and leaf slices, not every detail of a function body: swapping a
+subtraction's operands keeps every name. So a name alone never proves a log is current.
+- **Building the identity.** Each backend first renders the run's HDL and constraints,
+  then builds its input identity, then decides.
+- **For backends without their own record** (OPEN_TOOLS, QUARTUS, DIAMOND, GOWIN,
+  EFINITY, CC_TOOLS, PYRTL), the identity is `SYN.SYNTHESIS_INPUT_MANIFEST`:
+  - the ordered HDL and constraint files, by basename and SHA-256;
+  - the part and top entity;
+  - the tool installation (each executable's size and modification time);
+  - the compiler modules that write the run's scripts (their SHA-256);
+  - run settings such as the nextpnr seed.
+- **Reuse.** A log is reused only when its `<log>.inputs.json` record equals that
+  identity (`SYN.REUSE_SYNTHESIS_LOG`).
+- **The record marks completion.** It is written only after a run succeeds
+  (`SYN.RECORD_SYNTHESIS_LOG`), so a run that died leaves a log without one.
+- **Stale logs** are moved aside (`<log>.stale`, `.stale2`, ...), never read and never
+  deleted. A stale log has either no record (an older compiler wrote it, or its run
+  did not finish) or a record that differs. The build prints which input changed, for
+  example `Not reusing .../pyrtl_0CLK_c9594139.log: its inputs differ: HDL
+  top_0CLK_c9594139.vhd changed`.
+- **Never reused:** final bitstream builds (OPEN_TOOLS XC7 final top, GOWIN final),
+  `--yosys_json` netlist exports (the run exists to write the netlist, which a reused
+  log would not), and runs asked for `use_existing_log_file=False`.
+
+**Generated VHDL follows the same rule.** `AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES`
+renders every final pipelined entity once per process, and `WRITE_TEXT_IF_CHANGED`
+leaves identical files untouched. It used to skip any entity file already on disk.
+Inside one build that was sound, because the design source is frozen. Across builds
+in a reused `--out_dir`, it kept a same-named entity's earlier VHDL after the source
+changed.
+
+**Vivado and sky130 keep their older, stricter records.** Vivado's build-local log
+names contain both the recursive timing hash and a SHA256-derived input signature. `VIVADO.INPUT_MANIFEST` hashes the actual
+HDL and XDC bytes, part, Vivado version, and normalized TCL/report recipe.
+Relocating the output directory does not change identity. Changing a clock,
+MCP allowance, or report recipe does. Each observation has its own TCL,
+checkpoint, journal and `.inputs.json`. Compiler edits alone do not invalidate
+identical synthesis inputs.
+
+All HDL inputs participate, including the type package. An isolated
+synthesis lists a package holding only the types its files use
+([VHDL_DESIGN.md](VHDL_DESIGN.md#generated-vhdl-is-the-same-in-every-pass-of-a-run)), so re-elaboration that changes an unrelated
+type or FIFO depth does not invalidate its log. A change to a type it does use
+still does. Use `.inputs.json` to distinguish such a miss from changed cuts or
+constraints. Whole-design syntheses read the full `c_structs_pkg.pkg.vhd`.
+
+Logs named without an input signature, as older compiler versions wrote them,
+stay on disk for investigation but are never matched: they carry no input or
+recipe evidence, so an output directory from such a version re-synthesizes
+once. The shared operator-delay cache is separate. A matching log must have the
+completion marker and no ERROR lines (`VIVADO.REQUIRE_COMPLETE_LOG`).
+Incomplete or errored matching logs raise a clear error; they are never
+overwritten or automatically retried. Inspect and manually move aside only
+that exact artifact before retrying. Reuse is reported as a cache hit.
+DEVICE_MODELS validates its `<log>_timing.json` against the exact ordered VHDL,
+liberty, recipe and mapping-tool hashes (`_synthesis_input_identity`), and re-measures
+on a mismatch.
+
+Design Python source is frozen for the whole build, so later passes elaborate
+what the first parse read
+([PY_TO_LOGIC_DESIGN.md](PY_TO_LOGIC_DESIGN.md#repeated-parse_file-support-the-pin-and-confirm-loops-foundation)).
+Neither design source nor design parameters (`-D`) are part of any identity; only the
+HDL they produce is. A parameter only simulation code reads therefore reuses every
+result. That HDL does carry source positions: each entity's header comment names its
+Python file and line, and instance and signal names embed `<file>_py_l<line>_c<col>`
+([PY_TO_LOGIC_DESIGN.md](PY_TO_LOGIC_DESIGN.md#submodule-instance-names)). So any
+edit that shifts lines in a Python file, even one added comment line in a library file
+under `include/pypeline/`, re-synthesizes every entity defined below it in that file
+once, with unchanged names and usually unchanged delays.
+
+### Shared synthesis store (`--syn_cache DIR`)
+
+The output directory's logs serve one directory. `--syn_cache DIR` adds a store that
+several share. Examples: WireGuard's per-profile build directories, a fresh
+`--out_dir` next to a warm one, or a `measure.py` re-run.
+
+- **Lookup.** When the output directory has no matching log, the backend looks for
+  `DIR/v1/<tool>/<sig[:2]>/<sig>/`. On a hit it copies the entry's files into place
+  under this run's own names, writes the local record, and proceeds exactly as if
+  the log had been found locally:
+  - the log;
+  - for sky130, also the `_timing.json` report and the mapped netlist it names;
+  - never the tool's other outputs (a Vivado `.dcp` checkpoint, nextpnr's netlists).
+    For those, build without the store into a fresh output directory.
+
+  `sig` is `SYN.SYNTHESIS_INPUT_MANIFEST`'s signature, `VIVADO.INPUT_MANIFEST`'s
+  signature, or DEVICE_MODELS' `identity_sha256`. Every backend goes through
+  `SYN.SYNTHESIS_STORE_FETCH` and `SYN.SYNTHESIS_STORE_INSERT`.
+- **Insert.** After every successful run. A temporary directory is renamed into place,
+  so a reader sees a complete entry or none, and concurrent writers of one identity are
+  harmless because their files are identical. A damaged entry is replaced by the next
+  insert.
+- **Validation.** Each entry keeps its full identity in `manifest.json`. A fetch uses an
+  entry only if that identity equals the run's, field for field, not just the hash
+  prefix in the directory name. An unreadable or foreign entry is a miss, and the build
+  says so.
+- **Parsing.** Logs are stored raw and parsed on every use, so parser fixes apply to
+  stored results without invalidating them.
+- **Hygiene.**
+  - A hit refreshes the entry's `manifest.json` time.
+  - `--syn_cache_prune DAYS` removes entries no build has used for that long, at
+    the end of the build (`SYNTHESIS_REUSE_EXIT_REPORT`, an `atexit` hook), and any half-written entry an interrupted insert left
+    that long ago. It also removes the store's latency memory pieces
+    (`DIR/latency/v2/<tool>/<part>/<kind>/<key digest>.json`, shared by every output
+    directory, see [SWEEP_DESIGN.md](SWEEP_DESIGN.md#5-latency-memory)) and its
+    AUTO_FSM search results (`DIR/auto_fsm/v2/<tool>/<part>/<digest>.pkl.z`, see
+    [AUTO_FSM_DESIGN.md](AUTO_FSM_DESIGN.md#search-results-persist-across-builds))
+    that no build has read or written for that long, and the old `latency/v1/` and
+    `auto_fsm/v1/` files current builds no longer read.
+  - Deleting the store is always safe.
+  - Each build ends with `Synthesis results: N reused from the output directory,
+    M from the store DIR, K new run(s)`, plus a count of stale logs set aside
+    (`SYNTHESIS_REUSE_EXIT_REPORT`, just before the elapsed-time line).
+
+### Stored measurements
+
+An earlier run of a function's exact inputs is a measurement, so a build uses it
+wherever it would otherwise estimate (`STORED_MEASUREMENT`):
+- **A hierarchical function's delay**, which default and primitive-only modes
+  derive from children (§5). `STORED_DELAY_IS_USABLE` accepts through-delays of
+  fully combinational hierarchy and required primitive calibration.
+  Inspectable stateful hierarchy stays estimated: its internal critical path
+  measures a different quantity. Opaque text bypasses stored scalar delays at
+  initialization; path-directed fallback can reuse its exact synthesis inputs.
+- **AUTO_MCP endpoint evidence**, retained by datapath shape for count selection,
+  separately from scalar geometry ([AUTO_MULTI_CYCLE_DESIGN.md](AUTO_MULTI_CYCLE_DESIGN.md)).
+- **Area, sky130 only** (`MEASURED_AREA`). In `GET_ESTIMATED_COMBINATIONAL_AREA` (the
+  `Estimated area:` line) and `AUTO.ESTIMATE_ENTITY_AREA` (AUTO_FSM schedule pricing):
+  - a measured function counts its combinational cell area instead of its leaves' sum;
+  - an uncached leaf counts its own run.
+
+  Every per-function run a build does records its area (`Logic.measured_area`), user
+  code included, so this build's own runs count too.
+
+**How a lookup asks without running.** It calls the backend exactly as for a real run,
+inside `REUSE_ONLY`.
+- The backend renders the inputs and checks the output directory, then the store, as
+  above. A hit is read and parsed as usual.
+- Every backend's reuse decision goes through `REUSE_SYNTHESIS_LOG` or
+  `SYNTHESIS_STORE_FETCH`. Inside `REUSE_ONLY`, a miss there raises `SynthesisNotStored`
+  instead of returning to a run.
+- DEVICE_MODELS also calls `REUSE_ONLY_MISS` where a store hit that failed its own
+  validation would re-run. A new backend that can decide to run anywhere else must do
+  the same.
+- A run counted inside a lookup raises `SynthesisRanDuringLookup`, so a backend that
+  breaks this rule fails loudly instead of synthesizing.
+- A result the build cannot use (an errored Vivado log, a netlist with no timing
+  paths) is reported, and the build estimates.
+
+**When lookups happen.**
+- Only once `ADD_PATH_DELAY_TO_LOOKUP` has started on a parse. Before that the parse
+  may be incomplete: AUTO_COMB_OPT prices candidates during elaboration.
+- Once per function per parse (`parser_state.stored_measurements`). The next
+  AUTO_PIPELINE pass re-parses, so it finds what `MEASURE_DELAYS` synthesized in the
+  previous pass. Before lookups existed, every pass estimated those functions again.
+- In every `HIER_SYN_MODE`, `--no_hier_syn` included: a lookup never runs a tool.
+- Each hit prints `Function: f stored path delay: ... ns (an earlier run synthesized
+  these exact inputs)` and counts in the `Synthesis results:` line.
+
+**Reproducibility.** A plan now depends on what earlier builds left in the output
+directory or the store. Rebuilding in the same `--out_dir` can plan from measurements
+the first build made, as `cache/delay` already does for operators.
+`--no_stored_measurements` (`USE_STORED_MEASUREMENTS = False`) estimates as if no
+earlier run existed.
+
+## 7. Constraints and output files
+
+- **Clock constraints.** `GET_CLK_TO_MHZ_AND_CONSTRAINTS_PATH` picks the file
+  type per tool (`.xdc`, `.sdc`, `.ldc`, or a nextpnr `.py`) and the MHz per
+  clock; `WRITE_CLK_CONSTRAINTS_FILE` writes clocks (a clock with no goal gets
+  `INF_MHZ` so a report can still be produced), then asks
+  `AUTO_MULTI_CYCLE.GET_MCP_PATH_CONSTRAINTS` for multi-cycle paths
+  ([`AUTO_MULTI_CYCLE_DESIGN.md`](AUTO_MULTI_CYCLE_DESIGN.md#2-constraints)).
+- **Vivado MCP coverage diagnostics.** Fresh and cached per-module/top-level
+  reports retain endpoint pins and cell types. `CHECK_MCP_TIMING_REPORT` rejects
+  identifiable missing MCP coverage before the report can drive pipeline
+  feedback; see [MCP feedback](AUTO_MULTI_CYCLE_DESIGN.md#3-sweep-feedback).
+- **Final files.** `WRITE_FINAL_FILES` writes the VHDL of the final
+  `TimingParams` table (dumping AUTO_COMB_OPT's generated sources first),
+  invalidates every cached hash/latency in that table so the files are computed
+  against current state, and runs `CHECK_VHDL_FILES_CONSISTENCY`: every
+  `entity work.X` referenced inside a listed file must be defined by a listed
+  file.
+- **Final Verilog.** After a passing sweep, GHDL/Yosys conversion can still take
+  substantial time. The conversion-start message and script path are flushed
+  before the tools run, even when stdout is redirected. `sweep_history.json`
+  describes synthesis completion; the process exit and the requested final
+  artifacts determine whether the whole build succeeded, and a live GHDL LLVM
+  worker after timing confirmation is still build work.
+- **Estimates.** `WRITE_REGISTERS_ESTIMATE_FILE` and `WRITE_AREA_ESTIMATE_FILE`
+  print `Estimated register usage: ...` / `Estimated area: ...` before
+  synthesis; `PRINT_MEASURED_AREA_IF_AVAILABLE` prints `Measured area: ...` after
+  a whole-design run that reports area.
+- **Reports.** `WRITE_MODULE_INSTANCES_REPORT_BY_DELAY_USAGE` (`module_instances.log`)
+  and the name index below. `WRITE_FLOAT_MODULE_INSTANCES_REPORT` and
+  `WRITE_INTEGER_MODULE_INSTANCES_REPORT` (`float_module_instances.log`,
+  `integer_module_instances.log`: operator instance counts by type and width) are
+  written with the zero-added-clocks files by `AUTO_PIPELINE.WRITE_0_ADDED_CLKS_INIT_FILES`.
+  The design diagram `diagram.html`, with each function's measured delay and its
+  zero-added-clocks offsets, is written by `DIAGRAM.WRITE_DIAGRAM`
+  ([`DIAGRAM_DESIGN.md`](DIAGRAM_DESIGN.md)).
+
+**A synthesized netlist with no timing paths is always an error.** A design that
+synthesizes away to nothing, typically because it drives no top-level output, has no
+Fmax. PYRTL's generated script checks for a zero-length critical path before
+`max_freq` (which would divide by zero with `FF_OVERHEAD = 0`). It prints
+`PYRTL.NO_TIMING_PATHS_MARKER`, and `SYN_AND_REPORT_TIMING_NEW` raises a readable
+error on both fresh and reused logs. DEVICE_MODELS raises the same error for a
+zero worst period. `LOGIC_IS_ZERO_DELAY` never times a stateless user function with
+no submodules (every operator is a submodule, so its body is only casts, slices,
+concatenation, constant shifts or constants), so such a helper never reaches this
+error, nor gets its backend's register-to-register floor as a delay that the planner
+would then try to cut. One exception is known: a C conversion between float formats is
+inline `resize_float_e_m_t` logic, not a submodule (issue #376). Other logic that truly
+has no timing path should be marked
+`@wires`, which `LOGIC_IS_ZERO_DELAY` never times either. `PYRTL.PathReport` matches only lines
+*starting* with `Fmax (MHz):`, so a traceback quoting the script's `print` line can
+no longer parse as a number.
+
+### Build output: `name_index.log`
+
+Every successful build, including `--no_synth`, writes
+`SYN_OUTPUT_DIRECTORY/name_index.log` through `SYN.WRITE_NAME_INDEX_LOG`. Use it to
+trace an entity, record, helper, instance or wire back to Python without reverse
+engineering a truncated identifier. It contains:
+
+- **ENTITIES**: logical function key, emitted VHDL base, definition location, instance
+  count, and the full logical canonical name when that key was shortened.
+- **TYPES**: full logical struct/enum names for shortened internal type keys.
+- **USER NAMES** (only when the design uses `name=`):
+  - every function, struct and enum given a name: its logical key, emitted VHDL base,
+    the unnamed key it replaced, and its definition;
+  - every named AUTO_PIPELINE / AUTO_MULTI_CYCLE: its key and where it was constructed
+    (with the design line when a library factory built it).
+
+  The source descriptions below keep the automatic description and add a
+  `user name:` line.
+- **SOURCE DESCRIPTIONS**: source symbol, module/qualname, full source path and line,
+  parameters and nested type/callable descriptions, and structural identity. Shared
+  types retain all contributing origins. Generated helpers identify the originating
+  factory or user function as well as their generated implementation.
+- **INSTANCES AND WIRES**: each instance's hierarchy/scope, its logical and emitted
+  names, submodule call-site locations and raw/emitted wire names with logical types.
+  Duplicate-instance collapsing retains every contributing call-site origin.
+- **GENERATED SOURCES**: synthetic Python files dumped into
+  `pypeline_generated_source/` (interface wiring, casts/bytes helpers and other
+  generated functions). These make generated `_py_lNN` coordinates navigable.
+- **PIPELINE VARIANTS**: the timing hashes and stage counts associated with functions.
+  A timing hash is distinct from a naming digest: it identifies register placement
+  and referenced child timing shapes, including alternatives with equal latency.
+- **EMITTED IDENTIFIERS**: final composed VHDL identifiers mapped to their logical
+  spelling and expanded presentation. This also indexes emitted timing variants.
+
+For example, look up `kept_data_bus_t_from_kept_data_bus_n_4_data_t_uint8_t`
+to find the `make_kept_data_bus_t` declaration and `data_t=uint8_t, n=4` description.
+For a long `_h...` name, the full description and nested origins explain the omitted
+parameters. Instance/wire entries identify the particular call site separately from
+the shared function definition.
+
+The emission registry is shared by entity references, VHDL filenames, output
+directories and generated constraint paths. Internal logical keys still drive backend
+type lookup, function reuse and timing caches; they are not parsed from the rendered
+name. See [Generated VHDL names](PY_TO_LOGIC_DESIGN.md#generated-vhdl-names).
+Plain C builds have no Pypeline registry and retain their existing naming behavior;
+the index uses whatever source and timing information is available.
+
+### Also produced: source locations on stdout/`[sweep]` messages
+
+`LOGIC.FUNC_SRC_LOC_STR(parser_state, func_name)` appends `" [file.py:line]"` (from the same
+`Logic.ast_meta` `name_index.log` reads, empty string when there is none) to every stdout
+line that names a function without a location: `"Synthesizing function:"`,
+`"Isolated effective stage-delay estimate ..."`, and every `[sweep]` WARNING/NOTE
+line in `SWEEP.py` that names a hotspot or a MAIN. Reading a failing build's own console
+output no longer requires separately grepping `module_instances.log`
+just to find which line of which file a printed name refers to.
+
+### Also produced: elapsed time on stdout
+
+Times are `H:MM:SS` wall clock from compiler start (`SYN.ELAPSED_STR`). The build prints:
+
+- `Parsing done, elapsed time ...` once the design is parsed and elaborated.
+- `Elapsed time: ...` before each per-function or sweep synthesis.
+- `Whole-design synthesis took ..., elapsed time ...` after every whole-design run
+  (`SYN.RUN_MULTIMAIN_SYN`). The line notes when a cached log was reused.
+- `Throughput sweep done, elapsed time ...` before *Writing Results*.
+- `Total elapsed time: ... (parse/elaborate ..., whole-design synthesis ... over N runs)`
+  as the very last line of every build that got past argument checks, whether it
+  succeeds, fails timing, or raises (an `atexit` hook, `SYN.ELAPSED_SUMMARY_STR`). The
+  rest of the total is per-function characterization, HDL writing, simulation and
+  bitstream generation. A comb-only native `--sim` skips the build and this line.
+- `Time by build phase: ...` right after it, longest first, when any named phase
+  ran. `SYN.PHASE` / `SYN.PHASED` charge wall time to a phase, a nested phase's
+  time to that phase only: whole-design synthesis, per-function delay
+  measurement, re-elaboration, AUTO_FSM schedule search, AUTO_FSM pinned-unit
+  measurement and sweep planning. On WireGuard's 80 MHz AUTO_FSM builds, half or
+  more of the wall time was outside Vivado; this line says which phase it was.
+
+## 8. Command line
+
+`--stop_on_over_capacity` is opt-in and applies to whole-design synthesis,
+including pinned confirmation and combinational builds. It preserves artifacts,
+records `device_over_capacity`, and exits with `DOES NOT FIT` before using that
+netlist's timing to change the design. Without it, the sweep warns, keeps
+going, and retains the over-capacity qualification in its history. The build
+still fails if the implementation it ends on is over capacity:
+`SWEEP.ADD_OVER_CAPACITY_FAILURES` gives each MAIN that otherwise met its goal
+a `device_over_capacity` failure (`ERROR: DOES NOT FIT`), and its
+`sweep_history.json` `final.met` is false. Fit is judged only from that
+implementation's own observation (`retained_observation`). With no matching
+observation, `fit_status` is `unknown`.
+
+| flag | meaning |
+|---|---|
+| `--syn_tool NAME` | build with that backend (`vivado`, `quartus`, `diamond`, `gowin`, `efinity`, `open_tools`, `cc_tools`, `pyrtl`, `device_models`); alone, it supplies its own `DEFAULT_PART`. Must agree with the part -- see §2 |
+| `--part PARTSTR` | target that FPGA part instead of `PART(...)` in the source; setting both differently is an error |
+| `-j N` / `--jobs N` | cap synthesis runs in flight and AUTO_FSM search workers (default `config/num_processes.cfg`). Really a memory knob -- see §4 |
+| `--comb` | no pipelining; one synthesis run reporting combinational fmax per clock |
+| `--no_synth` | like `--comb`, without synthesis: just write the combinational HDL |
+| `--full_hier_syn` | synthesize every hierarchy level for path delays; opaque `vhdl()` text starts at zero estimated delay |
+| `--no_hier_syn` | Collect geometry from required primitive operators; opaque `vhdl()` text starts at zero. Skip combinational frontier measurements and hierarchical fallback. AUTO_MCP endpoint evidence and AUTO_FSM calibration remain independent consumers. Usable stored measurements can still replace estimates (§6). |
+| `--no_stored_measurements` | estimate delays and areas as if no earlier run existed: don't use an earlier synthesis of the same exact inputs from the output directory or the `--syn_cache` store in place of an estimate (§6) |
+| `--no_primitive_delay_model` | synthesize every built-in primitive width with no cached measurement instead of estimating it from measured widths (`USE_PRIMITIVE_DELAY_MODEL`, §6 "Shared operator cache") |
+| `--mux_delay_by_width` / `--no_mux_delay_by_width` | force width-keyed or collapsed MUX delay-cache entries |
+| `--syn_cache DIR` | share synthesis results between output directories through the store DIR (§6) |
+| `--syn_cache_prune DAYS` | at the end of the build, remove `--syn_cache` entries unused for DAYS days |
+| `--rebuild` | build even when `--out_dir` holds the timing-met build of this top from identical inputs; by default such a build is up to date and does nothing ([Simulating built hardware](SIM_DESIGN.md#simulating-built-hardware)) |
+| `--verilog`, `--yosys_json`, `--xo_axis`, `--pins FILE` | final-output variants: Verilog top, netlist export only, Vivado AXIS XO, bitstream with pin constraints |
+
+Sweep flags (`--coarse`, `--no_sweep`, `--pipeline_min_effort`, ...) are in
+[`SWEEP_DESIGN.md`](SWEEP_DESIGN.md#6-command-line).
+
+### The build driver (`src/pipelinec`)
+
+`src/pipelinec` (also reachable as `pypelinec`) is the command-line script. It has
+no design document of its own; this subsection describes it.
+
+**The driver stays thin.** It holds only:
+- argparse, argument validation and combination;
+- the settings for the whole run, written to module globals (`SYN.*`, `SWEEP.*`,
+  `C_TO_LOGIC.MULT_STYLE`, `OPEN_TOOLS.YOSYS_JSON_ONLY`, `AUTO.FORCE_ABSTRACT_AREA`,
+  `pypeline.SET_AUTO_PIPELINE_BUILD_MODE`, `SIM.SET_SIM_TOOL`, ...);
+- dispatch on those arguments: a top-level sequence of named calls.
+
+It defines no functions and no loops. A step with logic of its own is a function
+in the module whose feature it serves. In order, it:
+
+1. parses the arguments and installs the `-D` Pypeline design parameters.
+   `--list_params` prints `pypeline_sim.design_param_list_text` and exits. It then
+   sets the module globals and selects the simulator. A comb-only native simulation
+   of a `.py` design stops here and simulates without building
+   (`SIM.NATIVE_SIM_SKIPS_BUILD`). Then it takes the run's `SIM.BUILD_INPUTS`. A
+   plain build that finds the `--out_dir`'s build of this top current stops with
+   nothing to do (`SIM.BUILT_HARDWARE_IS_CURRENT`). So does a native `--sim` of
+   another top on the hardware built in `--out_dir` (`SIM.SIMULATE_BUILT_HARDWARE`,
+   which otherwise removes that directory's hardware record before the build
+   replaces it). After these shortcuts the build removes the directory's previous
+   design diagram (`DIAGRAM.FORGET_DIAGRAM`). The build settings come next, and
+   then the `atexit` hooks that end every build with `SYN.SYNTHESIS_REUSE_EXIT_REPORT`
+   (§6) and then the elapsed summary (§7);
+2. installs `--latency_hints` starting latencies (`SWEEP.INSTALL_LATENCY_HINTS`). It
+   then parses the design with `C_TO_LOGIC.PARSE_FILE` or
+   `PY_TO_LOGIC.PARSE_FILE_FOR_BUILD` (sources frozen, `@initial(syn)` hooks, host
+   software types);
+3. settles part and tool with `RESOLVE_BUILD_TARGET` (§2) and writes the
+   zero-added-latency files (`AUTO_PIPELINE.WRITE_0_ADDED_CLKS_INIT_FILES`). It then
+   applies the latency memory (`SWEEP.APPLY_LATENCY_MEMORY`, sweep builds only);
+4. with no synthesis tool for the part, continues as `--comb --no_synth`, with a
+   warning. `AUTO_PIPELINE.SWITCH_TO_FIXED_ONLY_BUILD` re-elaborates a design that
+   already read a `start_latency=` or a starting latency;
+5. for `--comb` or `--no_synth`, writes the final files with any fixed
+   `AUTO_PIPELINE(latency=)` call sites (`AUTO_PIPELINE.WRITE_COMB_FINAL_FILES`).
+   A `--no_synth` build then writes its design diagram (`DIAGRAM.WRITE_DIAGRAM`,
+   [`DIAGRAM_DESIGN.md`](DIAGRAM_DESIGN.md#2-when-the-page-is-written)). For `--comb`,
+   it then runs the comb-stage simulation (`SIM.DO_COMB_STAGE_SIM`);
+6. for every build without `--no_synth` (`--comb` included: its synthesis run
+   reports combinational fmax), runs `AUTO_PIPELINE.DO_PIPELINED_BUILD`
+   ([build entry points](AUTO_PIPELINE_DESIGN.md#4-build-entry-points)). Next,
+   `SWEEP.WRITE_SWEEP_RESULTS` writes the sweep history, final files and latency
+   profile, and `DIAGRAM.WRITE_DIAGRAM` the design diagram. The build exits non-zero if a timing goal was missed
+   (`SWEEP.PRINT_TIMING_FAILURES`). Otherwise it records the hardware, with the
+   run's build inputs, for native simulation and the next build's up-to-date check
+   (`SIM.WRITE_BUILT_HARDWARE`), generates the bitstream
+   (`--pins`) and runs the requested simulation (`SIM.DO_OPTIONAL_SIM`, see
+   [`SIM_DESIGN.md`](SIM_DESIGN.md));
+7. writes the generated sources (`AUTO_COMB_OPT.DUMP_GENERATED_SOURCE`, needed by a
+   `--no_synth` build without fixed latencies, which writes no final files) and
+   `name_index.log` (§7).
+
+`src_module_import_test.py` (unit) runs the fallback of step 4 in an environment with
+no tools: a plain build falls back with the warning, and a design that read a
+`start_latency=` `.latency` is re-elaborated so the read becomes 0.
+
+## 9. Operator QoR benchmark
+
+`src/tests/pypeline_tests/op_qor_bench.py` measures pipelined (sliced) fmax
+for candidate implementations of `PLUS`/`MINUS`/`INFERRED_MULT`/`GT`/`GTE`/
+`LT`/`LTE`/`EQ`/`NEQ`, across a width matrix including wireguard-fpga's actual
+instantiated widths (mixed `uint32×uint3`, `uint32×uint4`, `uint16×uint1`,
+`uint8×uint1`, plus `uint8/16/32/64` same-width pairs). It validates each
+soft-operator implementation choice against sliced (not just combinational)
+fmax, since a combinational win can vanish or reverse once a design is
+actually pipelined.
+
+**The decision metric is pipelined per-stage delay at n_cuts ≥ 1, not comb
+delay at n_cuts = 0.** An implementation that wins combinationally can lose
+once sliced -- synthesis collapses a comb blob in ways that vanish the moment
+registers are inserted (a 1-cut result *worse* than 0-cut is normal and
+expected), and a 30-40 stage pipeline never sees the n_cuts=0 number.
+Area/utilization is recorded (Vivado runs only) as a free diagnostic, never as
+a tiebreaker.
+
+### Harness
+
+One `pipelinec <design>.py --coarse --sweep --start 0 --stop N` invocation per
+`(op, impl, widths)` combination sweeps every cut count inside a single process
+(`--sweep` forces the dumb +1-clock-per-step path instead of the
+delay-report-based incremental guess `--coarse` normally uses), parsing every
+printed `Current: ... latency=N clks cuts=N slices` line rather than spawning
+one subprocess per cut count. `bench_main` never gets an explicit MHz goal, so
+the sweep never "meets timing" early and always walks the full requested range
+(or stops on its own once an operator can no longer be sliced -- itself a real
+data point: that cut count is the operator's floor). Two tools:
+
+- **`--tool pyrtl`** (default): no `PART()` call, so `PART_SET_TOOL(None)`
+  falls back to PyRTL's software gate-delay estimate -- seconds per case
+  instead of minutes. Used for broad matrix sweeps. `INFERRED_MULT`
+  raw-vs-soft is skipped under this tool (no DSP-inference model; see
+  Limitations, below).
+- **`--tool vivado`**: `PART("xc7a200tffg1156-2")` (wireguard-fpga's actual
+  part), real OOC synthesis, minutes per case. Ground truth.
+
+`--ops` / `--widths` / `--impls` narrow the matrix; results land in
+`op_qor_results_<tool>.csv`, one row per `(op, impl, widths, n_cuts)`,
+resumable by `(tool, op, impl, l_type, r_type)`. `--impls` is the flag to
+reach for when following up a PyRTL finding with a scoped Vivado head-to-head,
+e.g. `--tool vivado --impls soft_cmp_sub_swapped,soft_cmp_prefix` -- without
+it, a full `--tool vivado` run re-measures every impl in
+`CMP_IMPLS`/`PLUS_MINUS_IMPLS`/etc., which is minutes-per-case across the
+whole matrix.
+
+Five harness properties that are easy to get wrong:
+
+- **`--stop` is exclusive.** The coarse sweep (`SWEEP.py`) stops once `coarse_latency >=
+  stop_at_latency`, so `--stop N` measures cut counts `0..N-1`. The harness
+  passes `stop + 1` so the intended top cut count -- the most decision-relevant
+  point -- is actually measured.
+- **Result width must be full precision.** The generated design takes its
+  return type from `arith_result_type(op, l_t, r_t)`, not from `l_t`.
+  Declaring `l_t` truncates, and synthesis then prunes the discarded high
+  bits: `uint32 * uint32 -> uint64` declared as `uint32` throws away half the
+  product (and changes the DSP-inference decision entirely), while `PLUS`
+  silently loses its carry-out bit.
+- **`MINUS` has no distinct soft implementation.** `make_soft_sub` computes
+  `a + ~b + 1` using whatever `PLUS` is registered -- inferred by default --
+  so it is the *same netlist* as `raw_default` (confirmed: identical measured
+  delay). Only `raw_default` is a real measurement for `MINUS`; there is
+  nothing to compare against until a genuinely different subtractor exists.
+- **The harness shares the repo's `cache/delay`.** Entries it adds are
+  real measurements of real entities, so this is harmless for anything
+  reachable by default. The exception is `raw_revived_sliced`, whose
+  `FORCE_RAW_INT_CMP_FOR_QOR_BENCH` path emits a raw comparator under the same
+  canonical `BIN_OP_GT_*`/`BIN_OP_GTE_*` name a soft build would use -- a
+  build that runs the benchmark and then a normal build against the same
+  cache directory can pick up a comparator shape it never asked for. This is
+  already latent, not just hypothetical: the cache's `BIN_OP_{GT,GTE,LT,LTE}_*`
+  entries have mixed provenance today, some measuring the C front end's C-generated
+  comparator and some the `FORCE_RAW_INT_CMP_FOR_QOR_BENCH` RAW_VHDL one, both
+  filed under the same canonical entity name. Harmless only because compares
+  are soft by default today; flipping any of `GT`/`GTE`/`LT`/`LTE` back to
+  raw would silently pull numbers from an implementation that no longer
+  matches what gets built.
+- **Only a handful of Karatsuba thresholds build structurally distinct
+  hardware.** `op_qor_bench.py`'s `karatsuba_threshold_reps` groups the
+  threshold sweep by `CANONICAL_CALLABLE_KEY` before measuring, since most
+  threshold values collapse onto the same entity (at uint16: `T=6`≡`T=7`,
+  `T=9..15` all identical, `T>=16` degenerates to no-split/shift-add) --
+  sweeping every integer threshold would just re-measure the same few shapes
+  repeatedly. Separately, `make_soft_mult_karatsuba` itself rejects
+  `threshold < 3`: a 3-bit operand's middle sub-multiply recurses at the
+  same width as its parent, so anything below 3 never terminates (confirmed
+  by measurement: `RecursionError`).
+
+Current soft-operator defaults (comparator, barrel shifter, Karatsuba
+threshold, carry-save multiplier) and the QoR reasoning behind each are in
+[`pypeline_DESIGN.md`'s Soft Operator Library section](pypeline_DESIGN.md#soft-operator-library-includepypelineoperators);
+the investigations that established them are recorded in this file's History
+section, below.
+
+## 10. Limitations and future work
+
+1. **Watch for "rewire-only" entities when building a deep, many-node
+   soft-operator tree.** A `@hw_func`-tagged entity whose synthesized result
+   is pure wiring (a bit-slice, a concat-of-slices, or a reduction level
+   with zero arithmetic ops) has no timing path, so the first time it is
+   independently timing-estimated the build stops with the "no timing
+   paths" error (`PYRTL.NO_TIMING_PATHS_MARKER`; PyRTL's own `max_freq`
+   would otherwise divide by zero). `@wires` is the fix, but must be applied truthfully and
+   propagated through the *entire* reachable computation — tagging
+   something `@wires` that calls real arithmetic would silently hide that
+   delay from every future estimate. Preferring fewer, coarser-grained
+   entities (one `@hw_func` per structural level rather than per bit-slice/
+   concat node) reduces how many entities are even candidates for this.
+2. **`INFERRED_MULT` raw-vs-soft comparison is skipped under the PyRTL tool**
+   in the operator QoR benchmark (§9) — PyRTL has no DSP-inference cost
+   model, so multiplier coverage there is sky130/Vivado-only
+   ([#352](https://github.com/JulianKemmerer/PipelineC/discussions/352)).
+3. **`PLUS` has the same PyRTL blind spot as `INFERRED_MULT`, with a bigger
+   real-hardware caveat.** PyRTL's own sweep shows `soft_carry_select`
+   beating `raw_default` by a wide margin (uint32 `+` uint32 at 6 cuts: 219
+   vs. 119 MHz) — flipping the default on that data alone would be a
+   one-line change, and is deliberately not done: Xilinx's `CARRY4`
+   primitive gives the raw adder a dedicated fast-carry chain that a
+   generic gate-delay model cannot represent, so the PyRTL numbers are not
+   trustworthy here without a `--tool vivado` re-measurement, which hasn't
+   been done ([#352](https://github.com/JulianKemmerer/PipelineC/discussions/352)). Not implicated by the wireguard regression either way:
+   chacha20's quarter round uses only `+`, `^`, `|`, and constant-amount
+   rotates, and a constant shift/rotate amount resolves to a
+   `CONST_SL`/`SR_<n>_<type>` built-in before it ever reaches the operator
+   registry, so only variable-amount shifts in that design reach a
+   soft/raw choice at all.
+
+## History
+
+Why things are the way they are. Entries are keyed by **topic, not date** —
+when something changes, revise the entry that owns that topic rather than
+adding a new one. Keep a fact here only if it still changes a decision
+today: an alternative someone would otherwise retry, a measurement that is
+still a live regression reference, or the reason a default is what it is.
+Numbers carry the conditions they were measured under, not the date they
+were taken. The planner's own history (the planned sweep, the mux
+select-fanout cliff, divider acceptance) is in
+[`SWEEP_DESIGN.md`](SWEEP_DESIGN.md#history).
+
+### FSM characterization and ordered paths
+
+Constant-specialized operations and width-keyed decode proxies are independent geometry consumers. A later query sees newly registered consumers. Serialized paths preserve ordered Vivado increments and arrivals as well as the existing resource set; endpoint-only evidence remains usable and unmatched evidence is retained.
+
+### Comparator implementation selection
+
+`GT`/`GTE`/`LT`/`LTE` default to `make_soft_cmp_prefix` — a log2(n)-deep
+parallel-prefix magnitude compare (per-bit (gt,lt) codes combined by an
+associative leader-select tree, one `@hw_func` per level) — not the older
+operand-swapped subtract (`make_soft_cmp_sub_swapped`, still available via
+`register_soft_cmp_sub_swapped`) or a bitwise-decomposed one. Every cached
+leaf delay is a full out-of-context register-to-register measurement
+(clk→Q + routing + logic + setup) that is the same regardless of operand
+width — one logic level plus a fixed floor — so a hierarchical
+implementation that decomposes into many small leaves is estimated far
+worse than it measures (a fully bitwise-decomposed comparator's estimate
+ran 26-47x its measured delay). The prefix tree sidesteps that: pricing
+each tree level as its own entity, rather than unrolling one flat serial
+scan, is what let it clear PyRTL's sweep (24/24 (op,width) combinations,
+every `n_cuts>=1`) beating the previous default outright — the same
+per-level-entity structure that the rejected borrow-chain candidate below
+lacks, which is why PyRTL over-prices it so badly.
+
+Vivado (`xc7a200tffg1156-2`, all 32 (op,width) combinations) confirmed the
+prefix tree wins 28/32 at `n_cuts>=1`, margin widening with operand width
+across all four ops (up to 40% faster than the swapped-subtract shape at
+deep cuts for uint64 `GTE`) — enough to promote it as the unconditional
+default. The 4 losses are `GTE`/`LTE` specifically at the two narrowest
+widths (uint8, uint16): swapped-subtract's `GTE`/`LTE` costs the same as
+its `GT`/`LT` (one subtract, operand order swapped per op), and real
+synthesis already optimizes that single small subtract very well at 8-16
+bits, so the tree's fixed per-level overhead doesn't pay off until the
+comparator is wide enough to be the actual bottleneck — PyRTL's own sweep
+missed all four losses entirely, the sharpest concrete instance of its
+serial-vs-tree blind spot anywhere in this doc. `register_soft_cmp_sub_swapped`
+therefore stays the right pick, via `scope=`, for a design known to be
+narrow-width-`GTE`/`LTE`-heavy; `AUTO._SOFT_FACTORY_FOR_OP` also stays
+pinned to it deliberately (unrelated to this speed tradeoff — the pin
+selects for even decomposition as a sharing candidate, not fmax, and
+prefix's decomposition properties there haven't been evaluated).
+
+Two other candidates were measured and rejected. `make_soft_cmp_borrow`
+(explicit LSB-to-(width-2) bitwise borrow-propagate loop, same
+operand-swap identity as swapped-subtract) measured 7-8x worse under PyRTL
+(uint32 `GT` @0cuts: 79.86ns vs. swapped-subtract's 10.61-10.88ns) for a
+tool-artifact reason, not a real one: hand-unrolling 31 bits into
+individual bitwise leaves forfeits the lumped delay PyRTL gives the native
+`-` operator and prices 31 serial gate levels individually — not evidence
+about real hardware, and re-ranking it honestly needs a Vivado
+remeasurement that hasn't been done. `make_soft_cmp_chunked` (parallel
+`chunk_bits`-wide chunks, each an internal serial scan, reduced through the
+same prefix tree) beats swapped-subtract at `n_cuts>=2` but loses to the
+full prefix tree at every cut count measured, since each chunk still pays
+the serial-scan penalty internally — kept as a distinct point on the
+granularity spectrum between the two, not a leading candidate. Only a
+hand-pipelined raw-VHDL comparator (`raw_revived_sliced`, otherwise dead
+code, `RAW_VHDL.py`) is occasionally faster than the prefix tree, but
+degrades badly on first slicing, the wrong shape for a deeply pipelined
+design. Decision metric throughout ([§9](#9-operator-qor-benchmark)):
+pipelined per-stage delay at `n_cuts >= 1`, never comb delay at
+`n_cuts = 0` — synthesis collapses a comb blob in ways that vanish the
+moment registers are inserted, so a combinational win can invert once
+sliced.
+
+### Barrel shifter shape
+
+`make_soft_shift_barrel_sl/sr` is a chain of `MUX` leaf entities, one per
+bit of the shift amount; comb delay, the slicing floor, and the cuts needed
+to reach it are all set purely by *how many* stages the chain has, not by
+composition style, stage ordering, or codegen shape (all measured equal).
+The shipped shape carried one dead stage (`amount_bits` sized from
+`n_bits.bit_length()` instead of `(n_bits-1).bit_length()`, so a 32-bit
+shifter had an unreachable shift-by-32 stage) — fixed to the minimal stage
+count, which reaches the true floor one cut sooner on both PyRTL and real
+Vivado synthesis. A masked/AND-OR select (no mux) ties on combinational
+delay but is measurably worse once sliced, and a one-hot decode is
+decisively worse (the "free" parallel shifted versions still need real
+comparator+OR-tree logic to select among them) — both rejected. Rotate
+(`rotl`/`rotr`, previously constant-amount only) and a unified 4-mode
+shift/rotate primitive (`make_soft_shift_rot`) are now built from the same
+minimal-stage barrel via a single left-only funnel shift, rather than
+composing up to four separate barrels — equal-or-better at every cut count,
+roughly half the mux-entity count of the naive four-barrel composition.
+
+### Karatsuba base-case threshold
+
+`make_soft_mult_karatsuba`'s recursion floor (`threshold`) is 16, not 8.
+Below 16 bits, splitting is pure loss at every cut count: comb delay falls
+monotonically as `threshold` rises, but so does sliced fmax, all the way to
+the trivial no-split case — Karatsuba's recombination cost (two adds, a
+3-way subtract, a 3-way shifted sum, all at or near full output width) is
+fixed-ish overhead that a 16-bit-or-smaller multiply's actual work never
+earns back. 16 is deliberately the ceiling of what was measured, not an
+estimate of some wider optimum; a real (non-degenerate) optimum above 16
+bits — the original motivation for Karatsuba's presence in this library —
+remains open. `register_soft_mult_karatsuba(threshold=...)` still reaches
+any threshold explicitly.
+
+### Karatsuba with inferred leaves
+
+On an FPGA with DSP blocks, a Karatsuba multiplier should bottom out in small inferred
+multiplies, not in soft shift-and-add. `make_mult_karatsuba_inferred_leaves` is that
+opt-in hybrid; `register_mult_karatsuba_inferred_leaves` registers it. It is
+`make_soft_mult_karatsuba` with `leaf=make_inferred_mult` and `threshold=34`. Each split
+saves one of four sub-products; the three remaining ones are tiled onto DSPs by the
+vendor tool. A 130-bit product splits into 65/65/66-bit products and then nine leaves:
+two of 32 bits, four of 33 bits and three of 34 bits. A 64-bit product splits into
+32/32/33-bit leaves.
+
+The hardware reference that motivated this configuration is FPGA-House-AG's ChaCha20-Poly1305
+[`mul_136_kar.vhd`](https://github.com/FPGA-House-AG/ChaCha20Poly1305/blob/7e75c097af32429ff2c7979b976fe876efbdb9f3/src_dsp_opt/mul_136_kar.vhd):
+a registered three-level Karatsuba over 17 × 17 vendor multiplies. The library reuses
+its own combinational recursion instead of importing that RTL.
+
+Vivado 2019.2 synthesis (`-mode out_of_context`) on `xc7a200tffg1156-2`, built with
+`src/tests/pypeline_tests/qor/multiplier/karatsuba_inferred_leaves.py`. The probe has
+registered inputs and output and no internal registers. The hybrid is registered for
+exact types (`-D VARIANT=inferred|hybrid|soft -D WIDTH=130|64`):
+
+| Product | Implementation | DSP48E1 | Slice LUTs | Slice Registers |
+| ---: | --- | ---: | ---: | ---: |
+| 130 × 130 | inferred `*` | 64 | 1,276 | 724 |
+| 130 × 130 | hybrid, threshold 34 | **36** | 2,082 | 1,040 |
+| 130 × 130 | all-soft Karatsuba (default `register_soft_mult_karatsuba`) | 0 | 11,444 | 1,040 |
+| 64 × 64 | inferred `*` | 16 | 176 | 358 |
+| 64 × 64 | hybrid, threshold 34 | **12** | 465 | 512 |
+
+- **Agreement with the earlier probe.** These match an earlier standalone probe of the
+  same arithmetic, written as a hand-coded sum-form Karatsuba, to within one Slice LUT
+  for the hybrids. Its DSP counts were 64/36 and 16/12. Its Slice Registers are 520 and
+  256 lower in every row, which is exactly the input/output register bits that
+  pypelinec's top-level wrapper adds.
+- **Timing.** Timing from these builds is not a multiplier fmax: DSP register
+  absorption moves arithmetic across the measured register span. Still, the unpipelined
+  130-bit hybrid's worst internal path is about 26 ns in both probes. That is far from
+  60 MHz, so a real design needs the hybrid auto-pipelined.
+- **Inferred leaves are not a DSP guarantee.** The vendor tool decides the mapping. The
+  recombination adds and subtracts can also be absorbed into DSP post-adders, which is
+  why counting leaves does not predict DSPs. The same earlier evaluation tried a
+  three-level *difference-form* Karatsuba, padded to 136 bits with 27 17-bit leaves.
+  Vivado mapped it to 45 DSPs and 5,503 Slice LUTs, worse than this hybrid on both
+  counts. That form is not implemented here.
+- **Defaults are unchanged.** `register_soft_mult()` (carry-save) and
+  `register_soft_mult_karatsuba()` (threshold 16, shift-and-add leaves) stay
+  ASIC-oriented. The all-soft row above shows what that costs on an FPGA. It matches the
+  earlier probe's 0 DSPs and 11,444 Slice LUTs exactly.
+
+### Carry-save multiplier: default, and why it replaced shift-and-add
+
+`register_soft_mult()` registers `make_soft_mult_carry_save` (`max_width=2`),
+not `make_soft_mult_shift_add` (still available via
+`register_soft_mult_shift_add()`). The carry-save reduction is a direct
+algorithm port of a real, externally-authored sky130-targeted design (a
+CoHDL-generated `uint16 x uint16` multiplier, 684 MHz at 33 cycles): every
+add is capped at a fixed small width, and its carry-out is folded into the
+next stage's input rather than resolved in place — cheap on an ASIC with no
+dedicated carry chain, where `make_soft_mult_shift_add`'s balanced tree of a
+few full-width carry-propagate adds is the wrong (FPGA-carry-chain-shaped)
+tradeoff. Auto-pipelined via the *planned* sweep (not `--coarse`, which has
+an unrelated pre-existing crash on this design's many narrow leaves —
+[`SWEEP_DESIGN.md` Limitations](SWEEP_DESIGN.md#8-limitations-and-future-work), item 1) with a real `@MAIN(700)` target and the latchup-style
+`--no_sweep --no_hier_syn` flags, the first emitted candidate reaches
+700.64 MHz at 30 cycles (31 stages), beating the reference's
+own 684 MHz/33 cycles.
+
+| requested `CLK_RATE_MHZ` | added-clock latency | comb stages | measured fmax |
+|---:|---:|---:|---:|
+| 700 | 30 | 31 | 700.640825 MHz |
+| 701 | 59 | 60 | 909.794952 MHz |
+| 720 | 60 | 61 | 909.794952 MHz |
+| 905 | 60 | 61 | 909.794952 MHz |
+
+The 700 MHz point preserves the established 31-stage baseline. The first
+deeper family is selected by a 701 MHz request and improves measured fmax by
+29.852% while remaining below 64 stages. Its frozen mapped netlist has 7,164
+cells, 4,605 sequential cells, and zero unmapped cells.
+
+The old plateau had two independent causes. A two-input-bit `PLUS` was capped
+from its widened three-bit output and its nominal one-bit-per-stage lowering
+still left a complete full-adder path in stage 1. At the same time, one
+logical delay-axis cut selected one arbitrary member of a parallel narrow-op
+rank instead of registering the complete frontier.
+
+The fixes are generic: binary split width comes from the operands, the
+two-stage two-bit unsigned add uses registered carry-prefix state, and typed
+placement can synchronize parallel output or bit frontiers. Selection remains
+based on measured timing components and requested stage budget; neither the
+elaborated multiplier architecture nor an operator-overload choice depends on
+the requested clock, target device, or a hard-coded multiplier boundary.
+
+The 909.794952 MHz critical path is 1.099148767 ns: 0.6644067045 ns launch
+clk-to-Q, one 0.2936405239 ns `and2_1` arc, and 0.1411015387 ns setup. The
+exact 720 MHz candidate's final VHDL also passed the 51-product GHDL test with
+bubbles, ordering, and exact 60-clock latency.
+
+Two real bugs surfaced while porting, both worth remembering as traps for a
+similar port: (1) a bare pure-wire entity (a bit-slice passthrough, or a
+reduction level with zero `add` ops) crashes PyRTL's `max_freq` with a
+divide-by-zero the first time it's independently timing-estimated — fixed
+with `@wires`, which must be applied truthfully and threaded through the
+*entire* reachable computation (a combine node is only pure wires if both
+children are), since a false `@wires` tag would silently hide a real
+child's delay from every future estimate; (2) multiplying by a 1-bit
+operand makes every partial product disjoint, so the pairing scan that only
+shrinks the summand count on an `add` hung indefinitely — fixed by merging
+contiguous non-overlapping (`pass`) elements for bookkeeping only, with a
+hard iteration cap as a backstop.
+
+The first construction pass emitted one `@hw_func`/`@wires` entity per
+bit-slice and per 2-input concat node — 2,489 `.vhd` files for one
+`uint16 x uint16` instance, ~78% of them pure-wire entities synthesizing to
+nothing. Rebuilding around one `@hw_func` per reduction level (each owning
+its own reduction loop *and* its tail call to the next level, matching the
+precedent `soft_div_radix` already set for a loop body whose per-iteration
+closure data varies) cut that to 41 files with no change to either public
+factory signature. General lesson: prefer one entity per structural level
+over one entity per primitive operation when building a deep, repetitive
+soft-operator tree — fewer entities also means fewer places a `@wires` tag
+needs to be correct.

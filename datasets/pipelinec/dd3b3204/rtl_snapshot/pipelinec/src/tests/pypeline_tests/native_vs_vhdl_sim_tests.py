@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Cycle-accurate native-vs-VHDL simulation tests, via pypeline_sim_debug.py.
+
+Every entry here runs a design's native (Python) sim and its real cocotb+GHDL
+sim, and diffs their sim_print(..., debug=True) console output cycle by cycle
+(pypeline_sim_debug.py). MATCH (exit 0) proves the two sims agree, not just
+that each one self-checks -- strictly stronger than running the same design
+through native_sim_tests.py and (the now-removed) vhdl_sim_tests.py
+separately, which only proved each sim's own sim_assert/sim_finish passed.
+
+Designs registered here must:
+  - emit at least one sim_print(..., debug=True) probe covering the values
+    their sim_assert already checks;
+  - never emit a debug=True print on the same cycle sim_finish() is called
+    (GHDL's std.env.finish vs write-flush is a process-ordering race the
+    diff must not depend on -- see the design files' own comments, and
+    known_issues_tests.py's sim_finish_debug_print_race_test for a direct
+    reproduction of what happens if this rule is broken);
+  - for a non---comb (pipelined) entry, put every probe inside a stateful
+    (0-latency) MAIN, and valid-/count-gate it so VHDL's undefined ('U')
+    warm-up registers can't be compared against native's typed zeros.
+
+See docs/pypeline_TESTS.md and docs/pypeline_sim_DESIGN.md's Limitations
+section for the full probe-placement contract.
+
+Run standalone: python3 native_vs_vhdl_sim_tests.py [-j N]
+"""
+
+import sys
+
+from common import (
+    INST_DIR,
+    PYPELINE_SIM_DEBUG,
+    SYN_TOOL_ARGS,
+    Test,
+    main,
+)
+
+# fmt: off
+# (filename, source_dir, extra_args) -- extra_args always includes --sim and
+# --run; --comb selects the fast passthrough-latency compare, its absence
+# selects the full-build pipelined compare (pypeline_sim_debug.py builds once
+# then runs native + VHDL concurrently, each in its own copy of the warm build).
+COMB_TEST_FILES = [
+    ("self_check_auto_pipeline_ram_target_test.py", INST_DIR, []),
+    ("self_check_dsp_rom_test.py", INST_DIR, []),
+    ("valid_join_test.py", INST_DIR, []),
+    ("lut_atan2_test.py", INST_DIR, []),
+    ("self_check_auto_pipeline_ram_test.py", INST_DIR, []),
+    ("self_check_auto_comb_area_opt_composition_test.py", INST_DIR, []),
+    ("self_check_auto_comb_delay_opt_composition_test.py", INST_DIR, []),
+    ("self_check_stream_auto_comb_delay_opt_test.py", INST_DIR, []),
+    ("self_check_stream_auto_comb_area_opt_test.py", INST_DIR, []),
+    ("pipeline_latency_sim_test.py", INST_DIR, []),
+    # Global wires used in the body of fixed-latency AUTO_PIPELINE functions:
+    # aligned with the function's arguments/return in hardware, emulated by
+    # native sim's region write collector (pypeline._sim_regions).
+    ("global_wire_pipeline_aligned_test.py", INST_DIR, []),
+    ("self_check_counter_test.py", INST_DIR, []),
+    ("self_check_fifo_test.py", INST_DIR, []),
+    # A global FIFO, Fifo[T] of a struct, between two MAINs with backpressure
+    ("self_check_global_fifo_test.py", INST_DIR, []),
+    # A named clock on a pin (SYS_CLK carries clk_50p0_sys): the cocotb
+    # testbench drives the pin as its one clock
+    ("self_check_named_clock_pin_test.py", INST_DIR, []),
+    # Synchronous resets of user registers: a pin reset pulsed in cycle 0 and
+    # a reset Wire from a generator MAIN; "all" and "requested" policies,
+    # NO_RESET, one function per-policy, reset of a skipped clock-enabled call
+    ("self_check_reset_regs_test.py", INST_DIR, []),
+    # Reset of a fixed-latency AUTO_PIPELINE's stage and raw operator registers:
+    # no stale valid comes out after a reset
+    ("self_check_reset_pipeline_test.py", INST_DIR, []),
+    # Reset of an AUTO_FSM's caller while a request is in flight (the call site
+    # is a passthrough under --comb; the sky130 entry below builds the FSM)
+    ("self_check_reset_fsm_test.py", INST_DIR, []),
+    # Global instances (Inst[f] of a counter and of an AUTO_PIPELINE) and a
+    # same-clock Fifo[T] reset with their clock's reset, with no keyword
+    ("self_check_reset_global_inst_test.py", INST_DIR, []),
+    # A RAM reset: contents kept, a read in flight cancelled, the write at the
+    # reset edge suppressed
+    ("self_check_reset_ram_test.py", INST_DIR, []),
+    # Reset equivalence of stream library blocks (stream FIFO, skid buffers):
+    # one chain reset mid-traffic matches one held in reset until then
+    ("self_check_reset_stream_lib_test.py", INST_DIR, []),
+    # Reset equivalence of DSP library blocks (ROM NCO/log/atan2, CORDIC,
+    # elastic FIR, valid-only FIR decimator, moving average, DC blocker,
+    # magnitude): one chain reset mid-traffic matches one held in reset
+    ("self_check_reset_dsp_test.py", INST_DIR, []),
+    # Global instances, Inst[f]: a combinational instance driven from two
+    # MAINs, two instances of one counter, a skid buffer instance with
+    # backpressure, an AUTO_PIPELINE(f, latency=2) instance and a make_ram
+    # instance (a pipeline_latency function inside an instance's MAIN)
+    ("self_check_global_inst_test.py", INST_DIR, []),
+    # One function writing fields of two compound wires of different struct
+    # types: each wire's zero-init constant has its own name
+    ("self_check_two_struct_wire_writes_test.py", INST_DIR, []),
+    # @MAINs made by factories: counter lanes on one wire's elements, two
+    # stateless FIFO lanes from one make_stream_fifo, and a closure writing a
+    # wire -- each lane's own state per MAIN in native sim
+    ("self_check_factory_main_test.py", INST_DIR, []),
+    # make_stream_auto_pipeline at fixed core latencies 0 and 3: one word per
+    # cycle in, results back to back exactly L+4 cycles after the first accept.
+    ("self_check_stream_auto_pipeline_ii1_test.py", INST_DIR, []),
+    # make_ram/make_stream_ram: the hand-written simulation model against the
+    # generated raw VHDL -- init from Python values across element types,
+    # multi-port traffic, byte enables, a pure caller aligned around
+    # @pipeline_latency, and a stream RAM under backpressure.
+    ("self_check_ram_test.py", INST_DIR, []),
+    # The only MAIN is stateful and goal-less, calling @pipeline_latency(3)
+    # with a narrower argument expression (see the non---comb entry below).
+    ("single_stateful_main_fixed_latency_test.py", INST_DIR, []),
+    # Scalar int call arguments whose type differs from the parameter
+    # (widen, sign-extend, truncate, uint->int, keyword-bound): the port wire
+    # must take the parameter type, or GHDL rejects the instance port map.
+    ("call_arg_width_test.py", INST_DIR, []),
+    # Port annotations reaching a factory-local struct through a factory
+    # argument (`p: src.pair_t`): the port must take the resolved type, not a
+    # bare 'pair_t' (KeyError) or an unrelated same-named global's struct
+    # (GHDL rejects the port map).
+    ("factory_arg_port_annotation_test.py", INST_DIR, []),
+    # self_check_bit_math_test.py is deliberately NOT here: its whole body is
+    # one combinational block that calls sim_finish() the very same cycle it
+    # computes everything, with nothing before that cycle to safely print --
+    # structurally incompatible with the "no debug print on the sim_finish()
+    # cycle" rule (see module docstring). (It used to ALSO trip a real
+    # int16_t narrowing VHDL-emission bug -- nested_truncate(200) computed a
+    # different value in GHDL than in native sim -- fixed as part of adding
+    # T(x) casting; see nested_truncate_test.py, which carries the real
+    # regression coverage for that fix now that it's a plain -- not
+    # known_issues -- entry here.)
+    ("struct_ctor_positional_test.py", INST_DIR, []),
+    # See docs: Casting's "Make integer conversion match C" section --
+    # signed narrowing used to disagree with native sim in real GHDL.
+    ("nested_truncate_test.py", INST_DIR, []),
+    # AUTO_FSM through real GHDL in --comb mode (passthrough, latency 0). The
+    # scheduled FSM hardware is exercised by the non---comb entry below.
+    ("self_check_auto_fsm_test.py", INST_DIR, []),
+    # Constant multiply, truncation and signed extension, eight boundary cases.
+    ("self_check_auto_fsm_constants_test.py", INST_DIR, []),
+    # Exact raw latency and stalled stream results, including busy requests.
+    ("self_check_auto_fsm_pipelined_unit_test.py", INST_DIR, []),
+    # Indexed scalar/struct/array results, equality defaults and arithmetic groups.
+    ("self_check_auto_fsm_select_share_test.py", INST_DIR, []),
+    # make_stream_auto_fsm's handshake wrapper, same --comb/non---comb split.
+    ("self_check_stream_auto_fsm_test.py", INST_DIR, []),
+    # AUTO_FSM's operand mux over array values (5- and 7-way uint2_t[4]),
+    # called directly; GHDL rejected the old t[n] choices shape.
+    ("self_check_auto_fsm_array_mux_test.py", INST_DIR, []),
+    # Stateful calls from one physical source line in an unrolled loop must
+    # retain one native register bank per iteration ordinal, matching the
+    # hardware elaborator's loop_instance_prefix hierarchy.
+    ("sim_loop_reg_state_test.py", INST_DIR, []),
+    # Augmented assignment on Reg scalars, array elements, struct fields and
+    # a variable-index nested path: same values as GHDL every cycle,
+    # including wraparound at the declared width.
+    ("reg_aug_assign_test.py", INST_DIR, []),
+    # Iteration-ordinal loop naming (_elab_for/_bind_const_target/
+    # _elab_unpack_assign) through real GHDL: tuple/enumerate/zip/dict/str
+    # iteration, tuple-target and tuple-unpack-assignment destructuring, a
+    # negative loop value, an indexed call target, and the rewritten
+    # make_soft_mult_carry_save (soft_mult.py) all in one accumulation
+    # chain -- see the design file's own docstring for the full list.
+    ("self_check_loop_unpack_test.py", INST_DIR, []),
+    # Karatsuba hybrid (inferred leaves) registered for a plain 130-bit `*`,
+    # direct 64x64 / 37x20 hybrids and a soft-leaf Karatsuba, each checked
+    # against the pinned built-in multiply.
+    ("self_check_mult_karatsuba_test.py", INST_DIR, []),
+    ("global_wire_partial_field_test.py", INST_DIR, []),
+    ("global_wire_read_write_test.py", INST_DIR, []),
+    ("global_wire_split_driver_test.py", INST_DIR, []),
+    ("global_wire_readback_test.py", INST_DIR, []),
+    # global_wire_nested_split_test.py is deliberately NOT here: under this
+    # exact combination (--comb --sim --cocotb --ghdl) elaboration raises
+    # "Global Output 'combined' has multiple writer functions with
+    # overlapping driven fields: 'combiner' drives (whole wire) and
+    # 'soft_cmp_prefix_n_leaves_8_level_5ca4ac95' drives (whole wire)" --
+    # an internal soft-compare submodule is being misidentified as a second
+    # writer of the global wire. It still builds fine under plain --comb
+    # (synth_tests.py) and passes native_sim. The same false-writer error
+    # used to break the plain --comb build too (the former
+    # global_wire_nested_split_known_issue); that build passes again, but this
+    # combination has not been re-checked.
+    ("global_wire_hier_writer_test.py", INST_DIR, []),
+    ("global_wire_cond_driver_test.py", INST_DIR, []),
+    ("global_wire_array_split_test.py", INST_DIR, []),
+    ("global_wire_dynamic_index_write_test.py", INST_DIR, []),
+    ("var_ref_assign_readback_test.py", INST_DIR, []),
+    ("var_ref_assign_cond_loop_test.py", INST_DIR, []),
+    # struct -> AXI-Stream -> struct through real GHDL: the byte-lane muxing,
+    # variable-index buffer writes and keep arithmetic of stream/serializer.py,
+    # stream/deserializer.py and axi/type_axis.py all lower to VHDL here, on a
+    # 7-byte struct over a 4-byte bus so the partial-beat path is what gets
+    # diffed rather than the aligned happy path.
+    ("self_check_type_axis_test.py", INST_DIR, []),
+    # AUTO_PIPELINE(func, latency=2): plain native sim's 2-cycle delay line vs
+    # the --comb VHDL build's 2 fixed registers.
+    ("self_check_fixed_auto_pipeline_test.py", INST_DIR, []),
+]
+# Non---comb (pipelined/scheduled) compares: full build, then native sim runs
+# with the discovered latencies emulated, diffed against real pipelined VHDL.
+# Those builds synthesize, under the suite's default sky130 (--syn_tool
+# sky130, see NON_COMB_SYN_TOOL). --comb entries above never reach synthesis
+# (cocotb exits first), so they need no tool.
+NON_COMB_TEST_FILES = [
+    ("self_check_auto_comb_area_opt_composition_test.py", INST_DIR, []),
+    ("self_check_auto_comb_delay_opt_composition_test.py", INST_DIR, []),
+    ("pipeline_latency_sim_test.py", INST_DIR, ["--pipeline_min_effort", "0"]),
+    # Same RAM design as the --comb entry, through a real pipelined build: the
+    # pure lookup MAIN gets compiler alignment registers around the
+    # @pipeline_latency RAM, emulated natively by the fixed-pipeline evaluator.
+    ("self_check_ram_test.py", INST_DIR, ["--pipeline_min_effort", "0"]),
+    # A single stateful @MAIN with no target MHz: nothing to pipeline. Used to
+    # be forced into the coarse sweep ("Trying to slice into ... for no
+    # reason"); now characterized as written by the planned sweep, with no
+    # pure companion MAIN needed.
+    (
+        "single_stateful_main_fixed_latency_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0"],
+    ),
+    # Same self-checking design as the --comb entry above, but now through
+    # the REAL scheduled FSM (replaces synth_tests.py's former
+    # auto_fsm_native_sim_test + auto_fsm_vhdl_sim_test pair with one cycle diff).
+    ("self_check_auto_fsm_test.py", INST_DIR, []),
+    # Same constants through the generated FSM datapath, checked in GHDL.
+    ("self_check_auto_fsm_constants_test.py", INST_DIR, []),
+    # Requires a selected shared pipelined unit in the generated FSM.
+    ("self_check_auto_fsm_pipelined_unit_test.py", INST_DIR, []),
+    # Same indexed compound reads and sharing arithmetic through scheduled FSMs.
+    ("self_check_auto_fsm_select_share_test.py", INST_DIR, []),
+    # Unchanged canonical Poly1305, two lanes, independent Python vectors.
+    # Epilogue measured 2165–2501 s idle and 6622 s with two Vivado builds
+    # sharing the machine, against the category's 7200 s timeout.
+    ("self_check_auto_fsm_poly1305_test.py", INST_DIR, ["-D", "KERNEL=epilogue"]),
+    # Forced descent's width-halving equivalents through the real scheduled
+    # FSM: a 0.1 budget scale (4 ns states at 25 MHz) makes the 32-bit
+    # add/subtract and the 16x16 inferred multiply too slow for a state, so
+    # the FSM binds their split halves (carry-in-bit adds, pinned 8x16
+    # products), and the cycle diff checks them in GHDL.
+    ("self_check_auto_fsm_split_test.py", INST_DIR, ["--auto_fsm_budget_scale", "0.1"]),
+    # The same array-valued muxes inside a scheduled FSM: one shared unit
+    # whose ports take uint2_t[4] values (a 5-way array mux, array registers).
+    ("self_check_auto_fsm_array_mux_test.py", INST_DIR, []),
+    # Same, one layer up: the real scheduled FSM underneath
+    # make_stream_auto_fsm's handshake registers, with real backpressure
+    # toggled from the testbench (see the design file's own docstring).
+    ("self_check_stream_auto_fsm_test.py", INST_DIR, []),
+    # self_check_stream_auto_pipeline_test.py is deliberately NOT here: its VHDL
+    # sim produced zero debug output cycle over cycle (pypeline_sim_debug.py
+    # reported a MISMATCH against native's real output) despite the build
+    # itself succeeding cleanly (met timing, 4 pipeline stages). Root cause
+    # not established -- may be a cocotb/GHDL interaction specific to this
+    # design's FIFO-sized-by-.latency shape, not necessarily a compiler bug.
+    # It keeps its original native-only registration in build_report_tests.py
+    # (native_pipelined_sim_test) pending investigation.
+    ("native_vs_vhdl_ap_test.py", INST_DIR, []),
+    # Same fixed latency=2 design as the --comb entry, through the planned
+    # sweep's constrained-region enforcement and the harvested emulation.
+    ("self_check_fixed_auto_pipeline_test.py", INST_DIR, ["--pipeline_min_effort", "0"]),
+    (
+        "native_vs_vhdl_pipelined_main_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0"],
+    ),
+    # A naturally pipelined MAIN writing separate shallow and deep wires and
+    # reading its own wire around its write (aligned global writes)
+    (
+        "global_wire_pipelined_main_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0"],
+    ),
+    # Sliced 16x16 Karatsuba with inferred leaves (threshold 6): cuts land
+    # between the whole leaf multiplies and the recombination adds.
+    (
+        "self_check_mult_karatsuba_pipelined_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0"],
+    ),
+    # The same reset of a pipeline, with the sweep's sky130 build
+    ("self_check_reset_pipeline_test.py", INST_DIR, ["--pipeline_min_effort", "0"]),
+    # A mid-run reset of a sliced pure MAIN: nothing in flight comes out
+    # (native sim's delayed MAIN writes become zeros)
+    (
+        "self_check_reset_pipelined_main_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0"],
+    ),
+    # A scheduled AUTO_FSM reset mid-request: it returns to idle (its one-hot
+    # state to its idle bit) and restarts, with no result of the cancelled case
+    ("self_check_reset_fsm_test.py", INST_DIR, []),
+    # Typed physical operation boundaries and genuine bit-internal cuts on a
+    # flat/hierarchical fork-join pair with bypass/fanout alignment.
+    (
+        "typed_placement_alignment_test.py",
+        INST_DIR,
+        ["--pipeline_min_effort", "0", "--no_sweep"],
+    ),
+]
+# fmt: on
+
+# Non---comb entries build under the suite's default sky130.
+# pypeline_sim_debug.py builds once into <out_dir>/build, then runs native and
+# VHDL concurrently, each in its own copy of that warm directory (two
+# pypelinec processes never share one out_dir). The copies stay warm because
+# DEVICE_MODELS records its cache identity relative to the output directory,
+# and generated VHDL is the same in every parse pass of a run
+# (warm_copy_no_resynth_test).
+NON_COMB_SYN_TOOL = "device_models"
+
+
+def get_tests() -> list:
+    tests = [
+        Test(
+            name=filename[: -len(".py")] + "_comb",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                source_dir / filename,
+                "--sim",
+                "--comb",
+                "--run",
+                "all",
+            ]
+            + extra_args,
+            needs_out_dir=True,
+        )
+        for filename, source_dir, extra_args in COMB_TEST_FILES
+    ]
+    tests += [
+        Test(
+            name=filename[: -len(".py")],
+            category="native_vs_vhdl_sim",
+            cmd=[PYPELINE_SIM_DEBUG, source_dir / filename, "--sim", "--run", "all"]
+            + extra_args
+            + SYN_TOOL_ARGS[NON_COMB_SYN_TOOL],
+            needs_out_dir=True,
+            long_pole=filename == "self_check_auto_fsm_poly1305_test.py",
+        )
+        for filename, source_dir, extra_args in NON_COMB_TEST_FILES
+    ]
+    tests.append(
+        Test(
+            name="self_check_auto_pipeline_ram_selected_plan",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "self_check_auto_pipeline_ram_test.py",
+                "--sim",
+                "--run",
+                "all",
+                "--syn_tool",
+                "open_tools",
+                "--pipeline_min_effort",
+                "0",
+                "-D",
+                "AUTO_PIPELINE_RAM_AUTO=1",
+            ],
+            needs_out_dir=True,
+        )
+    )
+    tests.append(
+        Test(
+            name="self_check_auto_pipeline_ram_selected_plan_vivado",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "self_check_auto_pipeline_ram_test.py",
+                "--sim",
+                "--run",
+                "all",
+                "--syn_tool",
+                "vivado",
+                "--part",
+                "xc7a200tffg1156-2",
+                "--pipeline_min_effort",
+                "0",
+                "-D",
+                "AUTO_PIPELINE_RAM_AUTO=1",
+            ],
+            needs_out_dir=True,
+        )
+    )
+
+    tests.append(
+        Test(
+            name="self_check_dsp_rom_swap",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "self_check_dsp_rom_test.py",
+                "--comb",
+                "--sim",
+                "--run",
+                "all",
+                "-D",
+                "DSP_ROM_SWAP=1",
+            ],
+            needs_out_dir=True,
+        )
+    )
+    tests.append(
+        Test(
+            name="lut_atan2_pdw_width",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "lut_atan2_test.py",
+                "--comb",
+                "--sim",
+                "--run",
+                "all",
+                "-D",
+                "ATAN2_TEST_INPUT_WIDTH=40",
+            ],
+            needs_out_dir=True,
+        )
+    )
+    for name, rl, al in (("recip_slow", 3, 1), ("angle_slow", 1, 3)):
+        tests.append(
+            Test(
+                name="lut_atan2_" + name,
+                category="native_vs_vhdl_sim",
+                cmd=[
+                    PYPELINE_SIM_DEBUG,
+                    INST_DIR / "lut_atan2_test.py",
+                    "--comb",
+                    "--sim",
+                    "--run",
+                    "all",
+                    "-D",
+                    f"ATAN2_TEST_RECIP_LATENCY={rl}",
+                    "-D",
+                    f"ATAN2_TEST_ANGLE_LATENCY={al}",
+                ],
+                needs_out_dir=True,
+            )
+        )
+    tests.append(
+        Test(
+            name="self_check_auto_pipeline_ram_cli_target",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "self_check_auto_pipeline_ram_target_test.py",
+                "--comb",
+                "--sim",
+                "--run",
+                "all",
+                "--part",
+                "xc7a200tffg1156-2",
+                "-D",
+                "RAM_TARGET_IN_SOURCE=0",
+            ],
+            needs_out_dir=True,
+        )
+    )
+    # The prologue shares the fixture; measured 721–906 s (timeout 7200 s).
+    tests.append(
+        Test(
+            name="self_check_auto_fsm_poly1305_prologue",
+            category="native_vs_vhdl_sim",
+            cmd=[
+                PYPELINE_SIM_DEBUG,
+                INST_DIR / "self_check_auto_fsm_poly1305_test.py",
+                "--sim",
+                "--run",
+                "all",
+                "-D",
+                "KERNEL=prologue",
+            ]
+            + SYN_TOOL_ARGS[NON_COMB_SYN_TOOL],
+            needs_out_dir=True,
+            long_pole=True,
+        )
+    )
+    return tests
+
+
+if __name__ == "__main__":
+    sys.exit(
+        main(
+            get_tests,
+            "PipelineC pypeline native-vs-VHDL cycle-accurate simulation tests.",
+        )
+    )

@@ -1,0 +1,11805 @@
+# pyright: reportInvalidTypeForm=none
+"""
+pypeline.py — runtime support for Pypeline hardware design files.
+
+Usage in user design files:
+    from pypeline import MAIN, NamedTuple, uint32_t, uint1_t, ...
+
+    class point_t(NamedTuple):
+        x: uint32_t
+        y: uint32_t
+
+    # point_t[10] works as a type annotation after the class definition
+"""
+
+import hashlib as _hashlib
+import typing
+import functools as _functools
+import warnings as _warnings
+from enum import IntEnum as _IntEnum, auto as _auto
+
+# If a fully-expanded struct/enum canonical name exceeds this length, it is
+# collapsed via collapse_overflow_name (readable truncated prefix + sha256[:8])
+# to keep VHDL type identifiers manageable.
+_MAX_MANGLE_NAME_LEN = 96
+
+
+# ─────────────────────────────────────────────
+# Naming metadata: source descriptions of generated hardware
+# ─────────────────────────────────────────────
+# Logical type/operator keys are not VHDL presentation. Decorators and
+# generators snapshot a _NameInfo description (symbol, module, scopes,
+# file/line, parameters, fields) alongside those keys while the factory
+# arguments are still available; PY_TO_LOGIC.EmissionNames turns them into
+# VHDL identifiers at the emission boundary. See
+# docs/pypeline_DESIGN.md#naming-metadata and
+# docs/PY_TO_LOGIC_DESIGN.md#generated-vhdl-names.
+
+import dataclasses as _dataclasses
+import inspect as _inspect
+import itertools as _itertools
+import json as _json
+import os as _os
+import re as _re
+
+# VHDL-93/2008 reserved words (case-insensitive). PY_TO_LOGIC mangles Python
+# identifiers that collide with them; a user name= that collides is rejected.
+_VHDL_RESERVED_WORDS = frozenset(
+    {
+        "abs",
+        "access",
+        "after",
+        "alias",
+        "all",
+        "and",
+        "architecture",
+        "array",
+        "assert",
+        "attribute",
+        "begin",
+        "block",
+        "body",
+        "buffer",
+        "bus",
+        "case",
+        "component",
+        "configuration",
+        "constant",
+        "context",
+        "disconnect",
+        "downto",
+        "else",
+        "elsif",
+        "end",
+        "entity",
+        "exit",
+        "file",
+        "for",
+        "force",
+        "function",
+        "generate",
+        "generic",
+        "group",
+        "guarded",
+        "if",
+        "impure",
+        "in",
+        "inertial",
+        "inout",
+        "is",
+        "label",
+        "library",
+        "linkage",
+        "literal",
+        "loop",
+        "map",
+        "mod",
+        "nand",
+        "new",
+        "next",
+        "nor",
+        "not",
+        "null",
+        "of",
+        "on",
+        "open",
+        "or",
+        "others",
+        "out",
+        "package",
+        "parameter",
+        "port",
+        "postponed",
+        "procedure",
+        "process",
+        "property",
+        "pure",
+        "range",
+        "record",
+        "register",
+        "reject",
+        "release",
+        "rem",
+        "report",
+        "restrict",
+        "return",
+        "rol",
+        "ror",
+        "select",
+        "sequence",
+        "severity",
+        "signal",
+        "shared",
+        "sla",
+        "sll",
+        "sra",
+        "srl",
+        "strong",
+        "subtype",
+        "then",
+        "to",
+        "transport",
+        "type",
+        "unaffected",
+        "units",
+        "until",
+        "use",
+        "variable",
+        "vmode",
+        "vprop",
+        "vunit",
+        "wait",
+        "when",
+        "while",
+        "with",
+        "xnor",
+        "xor",
+    }
+)
+
+# Names of ports the compiler adds to entities (the synchronous reset port
+# RESET, see make_reset), which VHDL reads as one with a user identifier of any
+# case: _sanitize_vhdl_name renames such identifiers like reserved words
+_IMPLICIT_PORT_NAMES = frozenset({"reset"})
+
+# Runs of underscores, which a VHDL basic identifier cannot contain
+_CONSEC_UNDERSCORES_RE = _re.compile(r"_{2,}")
+
+
+def _sanitize_vhdl_name(name: str) -> str:
+    """Mangle a Python identifier so it is a legal VHDL basic identifier.
+
+    Rules (applied in order):
+    1. Strip leading underscores; prepend 'v' if any were removed.
+    2. Strip trailing underscores.
+    3. Replace runs of 2+ consecutive underscores with a single '_'.
+    4. If the result is a VHDL reserved word or the name of a port the
+       compiler adds (RESET; case-insensitive), append '_v'.
+    5. If empty after all stripping, return 'v'.
+    """
+    result = name.lstrip("_")
+    if len(result) < len(name):
+        result = "v_" + result if result else "v"
+    result = result.rstrip("_") or "v"
+    result = _CONSEC_UNDERSCORES_RE.sub("_", result)
+    lower = result.lower()
+    if lower in _VHDL_RESERVED_WORDS or lower in _IMPLICIT_PORT_NAMES:
+        result = result + "_v"
+    return result
+
+
+def _hw_func_name(mod_prefix, name):
+    """Canonical FuncLogicLookupTable key / Logic.func_name for a hardware
+    function: module-prefixed for sub-file functions, VHDL-name-sanitized.
+    Single source of truth -- PARSE_FILE Step 6/7, FuncElaborator.__init__,
+    _elab_call's lookups, _top_level_func_key and a @MAIN's default name
+    (_register_main) must all resolve to the same string for a given
+    (mod_prefix, name), or FuncLogicLookupTable lookups silently diverge (see
+    the closure-callable-collision bug regression-tested by
+    two_factory_wrappers_test.py). Always call this; never re-derive the
+    f-string locally. It lives here, not in PY_TO_LOGIC (which calls it
+    HW_FUNC_NAME), so native simulation names MAINs without importing the
+    compiler.
+
+    The prefix is dropped when `name` already starts with it (the common
+    one-module-one-entry-point layout, e.g. append_auth_tag.py's own
+    `append_auth_tag` function) -- otherwise every such name stutters
+    (`append_auth_tag_append_auth_tag`), and that name sits at the head of
+    every hierarchy path under it. Safe: a distinct (mod_prefix, name) pair
+    that collides after this elision is still caught by PARSE_FILE Step 6's
+    `_hw_name_lower_to_orig` guard, which raises naming both functions.
+    """
+    safe_name = _sanitize_vhdl_name(name)
+    if not mod_prefix:
+        return safe_name
+    if safe_name == mod_prefix or safe_name.startswith(mod_prefix + "_"):
+        return safe_name
+    return f"{mod_prefix}_{safe_name}"
+
+
+def _module_prefix(module_name):
+    """The hardware name prefix of the module named `module_name`: none for
+    the top design file (imported as "pypeline_design") or a script run
+    directly ("__main__"), else the module's import name with dots as
+    underscores -- what PY_TO_LOGIC's import discovery gives the same
+    module."""
+    if not module_name or module_name in ("pypeline_design", "__main__"):
+        return None
+    return module_name.replace(".", "_")
+
+
+_NAME_BASE_LIMIT = 192
+_NAME_IDENTIFIER_LIMIT = 240
+_REPR_ADDRESS = _re.compile(r" at 0x[0-9a-fA-F]+")
+_NAME_SEPARATORS = _re.compile(r"[^A-Za-z0-9]+")
+
+
+def _name_digest(value):
+    return _hashlib.sha256(value.encode()).hexdigest()[:12]
+
+
+def _safe_name(text):
+    text = _NAME_SEPARATORS.sub("_", str(text)).strip("_") or "v"
+    return text if text[0].isalpha() else "v_" + text
+
+
+def _shorten_name(text, limit=_NAME_IDENTIFIER_LIMIT, identity=None):
+    """Keep whole tokens, with an explicit hash of everything omitted."""
+    if len(text) <= limit:
+        return text
+    role = _re.search(
+        r"(_[0-9]+CLK_[0-9a-f]+(?:_top)?|_global_to_module_t|_module_to_global_t|_to_slv|_NULL|_top)$",
+        text,
+    )
+    suffix = "_h" + _name_digest(identity or text) + (role[0] if role else "")
+    budget = limit - len(suffix)
+    prefix = text[: budget + 1].rsplit("_", 1)[0]
+    if len(prefix) > budget or not prefix:
+        prefix = "generated"
+    return prefix + suffix
+
+
+def _stable_key(value, seen=frozenset()):
+    """Typed, address-free specialization snapshot (never a readable name).
+
+    Lists and tuples, strings and numbers, and punctuation-bearing strings
+    must not alias after identifier sanitization. Recursive graphs are bounded
+    by their defining type/symbol, never by the object address used as a guard.
+    """
+    cls = type(value)
+    typename = cls.__module__ + "." + cls.__qualname__
+    if id(value) in seen:
+        return ("cycle", typename, getattr(value, "__qualname__", ""))
+    seen = seen | {id(value)}
+    if isinstance(value, _IntEnum):
+        return ("enum", _stable_key(cls, seen), value.name, int(value))
+    if value is None or isinstance(value, (bool, int, str)):
+        return (typename, value)
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if isinstance(value, type):
+        info = getattr(value, "_pypeline_name_info", None)
+        if info is not None:
+            return ("type", _hashlib.sha256(info.identity.encode()).hexdigest())
+        elem = getattr(value, "_elem_ctype", None)
+        if elem is not None:
+            return ("array", value._arr_len, _stable_key(elem, seen))
+        return (
+            "type",
+            getattr(value, "_pypeline_ctype_canonical", None)
+            or getattr(value, "_ctype_name", None)
+            or (value.__module__, value.__qualname__),
+        )
+    if isinstance(value, (list, tuple)):
+        return (typename, tuple(_stable_key(v, seen) for v in value))
+    if isinstance(value, (dict, set, frozenset)):
+        items = (
+            [(_stable_key(k, seen), _stable_key(v, seen)) for k, v in value.items()]
+            if isinstance(value, dict)
+            else [_stable_key(v, seen) for v in value]
+        )
+        return (typename, tuple(sorted(items, key=repr)))
+    if hasattr(value, "inner_ctype"):
+        return (typename, _stable_key(value.inner_ctype, seen))
+    if isinstance(value, _functools.partial):
+        return (
+            "partial",
+            _stable_key(value.func, seen),
+            _stable_key(value.args, seen),
+            _stable_key(value.keywords, seen),
+        )
+    if getattr(value, "_is_auto_multi_cycle_tag", False) is True:
+        # Unlike an AUTO_PIPELINE's, an AUTO_MULTI_CYCLE's resolved cycle count IS
+        # identity: the function holding its registers bakes .latency-derived
+        # constants (the handshake counter) into its logic, so a pin-and-
+        # confirm pass that changes the count must rename that entity rather
+        # than reuse the previous pass's same-named file.
+        if getattr(value, "name", None) is not None:
+            # A named tag's start_latency is only a starting count: the
+            # resolved count (the hardware) is identity, the hint is not.
+            return (
+                "_is_auto_multi_cycle_tag",
+                value.canonical_key,
+                value.fixed_latency,
+                value.max_latency,
+                value._ncycles,
+            )
+        # A wrapped function's tag is identified by that function, without
+        # resolving its key (which needs the compiler)
+        return (
+            "_is_auto_multi_cycle_tag",
+            value.canonical_key
+            if value.func is None
+            else ("func", _stable_key(value.func, seen)),
+            value.fixed_latency,
+            value.start_latency,
+            value.max_latency,
+            value._ncycles,
+        )
+    if callable(value):
+        for attr in (
+            "_is_auto_pipeline_pragma", "_is_auto_fsm_pragma", "_is_auto_comb_area_opt_pragma", "_is_auto_comb_delay_opt_pragma"
+        ):
+            if getattr(value, attr, False):
+                # An AUTO_PIPELINE's constructor latency constraint is
+                # identity (two tags over one func with different latency=
+                # must name differently); its discovered/served .latency is
+                # not -- that changes during the compiler's pin-and-confirm
+                # elaboration loop. Unconstrained tags keep config () so
+                # their names never moved. A named tag is its name plus the
+                # constraints that change hardware: its start_latency is only
+                # a starting count, so editing it renames nothing.
+                # An object of a key used at several clock goals is told
+                # apart from the key's other objects (_auto_split_component);
+                # every other object's identity is unchanged.
+                kind = {
+                    "_is_auto_pipeline_pragma": "AUTO_PIPELINE",
+                    "_is_auto_fsm_pragma": "AUTO_FSM",
+                }.get(attr)
+                split = (
+                    _auto_split_component(kind, value) if kind is not None else None
+                )
+                split = () if split is None else (("split", split),)
+                if attr == "_is_auto_pipeline_pragma" and (
+                    getattr(value, "name", None) is not None
+                ):
+                    config = (("name", value.name),) + tuple(
+                        (name, getattr(value, attr_name))
+                        for name, attr_name in (
+                            ("latency", "fixed_latency"),
+                            ("max_latency", "max_latency"),
+                        )
+                        if getattr(value, attr_name, None) is not None
+                    )
+                    return (attr, _stable_key(value.func, seen), config) + split
+                config = (
+                    tuple(
+                        (name, getattr(value, attr_name, None))
+                        for name, attr_name in (
+                            ("latency", "fixed_latency"),
+                            ("start_latency", "start_latency"),
+                            ("max_latency", "max_latency"),
+                        )
+                        if getattr(value, attr_name, None) is not None
+                    )
+                    if attr == "_is_auto_pipeline_pragma"
+                    else (
+                        () if attr in ("_is_auto_comb_area_opt_pragma", "_is_auto_comb_delay_opt_pragma") else (
+                            getattr(value, "max_latency", None),
+                            getattr(value, "register_output", True),
+                        )
+                    )
+                )
+                return (attr, _stable_key(value.func, seen), config) + split
+        value = _inspect.unwrap(value)
+        code = getattr(value, "__code__", None)
+        if code is not None:
+            cells = []
+            for name, cell in zip(code.co_freevars, value.__closure__ or ()):
+                try:
+                    cells.append((name, _stable_key(cell.cell_contents, seen)))
+                except ValueError:
+                    cells.append((name, "empty_cell"))
+            # co_code and constants distinguish same-qualname lambdas/defs;
+            # repr(code objects) would introduce addresses and absolute paths.
+            return (
+                "callable",
+                value.__module__,
+                value.__qualname__,
+                code.co_code.hex(),
+                _code_constants(code),
+                tuple(cells),
+                _stable_key(value.__defaults__, seen),
+                _stable_key(value.__kwdefaults__, seen),
+            )
+    state = getattr(value, "__dict__", None)
+    if state is not None:
+        return (typename, _stable_key(state, seen))
+    return (typename, _REPR_ADDRESS.sub("", repr(value)))
+
+
+def _code_constants(code):
+    return tuple(
+        ("code", c.co_code.hex(), _code_constants(c))
+        if _inspect.iscode(c)
+        else _stable_key(c)
+        for c in code.co_consts
+    )
+
+
+def _name_identity(value):
+    return _json.dumps(_stable_key(value), ensure_ascii=True, separators=(",", ":"))
+
+
+@_dataclasses.dataclass(frozen=True)
+class _NameInfo:
+    kind: str
+    symbol: str
+    module: str = ""
+    qualname: str = ""
+    source: str = ""
+    line: int = 0
+    params: tuple = ()
+    fields: tuple = ()
+    identity: str = ""
+    # A user's name= (validated by _check_user_name): rendered verbatim in
+    # place of the automatic description. render(user=False) still gives the
+    # automatic one, for -- Specialization: comments and the name index.
+    user_name: str = ""
+
+    def render(self, limit=None, context=True, user=True):
+        if user and self.user_name:
+            return self.user_name
+        base = _safe_name(self.symbol)
+        if context and self.module:
+            base += "_from_" + _safe_name(self.module)
+            scopes = self.qualname.split(".<locals>.")[:-1]
+            # make_kept_data_bus_t / kept_data_bus_t repeats the symbol.
+            scopes = [
+                s
+                for s in scopes
+                if (s[5:] if s.startswith("make_") else s)
+                not in (
+                    self.symbol,
+                    self.symbol[:-2] if self.symbol.endswith("_t") else self.symbol,
+                )
+            ]
+            if scopes:
+                base += "_" + "_".join(_safe_name(s) for s in scopes)
+        values = self.params or self.fields
+        # Scalar settings precede nested types so e.g. n=4 survives deep
+        # composition. Ties retain Python declaration order.
+        values = sorted(
+            values,
+            key=lambda p: (1 if p[1].kind == "scalar_type" else 2)
+            if isinstance(p[1], _NameInfo)
+            else 0,
+        )
+        rendered = [
+            v.render(context=False) if isinstance(v, _NameInfo) else v for _, v in values
+        ]
+
+        def compose():
+            return base + "".join(
+                "_" + _safe_name(k) + "_" + v for (k, _), v in zip(values, rendered)
+            )
+
+        full = compose()
+        if limit is None or len(full) <= limit:
+            return full
+        # Reduce the largest nested descriptions first; each child keeps
+        # its own scalar parameters and a hash of its complete identity.
+        for _ in range(len(values) * 2):
+            candidates = [
+                i
+                for i, (_, v) in enumerate(values)
+                if isinstance(v, _NameInfo) and len(rendered[i]) > 48
+            ]
+            if not candidates or len(compose()) <= limit:
+                break
+            i = max(candidates, key=lambda j: len(rendered[j]))
+            target = max(48, len(rendered[i]) - (len(compose()) - limit) - 14)
+            rendered[i] = values[i][1].render(target, context=False)
+        result = compose()
+        # One parent digest also covers structure omitted from its nested
+        # presentation; no composition relies on a child's readable prefix.
+        return _shorten_name(
+            result + "_h" + _name_digest(self.identity or full), limit, self.identity or full
+        )
+
+
+def _value_description(value, seen=frozenset()):
+    if id(value) in seen:
+        return (
+            _safe_name(getattr(value, "__name__", type(value).__name__))
+            + "_h"
+            + _name_digest(_name_identity(value))
+        )
+    seen = seen | {id(value)}
+    if isinstance(value, type):
+        info = getattr(value, "_pypeline_name_info", None)
+        if info is not None:
+            return info
+        elem = getattr(value, "_elem_ctype", None)
+        if elem is not None:
+            return _NameInfo(
+                "array",
+                "array",
+                params=(
+                    ("n", str(value._arr_len)),
+                    ("of", _value_description(elem, seen)),
+                ),
+                identity=_name_identity(value),
+            )
+        return _NameInfo(
+            "scalar_type",
+            _safe_name(getattr(value, "_ctype_name", value.__name__)),
+            identity=_name_identity(value),
+        )
+    if hasattr(value, "inner_ctype"):
+        return _NameInfo(
+            "direction",
+            type(value).__name__,
+            params=(("of", _value_description(value.inner_ctype, seen)),),
+            identity=_name_identity(value),
+        )
+    if getattr(value, "_is_auto_multi_cycle_tag", False) is True and (
+        getattr(value, "name", None) is not None
+    ):
+        return _NameInfo(
+            "wrapper",
+            type(value).__name__,
+            params=(("name", value.name),),
+            identity=_name_identity(value),
+        )
+    if callable(value):
+        if any(getattr(value, attr, False) for attr in (
+            "_is_auto_comb_area_opt_pragma", "_is_auto_comb_delay_opt_pragma", "_is_auto_pipeline_pragma", "_is_auto_fsm_pragma"
+        )):
+            if getattr(value, "_is_auto_pipeline_pragma", False) and (
+                getattr(value, "name", None) is not None
+            ):
+                # A named AUTO_PIPELINE stands for its function in descriptions
+                return _NameInfo(
+                    "wrapper",
+                    type(value).__name__,
+                    params=(("name", value.name),),
+                    identity=_name_identity(value),
+                )
+            return _NameInfo(
+                "wrapper",
+                type(value).__name__,
+                params=(("func", _value_description(value.func, seen)),),
+                identity=_name_identity(value),
+            )
+        if isinstance(value, _functools.partial):
+            return _NameInfo(
+                "partial",
+                "partial",
+                params=(
+                    ("func", _value_description(value.func, seen)),
+                    ("args", _value_description(value.args, seen)),
+                    ("kwargs", _value_description(value.keywords, seen)),
+                ),
+                identity=_name_identity(value),
+            )
+        value = _inspect.unwrap(value)
+        info = getattr(value, "_pypeline_name_info", None)
+        if info is not None:
+            return info
+        code = getattr(value, "__code__", None)
+        if code is not None:
+            params = dict(getattr(value, "_pypeline_factory_args", {}) or {})
+            if not params:
+                for k, cell in zip(code.co_freevars, value.__closure__ or ()):
+                    try:
+                        params[k] = cell.cell_contents
+                    except ValueError:
+                        pass
+            return _NameInfo(
+                "function",
+                value.__name__,
+                value.__module__ or "",
+                value.__qualname__,
+                code.co_filename,
+                code.co_firstlineno,
+                tuple((k, _value_description(v, seen)) for k, v in params.items()),
+                identity=_name_identity(value),
+            )
+        return _safe_name(
+            getattr(value, "__qualname__", type(value).__name__).replace(
+                ".<locals>.", "_"
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return (
+            "_".join(
+                str(v.render(context=False) if isinstance(v, _NameInfo) else v)
+                for v in (_value_description(x, seen) for x in value)
+            )
+            or "empty"
+        )
+    if isinstance(value, dict):
+
+        def fragment(v):
+            desc = _value_description(v, seen)
+            return desc.render(context=False) if isinstance(desc, _NameInfo) else desc
+
+        return (
+            "_".join(
+                fragment(k) + "_" + fragment(v)
+                for k, v in sorted(
+                    value.items(), key=lambda kv: repr(_stable_key(kv[0]))
+                )
+            )
+            or "empty"
+        )
+    if isinstance(value, int):
+        return "neg" + str(-value) if value < 0 else str(value)
+    if isinstance(value, float):
+        return _safe_name(repr(value).replace("-", "neg").replace(".", "p"))
+    if value is None or isinstance(value, str):
+        return _safe_name(value)
+    return _safe_name(type(value).__name__) + "_h" + _name_digest(_name_identity(value))
+
+
+def _describe(obj, kind, params=None, frame=None):
+    """Snapshot a declaration while its factory parameters are available."""
+    obj = _inspect.unwrap(obj)
+    params = params or {}
+    if kind == "function" and not params:
+        for name, cell in zip(
+            getattr(obj, "__code__", None).co_freevars
+            if hasattr(obj, "__code__")
+            else (),
+            getattr(obj, "__closure__", None) or (),
+        ):
+            try:
+                params[name] = cell.cell_contents
+            except ValueError:
+                pass
+    source, line = "", 0
+    try:
+        source = _inspect.getsourcefile(obj) or ""
+        line = _inspect.getsourcelines(obj)[1]
+    except (OSError, TypeError):
+        if frame is not None:
+            source, line = frame.f_code.co_filename, frame.f_lineno
+    fields = getattr(obj, "__annotations__", {}) if kind != "function" else {}
+    # Snapshot before stamping the object, avoiding a self-reference.
+    semantic = _name_identity((kind, obj.__name__, params, fields))
+    module = getattr(obj, "__module__", "") or ""
+    if module == "pypeline_design" and source:
+        module = _os.path.splitext(_os.path.basename(source))[0]
+    return _NameInfo(
+        kind,
+        obj.__name__,
+        module,
+        getattr(obj, "__qualname__", obj.__name__),
+        source,
+        line,
+        tuple((k, _value_description(v)) for k, v in params.items()),
+        tuple((k, _value_description(v)) for k, v in fields.items()),
+        semantic,
+    )
+
+
+def _derived_type(iface, role, fields):
+    info = iface._pypeline_name_info
+    return _dataclasses.replace(
+        info,
+        kind="interface_" + role,
+        symbol=info.symbol + "_" + role + "_t",
+        fields=tuple((k, _value_description(v)) for k, v in fields),
+        identity=_name_identity((info.identity, role, dict(fields))),
+    )
+
+
+_replace_name_info = _dataclasses.replace
+
+
+# ── User names (name=) ──────────────────────────────────────────────────────
+# A user name is a prefix: the logical key is "<name>_s<digest of the key the
+# object would have had>", so it stays unique and changes exactly when the
+# unnamed key would; the VHDL base is the name itself (EmissionNames adds
+# "_h<digest>" only on a collision). See docs/pypeline_DESIGN.md#user-names.
+_USER_NAME_RE = _re.compile(r"[A-Za-z](?:_?[A-Za-z0-9])*")
+_USER_NAME_MAX_LEN = 64
+# Suffixes the compiler itself appends to generated identifiers: a user name
+# ending in one could collide with a generated name, or be mistaken for one.
+_USER_NAME_ROLE_SUFFIX_RE = _re.compile(
+    r"(?:_top|_NULL|_to_slv|_global_to_module_t|_module_to_global_t"
+    r"|_[0-9]+CLK_[0-9a-f]+|_[sh][0-9a-f]{8,})$"
+)
+
+
+def _check_user_name(name, what):
+    """Validate a user name= for `what` (e.g. "@hw_func"); returns it. Never
+    sanitizes: a name that would not appear verbatim in VHDL is an error."""
+    if not isinstance(name, str):
+        raise TypeError(f"{what}(name=...): must be a str, got {type(name).__name__}")
+    problem = None
+    if len(name) > _USER_NAME_MAX_LEN:
+        problem = f"is longer than {_USER_NAME_MAX_LEN} characters"
+    elif not _USER_NAME_RE.fullmatch(name):
+        problem = (
+            "must start with a letter and use only letters, digits and single "
+            "underscores between them (a VHDL basic identifier)"
+        )
+    elif name.lower() in _VHDL_RESERVED_WORDS:
+        problem = "is a VHDL reserved word"
+    elif _USER_NAME_ROLE_SUFFIX_RE.search(name):
+        problem = (
+            "ends like a generated name (_top, _NULL, _to_slv, "
+            "_global_to_module_t, _module_to_global_t, _<n>CLK_<hex>, "
+            "_s<hex>, _h<hex>)"
+        )
+    if problem is not None:
+        raise ValueError(f"{what}(name={name!r}): the name {problem}")
+    return name
+
+
+def _named_key(name, unnamed_key):
+    """Logical key of a named function or type: the user's name, then the
+    digest of the key the object would have had without one."""
+    return f"{name}_s{_name_digest(unnamed_key)}"
+
+
+
+
+# ─────────────────────────────────────────────
+# Elaboration-time C type objects
+# ─────────────────────────────────────────────
+
+
+class _CTypeMeta(type):
+    """Metaclass for C type objects.
+    str/repr return the C type name. Subscript produces array types.
+    """
+
+    def __repr__(cls):
+        return cls._ctype_name
+
+    def __str__(cls):
+        return cls._ctype_name
+
+    def __getitem__(cls, dim):
+        if not isinstance(dim, int):
+            raise TypeError(f"Array dimension must be int, got {type(dim)}: {dim!r}")
+        name = f"{cls._ctype_name}[{dim}]"
+        inner_elem = getattr(cls, "_elem_ctype", None)
+        if inner_elem is not None:
+            # cls is itself an array type (from an earlier bracket, e.g. T[A]). A
+            # further bracket T[A][dim] declares `dim` as a MORE DEEPLY NESTED
+            # dimension -- matching C, where in `T x[A][dim]` A is the outer/first
+            # dimension and dim is inner -- so push the new dim onto the leaf
+            # element type instead of wrapping outside, keeping this array's own
+            # outer length (A) unchanged.
+            arr = _make_ctype(name)
+            arr._elem_ctype = inner_elem[dim]
+            arr._arr_len = cls._arr_len
+            return arr
+        arr = _make_ctype(name)
+        arr._elem_ctype = cls
+        arr._arr_len = dim
+        return arr
+
+    @property
+    def width(cls):
+        import re
+
+        if cls._ctype_name == "char":
+            return 8
+        m = re.match(r"(?:u?int)(\d+)_t", cls._ctype_name)
+        if m:
+            return int(m.group(1))
+        raise NotImplementedError(f"width not defined for '{cls._ctype_name}'")
+
+    def __len__(cls):
+        import re
+
+        m = re.search(r"\[(\d+)\]", cls._ctype_name)
+        if m:
+            return int(m.group(1))
+        return cls.width
+
+    def __call__(cls, *args, **kwargs):
+        """`T(x)` -- a CAST: exactly one positional argument, no keywords.
+        (@struct types never reach here -- they override __new__ instead, via
+        _typed_new below, which handles both keyword-form struct init and
+        cast dispatch for compound destinations.)
+
+        A scalar int/uint destination always has a built-in meaning (mask/
+        sign-extend exactly like assignment -- see _sim_cast). Any other
+        destination (a distinct integer width the user registered a cast
+        for, e.g. never -- ints are built-in only) must go through
+        register_cast()/@cast, or this raises. Array ctypes (uint8_t[4])
+        cannot be cast at all: rejected explicitly, since silently falling
+        through to _sim_cast would reinterpret the array length as a bit
+        width (see _CTypeMeta.__len__) and mask to the wrong thing.
+        """
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"{cls._ctype_name}(...) is a cast and takes exactly one "
+                f"positional argument, got {len(args)} positional and "
+                f"{len(kwargs)} keyword argument(s)"
+            )
+        if getattr(cls, "_elem_ctype", None) is not None:
+            raise TypeError(
+                f"{cls._ctype_name} is an array type; casting to an array "
+                "type is not supported"
+            )
+        (val,) = args
+        src_t = _value_ctype(val)
+        if src_t is not None:
+            fn = _resolve_cast_entry((_ctype_str(src_t), cls._ctype_name))
+            if fn is not None:
+                return _struct_dispatch_call(fn, (val,))
+        if not _is_scalar_pypeline_int(cls):
+            src_desc = _ctype_str(src_t) if src_t is not None else type(val).__name__
+            raise TypeError(
+                f"No cast registered from {src_desc!r} to {cls._ctype_name!r} "
+                "-- use register_cast(...)/@cast to define one"
+            )
+        return _sim_cast(val, cls)
+
+
+def _make_ctype(name: str):
+    """Create a C type as a real Python class.
+    Passes isinstance(t, type) so NamedTuple accepts it as a field annotation.
+    str(uint32_t) == 'uint32_t',  uint32_t[2] -> _make_ctype('uint32_t[2]').
+    """
+    return _CTypeMeta(name, (object,), {"_ctype_name": name})
+
+
+def make_uint_t(width: int):
+    """Return the C unsigned integer type for the given bit width, e.g. make_uint_t(3) -> uint3_t."""
+    return _make_ctype(f"uint{width}_t")
+
+
+def make_int_t(width: int):
+    """Return the C signed integer type for the given bit width, e.g. make_int_t(8) -> int8_t."""
+    return _make_ctype(f"int{width}_t")
+
+
+def make_array_t(elem_t, n: int):
+    """Return the type of an n-element array whose elements are `elem_t`.
+
+    Same as `elem_t[n]` unless `elem_t` is itself an array. Arrays follow C
+    order by design (in `T[A][B]`, A is outer, as in C's `T x[A][B]` and a
+    Python list of lists), so `uint2_t[4][5]` is four `uint2_t[5]` elements. A factory that takes a caller's type and needs n
+    values of it uses this instead: make_array_t(uint2_t[4], 5) is
+    `uint2_t[5][4]`, five `uint2_t[4]` elements.
+    """
+    dims = []
+    leaf = elem_t
+    while _array_elem_ctype(leaf) is not None:
+        dims.append(_array_len(leaf))
+        leaf = _array_elem_ctype(leaf)
+    arr = leaf[int(n)]
+    for dim in dims:
+        arr = arr[dim]
+    return arr
+
+
+def _enum_bit_width(enum_cls) -> int:
+    """Compute the minimum uint bit width needed to represent all values of a pypeline enum type."""
+    max_val = max((m.value for m in enum_cls), default=0)
+    return max(1, max_val.bit_length()) if max_val > 0 else 1
+
+
+def enum_bit_width(enum_cls) -> int:
+    """Return the minimum uint bit width for a pypeline @enum type (inspects member values)."""
+    return _enum_bit_width(enum_cls)
+
+
+def enum_uint_type(enum_cls):
+    """Return the underlying uint pypeline type for a pypeline @enum type.
+    e.g. enum_uint_type(state_t) -> uint2_t  for a 3-state enum with values 0,1,2
+    """
+    return make_uint_t(_enum_bit_width(enum_cls))
+
+
+class PypelineEnum(_IntEnum):
+    """IntEnum base class for pypeline enum types with 0-based auto() numbering.
+
+    Unlike plain IntEnum (where auto() starts at 1), PypelineEnum makes
+    auto() start at 0, matching PipelineC's C enum convention.
+
+    Usage:
+        from enum import auto
+        from pypeline import enum, PypelineEnum
+
+        @enum
+        class state_t(PypelineEnum):
+            IDLE    = auto()   # 0
+            RUNNING = auto()   # 1
+            DONE    = auto()   # 2
+    """
+
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return count  # 0, 1, 2, …
+
+
+# ── unsigned integer types (every width 1-64) ─
+for _w in range(1, 65):
+    globals()[f"uint{_w}_t"] = make_uint_t(_w)
+del _w
+
+# ── signed integer types (every width 1-64) ───
+for _w in range(1, 65):
+    globals()[f"int{_w}_t"] = make_int_t(_w)
+del _w
+
+# ── char type (8-bit; distinct C-type-string "char", not "uint8_t") ──────────
+char_t = _make_ctype("char")
+
+# ─────────────────────────────────────────────
+# C-type-string helpers (shared with PY_TO_LOGIC)
+# ─────────────────────────────────────────────
+import re as _re_ctype
+
+_INT_CTYPE_RE = _re_ctype.compile(r"(u?)int(\d+)_t$")
+
+
+@_functools.lru_cache(maxsize=None)
+def _ctype_is_int(c_type: str) -> bool:
+    """True if c_type is a plain integer type (uint/int)."""
+    return bool(_INT_CTYPE_RE.match(c_type))
+
+
+@_functools.lru_cache(maxsize=None)
+def _infer_literal_ctype(val: int):
+    """Minimum C type string for a plain Python int, matching PY_TO_LOGIC._infer_const_ctype.
+
+    Used by SimVal arithmetic to infer the hardware type of integer literals that carry
+    no SimVal ctype, so that mixed SimVal/literal operations apply the same unsigned
+    wrapping that PY_TO_LOGIC produces in hardware.
+    Returns None for non-integers or booleans (handled separately by hardware elaborator).
+    """
+    if not isinstance(val, int) or isinstance(val, bool):
+        return None
+    if val in (0, 1):
+        return "uint1_t"
+    if val > 1:
+        return f"uint{val.bit_length()}_t"
+    bits = max(1, (-val - 1).bit_length() + 1)
+    return f"int{bits}_t"
+
+
+@_functools.lru_cache(maxsize=None)
+def _ctype_info(c_type: str):
+    """Parse integer C type string. Returns (is_signed, width).
+    e.g. 'uint32_t' -> (False, 32),  'int16_t' -> (True, 16)
+    """
+    m = _INT_CTYPE_RE.match(c_type)
+    if not m:
+        raise NotImplementedError(f"Cannot get integer type info from: {c_type!r}")
+    return (m.group(1) != "u", int(m.group(2)))
+
+
+def _int_ctype(is_signed: bool, width: int) -> str:
+    """Build integer C type string. e.g. (True, 32) -> 'int32_t'"""
+    return f"{'int' if is_signed else 'uint'}{width}_t"
+
+
+_negate_ctype_cache: dict = {}
+
+
+def _negate_ctype(ctype):
+    """Result ctype OBJECT of unary `-` applied to *ctype*.
+
+    Integer NEGATE widens by one bit and becomes signed. C_TO_LOGIC's
+    GET_UNARY_OP_NEGATE_INT_UINT_C_CODE is the authority -- it builds the
+    generated function's return type as `"int" + str(in_width + 1) + "_t"` --
+    and PY_TO_LOGIC._elab_unary applies the same rule on the built-in path.
+    The library's make_soft_negate (include/pypeline/operators/soft_misc.py)
+    is annotated to match, so registering the default soft ops does not change
+    the type of a single negate in a design.
+
+    Returns None for anything that is not an integer type (floats, @struct
+    types), leaving those to the caller's own handling.
+    """
+    try:
+        return _negate_ctype_cache[ctype]
+    except KeyError:
+        pass
+    try:
+        width = _ctype_info(_ctype_str(ctype))[1]
+    except NotImplementedError:
+        out = None
+    else:
+        out = make_int_t(width + 1)
+    _negate_ctype_cache[ctype] = out
+    return out
+
+
+@_functools.lru_cache(maxsize=None)
+def _arith_promote(l_type: str, r_type: str):
+    """Compute effective input types after sign promotion for arithmetic/compare ops.
+
+    If both types have the same signedness, they are returned unchanged.
+    If there is a mismatch, the unsigned operand gains +1 bit and becomes signed
+    so the VHDL backend can operate on matching-sign types:
+      e.g. (int32_t, uint32_t) -> (int32_t, int33_t, True)
+
+    Returns (eff_l_type, eff_r_type, result_is_signed).
+    For non-integer types, returns the inputs unchanged with result_is_signed=None.
+    """
+    if not (_ctype_is_int(l_type) and _ctype_is_int(r_type)):
+        return l_type, r_type, None
+    l_signed, l_w = _ctype_info(l_type)
+    r_signed, r_w = _ctype_info(r_type)
+    if l_signed == r_signed:
+        return l_type, r_type, l_signed
+    if l_signed:
+        return l_type, _int_ctype(True, r_w + 1), True  # promote r to signed
+    return _int_ctype(True, l_w + 1), r_type, True  # promote l to signed
+
+
+@_functools.lru_cache(maxsize=None)
+def _arith_output_ctype(op: str, eff_l_type: str, eff_r_type: str, result_signed: bool):
+    """Full-precision output ctype OBJECT for an arithmetic op (after sign promotion).
+
+    op: "add" | "sub" | "mul" | "div" | "mod"
+    Returns a _CTypeMeta ctype object (e.g. make_int_t(17)).
+    Width rules:
+      add  -> max(lw, rw) + 1
+      sub  -> max+1 (signed), max (unsigned)
+      mul  -> lw + rw
+      div/mod -> max(lw, rw)
+    """
+    _, l_w = _ctype_info(eff_l_type)
+    _, r_w = _ctype_info(eff_r_type)
+    max_w = max(l_w, r_w)
+    if op == "add":
+        out_w = max_w + 1
+    elif op == "sub":
+        out_w = (max_w + 1) if result_signed else max_w
+    elif op == "mul":
+        out_w = l_w + r_w
+    else:
+        out_w = max_w
+    return make_int_t(out_w) if result_signed else make_uint_t(out_w)
+
+
+_ARITH_RESULT_TYPE_OP_ALIAS = {
+    "PLUS": "add",
+    "MINUS": "sub",
+    "INFERRED_MULT": "mul",
+    "MULT": "mul",
+    "DIV": "div",
+    "MOD": "mod",
+}
+
+
+def arith_result_type(op: str, l_type, r_type):
+    """Public wrapper over the same sign-promotion/full-precision-width rules
+    the built-in inferred path uses, for library operator implementations that
+    must produce a result identically shaped to what the built-in path would
+    have produced (so switching an op's implementation never changes an
+    existing design's wire widths).
+
+    op:      "PLUS" | "MINUS" | "INFERRED_MULT" | "DIV" | "MOD" (or the short
+             aliases "add" | "sub" | "mul" | "div" | "mod")
+    l_type:  C type of the left operand (e.g. uint32_t)
+    r_type:  C type of the right operand
+
+    Returns (eff_l_type, eff_r_type, out_type): the effective (sign-promoted)
+    input types and the full-precision output ctype OBJECT.
+    """
+    short_op = _ARITH_RESULT_TYPE_OP_ALIAS.get(op, op)
+    eff_l, eff_r, result_signed = _arith_promote(_ctype_str(l_type), _ctype_str(r_type))
+    out_t = _arith_output_ctype(short_op, eff_l, eff_r, result_signed)
+    return _reconstruct_int_ctype(eff_l), _reconstruct_int_ctype(eff_r), out_t
+
+
+# ─────────────────────────────────────────────
+# NamedTuple with automatic subscript support
+# ─────────────────────────────────────────────
+
+
+def _mangle_type(s):
+    """Remove array brackets for VHDL-compatible name mangling: uint32_t[2] -> uint32_t_2."""
+    return s.replace("[", "_").replace("]", "")
+
+
+def _struct_class_getitem(cls, dim):
+    """Enables point_t[10] -> _make_ctype('point_t[10]') using the canonical C type name.
+    Always a base case (cls is the scalar struct type, never itself an array -- a
+    further bracket on the result goes through _CTypeMeta.__getitem__ instead)."""
+    name = getattr(cls, "_pypeline_ctype_name", cls.__name__)
+    arr = _make_ctype(f"{name}[{dim}]")
+    arr._elem_ctype = cls
+    arr._arr_len = dim
+    return arr
+
+
+@_functools.lru_cache(maxsize=None)
+def _is_scalar_pypeline_int(ctype):
+    """True for scalar uint/int types and @enum types; False for arrays and structs."""
+    if getattr(ctype, "_pypeline_is_enum", False):
+        return True
+    if not hasattr(ctype, "_ctype_name"):
+        return False
+    try:
+        _ = (
+            ctype.width
+        )  # raises NotImplementedError for arrays, AttributeError for structs
+        return True
+    except (NotImplementedError, AttributeError):
+        return False
+
+
+# ─────────────────────────────────────────────
+# SimVal — simulation-mode integer
+# Defined here (before @struct) so _typed_new can reference it.
+# Method bodies reference _unary_operator_registry etc. which are defined
+# later in this module; that is fine because methods are only called at runtime.
+# ─────────────────────────────────────────────
+
+
+class SimVal(int):
+    """Thin int subclass that carries a pypeline ctype and supports bit-slicing.
+
+    Used in simulation mode: struct constructors produce SimVal fields, and
+    arithmetic / operator-dispatch propagates type information through the call graph.
+    SimVal is a subclass of int, so it is transparent to the hardware elaborator.
+
+    PERF NOTE: All type-checks use `type(x) is SimVal` rather than isinstance —
+    subclassing SimVal is prohibited as a performance constraint.
+    """
+
+    def __new__(cls, value=0, ctype=None):
+        obj = _int_new(cls, int(value))
+        _obj_setattr(obj, "_ctype", ctype)
+        return obj
+
+    def __getitem__(self, key):
+        """Bit slice: x[bit] → uint1 value, x[hi:lo] → (hi-lo+1)-bit value.
+
+        The slice result carries a uintN_t ctype sized to the slice width (not the
+        original operand's ctype) -- this is what lets hex(x[hi:lo]) know how many
+        hex digits to zero-pad to, matching VHDL's %X rendering of the same slice.
+        """
+        if isinstance(key, int):
+            return SimVal((int(self) >> key) & 1, make_uint_t(1))
+        hi, lo = key.start, key.stop  # hardware convention: x[hi:lo]
+        width = hi - lo + 1
+        return SimVal((int(self) >> lo) & ((1 << width) - 1), make_uint_t(width))
+
+    def _dispatch_unary(self, op_name, fallback):
+        if self._ctype is not None:
+            l_str = _ctype_str(self._ctype)
+            fn = _unary_operator_registry.get((op_name, l_str))
+            if fn is None:
+                fn = _resolve_generic_unary_operator(op_name, l_str)
+            if fn is INFERRED:
+                fn = None
+            if callable(fn):
+                result = fn(self)
+                if type(result) is not SimVal or result._ctype is None:
+                    ret_t = getattr(
+                        getattr(fn, "__wrapped__", fn), "__annotations__", {}
+                    ).get("return")
+                    if ret_t is not None:
+                        return _sim_cast(result, ret_t)
+                return result
+        return SimVal(fallback)
+
+    def __neg__(self):
+        v = -int(self)
+        if self._ctype is None or "NEGATE" in _registered_unary_op_names:
+            return self._dispatch_unary("NEGATE", v)
+        # Built-in path. Integer NEGATE widens by one bit and becomes signed
+        # (see _negate_ctype for the authority). The widened type always holds
+        # the result, so there is nothing to mask -- masking back into
+        # self._ctype, which is what this used to do, made -uint24_t(5) come
+        # out uint24_t 16777211 in sim against hardware's int25_t -5, and
+        # wrapped the signed minimum instead of widening it. Unsigned operands
+        # were wrong for every value.
+        widened = _negate_ctype(self._ctype)
+        if widened is not None:
+            return _sim_val_make(v, widened)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    def __invert__(self):
+        v = ~int(self)
+        if self._ctype is None or "NOT" in _registered_unary_op_names:
+            return self._dispatch_unary("NOT", v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    def _dispatch_binary(self, op_name, other, fallback_int, preserve_ctype=False):
+        if self._ctype is not None:
+            l_str = _ctype_str(self._ctype)
+            rc = other._ctype if type(other) is SimVal else None
+            r_str = _ctype_str(rc) if rc else None
+            fn = None
+            if r_str:
+                fn = _operator_registry.get((op_name, l_str, r_str))
+                if fn is None:
+                    fn = _resolve_generic_operator(op_name, l_str, r_str)
+            if fn is None or fn is INFERRED:
+                fn = _left_operator_registry.get((op_name, l_str))
+                if fn is None:
+                    fn = _resolve_generic_left_operator(op_name, l_str)
+            if fn is INFERRED:
+                fn = None
+            if callable(fn):
+                result = fn(self, other)
+                if type(result) is not SimVal or result._ctype is None:
+                    ret_t = getattr(
+                        getattr(fn, "__wrapped__", fn), "__annotations__", {}
+                    ).get("return")
+                    if ret_t is not None:
+                        return _sim_cast(result, ret_t)
+                return result
+            # No registered operator. For shifts: PY_TO_LOGIC output type = left operand
+            # type (constant-shift built-in keeps l_type). Preserve ctype so downstream
+            # arithmetic can apply the correct unsigned/signed wrapping.
+            if preserve_ctype:
+                return _sim_cast(fallback_int, self._ctype)
+        return SimVal(fallback_int)
+
+    # A CONSTANT shift amount is not a dispatch point. PY_TO_LOGIC._elab_binop
+    # sends it to the CONST_SL/CONST_SR_<n>_<type> built-in -- pure rewiring --
+    # and never consults the operator registry; only a variable amount looks up
+    # a registered implementation. Sim has to make the same split. A registered
+    # barrel shifter shifts by a constant in its own body
+    # (include/pypeline/operators/soft_shift.py: `result << (1 << i)`), so
+    # dispatching on a constant amount recurses into the shifter forever, and
+    # takes DIV/MOD down with it because the divider shifts internally.
+    # An untyped SimVal counts as a constant here: a hardware shift amount is
+    # always a typed wire.
+    def __rshift__(self, o):
+        v = int(self) >> int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is None:
+            return SimVal(v)
+        if (
+            "SR" in _registered_binary_op_names
+            and type(o) is SimVal
+            and o._ctype is not None
+        ):
+            return self._dispatch_binary("SR", o, v, preserve_ctype=True)
+        return _sim_val_make(v, self._ctype)
+
+    def __lshift__(self, o):
+        v = int(self) << int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is None:
+            return SimVal(v)
+        if (
+            "SL" in _registered_binary_op_names
+            and type(o) is SimVal
+            and o._ctype is not None
+        ):
+            return self._dispatch_binary("SL", o, v, preserve_ctype=True)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    # Arithmetic with hardware type-promotion when both operands have known ctypes.
+    # SIM_STRICT_ARITH (default True) applies masking to the result so that
+    # intermediate values wrap identically to hardware. Set False for faster sim.
+    #
+    # When the other operand is a plain Python int (no _ctype), its hardware type is
+    # inferred via _infer_literal_ctype — the same minimum-bit-width rule that
+    # PY_TO_LOGIC uses for integer literals.  This ensures that, e.g.,
+    #   uint12_t_val - 641   →  uint12_t result (unsigned wrap, not signed Python int)
+    # matching what hardware produces for the expression `signal - CONSTANT`.
+    def __add__(self, o):
+        ov = int(o)
+        if SIM_RAW_INTS:
+            return int(self) + ov
+        result = int(self) + ov
+        if SIM_STRICT_ARITH and self._ctype is not None:
+            rc = o._ctype if type(o) is SimVal else _infer_literal_ctype(ov)
+            if rc is not None:
+                l_name = self._ctype._ctype_name
+                r_name = rc if isinstance(rc, str) else rc._ctype_name
+                eff_l, eff_r, rsig = _arith_promote(l_name, r_name)
+                if rsig is not None:
+                    out_ctype = _arith_output_ctype("add", eff_l, eff_r, rsig)
+                    try:
+                        mask, sign_bit, is_signed = _sim_cast_param_cache[out_ctype]
+                    except KeyError:
+                        mask, sign_bit, is_signed = _sim_type_init(out_ctype)
+                    v = result & mask
+                    if is_signed and v >= sign_bit:
+                        v -= mask + 1
+                    return _sim_val_make(v, out_ctype)
+        return SimVal(result)
+
+    def __sub__(self, o):
+        ov = int(o)
+        if SIM_RAW_INTS:
+            return int(self) - ov
+        result = int(self) - ov
+        if SIM_STRICT_ARITH and self._ctype is not None:
+            rc = o._ctype if type(o) is SimVal else _infer_literal_ctype(ov)
+            if rc is not None:
+                l_name = self._ctype._ctype_name
+                r_name = rc if isinstance(rc, str) else rc._ctype_name
+                eff_l, eff_r, rsig = _arith_promote(l_name, r_name)
+                if rsig is not None:
+                    out_ctype = _arith_output_ctype("sub", eff_l, eff_r, rsig)
+                    try:
+                        mask, sign_bit, is_signed = _sim_cast_param_cache[out_ctype]
+                    except KeyError:
+                        mask, sign_bit, is_signed = _sim_type_init(out_ctype)
+                    v = result & mask
+                    if is_signed and v >= sign_bit:
+                        v -= mask + 1
+                    return _sim_val_make(v, out_ctype)
+        return SimVal(result)
+
+    def __mul__(self, o):
+        ov = int(o)
+        if SIM_RAW_INTS:
+            return int(self) * ov
+        result = int(self) * ov
+        if SIM_STRICT_ARITH and self._ctype is not None:
+            rc = o._ctype if type(o) is SimVal else _infer_literal_ctype(ov)
+            if rc is not None:
+                l_name = self._ctype._ctype_name
+                r_name = rc if isinstance(rc, str) else rc._ctype_name
+                eff_l, eff_r, rsig = _arith_promote(l_name, r_name)
+                if rsig is not None:
+                    out_ctype = _arith_output_ctype("mul", eff_l, eff_r, rsig)
+                    try:
+                        mask, sign_bit, is_signed = _sim_cast_param_cache[out_ctype]
+                    except KeyError:
+                        mask, sign_bit, is_signed = _sim_type_init(out_ctype)
+                    v = result & mask
+                    if is_signed and v >= sign_bit:
+                        v -= mask + 1
+                    return _sim_val_make(v, out_ctype)
+        return SimVal(result)
+
+    # Bitwise ops: hardware requires matching-width operands and the result keeps
+    # that width/type (no arithmetic promotion like +/-). Losing the ctype here
+    # (falling back to a bare, untyped SimVal) previously made downstream width
+    # inference (_bit_manip_width, e.g. inside rotl()) fall back to
+    # int(v).bit_length() -- silently *narrower* than the real declared width
+    # whenever the result happens to have leading zero bits, corrupting any
+    # rotl()/rotr()/bswap() applied to a bitwise-op result (e.g. chacha20's
+    # `rotl(state[d] ^ a1, 16)`).
+    def _bitwise_ctype(self, o):
+        if self._ctype is not None:
+            return self._ctype
+        if type(o) is SimVal:
+            return o._ctype
+        return None
+
+    def __and__(self, o):
+        v = int(self) & int(o)
+        if SIM_RAW_INTS:
+            return v
+        ctype = self._bitwise_ctype(o)
+        if ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, ctype)
+
+    def __or__(self, o):
+        v = int(self) | int(o)
+        if SIM_RAW_INTS:
+            return v
+        ctype = self._bitwise_ctype(o)
+        if ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, ctype)
+
+    def __xor__(self, o):
+        v = int(self) ^ int(o)
+        if SIM_RAW_INTS:
+            return v
+        ctype = self._bitwise_ctype(o)
+        if ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, ctype)
+
+    # Reflected bitwise ops: plain-int op SimVal (`o` is always a non-SimVal here,
+    # same reasoning as __radd__ below). AND/OR/XOR are commutative, so just reuse
+    # self's ctype -- no promotion needed, unlike +/-.
+    def __rand__(self, o):
+        v = int(o) & int(self)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    def __ror__(self, o):
+        v = int(o) | int(self)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    def __rxor__(self, o):
+        v = int(o) ^ int(self)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is None:
+            return SimVal(v)
+        if SIM_STRICT_ARITH:
+            try:
+                mask, sign_bit, is_signed = _sim_cast_param_cache[self._ctype]
+            except KeyError:
+                mask, sign_bit, is_signed = _sim_type_init(self._ctype)
+            v = v & mask
+            if is_signed and v >= sign_bit:
+                v -= mask + 1
+        return _sim_val_make(v, self._ctype)
+
+    # Reflected arithmetic: plain-int op SimVal. Apply full SIM_STRICT_ARITH so that
+    # `CONSTANT - typed_signal` wraps the same way hardware does (e.g. 481 - uint12_t).
+    # `o` is always a non-SimVal here (Python only calls __radd__ when the left operand
+    # didn't handle it), so int(o) is fine.
+    def __radd__(self, o):
+        if SIM_RAW_INTS:
+            return int(o) + int(self)
+        result = int(o) + int(self)
+        if SIM_STRICT_ARITH and self._ctype is not None:
+            lc = _infer_literal_ctype(int(o))
+            if lc is not None:
+                eff_l, eff_r, rsig = _arith_promote(lc, self._ctype._ctype_name)
+                if rsig is not None:
+                    return _sim_cast(
+                        result, _arith_output_ctype("add", eff_l, eff_r, rsig)
+                    )
+        return SimVal(result)
+
+    def __rsub__(self, o):
+        if SIM_RAW_INTS:
+            return int(o) - int(self)
+        result = int(o) - int(self)
+        if SIM_STRICT_ARITH and self._ctype is not None:
+            lc = _infer_literal_ctype(int(o))
+            if lc is not None:
+                eff_l, eff_r, rsig = _arith_promote(lc, self._ctype._ctype_name)
+                if rsig is not None:
+                    return _sim_cast(
+                        result, _arith_output_ctype("sub", eff_l, eff_r, rsig)
+                    )
+        return SimVal(result)
+
+    def __rlshift__(self, o):
+        if SIM_RAW_INTS:
+            return int(o) << int(self)
+        return SimVal(int(o) << int(self))
+
+    def __rrshift__(self, o):
+        if SIM_RAW_INTS:
+            return int(o) >> int(self)
+        return SimVal(int(o) >> int(self))
+
+    # Comparisons, DIV and MOD: no built-in fast path exists for these (unlike
+    # +/-/* which always have an inferred lowering) -- when nothing is
+    # registered they simply fall back to plain int comparison/division, same
+    # result as before this dispatch existed. When a soft impl IS registered
+    # (default-flip library, or a user's own), route through it so sim agrees
+    # structurally with the generated hardware. Gated by
+    # _registered_binary_op_names so an unregistered design pays one set
+    # lookup, same pattern as __rshift__/__lshift__.
+    def __lt__(self, o):
+        v = int(self) < int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "LT" in _registered_binary_op_names:
+            return self._dispatch_binary("LT", o, v)
+        return v
+
+    def __le__(self, o):
+        v = int(self) <= int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "LTE" in _registered_binary_op_names:
+            return self._dispatch_binary("LTE", o, v)
+        return v
+
+    def __gt__(self, o):
+        v = int(self) > int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "GT" in _registered_binary_op_names:
+            return self._dispatch_binary("GT", o, v)
+        return v
+
+    def __ge__(self, o):
+        v = int(self) >= int(o)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "GTE" in _registered_binary_op_names:
+            return self._dispatch_binary("GTE", o, v)
+        return v
+
+    def __truediv__(self, o):
+        ov = int(o)
+        v = int(self) // ov if (int(self) < 0) == (ov < 0) else -(-int(self) // ov)
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "DIV" in _registered_binary_op_names:
+            return self._dispatch_binary("DIV", o, v, preserve_ctype=True)
+        return _sim_val_make(v, self._ctype) if self._ctype is not None else SimVal(v)
+
+    def __mod__(self, o):
+        ov = int(o)
+        d = int(self) // ov if (int(self) < 0) == (ov < 0) else -(-int(self) // ov)
+        v = int(self) - d * ov
+        if SIM_RAW_INTS:
+            return v
+        if self._ctype is not None and "MOD" in _registered_binary_op_names:
+            return self._dispatch_binary("MOD", o, v, preserve_ctype=True)
+        return _sim_val_make(v, self._ctype) if self._ctype is not None else SimVal(v)
+
+
+class _RawField(int):
+    """Bare int subclass used for struct fields in SIM_RAW_INTS mode.
+
+    Inherits all arithmetic from int (C-level, no Python dispatch overhead).
+    Only adds __getitem__ so struct.field[bit] still works in raw mode.
+    Arithmetic results are plain Python ints — the SimVal type system is not entered.
+    """
+
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        v = int(self)
+        if isinstance(key, int):
+            return (v >> key) & 1
+        hi, lo = key.start, key.stop  # hardware convention: x[hi:lo]
+        return (v >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+
+# Pre-bind low-level constructors so _sim_cast and arithmetic ops can create SimVals
+# without going through SimVal.__new__ (a Python function call = ~0.1µs overhead).
+_int_new = int.__new__
+_obj_setattr = object.__setattr__
+
+# Flyweight cache: (int_value, ctype) → SimVal for values 0..15 per ctype.
+# Mirrors CPython's own small-int cache. Populated lazily via _sim_type_init.
+_SIM_CONST_CACHE: dict = {}
+_SIM_CONST_MAX = 15
+
+
+def _sim_val_make(v, ctype):
+    """Create a typed SimVal, returning a cached flyweight for small non-negative values."""
+    if 0 <= v <= _SIM_CONST_MAX:
+        cached = _SIM_CONST_CACHE.get((v, ctype))
+        if cached is not None:
+            return cached
+    obj = _int_new(SimVal, v)
+    _obj_setattr(obj, "_ctype", ctype)
+    return obj
+
+
+def NamedTuple(cls=None, **kwargs):
+    """Used as a base class to create hardware struct types.
+    Automatically adds array subscript support so point_t[10] works.
+
+    Usage:
+        class point_t(NamedTuple):
+            x: uint32_t
+            y: uint32_t
+    """
+    # When used as a base class Python calls this as NamedTuple() to get
+    # the base object, then builds the subclass. We return a special sentinel.
+    # Building the class via __init_subclass__ on a sentinel base would work,
+    # but that's complex. Instead we use __class_getitem__ on the returned object.
+    #
+    # Simplest approach that works: return typing.NamedTuple and rely on
+    # a module-level __init__ hook. But that's not available.
+    #
+    # The actual working approach: NamedTuple is a function that,
+    # when used as `class Foo(NamedTuple):`, Python will call it with no args
+    # to get the base. We return typing.NamedTuple so the class is built
+    # correctly, then we cannot patch it at that point.
+    #
+    # THE REAL FIX: use typing.NamedTuple directly and provide a
+    # 'struct' decorator that patches __class_getitem__.
+    pass
+
+
+# Use typing.NamedTuple directly — it works fine for field annotations.
+# For subscript support on the resulting class, use the @struct decorator.
+NamedTuple = typing.NamedTuple
+
+
+_PARAM_VALUE_ADDR_RE = _re_ctype.compile(r" at 0x[0-9a-fA-F]+")
+_PARAM_VALUE_ILLEGAL_CHARS_RE = _re_ctype.compile(r"[^A-Za-z0-9_]+")
+
+
+def _sanitize_param_fragment(s: str) -> str:
+    """Collapse runs of non-identifier characters into single underscores and
+    trim leading/trailing underscores, for embedding a str/float/fallback
+    value into a generated name. Mirrors PY_TO_LOGIC._strip_qualname_markers'
+    character class; kept local since pypeline.py has zero dependency on the
+    compiler and must stay that way."""
+    s = _PARAM_VALUE_ILLEGAL_CHARS_RE.sub("_", s).strip("_")
+    return s or "v"
+
+
+def encode_param_value(val) -> str:
+    """Deterministic, VHDL-identifier-safe encoding of one factory-parameter/
+    closure value, for embedding in a generated canonical entity/type name.
+    Shared by struct()/enum() here and by PY_TO_LOGIC._canonical_func_name
+    (which imports it from here; pypeline.py itself has zero dependency on
+    the compiler and must stay that way, so this stays self-contained).
+
+    Must be a pure function of `val` -- no memory addresses, no id()s, no call
+    order -- since the AUTO_PIPELINE .latency pin-and-confirm loop re-executes
+    a design in-process and matches entities across passes by these names.
+    """
+    if isinstance(val, type):
+        if getattr(val, "_pypeline_is_interface", False):
+            info = val._pypeline_name_info
+            # Interfaces are classes too, but their literal __name__ does
+            # not identify the payload. This key is used for function reuse.
+            return collapse_overflow_name(
+                val._pypeline_iface_canonical + "_h" + _name_digest(info.identity),
+                val.__name__,
+                _MAX_MANGLE_NAME_LEN,
+            )
+        return _mangle_type(getattr(val, "_pypeline_ctype_name", val.__name__))
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, int):
+        return str(val) if val >= 0 else f"neg{-val}"
+    if val is None:
+        return "None"
+    if isinstance(val, str):
+        return _sanitize_param_fragment(val)
+    if isinstance(val, float):
+        s = repr(val).replace("-", "neg").replace(".", "p")
+        return _sanitize_param_fragment(s)
+    if isinstance(val, _IntEnum):
+        return f"{type(val).__name__}_{val.name}"
+    if isinstance(val, (list, tuple)):
+        if not val:
+            return "empty"
+        return "_".join(encode_param_value(e) for e in val)
+    if isinstance(val, dict):
+        if not val:
+            return "empty"
+        return "_".join(
+            f"{encode_param_value(k)}_{encode_param_value(val[k])}"
+            for k in sorted(val, key=repr)
+        )
+    if callable(val):
+        # Deterministic (no memory address): a function's default repr embeds
+        # its address, which would rename the struct on every design
+        # re-execution -- and the AUTO_PIPELINE .latency pin-and-confirm loop
+        # re-executes designs in-process, matching entities across passes by
+        # name. module+qualname is enough identity for this suffix; the
+        # struct's structural distinctness is already carried by its field
+        # types in the canonical name. (PY_TO_LOGIC._callable_canonical_name
+        # does a richer, factory-closure-recursing version of this same idea
+        # for hw_func closure params -- this is the simpler, dependency-free
+        # fallback used here and anywhere a live compiler isn't available.)
+        import inspect
+
+        if getattr(val, "_is_auto_comb_delay_opt_pragma", False):
+            return "AUTO_COMB_DELAY_OPT_" + encode_param_value(val.func)
+        if getattr(val, "_is_auto_comb_area_opt_pragma", False):
+            return "AUTO_COMB_AREA_OPT_" + encode_param_value(val.func)
+        if getattr(val, "_is_auto_pipeline_pragma", False):
+            if getattr(val, "name", None) is not None:
+                # One name is one group over one function: the name suffices
+                return "AUTO_PIPELINE_" + val.name + val.latency_suffix()
+            return (
+                "AUTO_PIPELINE_" + encode_param_value(val.func) + val.latency_suffix()
+            )
+        unwrapped = inspect.unwrap(val)
+        qual = getattr(unwrapped, "__qualname__", None)
+        if qual:
+            mod = getattr(unwrapped, "__module__", "") or ""
+            dotted = (f"{mod}.{qual}" if mod else qual).replace(".<locals>.", "_")
+            return _mangle_type(
+                dotted.replace(".", "_").replace("<", "_").replace(">", "_")
+            )
+        # Unintrospectable callable (no qualname) -- fall through below.
+    # Last resort: any other value (or an unintrospectable callable) gets a
+    # labeled hash of its address-stripped repr, so encoding never raises --
+    # an opaque-but-labeled term beats elaboration failing outright.
+    type_name = _sanitize_param_fragment(type(val).__name__)
+    addr_free_repr = _PARAM_VALUE_ADDR_RE.sub("", repr(val))
+    h = _hashlib.sha256(addr_free_repr.encode()).hexdigest()[:8]
+    return f"{type_name}_{h}"
+
+
+def collapse_overflow_name(full: str, fallback_prefix: str, max_len: int) -> str:
+    """Collapse an over-length generated name to fit `max_len` while keeping a
+    readable prefix, instead of discarding all descriptive content down to
+    just `{fallback_prefix}_{hash}`.
+
+    The hash is computed over the FULL untruncated name (so two different
+    over-length names that happen to share a truncated prefix still get
+    distinct results); the kept prefix is trimmed back to the last '_'
+    boundary so it never ends mid-token -- a bare truncation can otherwise
+    slice a trailing hash or type-name token in half (e.g.
+    "..._out_t_8_b1dab4d2", where "_8_" is half of an unrelated 8-hex-digit
+    hash), which is valid-but-nonsense rather than merely short.
+    """
+    if len(full) <= max_len:
+        return full
+    h = _hashlib.sha256(full.encode()).hexdigest()[:8]
+    budget = max_len - 9  # "_" + 8 hex chars
+    prefix = full[:budget]
+    last_us = prefix.rfind("_")
+    if last_us > budget // 2:
+        prefix = prefix[:last_us]
+    prefix = prefix.rstrip("_") or fallback_prefix
+    return f"{prefix}_{h}"
+
+
+def capture_factory_args(qualname: str, frame) -> dict:
+    """Capture the REAL argument values of every enclosing factory function
+    named in `qualname`'s '.<locals>.' chain, by walking the live call stack
+    starting at `frame`.
+
+    Skips any leading frames belonging to pypeline.py itself (its own
+    decorator/registration plumbing -- @wires, @MAIN, _register_main -- sits
+    between the caller and _sim_type_wrap at varying depth), the same way
+    include/pypeline/interface/interface_func.py's _factory_suffix skips its
+    own module's frames, so every decorator call shape lands on the same
+    real factory frame regardless of how it got here.
+
+    Then matches each '.<locals>.'-separated qualname segment (innermost
+    enclosing factory first) against frame.f_code.co_name, capturing that
+    frame's own declared parameters (in declaration order) before moving to
+    frame.f_back for the next segment out. Returns {} (safe degrade, not an
+    error) the instant a name fails to match -- e.g. a struct/function built
+    from an unusual call shape just falls back to closure-only naming, same
+    as before this function existed.
+
+    Returns an insertion-ordered dict: innermost factory's params first, then
+    each enclosing factory's params outward -- this is what lets the
+    generated name's leading term be the most identifying one (the innermost
+    factory is always the one whose params most directly describe the
+    returned function/type).
+    """
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if ".<locals>." not in qualname:
+        return {}
+    enclosing = list(reversed(qualname.split(".<locals>.")[:-1]))
+    result = {}
+    f = frame
+    for expected_name in enclosing:
+        while f is not None and f.f_code.co_name in (
+            "<listcomp>",
+            "<dictcomp>",
+            "<setcomp>",
+            "<genexpr>",
+        ):
+            f = f.f_back
+        if f is None or f.f_code.co_name != expected_name:
+            return {}
+        code = f.f_code
+        n = code.co_argcount + code.co_kwonlyargcount
+        for name in code.co_varnames[:n]:
+            if name in f.f_locals and name not in result:
+                if name == "name" and f.f_locals[name] is None:
+                    # A factory's name= forwarded to an AUTO tag or decorator:
+                    # left at None it describes nothing, so adding the
+                    # parameter to a factory renames none of its products
+                    continue
+                result[name] = f.f_locals[name]
+        f = f.f_back
+    return result
+
+
+class _CastDispatchMeta(type):
+    """Metaclass for @struct classes: `T(x)`, called with exactly one
+    positional argument and no keywords, dispatches to a registered cast
+    (register_cast/@cast) before falling through to ordinary construction.
+
+    Deliberately a metaclass __call__, not a __new__ override: copy.deepcopy/
+    copy.copy reconstruct an instance via `cls.__new__(cls, *fields)`
+    directly, bypassing __call__ entirely -- for a ONE-FIELD struct that is
+    the exact same (1 positional, 0 keyword) shape as a cast call. Dispatch
+    in __new__ would make deepcopy of, say, a fixed-point struct with a
+    registered raw-int->fixed cast on its own field type silently re-run
+    that cast instead of reconstructing the value. A metaclass is the only
+    interception point that can tell `T(x)` (goes through __call__) from
+    `T.__new__(T, x)` (does not) apart -- struct()'s _typed_new stays pure
+    positional/keyword field-fill, unaware casting exists at all.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        if len(args) == 1 and not kwargs:
+            src_t = _value_ctype(args[0])
+            if src_t is not None:
+                fn = _resolve_cast_entry((_ctype_str(src_t), cls._pypeline_ctype_name))
+                if fn is not None:
+                    return _struct_dispatch_call(fn, (args[0],))
+        return super().__call__(*args, **kwargs)
+
+
+def struct(cls=None, *, name=None):
+    """Decorator that adds array subscript support and stamps a canonical C type name.
+    The canonical name is derived from the class name, field types, and (for a
+    struct defined directly inside a factory function) that factory's own
+    parameters -- making it deterministic regardless of the Python variable
+    name used at the call site, and collision-free even when two different
+    parameter combinations would otherwise produce identical field types (e.g.
+    a fixed-point factory where int_bits+frac_bits alone sizes the only
+    field). This allows factory-produced structs nested inside other
+    factories to get unique, stable names without being visible at module
+    level, and without requiring any change at the @struct call site itself.
+
+    Usage:
+        @struct
+        class point_t(NamedTuple):
+            x: uint32_t
+            y: uint32_t
+
+        # Now point_t[10] works as an annotation, and point_t._pypeline_ctype_name
+        # is set to "point_t_x_uint32_t_y_uint32_t"
+
+    @struct(name="...") replaces the automatic name with a name of your
+    choosing (see hw_func): the C type name becomes "<name>_s<digest>" and
+    the VHDL record name is the name itself.
+    """
+    if cls is None:
+        return lambda c: _struct(c, name, _sys._getframe(1))
+    return _struct(cls, name, _sys._getframe(1))
+
+
+def _struct(cls, name, frame):
+    if name is not None:
+        _check_user_name(name, "@struct")
+    cls.__class_getitem__ = classmethod(_struct_class_getitem)
+
+    def _typeof(cls, field_name):
+        return cls.__annotations__[field_name]
+
+    cls.typeof = classmethod(_typeof)
+    parts = []
+    for field, ann in cls.__annotations__.items():
+        # A plain struct has one direction, so a reverse (Feedback) field or a
+        # whole interface has no meaning inside it -- reject at declaration
+        # rather than emitting a nonsense C type name that fails much later in
+        # VHDL writing. (Duck-typed so pypeline needn't import the interface lib.)
+        if isinstance(ann, _FeedbackType):
+            raise TypeError(
+                f"@struct {cls.__name__!r} field {field!r} is Feedback[...]; a "
+                "reverse-direction field is only meaningful in an @interface"
+            )
+        if getattr(ann, "_pypeline_is_interface", False):
+            raise TypeError(
+                f"@struct {cls.__name__!r} field {field!r} is an @interface; use "
+                "@interface for bundles that contain interfaces, or a derived "
+                "make_interface_type()/make_interface_feedback_type() struct here"
+            )
+        if isinstance(ann, type):
+            # Use canonical name for struct-typed fields if already computed
+            ann_str = getattr(ann, "_pypeline_ctype_name", ann.__name__)
+        else:
+            ann_str = str(ann)
+        parts.append(f"{field}_{_mangle_type(ann_str)}")
+    canonical = cls.__name__ + ("_" + "_".join(parts) if parts else "")
+    factory_args = capture_factory_args(cls.__qualname__, frame)
+    cls._pypeline_name_info = _describe(cls, "struct", factory_args, frame)
+    if factory_args:
+        canonical += "_" + "_".join(
+            f"{arg}_{encode_param_value(val)}" for arg, val in factory_args.items()
+        )
+    cls._pypeline_ctype_canonical = canonical  # full name retained for debugging
+    cls._pypeline_ctype_name = collapse_overflow_name(
+        canonical, cls.__name__, _MAX_MANGLE_NAME_LEN
+    )
+    if name is not None:
+        cls._pypeline_user_name = name
+        cls._pypeline_unnamed_ctype_name = cls._pypeline_ctype_name
+        cls._pypeline_ctype_name = _named_key(name, cls._pypeline_ctype_name)
+        info = cls._pypeline_name_info
+        cls._pypeline_name_info = _replace_name_info(
+            info,
+            user_name=name,
+            identity=_name_identity(("user_name", name, info.identity)),
+        )
+
+    # Override __new__ so that scalar integer fields are auto-wrapped in SimVals.
+    # This makes float32_t(sign=0, exp=127, man=0) produce typed SimVal fields for
+    # simulation without requiring a separate constructor. SimVal subclasses int, so
+    # the hardware elaborator sees plain integers and is unaffected.
+    _orig_new = cls.__new__
+
+    def _typed_new(klass, *args, **kwargs):
+        # NOTE: cast dispatch (T(x) where x's ctype has a registered cast into
+        # klass) deliberately does NOT live here. __new__ is also what
+        # copy.deepcopy/copy.copy call directly to reconstruct an instance
+        # (cls.__new__(cls, *fields)), which for a ONE-FIELD struct is the
+        # exact same (1 positional, 0 keyword) shape as a cast call -- adding
+        # cast dispatch here would silently reinterpret a deepcopy
+        # reconstruction as a cast whenever some unrelated code registered a
+        # cast from that field's type. See _CastDispatchMeta.__call__ below,
+        # which intercepts real `T(x)` call syntax before it ever reaches
+        # __new__ -- a distinction only a metaclass can make, since
+        # deepcopy/copy bypass __call__ entirely and go straight to __new__.
+        if args:
+            positional = dict(zip(klass._fields, args))
+            positional.update(kwargs)
+            kwargs = positional
+        typed = {}
+        if SIM_RAW_INTS:
+            for fname, v in kwargs.items():
+                ftype = klass.__annotations__.get(fname)
+                if (
+                    ftype is not None
+                    and isinstance(v, int)  # covers int, SimVal, IntEnum members
+                    and _is_scalar_pypeline_int(ftype)
+                ):
+                    v = _RawField(int(v))
+                elif ftype is not None and type(v) is list:
+                    elem_ftype = _array_elem_ctype(ftype)
+                    if elem_ftype is not None and _is_scalar_pypeline_int(elem_ftype):
+                        v = [_RawField(int(e)) if isinstance(e, int) else e for e in v]
+                typed[fname] = v
+        else:
+            for fname, v in kwargs.items():
+                ftype = klass.__annotations__.get(fname)
+                if (
+                    ftype is not None
+                    and isinstance(v, int)  # covers int, SimVal, IntEnum members
+                    and _is_scalar_pypeline_int(ftype)
+                ):
+                    # Always mask/sign-extend to the field's declared bit width,
+                    # same as a hardware-typed assignment (`_sim_cast`), so e.g.
+                    # p_t(c=a.c+1) wraps identically to `o.c = a.c+1`. A value
+                    # already carrying *some* ctype (e.g. arithmetic promoting
+                    # uint4_t+int to uint5_t) must still be recast down to
+                    # ftype -- `_sim_cast` itself short-circuits the no-op case
+                    # where the ctype already matches ftype exactly.
+                    v = _sim_cast(v, ftype)
+                elif ftype is not None and (type(v) is list or isinstance(v, str)):
+                    # Array-of-scalar field passed a raw Python list (e.g. a list
+                    # literal) or, for a char/uint8_t array field, a bare Python str:
+                    # cast/convert via _sim_cast_deep so it carries the field's bit
+                    # width (and, for char_t[N], becomes a CharArray). Struct/array
+                    # elements are left untouched -- they self-type via their own
+                    # constructor.
+                    if _array_elem_ctype(ftype) is not None:
+                        v = _sim_cast_deep(v, ftype)
+                typed[fname] = v
+        return _orig_new(klass, **typed)
+
+    cls.__new__ = staticmethod(_typed_new)
+
+    # Operator overloading for registered struct types (e.g. floating-point
+    # add/sub/mul/div): consult the same registries the hardware elaborator
+    # uses, so `a + b` also works during plain Python/native simulation, not
+    # just hardware elaboration. No registration -> clear TypeError, rather
+    # than the tuple/NamedTuple default (concatenation for +, repeat for *).
+    cls.__add__ = lambda self, other: _struct_dispatch_binary_op("PLUS", self, other)
+    cls.__sub__ = lambda self, other: _struct_dispatch_binary_op("MINUS", self, other)
+    cls.__mul__ = lambda self, other: _struct_dispatch_binary_op(
+        "INFERRED_MULT", self, other
+    )
+    cls.__truediv__ = lambda self, other: _struct_dispatch_binary_op("DIV", self, other)
+    cls.__neg__ = lambda self: _struct_dispatch_unary_op("NEGATE", self)
+    # Comparisons: no built-in fallback exists for structs (NamedTuple's default
+    # lexicographic tuple ordering is not a meaningful hardware comparison), so
+    # these are TypeErrors unless registered -- matching _elab_compare, which
+    # now also consults the operator registry (see PY_TO_LOGIC._elab_compare).
+    cls.__lt__ = lambda self, other: _struct_dispatch_binary_op("LT", self, other)
+    cls.__le__ = lambda self, other: _struct_dispatch_binary_op("LTE", self, other)
+    cls.__gt__ = lambda self, other: _struct_dispatch_binary_op("GT", self, other)
+    cls.__ge__ = lambda self, other: _struct_dispatch_binary_op("GTE", self, other)
+
+    # T.to_bytes(v) / T.from_bytes(b): thin classmethod sugar over the module-level
+    # type_to_bytes/type_from_bytes, which share _enumerate_leaves with
+    # make_type_to_bytes -- so the software and hardware layouts are one walk, not
+    # two that must be kept in sync. Referenced lazily inside the lambdas, so
+    # definition order within this module does not matter.
+    #
+    # Deliberately NOT attached by enum(): an @enum returns an IntEnum subclass
+    # whose members already carry int.to_bytes/int.from_bytes, and shadowing those
+    # would be actively harmful. Use pypeline.type_to_bytes(some_enum_t, v).
+    for _bytes_method in ("to_bytes", "from_bytes"):
+        if _bytes_method in cls._fields:
+            raise TypeError(
+                f"@struct {cls.__name__!r} has a field named {_bytes_method!r}, which "
+                f"collides with the generated {_bytes_method} classmethod; rename the field"
+            )
+    cls.to_bytes = classmethod(
+        lambda c, value, endian="little": type_to_bytes(c, value, endian)
+    )
+    cls.from_bytes = classmethod(
+        lambda c, data, endian="little": type_from_bytes(c, data, endian)
+    )
+
+    # Rebuild through _CastDispatchMeta so T(x) can dispatch a registered cast
+    # (see that class's docstring for why this must be a metaclass, not a
+    # __new__ override). Last step: every attribute set above (by this
+    # function, and everything @interface's _derive() and factory functions
+    # like make_fixed_t set afterward on whatever struct() returns) carries
+    # over via dict(vars(cls)) -- nothing here is order-sensitive except that
+    # this must be struct()'s final statement, since anything set on the
+    # PRE-rebuild `cls` after this point would be invisible on the object
+    # actually returned/bound at the call site.
+    cls = _CastDispatchMeta(cls.__name__, cls.__bases__, dict(vars(cls)))
+    return cls
+
+
+def enum(cls=None, *, name=None):
+    """Decorator for pypeline enum types. Stamps canonical _pypeline_ctype_name and
+    pypeline metadata onto an IntEnum subclass (or plain class, which is auto-converted).
+
+    Integer-encoded: each variant is an unsigned integer value. The underlying uint width
+    is computed from the maximum member value at decoration time.
+
+    Usage:
+        from enum import IntEnum
+        from pypeline import enum
+
+        @enum
+        class state_t(IntEnum):
+            IDLE    = 0
+            RUNNING = 1
+            DONE    = 2
+
+        # Parameterizable factory (user-written):
+        def make_my_enum_t(include_err=True):
+            members = {"IDLE": 0, "RUN": 1}
+            if include_err:
+                members["ERR"] = 2
+            return enum(IntEnum("my_enum_t", members))
+
+    @enum(name="...") replaces the automatic name with a name of your choosing
+    (see hw_func): the C type name becomes "<name>_s<digest>" and the VHDL
+    type name is the name itself.
+    """
+    if cls is None:
+        return lambda c: _enum(c, name, _sys._getframe(1))
+    return _enum(cls, name, _sys._getframe(1))
+
+
+def _enum(cls, name, frame):
+    if name is not None:
+        _check_user_name(name, "@enum")
+    name_info = _describe(cls, "enum", frame=frame)
+    if not isinstance(cls, type) or not issubclass(cls, _IntEnum):
+        # Plain class body: extract members in definition order, supporting both
+        # explicit int values and auto() (which assigns 0-based sequential values).
+        members = {}
+        counter = 0
+        for k, v in vars(cls).items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, _auto):
+                members[k] = counter
+                counter += 1
+            elif isinstance(v, int):
+                members[k] = v
+                counter = v + 1
+        cls = _IntEnum(cls.__name__, members)
+
+    # Canonical name: name_MEMBER1_val1_MEMBER2_val2 sorted by value. When
+    # every member's value is a plain 0..n-1 sequence in DECLARATION order
+    # (the auto()/near-universal case), the values are redundant with
+    # position and are dropped -- name_MEMBER1_MEMBER2 -- since spelling out
+    # e.g. "IDLE_0_RUNNING_1_DONE_2" wastes characters restating what the
+    # member order already says. A non-sequential (explicit/sparse-valued)
+    # enum keeps its values, so two differently-valued enums still can never
+    # collide on one name.
+    is_sequential = [m.value for m in cls] == list(range(len(cls.__members__)))
+    ordered_members = sorted(cls, key=lambda m: m.value)
+    if is_sequential:
+        parts = [m.name for m in ordered_members]
+    else:
+        parts = [f"{m.name}_{m.value}" for m in ordered_members]
+    canonical = cls.__name__ + ("_" + "_".join(parts) if parts else "")
+    ctype_name = collapse_overflow_name(canonical, cls.__name__, _MAX_MANGLE_NAME_LEN)
+
+    n_bits = _enum_bit_width(cls)
+    cls._pypeline_ctype_name = ctype_name
+    cls._pypeline_name_info = _replace_name_info(
+        name_info,
+        fields=tuple((m.name, _value_description(m.value)) for m in cls),
+        identity=_name_identity(
+            ("enum", cls.__name__, tuple((m.name, m.value) for m in cls))
+        ),
+    )
+    cls._pypeline_ctype_canonical = canonical
+    if name is not None:
+        cls._pypeline_user_name = name
+        cls._pypeline_unnamed_ctype_name = ctype_name
+        cls._pypeline_ctype_name = _named_key(name, ctype_name)
+        info = cls._pypeline_name_info
+        cls._pypeline_name_info = _replace_name_info(
+            info,
+            user_name=name,
+            identity=_name_identity(("user_name", name, info.identity)),
+        )
+    cls._pypeline_is_enum = True
+    cls._pypeline_enum_int_ctype = f"uint{n_bits}_t"
+    return cls
+
+
+# ─────────────────────────────────────────────
+# MAIN decorator and pragma registries
+# ─────────────────────────────────────────────
+
+_main_registry: list = []  # each registered @MAIN's wrapper, in registration order
+_part_registry: "str | None" = None
+_syn_tool_registry: "str | None" = None
+
+
+def PART(part_string: str):
+    """Set the global FPGA target part (equivalent to #pragma PART "...").
+
+    Call once at module level, e.g.::
+
+        PART("xc7a35ticsg324-1l")
+
+    The part selects the synthesis tool (see SYN_TOOL for naming one
+    directly). Can also come from the command line as ``--part``; setting
+    both to different values is an error. Calling this twice with different
+    parts is an error too, matching ``#pragma PART``.
+    """
+    global _part_registry
+    if (
+        _part_registry is not None
+        and part_string is not None
+        and _part_registry != part_string
+    ):
+        raise Exception(
+            f"Already set part to: {_part_registry} != {part_string}. "
+            "A design has one FPGA part -- is a board/part module imported twice?"
+        )
+    _part_registry = part_string
+
+
+def SYN_TOOL(tool_name: str):
+    """Set the global synthesis tool by name, instead of implying it from PART.
+
+    Call once at module level, e.g.::
+
+        SYN_TOOL("quartus")
+
+    Named alone, the tool supplies its own default part (its ``DEFAULT_PART``
+    in ``src/<TOOL>.py``), which is how a design stays part-neutral and still
+    builds on a specific backend. Can also come from the command line as
+    ``--syn_tool``. Setting both to different tools is an error, and so is
+    naming a tool that the design's PART does not select -- a part and a tool
+    are one decision spelled two ways, never an override.
+    """
+    global _syn_tool_registry
+    # Validate here so a typo points at this call, not at a later build step.
+    import SYN
+
+    SYN.GET_TOOL_MODULE(tool_name)
+    if (
+        _syn_tool_registry is not None
+        and tool_name is not None
+        and _syn_tool_registry != tool_name
+    ):
+        raise Exception(
+            f"Already set synthesis tool to: {_syn_tool_registry} != {tool_name}. "
+            "A design builds with one tool."
+        )
+    _syn_tool_registry = tool_name
+
+
+class _ClockResetDefault:
+    """The default of MAIN(reset=): the primary reset of the clock the MAIN
+    runs on (make_clock(..., reset=)), or no reset when that clock has none."""
+
+    def __repr__(self):
+        return "<the clock's reset>"
+
+
+_CLOCK_RESET = _ClockResetDefault()
+
+# MAIN(reset_registers=) values: which registers below the MAIN its reset resets
+_RESET_REGISTERS_POLICIES = ("requested", "all")
+
+
+class _MainInfo(typing.NamedTuple):
+    """What MAIN() recorded about one @MAIN; its wrapper's _pypeline_main."""
+
+    name: str  # hardware name: its entity, its port prefix, its main_mhz key
+    named: bool  # given by name= or by the function's own @hw_func(name=)
+    clock: "_Clock | None"  # the clock it names (a rate is its unnamed clock), None when bare
+    origin: str  # where it was made, for messages: "top.py:23"
+    # Its reset: a make_reset() reset, None for none, or _CLOCK_RESET (its
+    # clock's primary reset); resolved by _resolve_main_reset
+    reset: object = _CLOCK_RESET
+    # Which registers that reset resets: "requested" (only Reg[T, RESET]) or "all"
+    reset_registers: str = "requested"
+
+
+def _frame_origin(frame):
+    """'file.py:line' of a frame, for messages."""
+    return f"{_os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+
+
+def _register_main(
+    func, clock, name, origin, reset=_CLOCK_RESET, reset_registers="requested"
+):
+    """Register func as the @MAIN `name` on `clock` (a _Clock; None: bare),
+    made at `origin`, with its `reset` and `reset_registers` (MAIN(reset=,
+    reset_registers=), checked by _main_reset_args); returns its hw_func
+    wrapper, which carries a _MainInfo as _pypeline_main. Without a name the MAIN is named like its function:
+    its @hw_func(name=) if it has one, else its module-prefixed Python name
+    (_hw_func_name), as PY_TO_LOGIC names a top-level def. A given name is
+    used verbatim: MAIN() checks a user's name= first, and a global
+    instance's MAIN passes its wire's key plus a suffix, which may be longer
+    than a user name may be. Names must be deterministic: the build and
+    native sim re-execute the design and find each MAIN by its name."""
+    fn = _inspect.unwrap(func) if callable(func) else None
+    if fn is None or not hasattr(fn, "__code__"):
+        raise TypeError(f"MAIN({func!r}) at {origin}: a @MAIN must be a function")
+    if _sim_run_in_progress:
+        raise RuntimeError(
+            f"MAIN({fn.__qualname__}) at {origin} ran during a simulation run, "
+            f"after the design's @MAINs were collected. Make @MAINs while the "
+            f"design is imported: in module-level code, or in factories it calls."
+        )
+    wrapped = _sim_type_wrap(func)
+    for other in _main_registry:
+        if other is wrapped:
+            raise TypeError(
+                f"MAIN({fn.__qualname__}) at {origin}: that function already is "
+                f"the @MAIN '{other._pypeline_main.name}' "
+                f"({other._pypeline_main.origin}). Each @MAIN needs its own "
+                f"function: call the factory once per @MAIN."
+            )
+    user_name = getattr(wrapped, "_pypeline_user_name", None)
+    named = name is not None or user_name is not None
+    if name is None:
+        name = user_name or _hw_func_name(
+            _module_prefix(wrapped.__module__), wrapped.__name__
+        )
+    wrapped._pypeline_main = _MainInfo(
+        name, named, clock, origin, reset, reset_registers
+    )
+    _main_registry.append(wrapped)
+    return wrapped
+
+
+def _duplicate_main_names(mains):
+    """The error message for the first two of `mains` (@MAIN wrappers) that
+    share a name, ignoring case as VHDL does; None when all names differ."""
+    seen = {}
+    for fn in mains:
+        info = fn._pypeline_main
+        prior = seen.setdefault(info.name.lower(), fn)
+        if prior is fn:
+            continue
+        first = prior._pypeline_main
+        names = (
+            f"named '{info.name}'"
+            if first.name == info.name
+            else f"named '{first.name}' and '{info.name}', one name in VHDL"
+        )
+        return (
+            f"Two @MAINs are {names}: '{prior.__qualname__}' ({first.origin}) "
+            f"and '{fn.__qualname__}' ({info.origin}). Give each its own name "
+            f"with MAIN(fn, name=...)."
+        )
+    return None
+
+
+def MAIN(
+    func_or_clock=None,
+    *,
+    mhz=None,
+    clock=None,
+    name=None,
+    reset=_CLOCK_RESET,
+    reset_registers="requested",
+):
+    """Marks a function as a top-level hardware process.
+
+    As a decorator::
+
+        @MAIN                  # no clock named: inferred, or the default clock
+        @MAIN(100.0)           # positional MHz: the unnamed clock of that rate
+        @MAIN(mhz=100.0)       # keyword MHz
+        @MAIN(eth_clk)         # a clock from make_clock(...)
+        @MAIN(clock=eth_clk)   # keyword clock
+        @MAIN(name="top0")     # a name of your choosing (also with a clock)
+
+    Or called on a function, for @MAINs made in code (one per lane in a
+    loop, a factory's function, generated source)::
+
+        lanes = [MAIN(make_lane(i), name=f"lane{i}") for i in range(4)]
+        MAIN(fn, mhz=100.0, name="rx")
+        MAIN(fn, clock=eth_clk, name="rx")
+
+    Name the clock once: a rate or a clock, not both.
+
+    Resets (see make_reset)::
+
+        @MAIN(clk, reset_registers="all")   # every register below resets with clk.reset
+        @MAIN(clk)                          # only Reg[T, RESET] registers reset
+        @MAIN(clk, reset=gen_rst, reset_registers="all")  # another reset
+        @MAIN(clk, reset=None)              # no reset
+
+    reset= defaults to the primary reset of the MAIN's clock
+    (make_clock(..., reset=)); a bare MAIN uses the one of the clock it is
+    assigned. reset_registers="requested" (the default) resets only
+    Reg[T, RESET] registers; "all" resets every register below the MAIN but
+    Reg[T, NO_RESET] ones, the compiler's pipeline registers among them.
+
+    A @MAIN is named after its function, module-prefixed in an imported
+    module, unless name= gives its name verbatim. Its ports are
+    <name>_<argument> and <name>_return_output. Two @MAINs with one name
+    are an error. Call MAIN() while the design is imported.
+
+    Implies @hw_func: inputs/outputs are type-cast for simulation and
+    the function can be passed to sim_call().
+    """
+    if name is not None:
+        _check_user_name(name, "MAIN")
+    origin = _frame_origin(_sys._getframe(1))
+    _main_reset_args(reset, reset_registers, origin)
+    if callable(func_or_clock):
+        # Used as bare @MAIN, or called on a function
+        return _register_main(
+            func_or_clock,
+            _main_clock_arg(None, mhz, clock, origin),
+            name,
+            origin,
+            reset,
+            reset_registers,
+        )
+    # Used as @MAIN(100.0), @MAIN(clk), @MAIN(mhz=...), @MAIN(clock=...) or @MAIN(name=...)
+    main_clock = _main_clock_arg(func_or_clock, mhz, clock, origin)
+
+    def decorator(func):
+        return _register_main(
+            func,
+            main_clock,
+            name,
+            _frame_origin(_sys._getframe(1)),
+            reset,
+            reset_registers,
+        )
+
+    return decorator
+
+
+def _main_reset_args(reset, reset_registers, origin):
+    """Check MAIN(reset=, reset_registers=): a reset from make_reset(), None
+    or the default, and one of the reset_registers policies."""
+    if reset is not _CLOCK_RESET and reset is not None and not isinstance(reset, _Reset):
+        raise TypeError(
+            f"MAIN(reset={reset!r}) at {origin}: reset= takes a reset from "
+            f"make_reset() (the name it is bound to: `rst: Input[uint1_t] = "
+            f"make_reset()`, then reset=rst), or None for no reset"
+        )
+    if reset_registers not in _RESET_REGISTERS_POLICIES:
+        raise ValueError(
+            f"MAIN(reset_registers={reset_registers!r}) at {origin}: give "
+            f"\"requested\" (only Reg[T, RESET] registers reset, the default) or "
+            f"\"all\" (every register but Reg[T, NO_RESET] ones)"
+        )
+
+
+def _main_clock_arg(positional, mhz, clock, origin):
+    """The _Clock a MAIN(...) call names, or None for a bare @MAIN: a
+    positional rate or clock, mhz=, or clock=, at most one of them. A rate is
+    the unnamed clock of that rate."""
+    given = []
+    if isinstance(positional, _Clock):
+        given.append(("a clock", positional))
+    elif positional is not None:
+        if isinstance(positional, bool) or not isinstance(positional, (int, float)):
+            raise TypeError(
+                f"MAIN({positional!r}) at {origin}: give a rate in MHz, a clock from "
+                f"make_clock(...), or a function"
+            )
+        given.append(("a rate", positional))
+    if mhz is not None:
+        given.append(("mhz=", mhz))
+    if clock is not None:
+        if not isinstance(clock, _Clock):
+            raise TypeError(
+                f"MAIN(clock={clock!r}) at {origin}: clock= takes a clock from "
+                f"make_clock(...); give a rate as mhz="
+            )
+        given.append(("clock=", clock))
+    if len(given) > 1:
+        raise TypeError(
+            f"MAIN at {origin} names its clock twice ({given[0][0]} and "
+            f"{given[1][0]}): give a rate or a clock, once"
+        )
+    if not given:
+        return None
+    value = given[0][1]
+    if isinstance(value, _Clock):
+        return value
+    return _Clock(value, origin=origin)
+
+
+def sim_output(fn):
+    """Mark a function as simulation output-only.
+
+    Calls to @sim_output functions are skipped (return SimVal(0)) during
+    delta-cycle convergence passes and execute normally in the final
+    post-convergence pass each clock cycle. Use this for side effects such
+    as print, file writes, or live display updates that should fire exactly
+    once per cycle with the correct converged wire values.
+
+    The function body may also read (or write) a module-level Wire[T]/Input[T]/
+    Output[T] directly by bare name (or module.attr for a cross-module wire) --
+    the same AST rewriting @hw_func/@MAIN bodies get is applied here too, via
+    _sim_type_wrap, so e.g. `print(out0)` inside a @sim_output body works without
+    out0 being passed in as an argument. This works no matter where the function
+    is called from in the design -- a top-level @MAIN body, or a nested
+    non-MAIN helper -- not just one fixed location.
+
+    Known limitation: a @sim_output function that both references a wire
+    directly AND uses `global x; x = ...` to mutate an unrelated plain Python
+    module-level variable will only see that mutation in its own subsequent
+    calls (it runs against a rebuilt, detached copy of the module's globals
+    dict), not from other code reading the true module attribute externally.
+    """
+    fn._pypeline_sim_only = True  # its own body is plain Python: no call-site check
+    hw_fn = _sim_type_wrap(fn)
+
+    @_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _const_folding:
+            raise SimOnlyCallInElab(wrapper)
+        if _sim_converging:
+            return SimVal(0)
+        return hw_fn(*args, **kwargs)
+
+    wrapper._is_sim_output = True
+    return wrapper
+
+
+def sim_input(fn):
+    """Mark a function as simulation input-only -- the temporal/directional mirror
+    of @sim_output.
+
+    Two supported call forms, usable interchangeably or together:
+      - direct-write form: the function's own body assigns directly to a
+        module-level Wire[T]/Input[T]/Output[T] name (bare name, or module.attr
+        for a cross-module wire) -- e.g. `in0 = python_stuff()`. Called as a
+        bare statement: `in_global()`.
+      - return-value form: the function's own body has no wire reference; its
+        return value is captured by the calling @MAIN/@hw_func's own (already
+        AST-rewritten) assignment: `in1 = in_return()`. The call must be the
+        whole right-hand side and the target a module-level Wire[T]/Input[T]/
+        Output[T] (or a field/element of one, also `module.wire.field`). A local
+        target (`x = in_return()`), or the call nested in an expression, is an
+        error in both native sim (SimOnlyCallSiteError) and elaboration: the
+        value exists only in simulation, and HDL needs a real port
+        (`in1: Input[T]`) to carry it.
+
+    Both forms may be called from anywhere in the design -- a top-level @MAIN
+    body or a nested plain-Python helper -- any number of times, not just once
+    at a fixed point in simulation setup.
+
+    Runs the real body at most once per simulated clock cycle: the first call
+    (wherever in the design it happens to occur -- during delta-cycle
+    convergence or the unconditional final pass) computes for real and caches
+    the result; every later call the same cycle is a pure cache hit. This is
+    the temporal mirror of @sim_output's convergence gating: @sim_output defers
+    real execution to the final pass; @sim_input executes once, as early as it
+    is first reached, so a fresh value is available to every reader throughout
+    that cycle's convergence, not just after it. It also keeps convergence
+    stable: if the underlying value came from something non-idempotent (a
+    counter, a queue pop), calling it more than once per cycle would make its
+    wire look like it keeps changing.
+
+    The cache is reset once per cycle -- see pypeline_sim.py's _run_clock_cycle
+    (Layer 2) and this module's sim_call() (Layer 1, where each top-level
+    sim_call() invocation is itself one cycle).
+
+    Known limitation: the cache key is the function identity only (no args/
+    kwargs awareness) -- fine for zero-arg usage, but a @sim_input function
+    called with different arguments within the same cycle returns the first
+    call's cached result regardless of the later call's own arguments.
+    """
+    fn._pypeline_sim_only = True  # its own body is plain Python: no call-site check
+    hw_fn = _sim_type_wrap(fn)
+
+    @_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _const_folding:
+            # Before the cache: elaboration must never run (or cache) the body.
+            raise SimOnlyCallInElab(wrapper)
+        key = id(wrapper)
+        if key in _sim_input_cache:
+            return _sim_input_cache[key]
+        result = hw_fn(*args, **kwargs)
+        _sim_input_cache[key] = result
+        return result
+
+    wrapper._is_sim_input = True
+    return wrapper
+
+
+# ─────────────────────────────────────────────
+# @initial / @final: start/end-of-run hooks for simulation and synthesis
+# ─────────────────────────────────────────────
+
+# (fn, when, sim, syn) per decorated hook, in registration order. Cleared with
+# _main_registry on every design (re)import: PY_TO_LOGIC.PARSE_FILE and
+# pypeline_sim.import_design.
+_hook_registry: list = []
+# The syn hooks the pipelinec driver ran @initial from (set by PARSE_FILE's
+# run_syn_initial_hooks=True). Re-parses re-import the design into fresh module
+# globals; running syn @final hooks from this same list keeps them on the
+# initial hooks' module instance, so state shared between the two survives.
+_syn_hook_snapshot = None
+
+
+def _hook_decorator(when, fn, sim, syn):
+    if sim is None and syn is None:
+        sim = syn = True
+    sim, syn = bool(sim), bool(syn)
+
+    def register(f):
+        if not (sim or syn):
+            raise ValueError(
+                f"@{when} on {f.__name__!r}: sim=False and syn=False means the "
+                f"hook never runs -- enable at least one of sim/syn."
+            )
+        try:
+            required = [
+                p
+                for p in _inspect.signature(f).parameters.values()
+                if p.default is p.empty
+                and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+            ]
+        except (TypeError, ValueError):
+            required = []
+        if required:
+            raise TypeError(
+                f"@{when} hook {f.__name__!r} must take no arguments, got "
+                f"{[p.name for p in required]}."
+            )
+        f._is_pypeline_hook = True
+        _hook_registry.append((f, when, sim, syn))
+        return f
+
+    return register if fn is None else register(fn)
+
+
+def initial(fn=None, *, sim=None, syn=None):
+    """Run a plain Python function once at the start of a simulation and/or a
+    synthesis (hardware build) run.
+
+        @initial                  # both sim and syn
+        @initial(sim=True)        # simulation only
+        @initial(syn=True)        # synthesis only
+
+    The body is host Python, never hardware: it is not elaborated, and it
+    takes no arguments. Sim @initial hooks run once after the design is loaded
+    and reset, before the first clock cycle (so before any @sim_input), for
+    every simulator. Syn @initial hooks run once per pipelinec run, right after
+    the design is imported and before it is elaborated. Several hooks may
+    exist; they run in no particular order.
+    """
+    return _hook_decorator("initial", fn, sim, syn)
+
+
+def final(fn=None, *, sim=None, syn=None):
+    """Run a plain Python function once at the end of a simulation and/or a
+    synthesis (hardware build) run. Same forms as @initial.
+
+    Sim @final hooks run once after the last simulated cycle's @sim_output
+    calls, however the simulation ended: sim_finish(), --run N reaching N, or
+    an error (an assert, the --run all cap). On an error the original
+    exception is still the one raised. Syn @final hooks run once, right after
+    the final VHDL is written and before any bitstream generation.
+    """
+    return _hook_decorator("final", fn, sim, syn)
+
+
+def SNAPSHOT_HOOKS():
+    """A copy of the currently registered hooks (see _syn_hook_snapshot)."""
+    return list(_hook_registry)
+
+
+def _hook_fns(when, flow, hooks):
+    hooks = _hook_registry if hooks is None else hooks
+    return [fn for fn, w, sim, syn in hooks if w == when and (sim if flow == "sim" else syn)]
+
+
+def _call_hook(fn, when):
+    try:
+        fn()
+    except SimFinish:
+        raise RuntimeError(
+            f"sim_finish() called inside @{when} hook {fn.__name__!r} -- "
+            f"sim_finish() ends the clock loop and only means something inside "
+            f"a simulated cycle."
+        ) from None
+
+
+def RUN_INITIAL_HOOKS(flow, hooks=None):
+    """Run every @initial hook enabled for flow ("sim" or "syn")."""
+    for fn in _hook_fns("initial", flow, hooks):
+        _call_hook(fn, "initial")
+
+
+def RUN_FINAL_HOOKS(flow, hooks=None, pending_exc=None):
+    """Run every @final hook enabled for flow ("sim" or "syn").
+
+    Every hook runs even if an earlier one raises. With pending_exc (the error
+    that ended the run), hook errors are only printed so the original error is
+    what propagates; otherwise the first hook error is raised after all hooks
+    ran.
+    """
+    first_err = None
+    for fn in _hook_fns("final", flow, hooks):
+        try:
+            _call_hook(fn, "final")
+        except BaseException as e:
+            if pending_exc is not None or first_err is not None:
+                import traceback
+
+                print(f"ERROR in @final hook {fn.__name__!r}:", flush=True)
+                traceback.print_exception(type(e), e, e.__traceback__)
+            else:
+                first_err = e
+    if first_err is not None:
+        raise first_err
+
+
+# ─────────────────────────────────────────────
+# Design parameters: param() and -D NAME=VALUE
+# ─────────────────────────────────────────────
+
+import builtins as _builtins
+import keyword as _keyword
+import os as _param_os
+import sys as _param_sys
+
+# The -D table the driver installed (SET_DESIGN_PARAMS): name -> value text, or
+# True for a bare `-D NAME`. Like the AUTO_PIPELINE caches below, design
+# parameter state lives in this runtime module because PY_TO_LOGIC evicts the
+# design's modules between re-elaboration passes but never this one.
+_design_param_defines: dict = {}
+# name -> (value, source). A name resolves once per process, so every
+# re-elaboration pass and every simulation import of one build sees the value
+# the first import saw (an environment variable is read once, too).
+_design_param_values: dict = {}
+# name -> _ParamDecl for the current design import; reset per import, like the
+# MAIN and hook registries (RESET_DESIGN_PARAM_DECLARATIONS).
+_design_param_decls: dict = {}
+# -D names installed into builtins (cpp-style injected globals) -> the value
+# they replaced there (_NOT_INJECTED when there was none).
+_design_param_injected: dict = {}
+_NOT_INJECTED = object()
+_design_param_banner_printed = False
+
+
+class DesignParamError(ValueError):
+    """A -D value, a param() declaration, or how the design uses them is invalid."""
+
+
+def _parse_param_bool(text):
+    lowered = text.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("expected 1/0, true/false, yes/no or on/off")
+
+
+def _parse_param_int(text):
+    try:
+        return int(text)
+    except ValueError:
+        return int(text, 0)  # 0x10, 0b101
+
+
+def _parse_param_literal(text):
+    """A Python literal when the text is one (3, 2.5, (1, 2), 'x'), else the text."""
+    import ast
+
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return text
+
+
+def _parse_param_sequence(text, default):
+    """Comma-separated items ("16,64,256", optionally bracketed), each parsed
+    like the default's first element."""
+    body = text.strip()
+    if body[:1] + body[-1:] in ("()", "[]"):
+        body = body[1:-1]
+    items = [item.strip() for item in body.split(",") if item.strip()]
+    sample = default[0] if default else None
+    if sample is None:
+        return [_parse_param_literal(item) for item in items]
+    if isinstance(sample, bool):
+        return [_parse_param_bool(item) for item in items]
+    if isinstance(sample, int):
+        return [_parse_param_int(item) for item in items]
+    return [type(sample)(item) for item in items]
+
+
+def CHECK_DESIGN_PARAM_NAME(name):
+    """A -D or param() name must be a plain identifier that shadows nothing
+    Python itself provides (it may become a builtins entry)."""
+    if not isinstance(name, str) or not name.isidentifier() or _keyword.iskeyword(name):
+        raise DesignParamError(f"Design parameter name {name!r} is not a Python identifier")
+    if name.startswith("__") or (
+        hasattr(_builtins, name) and name not in _design_param_injected
+    ):
+        raise DesignParamError(
+            f"Design parameter name {name!r} would shadow the Python builtin of "
+            f"that name; choose another name"
+        )
+
+
+class _ParamDecl:
+    """One param() declaration: how to read its value and where it was declared."""
+
+    def __init__(self, name, default, type_, choices, help_, env, site):
+        # The -D rules: a name -D could never set (a builtin's) is an error here too
+        try:
+            CHECK_DESIGN_PARAM_NAME(name)
+        except DesignParamError as e:
+            raise DesignParamError(f"param(): {e} (at {site})") from None
+        self.name = name
+        self.default = default
+        self.type = type_ if type_ is not None or default is None else type(default)
+        self.choices = tuple(choices) if choices is not None else None
+        self.help = help_
+        self.env = env
+        self.site = site
+        if self.choices is not None and default is not None and default not in self.choices:
+            raise DesignParamError(
+                f"param({name!r}): default {default!r} is not one of {self.choices} (at {site})"
+            )
+
+    def same_as(self, other):
+        return (
+            type(self.default) is type(other.default)
+            and self.default == other.default
+            and self.type is other.type
+            and self.choices == other.choices
+            and self.env == other.env
+        )
+
+    def _error(self, problem, source):
+        where = {
+            "-D": "-D on the command line",
+            "default": "its default",
+        }.get(source, "environment variable " + source[len("env:"):])
+        return DesignParamError(
+            f"Design parameter {self.name}: {problem} (from {where}; declared at {self.site})"
+        )
+
+    def convert(self, raw, source):
+        if raw is True:  # bare `-D NAME`
+            if self.type in (None, bool):
+                return True
+            raise self._error(f"needs a value: -D {self.name}=...", source)
+        try:
+            if self.type is None:
+                return _parse_param_literal(raw)
+            if self.type is bool:
+                return _parse_param_bool(raw)
+            if self.type is int:
+                return _parse_param_int(raw)
+            if self.type in (tuple, list):
+                return self.type(_parse_param_sequence(raw, self.default))
+            return self.type(raw)
+        except (ValueError, TypeError) as e:
+            raise self._error(f"{raw!r} is not a valid value ({e})", source) from None
+
+    def resolve(self):
+        if self.name in _design_param_defines:
+            raw, source = _design_param_defines[self.name], "-D"
+        elif self.env is not None and _param_os.environ.get(self.env, "") != "":
+            raw, source = _param_os.environ[self.env], "env:" + self.env
+        else:
+            return self.default, "default"
+        value = self.convert(raw, source)
+        if self.choices is not None and value not in self.choices:
+            raise self._error(f"{value!r} is not one of {self.choices}", source)
+        return value, source
+
+
+def param(name, default=None, *, type=None, choices=None, help="", env=None):
+    """Declare a build parameter and return its value for this build.
+
+    The value comes from `-D NAME=VALUE` on the pypelinec / pypeline_sim.py
+    command line, else from environment variable `env` (only when given and
+    set), else `default`. It is a plain Python value, usable anywhere
+    elaboration-time Python is: clock rates, widths, factory arguments, which
+    module to import. Each build prints and records every parameter's value
+    and where it came from. See docs/pypeline_guide.md, "Build Parameters".
+
+    type: how -D/environment text is converted; inferred from the default.
+        bool accepts 1/0, true/false, yes/no, on/off; a tuple or list default
+        takes comma-separated items. With neither a default nor a type, the
+        text is read as a Python literal, else kept as a string.
+    choices: the allowed values; anything else is an error naming where the
+        value came from.
+    help: one line shown by `pypelinec design.py --list_params`.
+    """
+    frame = _param_sys._getframe(1)
+    site = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    decl = _ParamDecl(name, default, type, choices, help, env, site)
+    previous = _design_param_decls.get(name)
+    if previous is None:
+        _design_param_decls[name] = decl
+    elif not previous.same_as(decl):
+        raise DesignParamError(
+            f"param({name!r}) is declared differently at {previous.site} and "
+            f"{site}; declare it once and import the value"
+        )
+    if name not in _design_param_values:
+        _design_param_values[name] = decl.resolve()
+    value = _design_param_values[name][0]
+    return list(value) if isinstance(value, list) else value
+
+
+def SET_DESIGN_PARAMS(defines=None) -> None:
+    """Driver hook: install the -D table (name -> value text, or True for a
+    bare `-D NAME`) before the first design import, replacing any earlier one.
+
+    Every name is also installed in builtins, so a design can read an
+    undeclared -D name as a plain global, like a C preprocessor macro.
+    CHECK_DESIGN_PARAM_USE (below) rejects the mistakes that allows."""
+    global _design_param_defines, _design_param_banner_printed
+    _design_param_banner_printed = False
+    for name, previous in _design_param_injected.items():
+        if previous is _NOT_INJECTED:
+            _builtins.__dict__.pop(name, None)
+        else:
+            setattr(_builtins, name, previous)
+    _design_param_injected.clear()
+    defines = dict(defines or {})
+    for name in defines:
+        CHECK_DESIGN_PARAM_NAME(name)
+    _design_param_defines = defines
+    _design_param_values.clear()
+    _design_param_decls.clear()
+    for name, raw in defines.items():
+        _design_param_injected[name] = _builtins.__dict__.get(name, _NOT_INJECTED)
+        setattr(_builtins, name, True if raw is True else _parse_param_literal(raw))
+
+
+def RESET_DESIGN_PARAM_DECLARATIONS() -> None:
+    """Forget the previous design import's param() declarations (values stay)."""
+    _design_param_decls.clear()
+
+
+def DESIGN_PARAM_DEFINES() -> dict:
+    return dict(_design_param_defines)
+
+
+def DESIGN_PARAM_DECLARATIONS() -> dict:
+    return dict(_design_param_decls)
+
+
+def DESIGN_PARAM_VALUES() -> dict:
+    return dict(_design_param_values)
+
+
+# Driver side (pypelinec and pypeline_sim.py): -D parsing, the checks that keep
+# cpp-style injected globals honest, and the table every build prints and
+# records in source_provenance.json.
+
+_PARAM_SRC_DIR = _param_os.path.dirname(_param_os.path.abspath(__file__))
+_PARAM_LIBRARY_DIR = (
+    _param_os.path.join(_param_os.path.dirname(_PARAM_SRC_DIR), "include") + _param_os.sep
+)
+
+
+def PARSE_DESIGN_PARAM_DEFINES(items):
+    """-D arguments ("NAME=VALUE", or "NAME" for True) -> {name: text or True}.
+    Giving one name two different values is an error."""
+    defines = {}
+    for item in items or ():
+        name, sep, value = item.partition("=")
+        name = name.strip()
+        raw = value if sep else True
+        CHECK_DESIGN_PARAM_NAME(name)
+        if name in defines and defines[name] != raw:
+            raise DesignParamError(
+                f"-D {name} is given twice with different values "
+                f"({defines[name]!r} and {raw!r})"
+            )
+        defines[name] = raw
+    return defines
+
+
+def _param_system_roots():
+    import sysconfig
+
+    paths = sysconfig.get_paths()
+    return tuple(
+        _param_os.path.abspath(paths[key]) + _param_os.sep
+        for key in ("stdlib", "platstdlib", "purelib", "platlib")
+        if key in paths
+    )
+
+
+def DESIGN_PARAM_SOURCE_FILES(module_names, top_file):
+    """The design's own .py files: the top file plus every module a design
+    import loaded that is not the standard library, an installed package, the
+    compiler (src/*.py) or the Pypeline library (include/)."""
+    files = {_param_os.path.abspath(top_file)}
+    system = _param_system_roots()
+    for name in module_names:
+        path = getattr(_param_sys.modules.get(name), "__file__", None)
+        if not path or not path.endswith(".py"):
+            continue
+        path = _param_os.path.abspath(path)
+        parts = path.split(_param_os.sep)
+        if (
+            path.startswith(system)
+            or "site-packages" in parts
+            or "dist-packages" in parts
+            or _param_os.path.dirname(path) == _PARAM_SRC_DIR
+            or path.startswith(_PARAM_LIBRARY_DIR)
+        ):
+            continue
+        files.add(path)
+    return sorted(files)
+
+
+def _param_source_text(path):
+    # Under pypelinec the design source is frozen: check the bytes the build
+    # executed, not a file edited since.
+    ptl = _param_sys.modules.get("PY_TO_LOGIC")
+    if ptl is not None:
+        return ptl.READ_SOURCE_TEXT(path)
+    with open(path, "r") as f:
+        return f.read()
+
+
+def _param_scan_globals(path):
+    """(names bound at module scope, names read as unbound globals) in one file."""
+    import symtable
+
+    text = _param_source_text(path)
+    table = symtable.symtable(text, path, "exec")
+    bound, reads = set(), set()
+    for sym in table.get_symbols():
+        if sym.is_assigned() or sym.is_imported():
+            bound.add(sym.get_name())
+        elif sym.is_referenced():
+            reads.add(sym.get_name())
+    pending = list(table.get_children())
+    while pending:
+        scope = pending.pop()
+        for sym in scope.get_symbols():
+            if sym.is_declared_global() and sym.is_assigned():
+                bound.add(sym.get_name())
+            elif sym.is_global() and sym.is_referenced():
+                reads.add(sym.get_name())
+        pending.extend(scope.get_children())
+    return bound, reads - bound, text
+
+
+def _param_binding_line(text, name):
+    """First module-level line binding `name` (for error messages only)."""
+    import ast
+
+    pending = list(ast.parse(text).body)
+    while pending:
+        node = pending.pop(0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return node.lineno
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name.split(".")[0]) == name for a in node.names):
+                return node.lineno
+            continue
+        if isinstance(
+            node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            continue
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Store):
+            return node.lineno
+        pending.extend(ast.iter_child_nodes(node))
+    return None
+
+
+def _param_short_path(path):
+    try:
+        rel = _param_os.path.relpath(path)
+    except ValueError:  # another drive than the working directory (Windows)
+        return path
+    return path if rel.startswith("..") else rel
+
+
+def _param_short_site(site):
+    path, _, line = site.rpartition(":")
+    return f"{_param_short_path(path)}:{line}"
+
+
+def CHECK_DESIGN_PARAM_USE(design_files):
+    """After a design import: every -D name must reach the design, either
+    through param() or as an injected global some design module reads.
+
+    Fails on an injected name nothing reads (a typo), one a design module
+    assigns at module level (that module would ignore the command line), and a
+    declared name read as a bare global (it only resolves while -D gives it).
+    """
+    import difflib
+
+    defines = DESIGN_PARAM_DEFINES()
+    if not defines:
+        return
+    declared = DESIGN_PARAM_DECLARATIONS()
+    scans = {path: _param_scan_globals(path) for path in design_files}
+    all_reads = set()
+    for _, reads, _ in scans.values():
+        all_reads |= reads
+    errors = []
+    for name in sorted(defines):
+        readers = [path for path, (_, reads, _) in scans.items() if name in reads]
+        if name in declared:
+            for path in readers:
+                errors.append(
+                    f"-D {name}: {_param_short_path(path)} reads {name} as a bare "
+                    f"global, which only works while -D gives it. {name} is declared "
+                    f"with param() at {_param_short_site(declared[name].site)}; "
+                    f"import that value instead."
+                )
+            continue
+        binders = [path for path, (bound, _, _) in scans.items() if name in bound]
+        for path in binders:
+            line = _param_binding_line(scans[path][2], name)
+            where = _param_short_path(path) + ("" if line is None else f":{line}")
+            errors.append(
+                f"-D {name}: {where} assigns {name} at module level, so that module "
+                f"ignores the command-line value. Declare it there with "
+                f"{name} = param({name!r}, <default>) instead."
+            )
+        if not binders and not readers:
+            python_builtins = set(dir(_builtins)) - set(defines)
+            candidates = (set(declared) | all_reads) - python_builtins - {name}
+            guesses = difflib.get_close_matches(name, sorted(candidates), n=3)
+            known = ", ".join(sorted(declared)) or "none"
+            errors.append(
+                f"-D {name}: nothing in this design uses it -- no param() declares "
+                f"it and no design module reads it as a global."
+                + (f" Did you mean {' or '.join(guesses)}?" if guesses else "")
+                + f" (Declared parameters: {known}.)"
+            )
+    if errors:
+        raise DesignParamError("Design parameter errors:\n  " + "\n  ".join(errors))
+
+
+def _param_json_safe(value):
+    if isinstance(value, (tuple, list)):
+        return [_param_json_safe(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return repr(value)
+
+
+def _param_rows():
+    """(name, value, source, declaration or None) for every parameter the
+    current design import declared or the -D table injected."""
+    defines = DESIGN_PARAM_DEFINES()
+    declared = DESIGN_PARAM_DECLARATIONS()
+    values = DESIGN_PARAM_VALUES()
+    rows = []
+    for name in sorted(declared):
+        decl = declared[name]
+        value, source = values.get(name, (decl.default, "default"))
+        rows.append((name, value, source, decl))
+    for name in sorted(set(defines) - set(declared)):
+        raw = defines[name]
+        value = True if raw is True else _parse_param_literal(raw)
+        rows.append((name, value, "injected", None))
+    return rows
+
+
+def DESIGN_PARAM_REPORT():
+    """One JSON-ready record per parameter, for source_provenance.json."""
+    records = []
+    for name, value, source, decl in _param_rows():
+        record = {"name": name, "value": _param_json_safe(value), "source": source}
+        if decl is not None:
+            record.update(
+                declared_at=decl.site,
+                type=getattr(decl.type, "__name__", None) if decl.type else None,
+                default=_param_json_safe(decl.default),
+                choices=None if decl.choices is None else _param_json_safe(decl.choices),
+                help=decl.help or None,
+            )
+        records.append(record)
+    return records
+
+
+def DESIGN_PARAM_BANNER_LINES():
+    rows = _param_rows()
+    if not rows:
+        return []
+    width = max(len(name) for name, *_ in rows)
+    lines = ["Design parameters:"]
+    for name, value, source, decl in rows:
+        where = f"  {_param_short_site(decl.site)}" if decl is not None else ""
+        lines.append(f"  {name:<{width}} = {value!r} ({source}){where}")
+    return lines
+
+
+def PRINT_DESIGN_PARAM_BANNER_ONCE():
+    """Print the parameter table after the first design import of a process
+    (re-elaboration passes and simulation imports see the same values)."""
+    global _design_param_banner_printed
+    if _design_param_banner_printed:
+        return
+    lines = DESIGN_PARAM_BANNER_LINES()
+    if lines:
+        _design_param_banner_printed = True
+        print("\n".join(lines), flush=True)
+
+
+def DESIGN_PARAM_LIST_TEXT(design_file):
+    """--list_params output: every parameter the design declares, with its
+    type, default, allowed values and help, and any injected -D names."""
+    rows = _param_rows()
+    shown = _param_short_path(design_file)
+    out = [f"Design parameters of {shown} (set with -D NAME=VALUE):"]
+    if not rows:
+        out.append("  (none declared)")
+    for name, value, source, decl in rows:
+        if decl is None:
+            out.append(f"  {name} = {value!r} (injected global, read by name)")
+            continue
+        if decl.type is None:
+            kind = "literal"
+        elif decl.type in (bool, int, float, str, tuple, list):
+            kind = decl.type.__name__
+        else:
+            kind = "text"  # converted by a custom type= function
+        line = f"  {name}: {kind} = {value!r} ({source})"
+        if source != "default":
+            line += f"; default {decl.default!r}"
+        if decl.choices is not None:
+            line += f"; one of {', '.join(repr(c) for c in decl.choices)}"
+        if decl.env is not None:
+            line += f"; environment fallback {decl.env}"
+        out.append(line)
+        if decl.help:
+            out.append(f"      {decl.help}")
+        out.append(f"      declared at {_param_short_site(decl.site)}")
+    return "\n".join(out)
+
+
+# ─────────────────────────────────────────────
+# AUTO_PIPELINE: tool-pipelined regions with .latency feedback
+# ─────────────────────────────────────────────
+
+# canonical_key -> discovered pipeline stage count, harvested from the
+# previous elaborate+sweep pass. Installed only by the pipelinec driver:
+# between pin-and-confirm passes (SET_AUTO_PIPELINE_LATENCY_CACHE), and again
+# before a non---comb `--sim` run's native-sim design import so both
+# .latency reads and the AUTO_PIPELINE delay-line emulation see the built
+# stage counts. Always empty in plain native Pypeline sim (pypeline_sim.py
+# run directly) and in --comb/--no_synth/--yosys_json builds, so .latency
+# reads its constructor value there (fixed latency=N, else 0).
+_auto_pipeline_latency_cache: dict = {}
+
+# Complete auto-pipelined RAM implementations, installed before design re-import.
+# These live in the runtime module so compiler/design module eviction cannot
+# discard the selected topology (latency alone is insufficient).
+_auto_pipeline_ram_plan_cache: dict = {}
+# Bootstrap factories seen during the current import. Native simulation uses
+# these to reconcile a late PART/CLI target before any clocks or hooks run.
+_auto_pipeline_ram_served: dict = {}
+_auto_pipeline_ram_native_target = None
+
+
+def SET_AUTO_PIPELINE_RAM_PLAN_CACHE(plans):
+    global _auto_pipeline_ram_plan_cache
+    _auto_pipeline_ram_plan_cache = dict(plans or {})
+
+
+def AUTO_PIPELINE_RAM_PLAN_CACHE():
+    return dict(_auto_pipeline_ram_plan_cache)
+
+
+# True once any AUTO_PIPELINE .latency was read during the current design-file
+# execution. The pipelinec driver uses this to skip the pin-and-confirm pass
+# entirely: if no Python code consumed a latency value, the cache cannot have
+# influenced the elaborated design, so the bootstrap pass's result is final.
+_auto_pipeline_latency_was_read: bool = False
+# Which kind of pypelinec build (if any) is executing the design, set by the
+# pipelinec driver before its first PARSE_FILE (SET_AUTO_PIPELINE_BUILD_MODE):
+#   None          plain native sim, or any import outside the driver (default)
+#   "sweep"       a synthesizing build: its throughput sweep honors
+#                 start_latency=, so bootstrap .latency reads start_latency
+#   "fixed_only"  --comb / --no_synth / --yosys_json: no sweep runs; only
+#                 fixed latency= call sites get registers
+_AUTO_PIPELINE_BUILD_MODES = (None, "sweep", "fixed_only")
+_auto_pipeline_build_mode = None
+# (AUTO_PIPELINE object, value served) for every .latency read during the
+# current design execution -- recorded only inside a pypelinec build. The
+# driver compares them against the harvested stage counts: when every read
+# already equals what was built, the pin-and-confirm re-elaboration is skipped.
+_auto_pipeline_served: list = []
+# (AUTO_PIPELINE object, "file:line" that read it) for the same reads: the
+# pass report (AUTO_PIPELINE.RECORD_LATENCY_PASS) says where each value went.
+_auto_pipeline_read_sites: list = []
+# Per-construction serial: disambiguates plain-native-sim delay-line keys
+# without importing the compiler (see AUTO_PIPELINE._sim_key).
+_auto_pipeline_serial: int = 0
+# name -> (signature, "file:line") of the first AUTO_PIPELINE(..., name=) this
+# design execution constructed under that name. A name is one latency group:
+# every tag sharing it must wrap the same function with the same constraint.
+# Reset with the other per-execution tracking (RESET_AUTO_MULTI_CYCLE_TRACKING).
+_auto_pipeline_names: dict = {}
+
+
+def _construction_site():
+    """Where a design constructed an AUTO tag: "file:line", plus the design
+    frame that called the library when a library factory built it (the same
+    form as a .latency read site, see _latency_read_site)."""
+    return _latency_read_site()
+
+
+# ─────────────────────────────────────────────
+# AUTO objects and clock goals: an AUTO_PIPELINE / AUTO_FSM object's results
+# are those of its key at the clock goals of the MAINs that use it
+# (docs/pypeline_DESIGN.md, "AUTO objects and clock goals")
+# ─────────────────────────────────────────────
+
+# (kind, construction site) -> the key an object built there finds its installed
+# results under (its binding): its key at the clock goal of the MAINs that use
+# it. Only objects of keys used at more than one goal have entries; any other
+# object's binding is its canonical_key, as is that of an AUTO_PIPELINE used
+# at several goals itself (one depth per goal, so no installed value matches
+# it). Installed by PY_TO_LOGIC.PARSE_FILE from the previous parse
+# (SET_AUTO_GOAL_TABLES).
+_auto_site_bindings: dict = {}
+# (kind, canonical_key) -> how the objects of a key used at several goals and
+# built at several sites are told apart in generated names: "site" (each object
+# on its own, while PARSE_FILE learns where each is used) or {site: its goals}
+# (objects used at the same goals share hardware). Installed with the above.
+_auto_split_keys: dict = {}
+# Goal text (GOAL_TEXT) of a native simulation replaying built hardware, or
+# None: an object then resolves to its key's binding at this goal
+_auto_run_goal = None
+# (kind, tag) for every AUTO_PIPELINE / AUTO_FSM object the current design
+# execution constructed, in construction order
+_auto_constructed: list = []
+# Construction chain -> how many objects the current design execution built
+# with it (the ordinal that tells objects from one source line apart)
+_auto_site_counts: dict = {}
+# An object's binding before its first use resolves it
+_UNRESOLVED = object()
+# (kind, construction site) -> "file:line" sites that read the object's .latency
+# during the current design execution, outside a native simulation run
+_auto_reads: dict = {}
+
+
+def GOAL_TEXT(goal) -> str:
+    """A clock goal (MHz, or None) in the clock-port style bindings and
+    generated names use: 50.0 -> "50p0mhz", None -> "nogoal"."""
+    if goal is None:
+        return "nogoal"
+    return str(float(goal)).replace(".", "p").replace("-", "m") + "mhz"
+
+
+def GOAL_BINDING(key, goal) -> str:
+    """The binding of `key` at one clock goal: key@50p0mhz."""
+    return f"{key}@{GOAL_TEXT(goal)}"
+
+
+def SET_AUTO_GOAL_TABLES(site_bindings, split_keys) -> None:
+    """PY_TO_LOGIC.PARSE_FILE hook: install the bindings and split keys the
+    next design execution's AUTO objects resolve with (see above)."""
+    global _auto_site_bindings, _auto_split_keys
+    _auto_site_bindings = dict(site_bindings)
+    _auto_split_keys = dict(split_keys)
+
+
+def AUTO_GOAL_TABLES():
+    """(site bindings, split keys) installed for the current design execution."""
+    return dict(_auto_site_bindings), dict(_auto_split_keys)
+
+
+def SET_AUTO_RUN_GOAL(goal_text) -> None:
+    """pypeline_sim hook: the goal text of a replay of built hardware whose
+    results are per clock goal, or None."""
+    global _auto_run_goal
+    _auto_run_goal = goal_text
+
+
+def AUTO_READS():
+    """(kind, construction site) -> sites that read that object's .latency
+    during the current design execution (outside a native simulation run)."""
+    return {pair: list(sites) for pair, sites in _auto_reads.items()}
+
+
+def AUTO_CONSTRUCTED():
+    """(kind, canonical_key, site, splittable) of every AUTO_PIPELINE /
+    AUTO_FSM object the current design execution constructed, in construction
+    order. splittable: whether its latency can depend on the clock goal (not a
+    fixed latency=, nor an AUTO_FSM's pinned unit)."""
+    return [
+        (
+            kind,
+            tag.canonical_key,
+            tag.site,
+            kind != "AUTO_PIPELINE"
+            or (tag.fixed_latency is None and tag._auto_fsm_implementation is None),
+        )
+        for kind, tag in _auto_constructed
+    ]
+
+
+def _auto_construction_site():
+    """Where an AUTO_PIPELINE / AUTO_FSM object is built, unique within one
+    design execution: the (module, function, line) of each frame from its
+    construction out to the first module-level frame, so a factory's own line
+    and the line that called it both count, plus an ordinal among objects with
+    that chain (a loop, a comprehension): "module:function:line|...#ordinal".
+    An object built while elaborating a @hw_func body is one per body line, so
+    it has no ordinal. One built while a native simulation run steps its
+    cycles (every cycle, in a body) has none: nothing resolves by site there."""
+    if _sim_run_in_progress:
+        return None
+    if _const_folding:
+        return "body:" + _latency_read_site()
+    frames = []
+    frame = _sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_filename != __file__:
+            frames.append(
+                f"{frame.f_globals.get('__name__', '?')}:"
+                f"{frame.f_code.co_name}:{frame.f_lineno}"
+            )
+            if frame.f_code.co_name == "<module>":
+                break
+        frame = frame.f_back
+    chain = "|".join(frames)
+    ordinal = _auto_site_counts.get(chain, 0)
+    _auto_site_counts[chain] = ordinal + 1
+    return f"{chain}#{ordinal}"
+
+
+def _auto_binding(kind, tag, cache):
+    """The key `tag`'s installed results are under: its canonical_key, the
+    binding installed for its construction site, or in a replay of per-goal
+    results its key at the run's goal."""
+    key = tag.canonical_key
+    if _auto_run_goal is not None:
+        return key if key in cache else f"{key}@{_auto_run_goal}"
+    return _auto_site_bindings.get((kind, tag.site), key)
+
+
+def _auto_split_component(kind, tag):
+    """What tells `tag` apart from other objects of its key in generated names
+    (see _auto_split_keys), or None when nothing needs to."""
+    if not _auto_split_keys:
+        return None
+    mode = _auto_split_keys.get((kind, tag.canonical_key))
+    if mode is None:
+        return None
+    if mode == "site" or tag.site not in mode:
+        return tag.site
+    return "_".join(GOAL_TEXT(goal) for goal in mode[tag.site]) or "unused"
+
+
+# (kind, canonical_key) -> (latency, source text): starting latencies from the
+# latency memory and --latency_hints files, installed by the pipelinec driver
+# before its first parse of a synthesizing build (SWEEP.LOAD_LATENCY_SEEDS).
+# kind is "AUTO_PIPELINE" or "AUTO_MULTI_CYCLE". A seed is only a starting
+# value, like start_latency=: it is what .latency serves (and where the tag's
+# planned sweep starts) until the build has its own result; the harvested cache of a
+# later pin-and-confirm pass always wins over it, and it is never identity.
+_latency_seeds: dict = {}
+# (kind, key) -> (value served, source) for every seed applied during the
+# current design execution; and every (kind, key) a constructed tag looked up
+_latency_seeds_applied: dict = {}
+_latency_seeds_looked_up: set = set()
+
+def SET_LATENCY_SEEDS(seeds: dict) -> None:
+    """pipelinec-driver hook: install starting latencies
+    ({(kind, canonical_key): (latency, source)}) for the next design
+    executions of a synthesizing build; {} removes them."""
+    global _latency_seeds
+    _latency_seeds = dict(seeds)
+
+
+def LATENCY_SEEDS_APPLIED() -> dict:
+    """(kind, key) -> (value, source) of every seed the current design
+    execution's AUTO_PIPELINE / AUTO_MULTI_CYCLE constructions applied."""
+    return dict(_latency_seeds_applied)
+
+
+def LATENCY_SEEDS_UNUSED() -> list:
+    """Installed seeds no tag of the current design execution looked up
+    (a renamed or removed tag, or a stale hint), sorted."""
+    return sorted(
+        (kind, key, value, source)
+        for (kind, key), (value, source) in _latency_seeds.items()
+        if (kind, key) not in _latency_seeds_looked_up
+    )
+
+
+def _latency_seed(kind, key, max_latency, binding=None):
+    """The installed seed for one tag, clamped to max_latency, or None: the
+    one for its binding (its key at one clock goal) when that differs from the
+    key, else the key's own (a hints-file entry names the key)."""
+    _latency_seeds_looked_up.add((kind, key))
+    pair = (kind, binding) if binding and (kind, binding) in _latency_seeds else (kind, key)
+    if pair[1] != key:
+        _latency_seeds_looked_up.add(pair)
+    entry = _latency_seeds.get(pair)
+    if entry is None:
+        return None
+    value, source = entry
+    if max_latency is not None:
+        value = min(value, max_latency)
+    _latency_seeds_applied[pair] = (value, source)
+    return value
+
+
+# The --out_dir whose built hardware the installed caches hold, while native
+# simulation runs another top on it (pypeline_sim.run_sim built_hardware_from=);
+# None otherwise. While set, using an AUTO_PIPELINE / AUTO_FSM / AUTO_MULTI_CYCLE
+# or auto-pipelined RAM that build never decided is an error.
+_built_hardware_source = None
+# (kind, canonical_key) -> the .latency value that build's design read for an
+# AUTO_PIPELINE / AUTO_MULTI_CYCLE it never instantiated; set with
+# _built_hardware_source
+_built_unbuilt_reads = {}
+
+
+class BuiltHardwareError(RuntimeError):
+    """Native simulation of a built top's hardware met hardware that build did
+    not decide (see SET_BUILT_HARDWARE_SOURCE)."""
+
+
+def SET_BUILT_HARDWARE_SOURCE(source, unbuilt_reads=None) -> None:
+    """pypeline_sim hook: the build directory whose decisions the installed
+    caches hold, or None for an ordinary simulation. unbuilt_reads is that
+    build's {kind: {canonical_key: value}} of .latency values read for tags it
+    never instantiated (SIM.WRITE_BUILT_HARDWARE)."""
+    global _built_hardware_source
+    _built_hardware_source = source
+    _built_unbuilt_reads.clear()
+    for kind, reads in (unbuilt_reads or {}).items():
+        for key, value in reads.items():
+            _built_unbuilt_reads[(kind, key)] = value
+
+
+def BUILT_HARDWARE_SOURCE():
+    return _built_hardware_source
+
+
+def _require_built(kind, tag, read=False):
+    """While simulating built hardware, refuse a tag that build never decided
+    (tag._built_decided): its latency, and so the simulated timing, would be a
+    guess. A .latency read (read=True) of a tag the build read too but never
+    instantiated is allowed: the tag returns the value that build read
+    (_built_unbuilt_reads). Reads canonical_key only then, so plain simulation
+    never imports the compiler."""
+    if _built_hardware_source is not None and not tag._built_decided:
+        if read and (kind, tag.binding_key) in _built_unbuilt_reads:
+            return
+        raise BuiltHardwareError(
+            f"{kind} {tag.canonical_key} is not part of the hardware built in "
+            f"{_built_hardware_source}: that build never decided it. Simulate a "
+            "testbench whose hardware that build contains, or rebuild it."
+        )
+
+
+def SET_AUTO_PIPELINE_LATENCY_CACHE(cache: dict) -> None:
+    """pipelinec-driver hook: install the previous pass's harvested
+    AUTO_PIPELINE latencies (canonical_key -> stage count) so the next
+    design-file execution's AUTO_PIPELINE(...) constructions resolve
+    .latency to real values."""
+    global _auto_pipeline_latency_cache
+    _auto_pipeline_latency_cache = dict(cache)
+
+
+def SET_AUTO_PIPELINE_BUILD_MODE(mode) -> None:
+    """pipelinec-driver hook: declare what kind of build executes the design
+    (None / "sweep" / "fixed_only", see _auto_pipeline_build_mode)."""
+    global _auto_pipeline_build_mode
+    if mode not in _AUTO_PIPELINE_BUILD_MODES:
+        raise ValueError(
+            f"AUTO_PIPELINE build mode must be one of {_AUTO_PIPELINE_BUILD_MODES}, "
+            f"got {mode!r}"
+        )
+    _auto_pipeline_build_mode = mode
+
+
+def AUTO_PIPELINE_BUILD_MODE():
+    return _auto_pipeline_build_mode
+
+
+def CLEAR_AUTO_PIPELINE_LATENCY_READ_FLAG() -> None:
+    global _auto_pipeline_latency_was_read
+    _auto_pipeline_latency_was_read = False
+    _auto_pipeline_served.clear()
+    _auto_pipeline_read_sites.clear()
+    # AUTO_MULTI_CYCLE construction ordinals and reads are per design execution too
+    RESET_AUTO_MULTI_CYCLE_TRACKING()
+
+
+def AUTO_PIPELINE_LATENCY_WAS_READ() -> bool:
+    return _auto_pipeline_latency_was_read
+
+
+def AUTO_PIPELINE_SERVED_LATENCIES() -> dict:
+    """canonical_key -> set of values .latency returned during the current
+    design execution (pypelinec builds only; empty otherwise)."""
+    served = {}
+    for ap, value in _auto_pipeline_served:
+        served.setdefault(ap.binding_key, set()).add(value)
+    return served
+
+
+def AUTO_PIPELINE_READ_SITES() -> dict:
+    """canonical_key -> "file:line" sites that read .latency during the current
+    design execution, first read first (pypelinec builds only)."""
+    sites = {}
+    for ap, site in _auto_pipeline_read_sites:
+        found = sites.setdefault(ap.binding_key, [])
+        if site not in found:
+            found.append(site)
+    return sites
+
+
+_PYPELINE_LIBRARY_DIR = _param_os.path.join(
+    _param_os.path.dirname(_param_os.path.dirname(_param_os.path.abspath(__file__))),
+    "include",
+    "pypeline",
+) + _param_os.sep
+
+
+def _latency_read_site():
+    """Where a bottom-up .latency value was read: "file:line" of the first frame
+    outside this module, and when that is Pypeline library code (a factory
+    sizing its own FIFO), also the nearest design-file frame that called it.
+
+    A read inside a hardware body happens while PY_TO_LOGIC folds a constant
+    expression, compiled under a pseudo file name (<const_eval> and the like)
+    with the function's own source line numbers; the file is then the one the
+    elaborator (the nearest frame whose `self` has a src_file) is elaborating."""
+    abspath = _param_os.path.abspath
+    frame = _param_sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if frame is None:
+        return "<unknown>"
+    if frame.f_code.co_filename.startswith("<"):
+        outer = frame.f_back
+        while outer is not None:
+            src_file = getattr(outer.f_locals.get("self"), "src_file", None)
+            if isinstance(src_file, str):
+                return f"{abspath(src_file)}:{frame.f_lineno}"
+            outer = outer.f_back
+    path = abspath(frame.f_code.co_filename)
+    site = f"{path}:{frame.f_lineno}"
+    if not path.startswith(_PYPELINE_LIBRARY_DIR):
+        return site
+    outer = frame.f_back
+    while outer is not None and (
+        outer.f_code.co_filename == __file__
+        or abspath(outer.f_code.co_filename).startswith(_PYPELINE_LIBRARY_DIR)
+    ):
+        outer = outer.f_back
+    if outer is None:
+        return site
+    return f"{site} (via {abspath(outer.f_code.co_filename)}:{outer.f_lineno})"
+
+
+def _auto_pipeline_latency_suffix(latency, start_latency, max_latency) -> str:
+    """Canonical-key / entity-name suffix for an AUTO_PIPELINE latency
+    constraint; "" when unconstrained. Must match
+    LOGIC.AutoPipelineLatency.key_suffix (a unit test checks)."""
+    if latency is not None:
+        return f"_latency_{latency}"
+    suffix = ""
+    if start_latency is not None:
+        suffix += f"_start_latency_{start_latency}"
+    if max_latency is not None:
+        suffix += f"_max_latency_{max_latency}"
+    return suffix
+
+
+def _check_auto_pipeline_latency_arg(name, value):
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            f"AUTO_PIPELINE(func, {name}=...): must be an int, got "
+            f"{type(value).__name__}"
+        )
+    if value < 0:
+        raise ValueError(f"AUTO_PIPELINE(func, {name}={value}): must be >= 0")
+
+
+class AUTO_COMB_AREA_OPT:
+    """Area-first, bit-exact combinational implementation of a pure @hw_func.
+
+    The compiler may add operand selection and increase propagation delay, but
+    never adds storage or clock cycles. Native simulation calls the original
+    function. Compose with AUTO_PIPELINE or a multi-cycle stream for timing.
+    """
+
+    _is_auto_comb_area_opt_pragma = True
+    _is_hw_func = True
+    latency = 0
+
+    def __init__(self, func):
+        if type(func) is type(self):
+            func = func.func
+        if not is_hw_func(func):
+            raise TypeError(f"{type(self).__name__}(func): func must be @hw_func-decorated")
+        self.func = func
+        original = _inspect.unwrap(func)
+        self.__name__ = getattr(original, "__name__", "auto_comb_area_opt")
+        self.__qualname__ = getattr(original, "__qualname__", self.__name__)
+        self.__annotations__ = dict(getattr(original, "__annotations__", {}))
+        self.__signature__ = _inspect.signature(original)
+        if "return" not in self.__annotations__:
+            raise TypeError(f"{type(self).__name__}(func): an annotated return type is required")
+
+    @property
+    def canonical_key(self):
+        import PY_TO_LOGIC
+
+        return "AUTO_COMB_AREA_OPT_" + PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func)
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+    def __repr__(self):
+        if "PY_TO_LOGIC" in _sys.modules:
+            return self.canonical_key
+        return f"AUTO_COMB_AREA_OPT({self.func.__module__}.{self.__qualname__})"
+
+
+class AUTO_COMB_DELAY_OPT(AUTO_COMB_AREA_OPT):
+    """Delay-first, bit-exact, zero-cycle implementation of a pure @hw_func.
+
+    Allows area growth, but adds no registers. Selection uses cached timing
+    and estimates, not extra synthesis runs. Native calls retain the original
+    semantics; explicit nesting with AUTO_COMB_AREA_OPT preserves the written order.
+    """
+
+    _is_auto_comb_area_opt_pragma = False
+    _is_auto_comb_delay_opt_pragma = True
+
+    @property
+    def canonical_key(self):
+        import PY_TO_LOGIC
+
+        return "AUTO_COMB_DELAY_OPT_" + PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func)
+
+    def __repr__(self):
+        if "PY_TO_LOGIC" in _sys.modules:
+            return self.canonical_key
+        return f"AUTO_COMB_DELAY_OPT({self.func.__module__}.{self.__qualname__})"
+
+
+class AUTO_PIPELINE:
+    """AUTO_PIPELINE(func, latency=None, start_latency=None, max_latency=None):
+    let the synthesis tool insert pipeline registers inside calls to `func`
+    (equivalent to PipelineC's `#pragma AUTOPIPELINE`), and expose the
+    resulting register count as `.latency`::
+
+        MY_AP = AUTO_PIPELINE(some_func)                   # tool picks, from 0
+        MY_AP = AUTO_PIPELINE(some_func, latency=2)        # fixed: exactly 2
+        MY_AP = AUTO_PIPELINE(some_func, start_latency=3)  # sweep starts at 3
+        MY_AP = AUTO_PIPELINE(some_func, max_latency=6)    # sweep never > 6
+        MY_AP = AUTO_PIPELINE(some_func, start_latency=3, max_latency=6)
+
+        @hw_func
+        def my_pipeline(i: my_struct_t) -> my_struct_t:
+            return MY_AP(i)        # some_func(i), auto-pipelined
+
+        MY_AP.latency              # int: inserted register slices (clocks)
+
+    Latency counts inserted register slices (clock cycles of delay), not
+    combinational stages: latency=2 separates three stages.
+
+    latency=N (fixed) is honored everywhere: .latency always reads N, every
+    build -- including --comb / --no_synth / --yosys_json -- builds exactly N
+    registers inside the call, and native simulation (plain, or after a
+    build) delays the call's output by N cycles. It can't be combined with
+    start_latency / max_latency.
+
+    start_latency=S / max_latency=M (S <= M) steer a synthesizing build's
+    throughput sweep: its first iteration builds S registers at this call
+    site and grows from there if timing fails (the post-met trim may still go
+    below S), and it never builds more than M -- a cap that keeps timing from
+    being met fails the build with a warning naming it. During that build's
+    bootstrap elaboration .latency reads S; if the sweep lands exactly there,
+    the pin-and-confirm re-elaboration pass is skipped.
+
+    Without a fixed latency, .latency reads 0:
+      - in plain native Pypeline sim (pypeline_sim.py run directly -- no
+        synthesis ever runs),
+      - in --comb / --no_synth / --yosys_json builds (no sweep runs),
+      - during the bootstrap elaboration pass of a synthesizing build, unless
+        start_latency is given.
+    On a real build the pipelinec driver re-executes the design after the
+    throughput sweep with the built stage counts installed, so .latency then
+    resolves to the real value (see the pin-and-confirm loop in
+    docs/AUTO_PIPELINE_DESIGN.md) -- including in the native simulation a non---comb
+    `--sim` build launches at the end.
+
+    `func` must already be @hw_func-decorated. In elaboration the call becomes
+    a submodule instance of `func` tagged for auto-pipelining, and AUTO_PIPELINE
+    itself produces no hardware. In native simulation the call site behaves as
+    a .latency-deep pipeline: an N-deep output delay line makes
+    out(t) = func(in(t-N)), cycle-accurate against the generated VHDL (see
+    _sim_delay_line below); at .latency 0 it is a plain passthrough.
+
+    name="..." names this tag's latency group (see docs/pypeline_guide.md,
+    "Naming hardware"). The group key becomes the name (plus `_latency_N` /
+    `_max_latency_M` for those constraints), so latency hints and the
+    latency memory find it by that name, sweep reports print it, and the
+    call's VHDL instance is labeled with it. start_latency= is not part of a
+    named key, so changing it renames nothing. Two names on one function are
+    two independent groups (each planned to its own latency); tags sharing
+    a name must wrap the same function with the same constraints. The
+    function's own entity keeps its own name.
+
+    CONSTRUCTION TIMING MATTERS: construct AUTO_PIPELINE(...) once, eagerly,
+    as plain Python (typically at a factory function's own top level) and
+    capture the object by closure into whatever @hw_func body calls it —
+    that is what makes `.latency` visible to surrounding Python code (e.g.
+    FIFO sizing). Constructing it inline inside a @hw_func body still
+    pipelines correctly, but nothing outside that body can read `.latency`.
+    """
+
+    # Duck-type marker probed by the elaborator (PY_TO_LOGIC._elab_call).
+    _is_auto_pipeline_pragma = True
+
+    def __init__(
+        self,
+        func,
+        *,
+        latency=None,
+        start_latency=None,
+        max_latency=None,
+        name=None,
+        **removed,
+    ):
+        global _auto_pipeline_serial
+        if "depth" in removed:
+            raise TypeError(
+                "AUTO_PIPELINE(func, depth=...) was renamed: use latency=N for a "
+                "fixed latency, or start_latency=S / max_latency=M to steer the "
+                "throughput sweep"
+            )
+        if removed:
+            raise TypeError(
+                f"AUTO_PIPELINE(func, ...): unexpected keyword argument(s) "
+                f"{sorted(removed)}"
+            )
+        if not is_hw_func(func):
+            raise TypeError(
+                f"AUTO_PIPELINE(func, ...): "
+                f"{getattr(func, '__qualname__', func)!r} must be "
+                f"@hw_func-decorated before being passed in"
+            )
+        _check_auto_pipeline_latency_arg("latency", latency)
+        _check_auto_pipeline_latency_arg("start_latency", start_latency)
+        _check_auto_pipeline_latency_arg("max_latency", max_latency)
+        if latency is not None and (
+            start_latency is not None or max_latency is not None
+        ):
+            raise ValueError(
+                "AUTO_PIPELINE(func, latency=...) is a fixed latency and can't be "
+                "combined with start_latency= / max_latency="
+            )
+        if (
+            start_latency is not None
+            and max_latency is not None
+            and start_latency > max_latency
+        ):
+            raise ValueError(
+                f"AUTO_PIPELINE(func, start_latency={start_latency}, "
+                f"max_latency={max_latency}): start_latency exceeds max_latency"
+            )
+        fixed = getattr(func, "_pipeline_latency", None)
+        if fixed is not None:
+            problem = None
+            if latency is not None and latency != fixed:
+                problem = f"latency={latency}"
+            elif start_latency is not None and start_latency != fixed:
+                problem = f"start_latency={start_latency}"
+            elif max_latency is not None and max_latency < fixed:
+                problem = f"max_latency={max_latency}"
+            if problem is not None:
+                raise ValueError(
+                    f"AUTO_PIPELINE {problem} conflicts with "
+                    f"{func.__qualname__}'s pipeline_latency({fixed})"
+                )
+        self.func = func
+        # Compiler-owned fixed placement, populated only by AUTO_FSM codegen.
+        self._auto_fsm_implementation = None
+        self.fixed_latency = latency
+        self.start_latency = start_latency
+        self.max_latency = max_latency
+        self.name = name
+        self._canonical_key = None
+        self._sim_key_str = None
+        # Where it was built (_auto_construction_site); its binding is resolved
+        # on first use (binding_key)
+        self.site = _auto_construction_site()
+        self._binding_key = _UNRESOLVED
+        if self.site is not None:
+            _auto_constructed.append(("AUTO_PIPELINE", self))
+        if name is not None:
+            _check_user_name(name, "AUTO_PIPELINE")
+            signature = (_name_identity(func), latency, start_latency, max_latency)
+            site = _construction_site()
+            prior = _auto_pipeline_names.setdefault(name, (signature, site, self))
+            if prior[0] != signature:
+                raise TypeError(
+                    f"AUTO_PIPELINE(name={name!r}) at {site} differs from the "
+                    f"AUTO_PIPELINE(name={name!r}) at {prior[1]}: tags sharing a "
+                    "name are one latency group, so they must wrap the same "
+                    "function with the same latency= / start_latency= / "
+                    "max_latency=. Give one of them another name."
+                )
+        _auto_pipeline_serial += 1
+        self._serial = _auto_pipeline_serial
+        if latency is not None:
+            self._latency = latency
+        elif start_latency is not None and _auto_pipeline_build_mode == "sweep":
+            self._latency = start_latency
+        else:
+            self._latency = 0
+        # A starting latency from the latency memory or a hints file (see
+        # SET_LATENCY_SEEDS): sweep builds only, never for a fixed latency
+        self.seed = None
+        if (
+            _latency_seeds
+            and latency is None
+            and fixed is None
+            and _auto_pipeline_build_mode == "sweep"
+        ):
+            self.seed = _latency_seed(
+                "AUTO_PIPELINE", self.canonical_key, max_latency, self.binding_key
+            )
+            if self.seed is not None:
+                self._latency = self.seed
+        # Whether the installed build harvest has this tag (_require_built)
+        self._built_decided = False
+        # Skip key computation entirely when the cache is empty (native sim,
+        # comb builds, bootstrap pass): keeps pure-sim runs from importing
+        # the compiler (see canonical_key).
+        if _auto_pipeline_latency_cache or _built_hardware_source is not None:
+            binding = self.binding_key
+            cached = _auto_pipeline_latency_cache.get(binding)
+            self._built_decided = cached is not None
+            if cached is not None:
+                if latency is not None and cached != latency:
+                    raise ValueError(
+                        f"AUTO_PIPELINE {self.canonical_key}: latency={latency} is "
+                        f"fixed, but the build harvested {cached} clocks for it"
+                    )
+                self._latency = cached
+                self.seed = None  # the build's own result supersedes it
+            elif ("AUTO_PIPELINE", binding) in _built_unbuilt_reads:
+                # The simulated build read this tag but never built it
+                self._latency = _built_unbuilt_reads[("AUTO_PIPELINE", binding)]
+
+    def latency_suffix(self) -> str:
+        # A named tag's start_latency is a starting count, not identity
+        return _auto_pipeline_latency_suffix(
+            self.fixed_latency,
+            None if self.name is not None else self.start_latency,
+            self.max_latency,
+        )
+
+    @property
+    def latency(self) -> int:
+        global _auto_pipeline_latency_was_read
+        _require_built("AUTO_PIPELINE", self, read=True)
+        _auto_pipeline_latency_was_read = True
+        if not _sim_run_in_progress:
+            found = _auto_reads.setdefault(("AUTO_PIPELINE", self.site), [])
+            site = _latency_read_site()
+            if site not in found:
+                found.append(site)
+        if _auto_pipeline_build_mode is not None:
+            _auto_pipeline_served.append((self, self._latency))
+            _auto_pipeline_read_sites.append((self, _latency_read_site()))
+        return self._latency
+
+    @property
+    def binding_key(self) -> str:
+        """The key this object's installed results are under: its
+        canonical_key, or canonical_key@goal when its key is used at several
+        clock goals. See _auto_binding."""
+        if self._binding_key is _UNRESOLVED:
+            self._binding_key = _auto_binding(
+                "AUTO_PIPELINE", self, _auto_pipeline_latency_cache
+            )
+        return self._binding_key
+
+    @property
+    def canonical_key(self) -> str:
+        if self._canonical_key is None:
+            if self.name is not None:
+                # A named group's key is its name: no compiler needed
+                self._canonical_key = self.name + self.latency_suffix()
+                return self._canonical_key
+            # Lazy so pure native-sim runs never import the compiler; any
+            # context that needs the key (elaboration, non-empty cache) has
+            # PY_TO_LOGIC loaded already.
+            import PY_TO_LOGIC
+
+            # Unconstrained tags keep exactly the wrapped function's key.
+            self._canonical_key = (
+                PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func) + self.latency_suffix()
+            )
+        return self._canonical_key
+
+    def _sim_key(self) -> str:
+        """Instance-stack key for this call site's native-sim delay line.
+        The canonical key whenever the compiler is already loaded (builds, and
+        the --sim run after one); otherwise -- plain native sim of a fixed
+        latency=N -- a compiler-free module.qualname#serial that still tells
+        apart two AUTO_PIPELINE objects called from the same source line."""
+        if self._sim_key_str is None:
+            if _auto_pipeline_latency_cache or "PY_TO_LOGIC" in _sys.modules:
+                self._sim_key_str = self.canonical_key
+            else:
+                import inspect
+
+                inner = inspect.unwrap(self.func)
+                self._sim_key_str = (
+                    f"{getattr(inner, '__module__', '?')}."
+                    f"{getattr(inner, '__qualname__', '?')}#{self._serial}"
+                )
+        return self._sim_key_str
+
+    def __call__(self, *args, **kwargs):
+        if _sim_active:
+            _require_built("AUTO_PIPELINE", self)
+        pipeline_model = False
+        if _sim_active and _pipeline_latency_declared:
+            model = getattr(self.func, "_sim_model_cell", [None])[0]
+            pipeline_model = model is not None and getattr(
+                model[0], "_pipeline_dispatch", False
+            )
+        if _sim_active and (self._latency > 0 or pipeline_model):
+            # Native sim with a nonzero latency (a fixed latency=N, or a
+            # pipelinec non---comb --sim build having installed the harvested
+            # stage counts before the sim's design import): emulate the
+            # N-stage pipeline with a per-call-site output delay line instead
+            # of the zero-latency identity. The key distinguishes two
+            # different AUTO_PIPELINE objects called from the same source line
+            # (e.g. a loop over factory-produced APs whose funcs share a
+            # __qualname__).
+            _sim_inst_stack.append(
+                (
+                    "AUTO_PIPELINE:" + self._sim_key(),
+                    _sim_capture_call_loc(_sys._getframe(1)),
+                )
+            )
+            try:
+                model = getattr(self.func, "_sim_model_cell", [None])[0]
+                if getattr(self.func, "_pipeline_latency", None) is not None or (
+                    model is not None and getattr(model[0], "_pipeline_dispatch", False)
+                ):
+                    if (
+                        self.fixed_latency
+                        and getattr(self.func, "_pipeline_latency", None) is None
+                        and not _auto_pipeline_latency_cache
+                    ):
+                        raise RuntimeError(
+                            f"AUTO_PIPELINE({self.func.__qualname__}, "
+                            f"latency={self.fixed_latency}) wraps code that "
+                            "reaches a @pipeline_latency function; plain native "
+                            "sim can't emulate where the tool places the fixed "
+                            "latency's registers around it. Simulate through "
+                            "a build instead: pypelinec <design> --sim"
+                        )
+                    return self.func(*args, **kwargs)
+                return self._sim_delay_line(args, kwargs)
+            finally:
+                _sim_inst_stack.pop()
+        return self.func(*args, **kwargs)
+
+    def _sim_delay_line(self, args, kwargs):
+        """Native-sim emulation of this call site as an N-stage pipeline:
+        out(t) = func(in(t - N)), N = self._latency.
+
+        Follows _call_sim_model's commit discipline: read the delay line
+        committed at the last clock edge, buffered-write the shifted copy, so
+        under convergence every re-evaluation this cycle reads the same
+        committed line (output is input-independent -- no convergence churn)
+        and only the final pass's buffered write lands at
+        _sim_reg_flush_buffer. Warm-up matches hardware's empty pipeline:
+        the first N outputs are typed zeros of func's return type.
+
+        Deepcopies guard aliasing: the pushed result may alias caller objects
+        (e.g. func returning an input), and committed[0] is returned to every
+        re-evaluation in the cycle -- caller mutation of either must not
+        corrupt the committed line.
+        """
+        inst_path = _sim_current_inst_path()
+        committed = _sim_reg_read(inst_path, _SIM_AP_DELAY_KEY, None)
+        if committed is None:
+            out_t = hw_return_type(self.func)
+            committed = [sim_zero(out_t) for _ in range(self._latency)]
+        # Global wires used in func's own body are aligned with its arguments
+        # and return value in hardware: read at entry, writes published with
+        # the delayed return (a parallel committed line of write-sets,
+        # replayed at cycle start by _sim_apply_ap_delayed_writes).
+        region = {"root": self.func, "name": f"AUTO_PIPELINE({self.func.__qualname__})"}
+        now = _sim_run_in_region(region, self.func, *args, **kwargs)
+        _sim_reg_write(
+            inst_path, _SIM_AP_DELAY_KEY, committed[1:] + [_copy.deepcopy(now)]
+        )
+        writes = _sim_reg_read(inst_path, _SIM_AP_WRITES_KEY, None)
+        if region["collector"] or writes is not None:
+            if writes is None:
+                writes = [[] for _ in range(self._latency)]
+            _sim_reg_write(
+                inst_path,
+                _SIM_AP_WRITES_KEY,
+                writes[1:] + [_copy.deepcopy(region["collector"])],
+            )
+            _sim_ap_write_sites.add(inst_path)
+        return _copy.deepcopy(committed[0])
+
+    def __repr__(self):
+        # AUTO_PIPELINE objects get captured in factory closures (e.g.
+        # _auto_pipeline_with_io_regs), and closure cell reprs can feed the
+        # canonical entity-name hashing in PY_TO_LOGIC. That makes two
+        # properties load-bearing here:
+        #   - deterministic (no memory address): an address-bearing default
+        #     repr would rename entities on every design re-execution,
+        #     breaking the pin-and-confirm pass's cross-pass matching;
+        #   - fully distinguishing: two AUTO_PIPELINE objects wrapping
+        #     different factory-produced funcs must repr differently even
+        #     when the funcs share a qualname (the funcs' own closure values
+        #     included -- e.g. five make_stream_auto_pipeline invocations all wrap
+        #     a 'func_stream' closure, each over a different user core), or
+        #     their wrapper entities collide into one FuncLogicLookupTable
+        #     entry and mis-wire.
+        # CANONICAL_CALLABLE_KEY of the wrapped func provides both; in pure
+        # native-sim runs the compiler isn't loaded (and nothing hashes reprs
+        # there), so fall back to a readable module.qualname. The latency
+        # constraint (if any) is appended the way it was written.
+        import sys
+
+        if "PY_TO_LOGIC" in sys.modules:
+            import PY_TO_LOGIC
+
+            inner = PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func)
+        else:
+            import inspect
+
+            func = inspect.unwrap(self.func)
+            qual = getattr(func, "__qualname__", "?")
+            mod = getattr(func, "__module__", "?")
+            inner = f"{mod}.{qual}"
+        config = ""
+        if self.fixed_latency is not None:
+            config = f", latency={self.fixed_latency}"
+        else:
+            if self.start_latency is not None:
+                config += f", start_latency={self.start_latency}"
+            if self.max_latency is not None:
+                config += f", max_latency={self.max_latency}"
+        return f"AUTO_PIPELINE({inner}{config})"
+
+
+def _auto_pipeline_with_io_regs(
+    func,
+    has_input_reg: bool,
+    has_output_reg: bool,
+    *,
+    latency=None,
+    start_latency=None,
+    max_latency=None,
+    name=None,
+):
+    """Internal helper: AUTO_PIPELINE(func) plus optional unconditional
+    every-cycle Reg[T] input/output boundary registers around the call
+    (the registered-input/registered-output idiom).
+
+    latency= / start_latency= / max_latency= / name= are forwarded unchanged
+    to the AUTO_PIPELINE(func, ...) constructed here (see AUTO_PIPELINE), so
+    they constrain and name func's core register count only, never the
+    boundary registers.
+
+    Returns wrapped_func with func's own (in_type) -> out_type signature and
+    .return_t metadata. Its .auto_pipeline attribute is the AUTO_PIPELINE
+    instance, so callers can read .auto_pipeline.latency. This is func's own core
+    pipeline depth only — the boundary registers added here are NOT included
+    (callers account for them, e.g. total = has_input_reg + .latency +
+    has_output_reg).
+    """
+    ap = AUTO_PIPELINE(
+        func,
+        latency=latency,
+        start_latency=start_latency,
+        max_latency=max_latency,
+        name=name,
+    )
+    (in_type,) = hw_arg_types(func)
+    out_type = hw_return_type(func)
+
+    if has_input_reg and has_output_reg:
+
+        @hw_func
+        def auto_pipelined(x: in_type) -> out_type:
+            in_reg: Reg[in_type]
+            out_reg: Reg[out_type]
+            rv: out_type = out_reg
+            out_reg = ap(in_reg)
+            in_reg = x
+            return rv
+
+    elif has_input_reg:
+
+        @hw_func
+        def auto_pipelined(x: in_type) -> out_type:
+            in_reg: Reg[in_type]
+            rv: out_type = ap(in_reg)
+            in_reg = x
+            return rv
+
+    elif has_output_reg:
+
+        @hw_func
+        def auto_pipelined(x: in_type) -> out_type:
+            out_reg: Reg[out_type]
+            rv: out_type = out_reg
+            out_reg = ap(x)
+            return rv
+
+    else:
+
+        @hw_func
+        def auto_pipelined(x: in_type) -> out_type:
+            return ap(x)
+
+    auto_pipelined.auto_pipeline = ap
+    return auto_pipelined
+
+
+# ─────────────────────────────────────────────
+# AUTO_FSM: tool-scheduled resource-shared FSM regions
+# ─────────────────────────────────────────────
+
+# canonical_key -> schedule dict, harvested from the previous elaborate pass by
+# AUTO_FSM.HARVEST_AUTO_FSM_SCHEDULES and installed by the pipelinec driver
+# (SET_AUTO_FSM_SCHEDULE_CACHE) before the design file is re-executed, and again
+# before a non---comb `--sim` run's native-sim design import so both .latency
+# reads and the FSM's native-sim emulation see the built state count. Always
+# empty in plain native Pypeline sim (pypeline_sim.py run directly) and in
+# --comb/--no_synth/--yosys_json builds, so .latency reads 0 and the call site
+# stays a zero-latency combinational passthrough there.
+#
+# Schedule dict shape (plain picklable data; see docs/AUTO_FSM_DESIGN.md):
+#   {"version", "key", "entity", "n_states", "latency", "budget_scale",
+#    "at_floor", "floor_ns", "node_to_state", "fu_of_node", "fus",
+#    "fu_order", "descended", "entity_delays_snapshot", ...}
+# Shared schema identity; native simulation checks it without compiler imports.
+_AUTO_FSM_SCHEDULE_VERSION = 15
+# The schedule fields native simulation reads (AUTO_FSM.__init__ and _sim_fsm);
+# a build's hardware record keeps only these (SIM.WRITE_BUILT_HARDWARE)
+AUTO_FSM_SIM_SCHEDULE_FIELDS = (
+    "version", "n_states", "latency", "max_latency", "register_output"
+)
+_auto_fsm_schedule_cache: dict = {}
+
+
+def SET_AUTO_FSM_SCHEDULE_CACHE(cache: dict) -> None:
+    """pipelinec-driver hook: install the previous pass's harvested AUTO_FSM
+    schedules (canonical_key -> schedule dict) so the next design-file
+    execution's AUTO_FSM(...) constructions resolve .latency to real values and
+    their call sites elaborate to the generated FSM instead of a passthrough."""
+    global _auto_fsm_schedule_cache
+    _auto_fsm_schedule_cache = dict(cache)
+
+
+def AUTO_FSM_SCHEDULE_CACHE() -> dict:
+    return _auto_fsm_schedule_cache
+
+
+# Native-sim state key for an AUTO_FSM call site's emulated FSM registers,
+# mirroring _SIM_AP_DELAY_KEY's role for AUTO_PIPELINE delay lines.
+_SIM_AUTO_FSM_STATE_KEY = "__sim_auto_fsm_state__"
+
+
+def _make_auto_fsm_stream_t(data_t):
+    """Build the plain `{data, valid}` struct AUTO_FSM uses at its call-site
+    boundary. Deliberately a pypeline.py-local twin of
+    include/pypeline/stream/stream.py's make_stream_t rather than an import of
+    it: pypeline.py is the base module every design imports and must keep zero
+    dependency on the include/pypeline library (which designs put on sys.path
+    themselves). The two produce structurally identical, duck-type-compatible
+    types -- a make_stream_t(T) value can be passed straight into an AUTO_FSM
+    call site and vice versa -- they just carry different canonical type names.
+    """
+
+    @struct
+    class auto_fsm_stream_t(NamedTuple):
+        data: data_t
+        valid: uint1_t
+
+    return auto_fsm_stream_t
+
+
+class AUTO_FSM:
+    """AUTO_FSM(func): implement a pure combinational function as a
+    resource-shared finite state machine -- the resource-minimizing dual of
+    AUTO_PIPELINE.
+
+    Where AUTO_PIPELINE(func) builds an initiation-interval-1 pipeline (one full
+    copy of func's hardware, cut into N register stages), AUTO_FSM(func) builds
+    an ~N-state FSM holding ONE shared copy of each distinct operation, executed
+    over N clock cycles::
+
+        MY_FSM = AUTO_FSM(some_pure_func)      # tool picks the state count
+        MY_FSM = AUTO_FSM(some_pure_func, max_latency=8)   # ...but never past 8
+
+        @MAIN(100.0)
+        def top():
+            s: MY_FSM.in_stream_t             # {data, valid}
+            s.data = x
+            s.valid = start_pulse
+            o = MY_FSM(s)                     # o: {data, valid}
+            if o.valid:
+                result_reg = o.data
+            ...
+        MY_FSM.latency                        # int: fixed in->out cycle count; 0 until known
+
+    Twelve identical adders in `func` (whether written as a Python loop that
+    elaborates unrolled, or as twelve separate lines) become ONE adder used in
+    twelve different states. The cost is latency and operand multiplexers; the
+    win is area. The tool picks the state count so that the chain of operations
+    executed in any single state fits the design's clock period -- if a timing
+    report blames the FSM, the driver shrinks the per-state delay budget and
+    reschedules into more states, the same way the throughput sweep adds
+    pipeline stages for AUTO_PIPELINE.
+
+    `max_latency=N` caps that: the tool may spend at most N cycles in->out
+    (execution states plus the registered-output cycle). Use it when the surrounding
+    design has a real deadline -- a result needed before the next frame, a
+    protocol turnaround -- and you would rather have a bigger FSM than a late
+    one. It is a HARD constraint, not a hint: if no schedule meeting the clock
+    goal fits inside N cycles the build FAILS with a message naming the FSM and
+    the latency it actually needs, rather than quietly returning a slower or
+    a timing-missing design. Omit it to let the tool minimize resources
+    without a deadline. Note that the tool also searches for the SMALLEST
+    design it can (see the area sweep in docs/AUTO_FSM_DESIGN.md), so a
+    generous cap is not the same thing as no cap: sharing more finely costs
+    latency, and the cap bounds how much of it the search may spend.
+
+    `register_output=False` exposes the result combinationally in the final
+    execution state and removes the result data/valid register bank. The
+    default is True so a raw call site's data holds between valid pulses.
+    `make_stream_auto_fsm` uses False because its backpressure holding register
+    is already the output boundary; registering the payload twice only costs
+    area. In this mode latency is the number of execution states, with no
+    additional output cycle.
+
+    Contract at the call site (fixed latency, one computation in flight):
+      - `func` must be @hw_func-decorated, pure (no Reg/Feedback/global wires
+        anywhere in its call subtree), and take exactly ONE annotated argument
+        (bundle multiple inputs in an @struct) with an annotated return type.
+      - The argument is a `{data, valid}` struct -- use `MY_FSM.in_stream_t`,
+        or any structurally identical type (e.g. make_stream_t(in_t)).
+      - An input is accepted only when the FSM is idle; `valid` pulses asserted
+        while it is busy are IGNORED (no backpressure signal in this version --
+        space inputs at least .latency cycles apart, which .latency itself lets
+        surrounding Python compute). For a real valid/ready stream port around
+        an AUTO_FSM instance instead of this manual spacing, see
+        make_stream_auto_fsm (include/pypeline/stream/stream_auto_fsm.py).
+      - The result appears with a one-cycle `valid` pulse exactly .latency
+        cycles after the accepted input cycle. With the default registered
+        output, `.data` holds the last result between pulses; with
+        `register_output=False`, only the valid cycle's data is meaningful.
+        Initiation interval == .latency.
+
+    .latency reads 0 (and the call site is a zero-latency combinational
+    passthrough, `o.data = func(s.data)`, `o.valid = s.valid`):
+      - always in plain native Pypeline sim (pypeline_sim.py run directly),
+      - always in --comb / --no_synth / --yosys_json builds,
+      - during the bootstrap elaboration pass of a real synthesizing build.
+    On a real build the pipelinec driver measures the function's operation
+    delays, schedules it, and re-executes the design with the schedule
+    installed, so .latency then resolves to the real value -- including in the
+    native simulation a non---comb `--sim` build launches at the end, where the
+    call site emulates the built FSM cycle-accurately.
+
+    CONSTRUCTION TIMING MATTERS, exactly as for AUTO_PIPELINE: construct
+    AUTO_FSM(...) once, eagerly, as plain Python (typically at module or factory
+    top level) and capture it by closure into the @hw_func body that calls it --
+    that is what makes .latency visible to the surrounding Python.
+
+    See docs/AUTO_FSM_DESIGN.md for the scheduler, the generated FSM's shape,
+    and the driver's schedule-and-confirm loop.
+    """
+
+    # Duck-type marker probed by the elaborator (PY_TO_LOGIC._elab_call).
+    _is_auto_fsm_pragma = True
+
+    def __init__(self, func, max_latency=None, register_output=True):
+        if not is_hw_func(func):
+            raise TypeError(
+                f"AUTO_FSM(func): {getattr(func, '__qualname__', func)!r} must be "
+                f"@hw_func-decorated before being passed in"
+            )
+        if not isinstance(register_output, bool):
+            raise TypeError(
+                "AUTO_FSM(func, register_output=...): must be a bool, got "
+                f"{type(register_output).__name__}"
+            )
+        self.register_output = register_output
+        if max_latency is not None:
+            # Validated here rather than at schedule time so the error names the
+            # user's own construction site. Registered latency is n_states + 1
+            # (the output bank); unregistered latency is n_states. Every FSM
+            # has at least one execution state.
+            if not isinstance(max_latency, int) or isinstance(max_latency, bool):
+                raise TypeError(
+                    f"AUTO_FSM(func, max_latency=...): must be an int, got "
+                    f"{type(max_latency).__name__}"
+                )
+            minimum_latency = 2 if register_output else 1
+            if max_latency < minimum_latency:
+                raise ValueError(
+                    f"AUTO_FSM(func, max_latency={max_latency}): the smallest "
+                    f"possible FSM latency is {minimum_latency} with "
+                    f"register_output={register_output}"
+                )
+        self.max_latency = max_latency
+        arg_types = hw_arg_types(func)
+        if len(arg_types) != 1:
+            raise TypeError(
+                f"AUTO_FSM(func): {getattr(func, '__qualname__', func)!r} must take "
+                f"exactly one annotated argument (got {len(arg_types)}); bundle "
+                f"multiple inputs into a single @struct type"
+            )
+        self.func = func
+        self.in_type = arg_types[0]
+        self.out_type = hw_return_type(func)
+        if self.out_type is None:
+            raise TypeError(
+                f"AUTO_FSM(func): {getattr(func, '__qualname__', func)!r} must have "
+                f"an annotated return type"
+            )
+        self.in_stream_t = _make_auto_fsm_stream_t(self.in_type)
+        self.out_stream_t = _make_auto_fsm_stream_t(self.out_type)
+        self._canonical_key = None
+        self._generated = None  # memoized generated hw_func for this pass
+        # Where it was built (_auto_construction_site); its binding is resolved
+        # on first use (binding_key)
+        self.site = _auto_construction_site()
+        self._binding_key = _UNRESOLVED
+        if self.site is not None:
+            _auto_constructed.append(("AUTO_FSM", self))
+        # Snapshot the installed schedule at construction time, mirroring
+        # AUTO_PIPELINE's latency snapshot: the driver installs the cache before
+        # re-executing the design, so every construction in one pass sees one
+        # consistent view. Skip key computation entirely when the cache is empty
+        # (native sim, comb builds, bootstrap pass) so pure-sim runs never import
+        # the compiler.
+        if _auto_fsm_schedule_cache or _built_hardware_source is not None:
+            self._schedule = _auto_fsm_schedule_cache.get(self.binding_key)
+            # Native simulation consumes latency/state count and evaluates the
+            # original pure function. Deep graph/recipe validation belongs to
+            # the compiler before emission, without a compiler dependency here.
+            if self._schedule is not None and not (
+                isinstance(self._schedule, dict)
+                and self._schedule.get("version") == _AUTO_FSM_SCHEDULE_VERSION
+                and type(self._schedule.get("n_states")) is int
+                and self._schedule["n_states"] >= 1
+                and type(self._schedule.get("latency")) is int
+                and self._schedule["latency"] >= self._schedule["n_states"]
+            ):
+                self._schedule = None
+            # A schedule built under a different latency cap is not this tag's
+            # schedule. The cap is a constructor constant, so this can only
+            # happen if the design changed between passes -- treat it as a miss
+            # (back to the bootstrap passthrough) rather than silently building
+            # hardware that violates the cap the source asks for.
+            if self._schedule is not None and self._schedule.get(
+                "max_latency"
+            ) != max_latency:
+                self._schedule = None
+            if self._schedule is not None and self._schedule.get(
+                "register_output", True
+            ) != register_output:
+                self._schedule = None
+        else:
+            self._schedule = None
+        self._latency = self._schedule["latency"] if self._schedule else 0
+
+    @property
+    def _built_decided(self) -> bool:
+        """Whether the installed build harvest has this call site's schedule
+        (_require_built)."""
+        return self._schedule is not None
+
+    @property
+    def latency(self) -> int:
+        _require_built("AUTO_FSM", self)
+        return self._latency
+
+    @property
+    def schedule(self):
+        """The installed schedule dict for this call site, or None before one
+        has been computed. Read by the elaborator; designs use .latency."""
+        return self._schedule
+
+    @property
+    def binding_key(self) -> str:
+        """The key this call site's installed schedule is under: its
+        canonical_key, or canonical_key@goal when its key is used at several
+        clock goals (an object used at several goals has the tightest one's).
+        See _auto_binding."""
+        if self._binding_key is _UNRESOLVED:
+            self._binding_key = _auto_binding(
+                "AUTO_FSM", self, _auto_fsm_schedule_cache
+            )
+        return self._binding_key
+
+    @property
+    def canonical_key(self) -> str:
+        if self._canonical_key is None:
+            # Lazy so pure native-sim runs never import the compiler; any
+            # context that needs the key (elaboration, non-empty cache) has
+            # PY_TO_LOGIC loaded already.
+            import PY_TO_LOGIC
+
+            self._canonical_key = PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func)
+            if self.max_latency is not None:
+                self._canonical_key += f"_max_latency_{self.max_latency}"
+            if not self.register_output:
+                self._canonical_key += "_unregistered_output"
+        return self._canonical_key
+
+    def __call__(self, s):
+        data = getattr(s, "data", None)
+        valid = getattr(s, "valid", None)
+        if data is None or valid is None:
+            raise TypeError(
+                f"AUTO_FSM call argument must be a {{data, valid}} struct (e.g. "
+                f"MY_FSM.in_stream_t), got {type(s).__name__}"
+            )
+        if _sim_active:
+            _require_built("AUTO_FSM", self)
+        if _sim_active and self._schedule is not None:
+            # Native sim with a pinned schedule (pipelinec non---comb --sim builds
+            # install the harvested schedules before the sim's design import):
+            # emulate the built FSM's registers instead of the zero-latency
+            # passthrough. canonical_key is already computed (cache was non-empty
+            # at __init__) and distinguishes two different AUTO_FSM objects called
+            # from the same source line.
+            _sim_inst_stack.append(
+                (
+                    "AUTO_FSM:" + self.canonical_key,
+                    _sim_capture_call_loc(_sys._getframe(1)),
+                )
+            )
+            try:
+                return self._sim_fsm(data, valid)
+            finally:
+                _sim_inst_stack.pop()
+        return self.out_stream_t(data=self.func(data), valid=valid)
+
+    def _sim_fsm(self, data, valid):
+        """Native-sim emulation of this call site as the generated FSM: a
+        register-level model of exactly the state and optional output registers
+        the generated hardware declares (see AUTO_FSM.GENERATE_FSM_SOURCE), so the two are
+        cycle-accurate against each other by construction rather than by a
+        separate timing argument.
+
+        Follows _call_sim_model's / _sim_delay_line's commit discipline: the
+        returned value is computed only from state committed at the last clock
+        edge (so every re-evaluation during this cycle's convergence returns the
+        same thing -- no convergence churn), and the next state is written into
+        the buffer, where last-write-wins and only the final pass's write lands
+        at _sim_reg_flush_buffer.
+        """
+        n_states = self._schedule["n_states"]
+        inst_path = _sim_current_inst_path()
+        st = _sim_reg_read(inst_path, _SIM_AUTO_FSM_STATE_KEY, None)
+        if st is None:
+            # Warm-up matches hardware reset: idle, no result yet, typed zeros.
+            st = {
+                "st": 0,
+                "in": sim_zero(self.in_type),
+                "out_data": sim_zero(self.out_type),
+                "out_valid": 0,
+            }
+        # Registered mode exposes committed output registers. Unregistered
+        # mode is used by make_stream_auto_fsm, whose own holding register is
+        # the output boundary: the raw result is combinational only in the last
+        # execution state and therefore avoids a redundant full-width bank.
+        if self.register_output:
+            out = self.out_stream_t(data=st["out_data"], valid=st["out_valid"])
+        elif st["st"] >= n_states:
+            out = self.out_stream_t(data=self.func(st["in"]), valid=1)
+        else:
+            out = self.out_stream_t(data=sim_zero(self.out_type), valid=0)
+        # Next-state, mirroring the generated body's write order.
+        nxt = {
+            "st": st["st"],
+            "in": st["in"],
+            "out_data": st["out_data"],
+            "out_valid": 0,
+        }
+        if st["st"] == 0:
+            if valid:
+                nxt["in"] = _copy.deepcopy(data)
+                nxt["st"] = 1
+        elif st["st"] >= n_states:
+            # Last execution state: the whole function's result lands in the
+            # output registers. (The native model computes func() in one go
+            # rather than per-state; the FSM's per-state decomposition is a
+            # hardware implementation detail with identical cycle-level
+            # behavior at the boundary.)
+            if self.register_output:
+                nxt["out_data"] = _copy.deepcopy(self.func(st["in"]))
+                nxt["out_valid"] = 1
+            nxt["st"] = 0
+        else:
+            nxt["st"] = st["st"] + 1
+        _sim_reg_write(inst_path, _SIM_AUTO_FSM_STATE_KEY, nxt)
+        return out
+
+    def __repr__(self):
+        # Same determinism requirement as AUTO_PIPELINE.__repr__ (see the long
+        # comment there): these objects get captured in factory closures whose
+        # cell reprs feed canonical entity-name hashing, so the repr must be
+        # address-free and fully distinguishing.
+        import sys
+
+        if "PY_TO_LOGIC" in sys.modules:
+            inner = self.canonical_key
+        else:
+            import inspect
+
+            func = inspect.unwrap(self.func)
+            qual = getattr(func, "__qualname__", "?")
+            mod = getattr(func, "__module__", "?")
+            inner = f"{mod}.{qual}"
+        if self.max_latency is not None:
+            inner += f",max_latency={self.max_latency}"
+        if not self.register_output:
+            inner += ",register_output=False"
+        return f"AUTO_FSM({inner})"
+
+
+# ─────────────────────────────────────────────
+# Operator overloading registry
+# ─────────────────────────────────────────────
+
+
+@_functools.lru_cache(maxsize=None)
+def _ctype_str(t) -> str:
+    """Return the canonical C type name for a type object.
+    Works for _CTypeMeta integer types (uint32_t) and @struct NamedTuple types.
+    """
+    if hasattr(t, "_pypeline_ctype_name"):
+        return t._pypeline_ctype_name
+    return str(t)
+
+
+def ctype_name(t) -> str:
+    """Return the logical C hardware type key for a pypeline type
+    (e.g. uint32_t -> "uint32_t", an @struct NamedTuple -> its mangled name).
+    Useful when writing raw vhdl(...) text that needs to reference the
+    compiler's auto-generated {type}_SLV_LEN constant or {type}_to_slv /
+    slv_to_{type} conversion functions for a given pypeline type.
+    """
+    return _ctype_str(t)
+
+
+def _value_ctype(val):
+    """Best-effort ctype of a native-sim value, for cast dispatch.
+    SimVal carries it directly; a @struct instance's ctype IS its own class
+    (the class itself carries _pypeline_ctype_name, stamped by @struct/
+    @interface's _derive). A plain unannotated Python int falls back to its
+    minimum-width inferred type (_infer_literal_ctype -- same rule
+    PY_TO_LOGIC._infer_const_ctype uses at elaboration time for a bare
+    literal), so e.g. `float_t(5)` dispatches a registered int->float cast
+    in native sim exactly as it would during elaboration, rather than
+    silently falling through to positional field-fill because `5` looked
+    untyped. Returns None only for a bool (excluded by _infer_literal_ctype)
+    or a non-int, non-pypeline value -- there is no source type to dispatch
+    a cast on."""
+    t = getattr(val, "_ctype", None)
+    if t is not None:
+        return t
+    cls = type(val)
+    if hasattr(cls, "_pypeline_ctype_name"):
+        return cls
+    if isinstance(val, int):
+        lit_t = _infer_literal_ctype(val)
+        if lit_t is not None:
+            return _reconstruct_int_ctype(lit_t)
+    return None
+
+
+_operator_registry: dict = {}  # (op_str, l_type_str, r_type_str) -> name_or_callable
+_left_operator_registry: dict = {}  # (op_str, l_type_str) -> name_or_callable
+_unary_operator_registry: dict = {}  # (op_str, type_str) -> name_or_callable
+# ── Native-sim dispatch gate ─────────────────────────────────────────────
+#
+# SimVal's dunders (__neg__/__invert__, __rshift__/__lshift__, the comparisons,
+# __truediv__/__mod__) check one of these sets before bothering to look in the
+# precise per-type registries at all, so an unregistered design pays a single
+# set lookup and nothing else. Membership means "executing a registered
+# implementation for this op is enabled in native simulation".
+#
+# HARDWARE ELABORATION NEVER CONSULTS THESE SETS. PY_TO_LOGIC goes straight to
+# the registries, so what is or is not in here can only make sim more or less
+# faithful to the hardware -- it can never change the hardware that gets built.
+_registered_binary_op_names: set = set()
+_registered_unary_op_names: set = set()
+# (_registered_mux_type_names, the MUX equivalent, is defined with the rest of
+#  the MUX registry below -- it is keyed by muxed type string, not op name.)
+
+# The two sources a gate name can come from. They are kept apart because the
+# SIM_SOFT_OPS policy below treats them differently:
+#
+#   concrete -- register_operator("SR", signed_man_t, exp_t, impl): a
+#               deliberate, narrow override naming an exact type. Always
+#               dispatches; the policy does not switch it off.
+#   matcher  -- register_operator("DIV", any_uint_t, any_uint_t, factory): a
+#               process-wide default. operators.soft.register_sw_lib_replacements()
+#               installs one for int NEGATE, GT/GTE/LT/LTE, DIV, MOD and
+#               variable-amount SL/SR, i.e. every integer op in every design
+#               at once. Subject to the policy.
+#
+# Recording the name at REGISTRATION time (rather than lazily, on the first
+# successful _resolve_generic_* call, which is what used to happen) is what
+# lets a matcher registration reach native sim at all, and is what stops sim
+# behaving differently depending on whether an elaboration happened to run
+# first in the same process.
+_concrete_binary_op_names: set = set()
+_concrete_unary_op_names: set = set()
+_concrete_mux_type_names: set = set()
+_matcher_binary_op_names: set = set()
+_matcher_unary_op_names: set = set()
+_matcher_mux_type_names: set = set()
+
+# ── SIM_SOFT_OPS ─────────────────────────────────────────────────────────
+#
+# Which matcher-registered ops execute their implementation during native
+# simulation. Both paths compute the same VALUE -- verified for every default
+# soft family -- so this is a fidelity/performance trade, not a correctness
+# one. Dispatching gives *structural* fidelity: sim runs the same unrolled
+# per-bit logic the hardware will, which is what you want when the thing under
+# test is the operator implementation itself. It is expensive. Measured on
+# uint16 operands, steady state:
+#
+#     DIV      1.55 us -> 41,842 us   (27,000x)
+#     LT       0.50 us ->  1,353 us   ( 2,700x)
+#     NEGATE   1.31 us ->     16.8 us (    13x)
+#
+# PYPELINE_SIM_SOFT_OPS, read once at import, selects the policy:
+#
+#   unset / "all" / "1"   every registered op dispatches (DEFAULT)
+#   "none" / "0"          matcher registrations do not dispatch; the built-in
+#                         fallbacks run instead. Those are value- AND
+#                         ctype-faithful to elaboration (SimVal.__neg__'s
+#                         widening rule, the constant-shift split above), so
+#                         this costs structural fidelity and nothing else.
+#   comma list            only those op names, e.g. "NEGATE,LT,LTE,GT,GTE" to
+#                         keep compare fidelity without paying for DIV/MOD.
+#
+# set_sim_soft_ops() is the programmatic equivalent. The policy is applied when
+# a name is ADDED to a gate set, never when an operator is evaluated, so the
+# hot path stays at exactly one set-membership test either way.
+_SIM_SOFT_OPS_ALL = object()  # sentinel: "every op", distinct from any name set
+
+
+def _parse_sim_soft_ops(spec):
+    """Turn a PYPELINE_SIM_SOFT_OPS spelling into a policy value."""
+    if spec is None:
+        return _SIM_SOFT_OPS_ALL
+    text = str(spec).strip()
+    if text.lower() in ("all", "1", "true", "yes"):
+        return _SIM_SOFT_OPS_ALL
+    if text.lower() in ("none", "0", "false", "no", ""):
+        return frozenset()
+    return frozenset(part.strip().upper() for part in text.split(",") if part.strip())
+
+
+def _sim_soft_ops_allows(op_name) -> bool:
+    return _sim_soft_ops_policy is _SIM_SOFT_OPS_ALL or op_name in _sim_soft_ops_policy
+
+
+def _recompute_sim_gate_sets() -> None:
+    """Rebuild the gate sets from the concrete/matcher bookkeeping + policy.
+    A couple of dozen names at most, and only called when a registration or
+    the policy changes -- never per operator evaluation."""
+    for gate, concrete, matcher in (
+        (
+            _registered_binary_op_names,
+            _concrete_binary_op_names,
+            _matcher_binary_op_names,
+        ),
+        (_registered_unary_op_names, _concrete_unary_op_names, _matcher_unary_op_names),
+    ):
+        gate.clear()
+        gate.update(concrete)
+        gate.update(name for name in matcher if _sim_soft_ops_allows(name))
+    # MUX has no operator string of its own (one fixed shape, keyed by the
+    # muxed type), so the whole family is gated on the name "MUX".
+    _registered_mux_type_names.clear()
+    _registered_mux_type_names.update(_concrete_mux_type_names)
+    if _sim_soft_ops_allows("MUX"):
+        _registered_mux_type_names.update(_matcher_mux_type_names)
+
+
+def set_sim_soft_ops(spec) -> None:
+    """Set which matcher-registered operators execute during native simulation.
+
+    spec: None or "all"/"1" for every op (the default), "none"/"0" for none, or
+    a comma-separated list of op names ("NEGATE,LT,LTE,GT,GTE"). Equivalent to
+    the PYPELINE_SIM_SOFT_OPS environment variable, which is read at import.
+
+    Call before simulating: it rebuilds the dispatch gate sets, so it has no
+    effect on a value already computed. It has no effect at all on hardware
+    elaboration -- the same hardware gets built either way.
+    """
+    global _sim_soft_ops_policy
+    _sim_soft_ops_policy = _parse_sim_soft_ops(spec)
+    _recompute_sim_gate_sets()
+
+
+def _sim_soft_ops_env_policy():
+    import os as _os
+
+    return _parse_sim_soft_ops(_os.environ.get("PYPELINE_SIM_SOFT_OPS"))
+
+
+_sim_soft_ops_policy = _sim_soft_ops_env_policy()
+
+# Number of entries at the TAIL of each _generic_*_registry list that came from
+# a scope= registration currently pushed by _push_scoped_registrations. A
+# resolution that matches one of those must not be memoized into the global
+# precise registry: _pop_scoped_registrations pops the list entries but cannot
+# reach a memo, so the scoped implementation would leak past scope exit and
+# silently become every other function's implementation -- wrong hardware, not
+# just wrong sim.
+_scoped_generic_tail = {"op": 0, "left": 0, "unary": 0, "mux": 0}
+# Number of entries at the HEAD of each _generic_*_registry list that came from
+# _push_fallback_registrations: lowest-priority defaults installed for one
+# elaboration only. Never memoized either, for the same reason as the tail.
+_fallback_generic_head = {"op": 0, "left": 0, "unary": 0, "mux": 0}
+
+# Scoped registrations: active only while elaborating the keyed function.
+# id(func) -> {registry_key: name_or_callable}
+_scoped_operator_registry: dict = {}
+_scoped_left_operator_registry: dict = {}
+_scoped_unary_operator_registry: dict = {}
+# Fast-lookup set: id(func) for any func that has at least one scoped registration.
+# Allows _push_scoped_registrations to short-circuit with a single O(1) check.
+_scoped_funcs: set = set()
+
+
+# ─────────────────────────────────────────────
+# Generic (matcher-based) operator registrations
+#
+# Exact registrations (register_operator(op, uint32_t, uint32_t, impl)) require
+# one call per concrete type pair. A library implementation (e.g. a soft adder)
+# needs to cover every width a design happens to promote to, so register_* also
+# accept a *type matcher* in place of a concrete type -- and, in that case, a
+# *factory* (called lazily with the concrete type objects) in place of a
+# finished hw_func. Matches are resolved on miss and memoized back into the
+# ordinary exact dicts, so the hot path stays a single dict lookup.
+# ─────────────────────────────────────────────
+
+
+class _IntTypeMatcher:
+    """Matches integer ctypes by signedness/max-width predicate.
+    Deterministic repr (no object id) -- these can end up embedded in factory
+    closures, and canonical entity-name hashing must stay a pure function of
+    source (see docs: project_canonical_name_determinism)."""
+
+    __slots__ = ("_name", "_signed", "_max_width")
+
+    def __init__(self, name, signed, max_width=None):
+        self._name = name
+        self._signed = signed  # True / False / None (None = either signedness)
+        self._max_width = max_width
+
+    def matches(self, ctype_str) -> bool:
+        if not _ctype_is_int(ctype_str):
+            return False
+        is_signed, width = _ctype_info(ctype_str)
+        if self._signed is not None and is_signed != self._signed:
+            return False
+        if self._max_width is not None and width > self._max_width:
+            return False
+        return True
+
+    def __repr__(self):
+        return self._name
+
+
+any_uint_t = _IntTypeMatcher("any_uint_t", signed=False)
+any_int_t = _IntTypeMatcher("any_int_t", signed=True)
+any_integer_t = _IntTypeMatcher("any_integer_t", signed=None)
+
+
+def uint_upto(n: int):
+    """Matcher: any uintW_t with W <= n."""
+    return _IntTypeMatcher(f"uint_upto_{n}", signed=False, max_width=n)
+
+
+def int_upto(n: int):
+    """Matcher: any intW_t with W <= n."""
+    return _IntTypeMatcher(f"int_upto_{n}", signed=True, max_width=n)
+
+
+class _ExactTypeMatcher:
+    """Wraps a concrete type as a matcher, so register_operator can mix one
+    matcher side with one exact side (e.g. any_uint_t on the left, a fixed
+    shift-amount type on the right)."""
+
+    __slots__ = ("_s",)
+
+    def __init__(self, t):
+        self._s = _ctype_str(t)
+
+    def matches(self, ctype_str) -> bool:
+        return ctype_str == self._s
+
+    def __repr__(self):
+        return self._s
+
+
+def _is_type_matcher(x) -> bool:
+    return isinstance(x, _IntTypeMatcher)
+
+
+def _as_matcher(x):
+    return x if _is_type_matcher(x) else _ExactTypeMatcher(x)
+
+
+def _reconstruct_int_ctype(ctype_str: str):
+    """Rebuild a ctype OBJECT (make_uint_t/make_int_t) from its canonical
+    string. Only used to hand a generic-registration factory concrete type
+    objects -- exact (non-matcher) registrations never need this."""
+    is_signed, width = _ctype_info(ctype_str)
+    return make_int_t(width) if is_signed else make_uint_t(width)
+
+
+class _InferredSentinel:
+    """Registered as an operator impl to mean "fall through to the built-in
+    inferred path" -- the escape hatch for overriding one narrower case out of
+    a broader generic registration (e.g. keep one hot function's multiply on
+    a DSP while everything else in the design is soft), and the mechanism a
+    soft library implementation uses to pin down its own internal recursion
+    (e.g. a soft adder's carry chain must not recursively call itself)."""
+
+    def __repr__(self):
+        return "INFERRED"
+
+
+INFERRED = _InferredSentinel()
+
+# Generic (matcher-based) registrations. Lists, most-recently-registered last;
+# resolution scans in reverse so a later registration overrides an earlier,
+# broader one for overlapping matchers (e.g. register_soft_mult() then
+# register_soft_mult_karatsuba() -- the karatsuba registration wins).
+_generic_operator_registry: list = []  # [(op, l_matcher, r_matcher, factory_or_INFERRED)]
+_generic_left_operator_registry: list = []  # [(op, l_matcher, factory_or_INFERRED)]
+_generic_unary_operator_registry: list = []  # [(op, matcher, factory_or_INFERRED)]
+# Memoization of resolved generic lookups, keyed on the concrete type string(s).
+_generic_operator_cache: dict = {}
+_generic_left_operator_cache: dict = {}
+_generic_unary_operator_cache: dict = {}
+# Scoped counterparts, mirroring _scoped_operator_registry etc.
+_scoped_generic_operator_registry: dict = {}  # id(scope) -> [(op, lm, rm, factory)]
+_scoped_generic_left_operator_registry: dict = {}
+_scoped_generic_unary_operator_registry: dict = {}
+
+
+def _resolve_generic_operator(op, l_str, r_str):
+    """Consult the generic binary registry. Returns a callable, INFERRED, or
+    None (no generic registration matches)."""
+    key = (op, l_str, r_str)
+    if key in _generic_operator_cache:
+        return _generic_operator_cache[key]
+    impl = None
+    transient = False
+    scoped_from = len(_generic_operator_registry) - _scoped_generic_tail["op"]
+    for idx in range(len(_generic_operator_registry) - 1, -1, -1):
+        entry_op, lm, rm, factory = _generic_operator_registry[idx]
+        if entry_op == op and lm.matches(l_str) and rm.matches(r_str):
+            transient = idx >= scoped_from or idx < _fallback_generic_head["op"]
+            impl = (
+                factory
+                if factory is INFERRED
+                else factory(_reconstruct_int_ctype(l_str), _reconstruct_int_ctype(r_str))
+            )
+            break
+    _generic_operator_cache[key] = impl
+    # Memoize into the precise registry so later lookups skip the scan -- but
+    # only for a globally registered entry (see _scoped_generic_tail and
+    # _fallback_generic_head). The gate-set name is deliberately NOT added
+    # here: it is recorded at registration time instead.
+    if impl is not None and impl is not INFERRED and not transient:
+        _operator_registry[key] = impl
+    return impl
+
+
+def _resolve_generic_left_operator(op, l_str):
+    key = (op, l_str)
+    if key in _generic_left_operator_cache:
+        return _generic_left_operator_cache[key]
+    impl = None
+    transient = False
+    scoped_from = len(_generic_left_operator_registry) - _scoped_generic_tail["left"]
+    for idx in range(len(_generic_left_operator_registry) - 1, -1, -1):
+        entry_op, lm, factory = _generic_left_operator_registry[idx]
+        if entry_op == op and lm.matches(l_str):
+            transient = idx >= scoped_from or idx < _fallback_generic_head["left"]
+            impl = factory if factory is INFERRED else factory(_reconstruct_int_ctype(l_str))
+            break
+    _generic_left_operator_cache[key] = impl
+    if impl is not None and impl is not INFERRED and not transient:
+        _left_operator_registry[key] = impl
+    return impl
+
+
+def _resolve_generic_unary_operator(op, t_str):
+    key = (op, t_str)
+    if key in _generic_unary_operator_cache:
+        return _generic_unary_operator_cache[key]
+    impl = None
+    transient = False
+    scoped_from = len(_generic_unary_operator_registry) - _scoped_generic_tail["unary"]
+    for idx in range(len(_generic_unary_operator_registry) - 1, -1, -1):
+        entry_op, m, factory = _generic_unary_operator_registry[idx]
+        if entry_op == op and m.matches(t_str):
+            transient = idx >= scoped_from or idx < _fallback_generic_head["unary"]
+            impl = factory if factory is INFERRED else factory(_reconstruct_int_ctype(t_str))
+            break
+    _generic_unary_operator_cache[key] = impl
+    if impl is not None and impl is not INFERRED and not transient:
+        _unary_operator_registry[key] = impl
+    return impl
+
+
+# MUX registry: keyed by the muxed (iftrue/iffalse) type only, since MUX has
+# a single fixed shape (cond: uint1_t, iftrue/iffalse: T) -> T rather than an
+# operator string. Mirrors the unary-operator registry structure exactly.
+_mux_registry: dict = {}  # type_str -> name_or_callable
+_scoped_mux_registry: dict = {}
+_generic_mux_registry: list = []  # [(matcher, factory_or_INFERRED)]
+_generic_mux_cache: dict = {}
+_scoped_generic_mux_registry: dict = {}
+_registered_mux_type_names: set = set()  # type strings with an active exact/generic reg
+
+
+def _resolve_generic_mux(t_str):
+    if t_str in _generic_mux_cache:
+        return _generic_mux_cache[t_str]
+    impl = None
+    transient = False
+    scoped_from = len(_generic_mux_registry) - _scoped_generic_tail["mux"]
+    for idx in range(len(_generic_mux_registry) - 1, -1, -1):
+        m, factory = _generic_mux_registry[idx]
+        if m.matches(t_str):
+            transient = idx >= scoped_from or idx < _fallback_generic_head["mux"]
+            impl = factory if factory is INFERRED else factory(_reconstruct_int_ctype(t_str))
+            break
+    _generic_mux_cache[t_str] = impl
+    if impl is not None and impl is not INFERRED and not transient:
+        _mux_registry[t_str] = impl
+        # MUX matcher entries have no op-name string to record at registration
+        # time (the registry is keyed by muxed type), so the gate name is still
+        # recorded lazily here -- subject to the SIM_SOFT_OPS policy.
+        _matcher_mux_type_names.add(t_str)
+        if _sim_soft_ops_allows("MUX"):
+            _registered_mux_type_names.add(t_str)
+    return impl
+
+
+def register_mux_impl(type_, func, scope=None) -> None:
+    """Register a hardware function (or factory) as the implementation of
+    MUX(cond, iftrue, iffalse) for integer type `type_` (or a type matcher).
+
+    Only applies where the elaborator already routes MUX through a lookup
+    (currently: the VAR_REF_RD binary mux tree, used for variable array
+    indexing). Struct/array MUX stays inferred (pure wiring) regardless of
+    what is registered here.
+    """
+    if _is_type_matcher(type_):
+        entry = (type_, func)
+        if scope is None:
+            _generic_mux_registry.append(entry)
+            _generic_mux_cache.clear()
+        else:
+            _scoped_funcs.add(id(scope))
+            _scoped_generic_mux_registry.setdefault(id(scope), []).append(entry)
+        return
+    key = _ctype_str(type_)
+    if scope is None:
+        _mux_registry[key] = func
+        _concrete_mux_type_names.add(key)
+        _registered_mux_type_names.add(key)
+    else:
+        _scoped_funcs.add(id(scope))
+        _scoped_mux_registry.setdefault(id(scope), {})[key] = func
+
+
+def register_operator(op: str, left_type, right_type, func, scope=None) -> None:
+    """Register a hardware function (or factory) as the implementation of a
+    binary operator.
+
+    op:         operator name string, e.g. "PLUS" (+), "GT" (>), "SL" (<<).
+    left_type:  C type of the left operand (e.g. uint32_t), OR a type matcher
+                (any_uint_t / any_int_t / any_integer_t / uint_upto(n) /
+                int_upto(n)) to cover many concrete types with one call.
+    right_type: C type of the right operand, or a type matcher (as above).
+    func:       callable hardware function object for an exact (concrete-type)
+                registration; a factory func(left_type, right_type) -> hw_func
+                for a matcher-based (generic) registration; or INFERRED to
+                explicitly fall through to the built-in inferred path (an
+                escape hatch for overriding one case out of a broader generic
+                registration).
+    scope:      if provided, registration is active only while elaborating that
+                callable (and its callees).
+    """
+    if _is_type_matcher(left_type) or _is_type_matcher(right_type):
+        entry = (op, _as_matcher(left_type), _as_matcher(right_type), func)
+        if scope is None:
+            _generic_operator_registry.append(entry)
+            _generic_operator_cache.clear()
+            # Record the gate name now, not lazily on the first successful
+            # resolution -- see the _matcher_*_op_names comment above. Subject
+            # to SIM_SOFT_OPS, which _recompute_sim_gate_sets applies.
+            _matcher_binary_op_names.add(op)
+            _recompute_sim_gate_sets()
+        else:
+            _scoped_funcs.add(id(scope))
+            _scoped_generic_operator_registry.setdefault(id(scope), []).append(entry)
+        return
+    key = (op, _ctype_str(left_type), _ctype_str(right_type))
+    if scope is None:
+        _operator_registry[key] = func
+        _concrete_binary_op_names.add(op)
+        _registered_binary_op_names.add(op)
+    else:
+        _scoped_funcs.add(id(scope))
+        _scoped_operator_registry.setdefault(id(scope), {})[key] = func
+
+
+def register_left_operator(op: str, left_type, func, scope=None) -> None:
+    """Register a hardware function (or factory) as the implementation of a
+    binary operator, matching only on the left operand type. The right
+    operand type is derived from the registered function (e.g. shift amount
+    derived from value width).
+
+    op:        operator name string, e.g. "SL" (<<) or "SR" (>>).
+    left_type: C type of the left operand (e.g. uint32_t), or a type matcher.
+    func:      callable hardware function object (exact registration), a
+               factory func(left_type) -> hw_func (matcher registration), or
+               INFERRED.
+    scope:     if provided, registration is active only while elaborating that
+               callable (and its callees).
+    """
+    if _is_type_matcher(left_type):
+        entry = (op, left_type, func)
+        if scope is None:
+            _generic_left_operator_registry.append(entry)
+            _generic_left_operator_cache.clear()
+            _matcher_binary_op_names.add(op)
+            _recompute_sim_gate_sets()
+        else:
+            _scoped_funcs.add(id(scope))
+            _scoped_generic_left_operator_registry.setdefault(id(scope), []).append(entry)
+        return
+    key = (op, _ctype_str(left_type))
+    if scope is None:
+        _left_operator_registry[key] = func
+        _concrete_binary_op_names.add(op)
+        _registered_binary_op_names.add(op)
+    else:
+        _scoped_funcs.add(id(scope))
+        _scoped_left_operator_registry.setdefault(id(scope), {})[key] = func
+
+
+def register_unary_operator(op: str, operand_type, func, scope=None) -> None:
+    """Register a hardware function (or factory) as the implementation of a
+    unary operator.
+
+    op:           operator name string, e.g. "NEGATE" (-) or "NOT" (~).
+    operand_type: C type of the operand (e.g. uint32_t), or a type matcher.
+    func:         callable hardware function object (exact registration), a
+                  factory func(operand_type) -> hw_func (matcher registration),
+                  or INFERRED.
+    scope:        if provided, registration is active only while elaborating
+                  that callable (and its callees).
+    """
+    if _is_type_matcher(operand_type):
+        entry = (op, operand_type, func)
+        if scope is None:
+            _generic_unary_operator_registry.append(entry)
+            _generic_unary_operator_cache.clear()
+            _matcher_unary_op_names.add(op)
+            _recompute_sim_gate_sets()
+        else:
+            _scoped_funcs.add(id(scope))
+            _scoped_generic_unary_operator_registry.setdefault(id(scope), []).append(entry)
+        return
+    key = (op, _ctype_str(operand_type))
+    if scope is None:
+        _unary_operator_registry[key] = func
+        _concrete_unary_op_names.add(op)
+        _registered_unary_op_names.add(op)
+    else:
+        _scoped_funcs.add(id(scope))
+        _scoped_unary_operator_registry.setdefault(id(scope), {})[key] = func
+
+
+# ─────────────────────────────────────────────
+# Casting: T(x)
+#
+# A call on a pypeline type with exactly one positional argument and no
+# keywords is a cast (see _CTypeMeta.__call__ for scalar int/uint
+# destinations, and struct()'s _typed_new below for compound ones). Every
+# non-scalar cast is implemented as an ordinary hardware function -- a real
+# submodule instance at elaboration time, an ordinary call in native sim --
+# registered here by (src_ctype_str, dst_ctype_str). There is no built-in
+# compound cast: even the interface-half wrap/unwrap casts
+# (stream.make_stream_interface) are registered functions, not special-cased.
+#
+# Scalar int/uint destinations are the one exception: they are not looked up
+# here at all (see _CTypeMeta.__call__) -- casting between two integer
+# widths/signs is a language primitive with the same truncation/sign-
+# extension behavior as assignment, not something a user can override.
+# ─────────────────────────────────────────────
+
+_cast_registry: dict = {}  # (src_type_str, dst_type_str) -> hw_func
+
+
+def register_cast(src_t, dst_t, func) -> None:
+    """Register `func` -- a hardware function of the form
+    `def f(x: src_t) -> dst_t` -- as the implementation of `dst_t(value)`
+    whenever `value`'s ctype is `src_t`.
+
+    Imperative form, for a factory that already built the function (e.g.
+    make_float_converter/make_fixed_resize) and just needs to wire it in.
+    Prefer the @cast decorator when writing the function directly.
+    """
+    key = (_ctype_str(src_t), _ctype_str(dst_t))
+    _cast_registry[key] = func
+
+
+class _LazyCast:
+    """A cast registered via a thunk instead of a finished function: `build()`
+    (a zero-arg callable returning the real cast function) only runs on the
+    first actual lookup of this (src_t, dst_t) pair, via _resolve_cast_entry
+    -- not at registration time. See register_lazy_cast."""
+
+    __slots__ = ("build",)
+
+    def __init__(self, build):
+        self.build = build
+
+
+def register_lazy_cast(src_t, dst_t, build) -> None:
+    """Like register_cast, but defers building the real cast function until
+    first use (see _LazyCast). For a cast whose implementation is itself
+    generated (e.g. stream.make_stream_interface's wrap/unwrap casts,
+    generated as real source text + exec()) -- so a design that builds the
+    type but never casts it never pays for generating (and, in hardware,
+    instantiating) an implementation it doesn't use.
+    """
+    key = (_ctype_str(src_t), _ctype_str(dst_t))
+    _cast_registry[key] = _LazyCast(build)
+
+
+def _resolve_cast_entry(key):
+    """Look up _cast_registry[key], resolving (and caching back) a lazy
+    entry. The single lookup path both _CastDispatchMeta.__call__ (native
+    sim) and PY_TO_LOGIC._elab_cast_call (elaboration) use -- so a lazy
+    cast's first use, from either side, builds it exactly once."""
+    entry = _cast_registry.get(key)
+    if isinstance(entry, _LazyCast):
+        entry = entry.build()
+        _cast_registry[key] = entry
+    return entry
+
+
+def cast(fn):
+    """Decorator: register `fn` -- a function of the form
+    `def f(x: src_t) -> dst_t` -- as the implementation of `dst_t(value)`
+    whenever `value`'s ctype is `src_t`. `src_t`/`dst_t` are read from the
+    function's own argument/return annotations; it must take exactly one
+    argument.
+
+    Apply directly to a plain (undecorated) function -- @cast wraps it with
+    @wires itself, so the result is a real, callable hw_func exactly as if
+    @wires had been applied directly:
+
+        @cast
+        def stream_to_fwd(x: stream_t) -> fwd_t:
+            return fwd_t(stream=x)
+
+    This marks the function as a cast BEFORE hw_func-wrapping runs its
+    interface-port-pairing check (_check_partial_interface_ports), which is
+    what lets a cast take or return a lone interface half (.fwd_t/.fb_t)
+    without its paired other half: a cast is a conversion between a half and
+    its payload, not a port crossing, so there is no second half to pair.
+    Decorator evaluation is bottom-up, so this ONLY works when @cast is
+    applied to a not-yet-wrapped function -- @cast on an already-@hw_func/
+    @wires-decorated function is also accepted (for a cast whose types are
+    never a lone interface half, e.g. a hand-written struct or float
+    conversion needing real delay, pre-wrapped with plain @hw_func by the
+    caller), but for an interface-half cast the port-pairing check has
+    already run by then and raises regardless of any exemption.
+
+    A cast is assumed to be pure rewiring (like the interface wrap/unwrap
+    casts this exists for) -- @wires, not @hw_func, is what gets applied. A
+    cast needing real combinational delay should be built as an ordinary
+    @hw_func (e.g. via a factory) and registered with register_cast(...)
+    instead, or pre-wrapped with plain @hw_func before applying @cast.
+    """
+    if is_hw_func(fn):
+        wrapped = fn
+    else:
+        fn._pypeline_is_cast = True
+        wrapped = wires(fn)
+    arg_types = hw_arg_types(wrapped)
+    if len(arg_types) != 1:
+        raise TypeError(
+            f"@cast function {getattr(wrapped, '__qualname__', wrapped)!r} must take "
+            f"exactly one argument, got {len(arg_types)}"
+        )
+    register_cast(arg_types[0], hw_return_type(wrapped), wrapped)
+    wrapped._pypeline_is_cast = True
+    return wrapped
+
+
+def _struct_dispatch_call(fn, args):
+    """Call a registered struct-operator impl with simulation properly active.
+
+    Mirrors sim_call(): activates _sim_active and pushes fn's own scoped
+    registrations for the duration of the call. Without this, a registered
+    impl invoked from a bare `a + b` (outside any enclosing sim_call) would
+    take _sim_type_wrap's raw-passthrough branch -- skipping both its own
+    scoped sub-registrations (e.g. a float adder's internal NEGATE/SR
+    helpers) and its own arg/return casting -- silently computing wrong
+    results rather than raising, since ints tolerate ctype mismatches
+    numerically in a way structs don't surface as errors.
+    """
+    global _sim_active
+    prev_active = _sim_active
+    _sim_active = True
+    saved = _push_scoped_registrations(fn)
+    try:
+        return fn(*args)
+    finally:
+        _pop_scoped_registrations(saved)
+        _sim_active = prev_active
+
+
+def _struct_dispatch_binary_op(op_name, left, right):
+    """Look up and call a registered operator for a @struct-typed binary op.
+    Mirrors SimVal._dispatch_binary, but structs have no meaningful raw
+    fallback (unlike ints), so an unregistered pair raises TypeError instead
+    of silently falling through to e.g. tuple concatenation/repeat.
+    """
+    l_str = left._pypeline_ctype_name
+    r_str = getattr(right, "_pypeline_ctype_name", None)
+    fn = None
+    if r_str:
+        fn = _operator_registry.get((op_name, l_str, r_str))
+        if fn is None:
+            fn = _resolve_generic_operator(op_name, l_str, r_str)
+    if fn is None or fn is INFERRED:
+        fn = _left_operator_registry.get((op_name, l_str))
+        if fn is None:
+            fn = _resolve_generic_left_operator(op_name, l_str)
+    if fn is INFERRED:
+        fn = None
+    if not callable(fn):
+        raise TypeError(
+            f"No {op_name!r} operator registered for {l_str!r} and "
+            f"{r_str or type(right).__name__!r} -- use register_operator(...)"
+        )
+    return _struct_dispatch_call(fn, (left, right))
+
+
+def _struct_dispatch_unary_op(op_name, operand):
+    """Look up and call a registered operator for a @struct-typed unary op."""
+    l_str = operand._pypeline_ctype_name
+    fn = _unary_operator_registry.get((op_name, l_str))
+    if fn is None:
+        fn = _resolve_generic_unary_operator(op_name, l_str)
+    if fn is INFERRED:
+        fn = None
+    if not callable(fn):
+        raise TypeError(f"No {op_name!r} operator registered for {l_str!r}")
+    return _struct_dispatch_call(fn, (operand,))
+
+
+def _push_scoped_registrations(func):
+    """Merge scoped operator registrations for *func* into the active global registries.
+    Returns a list of (registry, key, old_value) triples for restoring afterward.
+    Scoped entries from outer elaboration frames are already present in the global
+    registries, so inner callees automatically inherit them.
+
+    Also provisionally records the op name in the concrete/matcher bookkeeping
+    sets that feed the native-sim dispatch gate (see _recompute_sim_gate_sets),
+    so a scoped-only registration dispatches correctly even when no unrelated
+    global registration for that op name happens to already exist. Without
+    this, a scoped NEGATE/SR/SL registration would silently never be consulted
+    -- SimVal would take its default int-arithmetic fallback instead -- unless
+    some other, unrelated module happened to have also globally registered that
+    same op name (for any type), which is not something a self-contained
+    factory function should have to depend on.
+
+    Scoped MATCHER entries get the same treatment, via _matcher_*_op_names.
+    They used to be extended onto the live generic list without any name being
+    recorded at all, which is the scoped half of the same hole that kept every
+    matcher registration out of native sim.
+    """
+    func_id = id(func)
+    if func_id not in _scoped_funcs:
+        return _EMPTY_SAVED
+    saved = []
+    for key, val in _scoped_operator_registry.get(func_id, {}).items():
+        saved.append((_operator_registry, key, _operator_registry.get(key)))
+        _operator_registry[key] = val
+        if key[0] not in _concrete_binary_op_names:
+            _concrete_binary_op_names.add(key[0])
+            saved.append((_concrete_binary_op_names, key[0], _SCOPED_SET_ADD))
+    for key, val in _scoped_left_operator_registry.get(func_id, {}).items():
+        saved.append((_left_operator_registry, key, _left_operator_registry.get(key)))
+        _left_operator_registry[key] = val
+        if key[0] not in _concrete_binary_op_names:
+            _concrete_binary_op_names.add(key[0])
+            saved.append((_concrete_binary_op_names, key[0], _SCOPED_SET_ADD))
+    for key, val in _scoped_unary_operator_registry.get(func_id, {}).items():
+        saved.append((_unary_operator_registry, key, _unary_operator_registry.get(key)))
+        _unary_operator_registry[key] = val
+        if key[0] not in _concrete_unary_op_names:
+            _concrete_unary_op_names.add(key[0])
+            saved.append((_concrete_unary_op_names, key[0], _SCOPED_SET_ADD))
+    for key, val in _scoped_mux_registry.get(func_id, {}).items():
+        saved.append((_mux_registry, key, _mux_registry.get(key)))
+        _mux_registry[key] = val
+        if key not in _concrete_mux_type_names:
+            _concrete_mux_type_names.add(key)
+            saved.append((_concrete_mux_type_names, key, _SCOPED_SET_ADD))
+    # Generic (matcher-based) scoped entries: appended to the live list (stack
+    # discipline -- nested push/pop always fully completes before this pop
+    # runs, so popping the last N entries is always correct), and the
+    # memoization cache is cleared since availability just changed.
+    generic_entries = _scoped_generic_operator_registry.get(func_id, [])
+    if generic_entries:
+        _generic_operator_registry.extend(generic_entries)
+        _generic_operator_cache.clear()
+        _scoped_generic_tail["op"] += len(generic_entries)
+        saved.append((_generic_operator_registry, len(generic_entries), _SCOPED_GENERIC_POP))
+        for entry in generic_entries:
+            if entry[0] not in _matcher_binary_op_names:
+                _matcher_binary_op_names.add(entry[0])
+                saved.append((_matcher_binary_op_names, entry[0], _SCOPED_SET_ADD))
+    generic_left_entries = _scoped_generic_left_operator_registry.get(func_id, [])
+    if generic_left_entries:
+        _generic_left_operator_registry.extend(generic_left_entries)
+        _generic_left_operator_cache.clear()
+        _scoped_generic_tail["left"] += len(generic_left_entries)
+        saved.append(
+            (_generic_left_operator_registry, len(generic_left_entries), _SCOPED_GENERIC_POP)
+        )
+        for entry in generic_left_entries:
+            if entry[0] not in _matcher_binary_op_names:
+                _matcher_binary_op_names.add(entry[0])
+                saved.append((_matcher_binary_op_names, entry[0], _SCOPED_SET_ADD))
+    generic_unary_entries = _scoped_generic_unary_operator_registry.get(func_id, [])
+    if generic_unary_entries:
+        _generic_unary_operator_registry.extend(generic_unary_entries)
+        _generic_unary_operator_cache.clear()
+        _scoped_generic_tail["unary"] += len(generic_unary_entries)
+        saved.append(
+            (_generic_unary_operator_registry, len(generic_unary_entries), _SCOPED_GENERIC_POP)
+        )
+        for entry in generic_unary_entries:
+            if entry[0] not in _matcher_unary_op_names:
+                _matcher_unary_op_names.add(entry[0])
+                saved.append((_matcher_unary_op_names, entry[0], _SCOPED_SET_ADD))
+    generic_mux_entries = _scoped_generic_mux_registry.get(func_id, [])
+    if generic_mux_entries:
+        _generic_mux_registry.extend(generic_mux_entries)
+        _generic_mux_cache.clear()
+        _scoped_generic_tail["mux"] += len(generic_mux_entries)
+        saved.append((_generic_mux_registry, len(generic_mux_entries), _SCOPED_GENERIC_POP))
+    if saved:
+        _recompute_sim_gate_sets()
+    return saved
+
+
+_SCOPED_MISSING = object()  # sentinel for _pop_scoped_registrations; created once
+_SCOPED_SET_ADD = object()  # sentinel: this saved entry is a set .add() to undo
+_SCOPED_GENERIC_POP = object()  # sentinel: this saved entry is N generic-list entries to pop
+_EMPTY_SAVED = []  # returned by _push_scoped_registrations when nothing to push
+
+
+def _pop_scoped_registrations(saved):
+    """Restore registry entries (and gate-set membership) to their pre-push state."""
+    for registry, key, old_val in saved:
+        if old_val is _SCOPED_SET_ADD:
+            registry.discard(key)
+        elif old_val is _SCOPED_GENERIC_POP:
+            n = key  # here `key` holds the count of entries appended by push
+            del registry[len(registry) - n :]
+            if registry is _generic_operator_registry:
+                _generic_operator_cache.clear()
+                _scoped_generic_tail["op"] -= n
+            elif registry is _generic_left_operator_registry:
+                _generic_left_operator_cache.clear()
+                _scoped_generic_tail["left"] -= n
+            elif registry is _generic_mux_registry:
+                # Used to fall into the unary branch below and clear the wrong
+                # cache, leaving a popped scoped mux resolution memoized.
+                _generic_mux_cache.clear()
+                _scoped_generic_tail["mux"] -= n
+            else:
+                _generic_unary_operator_cache.clear()
+                _scoped_generic_tail["unary"] -= n
+        elif old_val is None:
+            registry.pop(key, _SCOPED_MISSING)
+        else:
+            registry[key] = old_val
+    if saved:
+        _recompute_sim_gate_sets()
+
+
+def _push_fallback_registrations(scope):
+    """Install *scope*'s scoped matcher registrations as the lowest-priority
+    generic entries (the head of each list, behind every global and scoped
+    entry) until _pop_fallback_registrations(saved).
+
+    PY_TO_LOGIC.ELABORATE_LIVE_ROOTS uses this for the default operator
+    lowerings. PARSE_FILE registers those globally before the design file is
+    imported, so every design registration outranks them; here the design's
+    registrations already exist, and the head is the position that keeps that
+    precedence. Unlike a global registration this records no sim gate name,
+    and nothing resolved through it is memoized (_fallback_generic_head), so
+    native-sim dispatch afterwards is exactly what it was before.
+
+    Matcher entries only: an exact-type entry would sit in a precise registry,
+    where it would override global registrations instead of backing them up.
+    """
+    func_id = id(scope)
+    if any(
+        func_id in registry
+        for registry in (
+            _scoped_operator_registry,
+            _scoped_left_operator_registry,
+            _scoped_unary_operator_registry,
+            _scoped_mux_registry,
+        )
+    ):
+        raise TypeError("fallback registrations must use type matchers, not exact types")
+    saved = []
+    for kind, registry, scoped, cache in (
+        (
+            "op",
+            _generic_operator_registry,
+            _scoped_generic_operator_registry,
+            _generic_operator_cache,
+        ),
+        (
+            "left",
+            _generic_left_operator_registry,
+            _scoped_generic_left_operator_registry,
+            _generic_left_operator_cache,
+        ),
+        (
+            "unary",
+            _generic_unary_operator_registry,
+            _scoped_generic_unary_operator_registry,
+            _generic_unary_operator_cache,
+        ),
+        ("mux", _generic_mux_registry, _scoped_generic_mux_registry, _generic_mux_cache),
+    ):
+        entries = scoped.get(func_id, [])
+        if entries:
+            registry[:0] = entries
+            _fallback_generic_head[kind] += len(entries)
+            cache.clear()
+            saved.append((kind, registry, cache, len(entries)))
+    return saved
+
+
+def _pop_fallback_registrations(saved):
+    """Remove what _push_fallback_registrations(scope) installed."""
+    for kind, registry, cache, n in saved:
+        del registry[:n]
+        _fallback_generic_head[kind] -= n
+        cache.clear()
+
+
+# ─────────────────────────────────────────────
+# Reg[T] — hardware state register annotation
+# ─────────────────────────────────────────────
+
+
+class _MultiCycleRole:
+    """One endpoint (.start or .end) of a MULTI_CYCLE[...] tag. Produced by
+    MULTI_CYCLE[ncycles].start / .end, consumed by Reg[T, role] to mark that
+    register declaration as one end of a multi-cycle timing path."""
+
+    def __init__(self, tag, is_start):
+        self.tag = tag
+        self.is_start = is_start
+
+
+class _MultiCycleTag:
+    """Returned by MULTI_CYCLE[ncycles]. Tag exactly two Reg[T] declarations
+    with .start / .end (equivalent of PipelineC's
+    `#pragma MULTI_CYCLE <ncycles> <start_reg> <end_reg>`):
+
+        MC = MULTI_CYCLE[32]
+        data0: Reg[my_struct_t, MC.start]
+        data1: Reg[my_struct_t, MC.end]
+    """
+
+    def __init__(self, ncycles):
+        self.ncycles = ncycles
+        self.start = _MultiCycleRole(self, is_start=True)
+        self.end = _MultiCycleRole(self, is_start=False)
+
+
+class _MultiCycleMeta(type):
+    def __getitem__(cls, ncycles):
+        if not isinstance(ncycles, int):
+            raise TypeError(f"MULTI_CYCLE[ncycles] expects an int, got {ncycles!r}")
+        return _MultiCycleTag(ncycles)
+
+
+class MULTI_CYCLE(metaclass=_MultiCycleMeta):
+    """MULTI_CYCLE[ncycles] — tag for two Reg[T] declarations forming a
+    multi-cycle timing path (equivalent of PipelineC's
+    `#pragma MULTI_CYCLE <ncycles> <start_reg> <end_reg>`).
+
+    Usage:
+        MC = MULTI_CYCLE[32]
+        data0: Reg[my_struct_t, MC.start]
+        data1: Reg[my_struct_t, MC.end]
+    """
+
+    pass
+
+
+# ─────────────────────────────────────────────
+# AUTO_MULTI_CYCLE: tool-tuned multi-cycle paths with .latency feedback
+# ─────────────────────────────────────────────
+
+# canonical_key -> multi-cycle count chosen by the previous build pass's
+# throughput sweep. Installed only by the pipelinec driver between
+# pin-and-confirm passes, and again before a non---comb `--sim` run's
+# native-sim design import (SET_AUTO_MULTI_CYCLE_LATENCY_CACHE). Empty otherwise, so
+# .latency reads its constructor value (latency=, else start_latency=, else 1).
+_auto_multi_cycle_latency_cache: dict = {}
+# AUTO_MULTI_CYCLE object -> set of values design code read through
+# .latency/.ncycles during the current design execution. The compiler's own
+# read (the set_multicycle_path value, AUTO_MULTI_CYCLE._ncycles_for_compiler) is
+# NOT recorded: an AUTO_MULTI_CYCLE nothing in the design reads can't have its
+# handshake follow the sweep, and the driver fails the build on it
+# (AUTO_MULTI_CYCLE_UNREAD_KEYS). Keyed by object so plain native sim never
+# resolves a key (see AUTO_MULTI_CYCLE.canonical_key).
+_auto_multi_cycle_served: dict = {}
+# (AUTO_MULTI_CYCLE object, "file:line") of those reads, first read first (an
+# ordered set: the values are None)
+_auto_multi_cycle_read_sites: dict = {}
+# AUTO_MULTI_CYCLE objects constructed during the current design execution, in
+# construction order
+_auto_multi_cycle_constructed: list = []
+# (module, code name, line) -> constructions seen at that source site during
+# the current design execution; the ordinal disambiguates one factory line
+# building several AUTO_MULTI_CYCLE tags (see AUTO_MULTI_CYCLE.canonical_key)
+_auto_multi_cycle_site_counts: dict = {}
+# name -> (signature, "file:line", tag) of the first AUTO_MULTI_CYCLE(name=) this
+# design execution constructed under that name. A name is one multi-cycle
+# group: every tag sharing it must have the same constraints (and wrap the
+# same function, for a make_stream_auto_multi_cycle tag).
+_auto_multi_cycle_names: dict = {}
+# Pseudo file names the decorator / elaborator compile compile-time
+# expressions under. An AUTO_MULTI_CYCLE constructed under one of these is being built
+# inside a @hw_func body, which re-creates it on every evaluation.
+_AUTO_MULTI_CYCLE_BODY_EVAL_FILES = frozenset(
+    (
+        "<local_const>",
+        "<const_eval>",
+        "<annotation>",
+        "<ann>",
+        "<reg_init>",
+        "<wire_ann>",
+    )
+)
+
+
+def SET_AUTO_MULTI_CYCLE_LATENCY_CACHE(cache: dict) -> None:
+    """pipelinec-driver hook: install the multi-cycle counts the previous
+    build pass settled on (canonical_key -> cycles) so the next design-file
+    execution's AUTO_MULTI_CYCLE(...) constructions resolve .latency to them."""
+    global _auto_multi_cycle_latency_cache
+    _auto_multi_cycle_latency_cache = dict(cache)
+
+
+def RESET_AUTO_MULTI_CYCLE_TRACKING() -> None:
+    """Forget constructions/reads from a previous design execution (called
+    before every design (re-)execution: PARSE_FILE, native-sim import)."""
+    _auto_multi_cycle_served.clear()
+    _auto_multi_cycle_read_sites.clear()
+    _auto_multi_cycle_constructed.clear()
+    _auto_multi_cycle_site_counts.clear()
+    _auto_multi_cycle_names.clear()
+    _auto_pipeline_names.clear()
+    _latency_seeds_applied.clear()
+    _latency_seeds_looked_up.clear()
+    _auto_constructed.clear()
+    _auto_site_counts.clear()
+    _auto_reads.clear()
+
+
+def USER_NAMED_AUTO_TAGS() -> list:
+    """(kind, name, canonical_key, "file:line") for every AUTO_PIPELINE /
+    AUTO_MULTI_CYCLE given a name= during the current design execution, sorted."""
+    rows = [
+        ("AUTO_PIPELINE", name, tag.canonical_key, site)
+        for name, (_, site, tag) in _auto_pipeline_names.items()
+    ]
+    rows += [
+        ("AUTO_MULTI_CYCLE", name, tag.canonical_key, site)
+        for name, (_, site, tag) in _auto_multi_cycle_names.items()
+    ]
+    return sorted(rows)
+
+
+def AUTO_MULTI_CYCLE_SERVED_LATENCIES() -> dict:
+    """canonical_key -> set of .latency values design code read (over every
+    tag of the key)."""
+    served = {}
+    for tag, values in _auto_multi_cycle_served.items():
+        served.setdefault(tag.canonical_key, set()).update(values)
+    return served
+
+
+def AUTO_MULTI_CYCLE_READ_SITES() -> dict:
+    """canonical_key -> "file:line" sites that read .latency, first read first."""
+    sites = {}
+    for tag, site in _auto_multi_cycle_read_sites:
+        found = sites.setdefault(tag.canonical_key, [])
+        if site not in found:
+            found.append(site)
+    return sites
+
+
+def AUTO_MULTI_CYCLE_CONSTRUCTED() -> dict:
+    """canonical_key -> AUTO_MULTI_CYCLE object, for the current design execution
+    (the last one constructed, when several share a key)."""
+    return {tag.canonical_key: tag for tag in _auto_multi_cycle_constructed}
+
+
+def AUTO_MULTI_CYCLE_UNREAD_KEYS() -> list:
+    """Keys of sweep-adjustable (not fixed latency=) AUTO_MULTI_CYCLE tags whose .latency
+    design code never read (through any tag of the key)."""
+    read = {tag.canonical_key for tag in _auto_multi_cycle_served}
+    return sorted(
+        {
+            tag.canonical_key
+            for tag in _auto_multi_cycle_constructed
+            if tag.fixed_latency is None and tag.canonical_key not in read
+        }
+    )
+
+
+def _auto_multi_cycle_latency_suffix(latency, start_latency, max_latency) -> str:
+    """Canonical-key suffix for an AUTO_MULTI_CYCLE constraint ("" when unconstrained).
+    Must match LOGIC.AutoMultiCycleConstraint.key_suffix."""
+    return _auto_pipeline_latency_suffix(latency, start_latency, max_latency)
+
+
+def _check_auto_multi_cycle_latency_arg(name, value):
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            f"AUTO_MULTI_CYCLE({name}=...): must be an int, got {type(value).__name__}"
+        )
+    if value < 1:
+        raise ValueError(
+            f"AUTO_MULTI_CYCLE({name}={value}): must be >= 1 (a multi-cycle path spans "
+            "at least one clock cycle)"
+        )
+
+
+class AUTO_MULTI_CYCLE:
+    """AUTO_MULTI_CYCLE(latency=None, start_latency=None, max_latency=None): a
+    multi-cycle path whose cycle count the pypelinec throughput sweep picks
+    (the auto-tuned counterpart of MULTI_CYCLE[N]). Tag exactly two Reg[T]
+    declarations with .start / .end, and drive the handshake from .latency::
+
+        MC = AUTO_MULTI_CYCLE(start_latency=3)            # sweep starts at 3 cycles
+        MC = AUTO_MULTI_CYCLE(start_latency=3, max_latency=8)
+        MC = AUTO_MULTI_CYCLE(latency=4)                  # fixed: exactly 4 cycles
+
+        @hw_func
+        def slow(i: in_t) -> out_t:
+            launch: Reg[in_t, MC.start]
+            capture: Reg[out_t, MC.end]
+            ...
+            if count == MC.latency + 1: ...      # the handshake follows it
+
+    .latency is the multi-cycle count N (the setup-check multiplier of the
+    launch->capture path). It reads the value the build settled on (installed
+    by the pipelinec driver's pin-and-confirm pass), else latency=, else
+    start_latency=, else 1 -- in every build and in native simulation (which
+    never models settling: the data path is ready instantly, only the
+    handshake timing depends on N).
+
+    In a synthesizing build (Vivado only, like MULTI_CYCLE) the sweep checks
+    each timing report: when the failing path runs from this tag's .start
+    register to its .end register, it raises N to what the reported slack
+    needs (never below start_latency, never above max_latency -- a cap that
+    blocks the goal fails the build), then re-elaborates the design with the
+    final N so every .latency-derived constant matches the constraint.
+    Because of that, design code MUST read .latency (a start/max AUTO_MULTI_CYCLE
+    nothing reads fails the build); use MULTI_CYCLE[N] for a hand-timed MCP.
+
+    Construct it once, eagerly, outside any @hw_func body (e.g. at a factory's
+    top level) and capture it by closure.
+
+    An unnamed tag's key is the constructing source line and a construction
+    ordinal. A make_stream_auto_multi_cycle tag's is instead the function it
+    wraps (_func=, set only by that factory), like an AUTO_PIPELINE's: tags
+    over one function with the same constraints are one group with one count.
+
+    name="..." names the tag: its key becomes the name (plus `_latency_N` /
+    `_max_latency_M`), so latency hints and the latency memory find it by
+    that name and reports print it. start_latency= is not part of a named
+    key. Tags sharing a name are one group with one count, so they must have
+    the same latency= / start_latency= / max_latency= (and wrap the same
+    function, for make_stream_auto_multi_cycle tags).
+    """
+
+    # Duck-type marker (_stable_key, PY_TO_LOGIC)
+    _is_auto_multi_cycle_tag = True
+
+    def __init__(
+        self,
+        *,
+        latency=None,
+        start_latency=None,
+        max_latency=None,
+        name=None,
+        _func=None,
+    ):
+        _check_auto_multi_cycle_latency_arg("latency", latency)
+        _check_auto_multi_cycle_latency_arg("start_latency", start_latency)
+        _check_auto_multi_cycle_latency_arg("max_latency", max_latency)
+        if latency is not None and (
+            start_latency is not None or max_latency is not None
+        ):
+            raise ValueError(
+                "AUTO_MULTI_CYCLE(latency=...) is a fixed cycle count and can't be "
+                "combined with start_latency= / max_latency="
+            )
+        if (
+            start_latency is not None
+            and max_latency is not None
+            and start_latency > max_latency
+        ):
+            raise ValueError(
+                f"AUTO_MULTI_CYCLE(start_latency={start_latency}, "
+                f"max_latency={max_latency}): start_latency exceeds max_latency"
+            )
+        frame = _sys._getframe(1)
+        code = frame.f_code
+        if code.co_filename in _AUTO_MULTI_CYCLE_BODY_EVAL_FILES or _sim_active:
+            raise TypeError(
+                "AUTO_MULTI_CYCLE(...) must be constructed outside @hw_func bodies (e.g. "
+                "at a factory's top level) and captured by closure: a tag built "
+                "inside a body is re-created on every evaluation, so the build "
+                "can't track its cycle count"
+            )
+        if _func is not None and not is_hw_func(_func):
+            raise TypeError("AUTO_MULTI_CYCLE(_func=...): must be @hw_func-decorated")
+        self.fixed_latency = latency
+        self.start_latency = start_latency
+        self.max_latency = max_latency
+        self.name = name
+        # The function a make_stream_auto_multi_cycle tag's path computes, else
+        # None: an unnamed tag's key derives from it (canonical_key)
+        self.func = _func
+        self.start = _MultiCycleRole(self, is_start=True)
+        self.end = _MultiCycleRole(self, is_start=False)
+        # Resolved on first use (canonical_key): a wrapped function's key needs
+        # the compiler, which plain native sim never imports
+        self._canonical_key = None
+        if name is not None:
+            _check_user_name(name, "AUTO_MULTI_CYCLE")
+            signature = (
+                None if _func is None else _name_identity(_func),
+                latency,
+                start_latency,
+                max_latency,
+            )
+            where = _construction_site()
+            prior = _auto_multi_cycle_names.setdefault(name, (signature, where, self))
+            if prior[0] != signature:
+                raise TypeError(
+                    f"AUTO_MULTI_CYCLE(name={name!r}) at {where} differs from the "
+                    f"AUTO_MULTI_CYCLE(name={name!r}) at {prior[1]}: tags sharing a "
+                    "name are one multi-cycle group with one count, so they must "
+                    "have the same latency= / start_latency= / max_latency= (and "
+                    "wrap the same function). Give one of them another name."
+                )
+            # Named tags never consume a site ordinal, so unnamed keys at the
+            # same site don't move
+            self._canonical_key = name + _auto_multi_cycle_latency_suffix(
+                latency, None, max_latency
+            )
+        elif _func is None:
+            site = (frame.f_globals.get("__name__", "?"), code.co_name, frame.f_lineno)
+            ordinal = _auto_multi_cycle_site_counts.get(site, 0)
+            _auto_multi_cycle_site_counts[site] = ordinal + 1
+            self._canonical_key = (
+                f"{site[0]}.{site[1]}_line{site[2]}_{ordinal}"
+                + _auto_multi_cycle_latency_suffix(latency, start_latency, max_latency)
+            )
+        if latency is not None:
+            ncycles = latency
+        elif start_latency is not None:
+            ncycles = start_latency
+        else:
+            ncycles = 1
+        # A starting count from the latency memory or a hints file (see
+        # SET_LATENCY_SEEDS): sweep builds only, never for a fixed count. The
+        # sweep may still lower it (it is registered as a provisional seed).
+        self.seed = None
+        if _latency_seeds and latency is None and _auto_pipeline_build_mode == "sweep":
+            seed = _latency_seed("AUTO_MULTI_CYCLE", self.canonical_key, max_latency)
+            if seed is not None and seed >= 1:
+                self.seed = ncycles = seed
+        # Whether the installed build harvest has this tag (_require_built)
+        self._built_decided = False
+        # Skip key resolution when nothing is installed (plain native sim)
+        if _auto_multi_cycle_latency_cache or _built_unbuilt_reads:
+            cached = _auto_multi_cycle_latency_cache.get(self.canonical_key)
+            self._built_decided = cached is not None
+            if cached is not None:
+                if latency is not None and cached != latency:
+                    raise ValueError(
+                        f"AUTO_MULTI_CYCLE {self.canonical_key}: latency={latency} is "
+                        f"fixed, but the build settled on {cached} cycles for it"
+                    )
+                if max_latency is not None and cached > max_latency:
+                    raise ValueError(
+                        f"AUTO_MULTI_CYCLE {self.canonical_key}: the build settled on "
+                        f"{cached} cycles, above max_latency={max_latency}"
+                    )
+                ncycles = cached
+                self.seed = None  # the build's own result supersedes it
+            elif ("AUTO_MULTI_CYCLE", self.canonical_key) in _built_unbuilt_reads:
+                # The simulated build read this tag but never built it
+                ncycles = _built_unbuilt_reads[("AUTO_MULTI_CYCLE", self.canonical_key)]
+        self._ncycles = ncycles
+        _auto_multi_cycle_constructed.append(self)
+
+    @property
+    def canonical_key(self) -> str:
+        """The tag's group key: its name, its construction site, or the
+        function a make_stream_auto_multi_cycle tag wraps plus `_mcp`; then
+        the constraint suffix."""
+        if self._canonical_key is None:
+            # Lazy so plain native sim never imports the compiler; any context
+            # that needs the key (elaboration, an installed cache) has
+            # PY_TO_LOGIC loaded already.
+            import PY_TO_LOGIC
+
+            self._canonical_key = (
+                PY_TO_LOGIC.CANONICAL_CALLABLE_KEY(self.func)
+                + "_mcp"
+                + _auto_multi_cycle_latency_suffix(
+                    self.fixed_latency, self.start_latency, self.max_latency
+                )
+            )
+        return self._canonical_key
+
+    @property
+    def binding_key(self) -> str:
+        """The key installed results are under (_require_built): one count
+        per tag, whatever clock goals use it, so its canonical_key."""
+        return self.canonical_key
+
+    def _ncycles_for_compiler(self) -> int:
+        """The cycle count without counting as a design read."""
+        return self._ncycles
+
+    @property
+    def latency(self) -> int:
+        _require_built("AUTO_MULTI_CYCLE", self, read=True)
+        _auto_multi_cycle_served.setdefault(self, set()).add(self._ncycles)
+        _auto_multi_cycle_read_sites[(self, _latency_read_site())] = None
+        return self._ncycles
+
+    @property
+    def ncycles(self) -> int:
+        """Alias of .latency (MULTI_CYCLE[...] tags spell it ncycles)."""
+        return self.latency
+
+    def describe(self) -> str:
+        if self.fixed_latency is not None:
+            return f"latency={self.fixed_latency}"
+        parts = []
+        if self.start_latency is not None:
+            parts.append(f"start_latency={self.start_latency}")
+        if self.max_latency is not None:
+            parts.append(f"max_latency={self.max_latency}")
+        return ", ".join(parts) if parts else "unconstrained"
+
+    def __repr__(self):
+        if self._canonical_key is None and "PY_TO_LOGIC" not in _sys.modules:
+            inner = _inspect.unwrap(self.func)
+            key = f"func={inner.__module__}.{inner.__qualname__}"
+        else:
+            key = self.canonical_key
+        return f"AUTO_MULTI_CYCLE({key}, {self.describe()}, {self._ncycles} cycles)"
+
+
+class _ResetMarker:
+    """`RESET` / `NO_RESET` -- optional markers of Reg[T, ...]. RESET: the
+    register resets with its MAIN's reset under either reset_registers policy;
+    NO_RESET: it does not, even under reset_registers="all". A plain Reg[T]
+    follows its MAIN's policy. See make_reset."""
+
+    def __init__(self, mode):
+        self.mode = mode  # "reset" or "no_reset": _RegType.reset_mode
+
+    def __repr__(self):
+        return "RESET" if self.mode == "reset" else "NO_RESET"
+
+
+RESET = _ResetMarker("reset")
+NO_RESET = _ResetMarker("no_reset")
+
+
+class _RegType:
+    """Produced by Reg[T] or Reg[T, markers...]: a MULTI_CYCLE[...].start/.end
+    role and RESET or NO_RESET, in any order.
+    Marks a variable as a hardware register (flip-flop)."""
+
+    def __init__(self, inner_ctype, multi_cycle_role=None, reset_mode=None):
+        self.inner_ctype = inner_ctype  # a _CTypeMeta class or array ctype
+        self.multi_cycle_role = multi_cycle_role  # _MultiCycleRole or None
+        # "reset" (Reg[T, RESET]), "no_reset" (Reg[T, NO_RESET]) or None: its
+        # MAIN's reset_registers policy decides
+        self.reset_mode = reset_mode
+
+    def __str__(self):
+        return f"Reg[{self.inner_ctype}]"
+
+    def __repr__(self):
+        return str(self)
+
+
+class _RegMeta(type):
+    def __getitem__(cls, inner_type):
+        if not isinstance(inner_type, tuple):
+            return _RegType(inner_type)
+        base_type, *markers = inner_type
+        role = reset = None
+        for m in markers:
+            if isinstance(m, _MultiCycleRole) and role is None:
+                role = m
+            elif isinstance(m, _ResetMarker) and reset is None:
+                reset = m
+            elif isinstance(m, _ResetMarker):
+                raise TypeError(
+                    f"Reg[T, {reset!r}, {m!r}]: give RESET or NO_RESET, once"
+                )
+            elif isinstance(m, _MultiCycleRole):
+                raise TypeError("Reg[T, ...] takes one MULTI_CYCLE[...] role")
+            else:
+                raise TypeError(
+                    f"Reg[T, ...] markers are a MULTI_CYCLE[...].start or .end "
+                    f"role and RESET or NO_RESET, got {m!r}"
+                )
+        return _RegType(
+            base_type,
+            multi_cycle_role=role,
+            reset_mode=None if reset is None else reset.mode,
+        )
+
+
+class Reg(metaclass=_RegMeta):
+    """Marks a local variable as a hardware state register (persistent between cycles).
+
+    Usage in hardware functions:
+        acc: Reg[uint32_t]      # register, initial value 0
+        acc: Reg[uint32_t] = 5  # initial value 5: its FPGA power-up value
+        acc = acc + data_in     # read current value; write sets next-cycle value
+
+    The initial value is also its reset value: a register that resets (see
+    make_reset) returns to it. Its MAIN's reset_registers policy says whether
+    it resets; markers override that:
+        pc: Reg[uint32_t, RESET]     # resets with its MAIN's reset
+        hist: Reg[uint8_t, NO_RESET] # never resets
+
+    A register may also be tagged as one end of a multi-cycle timing path:
+        MC = MULTI_CYCLE[32]
+        data0: Reg[my_struct_t, MC.start]
+        data1: Reg[my_struct_t, MC.end]
+    """
+
+    pass
+
+
+# Feedback[T] — combinatorial feedback wire annotation
+# ──────────────────────────────────────────────────────
+
+
+class _FeedbackType:
+    """Produced by Feedback[T]. Marks a variable as a combinatorial feedback wire."""
+
+    def __init__(self, inner_ctype):
+        self.inner_ctype = inner_ctype
+
+    def __str__(self):
+        return f"Feedback[{self.inner_ctype}]"
+
+    def __repr__(self):
+        return str(self)
+
+    def __call__(self, *args, **kwargs):
+        # Never meant to be constructed -- defined only so that typing's
+        # _type_check (which merely requires callable()) accepts Feedback[T] as a
+        # NamedTuple field annotation, which is how @interface marks a reverse
+        # field. Local-variable use (`f: Feedback[T]`) never goes through typing.
+        raise TypeError("Feedback[T] is a direction annotation, not a constructible type")
+
+
+class _FeedbackMeta(type):
+    def __getitem__(cls, inner_type):
+        return _FeedbackType(inner_type)
+
+
+class Feedback(metaclass=_FeedbackMeta):
+    """Marks a local variable as a combinatorial feedback wire.
+
+    Usage in hardware functions:
+        f: Feedback[uint1_t]   # declare feedback — NOT zero-initialised
+        rv = f | a             # use f before its driver is known
+        f = ~b                 # driver resolved; back-patched at end of elaboration
+    """
+
+    pass
+
+
+# Wire[T] — global combinatorial wire annotation
+# ───────────────────────────────────────────────
+
+
+class _VolatileMarker:
+    """`VOLATILE` -- the optional second argument of Wire/Input/Output[T, VOLATILE].
+
+    By default a function with pipeline stages treats every global it touches like
+    an extra argument/return: reads are sampled with its arguments, writes are
+    published with its return value. A VOLATILE wire is not aligned: each operation
+    reads it at the stage where that operation runs (so different reads can see
+    different cycles) and writes are driven as soon as their value is ready. No
+    delay registers are added for it. See pypeline_guide.md "Global wires in
+    pipelined code".
+    """
+
+    def __repr__(self):
+        return "VOLATILE"
+
+
+VOLATILE = _VolatileMarker()
+
+
+class _AsyncMarker:
+    """`ASYNC` -- marks Wire/Input/Output[T, ASYNC] as an async wire: functions
+    on clocks other than its writer's may read it. Nothing is added between
+    writer and readers, and the paths between clocks are untimed; a reader
+    that needs a stable value synchronizes it with its own registers. Inside
+    pipelined functions it behaves as VOLATILE. Input[T, ASYNC] is a pin
+    synchronous to no clock. See pypeline_guide.md "Async Wires"."""
+
+    def __repr__(self):
+        return "ASYNC"
+
+
+ASYNC = _AsyncMarker()
+
+
+def _wire_ann_args(kind, item):
+    """Split a Wire/Input/Output[...] subscript into (inner ctype, volatile,
+    is_async, clock): the type, then markers in any order -- at most one of
+    ASYNC or a clock (from make_clock), plus VOLATILE alone or with a clock.
+    ASYNC already behaves as VOLATILE, so naming both is an error."""
+    if not isinstance(item, tuple):
+        return item, False, False, None
+    inner, *markers = item
+    volatile = is_async = False
+    clock = None
+    for m in markers:
+        if m is VOLATILE and not volatile:
+            volatile = True
+        elif m is ASYNC and not is_async:
+            is_async = True
+        elif isinstance(m, _Clock) and clock is None:
+            clock = m
+        else:
+            raise TypeError(
+                f"{kind}[...] takes one hardware type, then optional markers: "
+                f"{kind}[T, VOLATILE], {kind}[T, ASYNC], {kind}[T, clk] or "
+                f"{kind}[T, clk, VOLATILE], with clk from make_clock(...); got "
+                f"{kind}{list(item)}"
+            )
+    if is_async and clock is not None:
+        raise TypeError(
+            f"{kind}[T, ASYNC, {clock.port_name}]: ASYNC says any clock may read "
+            f"it, a clock marker that it is on {clock.port_name}; use one of them"
+        )
+    if is_async and volatile:
+        raise TypeError(
+            f"{kind}[T, ASYNC, VOLATILE]: ASYNC already behaves as VOLATILE in "
+            f"pipelined functions; write {kind}[T, ASYNC]"
+        )
+    return inner, volatile, is_async, clock
+
+
+def _wire_ann_str(kind, ann):
+    """How an annotation prints: Wire[uint8_t, ASYNC]."""
+    markers = ""
+    if ann.is_async:
+        markers += ", ASYNC"
+    if ann.clock is not None:
+        markers += f", {ann.clock.port_name}"
+    if ann.volatile and not ann.is_async:
+        markers += ", VOLATILE"
+    return f"{kind}[{ann.inner_ctype}{markers}]"
+
+
+class _WireType:
+    """Produced by Wire[T]. Marks a module-level variable as a global combinatorial wire."""
+
+    def __init__(self, inner_ctype, volatile=False, is_async=False, clock=None):
+        self.inner_ctype = inner_ctype
+        # Not aligned in pipelined functions: VOLATILE, or ASYNC, which behaves so
+        self.volatile = volatile or is_async
+        self.is_async = is_async  # Wire[T, ASYNC]: readable on other clocks
+        self.clock = clock  # Wire[T, clk]: the clock its writers must be on
+
+    def __str__(self):
+        return _wire_ann_str("Wire", self)
+
+    def __repr__(self):
+        return str(self)
+
+
+class _WireMeta(type):
+    def __getitem__(cls, item):
+        return _WireType(*_wire_ann_args("Wire", item))
+
+
+def _wire_ann_inner_ctype(ann):
+    """The ctype a Wire/Input/Output annotation's `.inner_ctype` actually
+    denotes: for `Wire[SomeInterface]` (the bare @interface class, not
+    .fwd_t/.fb_t/.stream_t), that's sugar for `Wire[SomeInterface.wire_t]` --
+    a flat, non-directional struct (Feedback[T] fields unwrapped to plain T)
+    that's a real, flattenable, multi-writer struct ctype. Only Wire gets
+    this sugar -- Input/Output are chip-boundary signals, a different use
+    case that hasn't come up. Every native-sim/sim_call code path that reads
+    a Wire/Input/Output annotation's ctype must go through this, not
+    `ann.inner_ctype` directly, so it agrees with PY_TO_LOGIC's real-VHDL
+    path (PY_TO_LOGIC._discover_global_wires does the same substitution)."""
+    inner_ctype = ann.inner_ctype
+    if isinstance(ann, _WireType) and getattr(
+        inner_ctype, "_pypeline_is_interface", False
+    ):
+        return inner_ctype.wire_t
+    return inner_ctype
+
+
+class Wire(metaclass=_WireMeta):
+    """Marks a module-level variable as a global combinatorial wire.
+
+    Usage at module level only:
+        my_sig: Wire[uint1_t]   # global combinatorial wire
+
+    Exactly one function may write to it; any number of functions may read from it.
+    Wire[T] inside a function body is an ElaborationError.
+    """
+
+    pass
+
+
+# Input[T] / Output[T] — top-level module I/O port annotations
+# ──────────────────────────────────────────────────────────────
+
+
+class _InputType:
+    """Produced by Input[T]. Marks a module-level variable as a top-level design input."""
+
+    def __init__(self, inner_ctype, volatile=False, is_async=False, clock=None):
+        self.inner_ctype = inner_ctype
+        # Not aligned in pipelined functions: VOLATILE, or ASYNC, which behaves so
+        self.volatile = volatile or is_async
+        self.is_async = is_async  # Input[T, ASYNC]: readable on any clock
+        self.clock = clock  # Input[T, clk]: the clock it is on
+
+    def __str__(self):
+        return _wire_ann_str("Input", self)
+
+    def __repr__(self):
+        return str(self)
+
+
+class _InputMeta(type):
+    def __getitem__(cls, item):
+        return _InputType(*_wire_ann_args("Input", item))
+
+
+class Input(metaclass=_InputMeta):
+    """Marks a module-level variable as a top-level design input port.
+
+    Usage at module level only:
+        my_in: Input[uint1_t]
+
+    Any number of functions may read it; no function may write it.
+    Input[T] inside a function body is an ElaborationError.
+    """
+
+    pass
+
+
+class _OutputType:
+    """Produced by Output[T]. Marks a module-level variable as a top-level design output."""
+
+    def __init__(self, inner_ctype, volatile=False, is_async=False, clock=None):
+        self.inner_ctype = inner_ctype
+        # Not aligned in pipelined functions: VOLATILE, or ASYNC, which behaves so
+        self.volatile = volatile or is_async
+        self.is_async = is_async  # Output[T, ASYNC]: readable on any clock
+        self.clock = clock  # Output[T, clk]: the clock it is on
+
+    def __str__(self):
+        return _wire_ann_str("Output", self)
+
+    def __repr__(self):
+        return str(self)
+
+
+class _OutputMeta(type):
+    def __getitem__(cls, item):
+        return _OutputType(*_wire_ann_args("Output", item))
+
+
+class Output(metaclass=_OutputMeta):
+    """Marks a module-level variable as a top-level design output port.
+
+    Usage at module level only:
+        my_out: Output[uint1_t]
+
+    Exactly one function (with exactly one hierarchy instance) may write it.
+    Output[T] inside a function body is an ElaborationError.
+    """
+
+    pass
+
+
+# Inst[f] / Fifo[T] — global instances and global FIFOs
+# ──────────────────────────────────────────────────────
+
+
+class GlobalInstError(TypeError):
+    """A global instance whose hardware cannot be placed at module level:
+    Inst[f] of something that is not a hardware function, or whose ports do
+    not map onto a wire (an array of interface port halves, a name clash).
+    Raised by native sim and the compiler alike, when the declaration runs."""
+
+
+class GlobalFifoError(GlobalInstError):
+    """A Fifo[T] declaration whose hardware cannot be a global FIFO of T: a
+    module initializer without exactly one valid/ready input port and one
+    output port of T. Raised by native sim and the compiler alike (the
+    compiler reports it as an ElaborationError naming the declaration)."""
+
+
+class _InstPort(typing.NamedTuple):
+    """One port of a global instance's hardware (_global_inst_ports)."""
+
+    name: str  # its argument / return field name; "out" for a whole return value
+    arg_t: object  # its argument's type, None when it has no argument
+    ret_t: object  # its return field's type (or the whole return value's), or None
+    interface: object  # its @interface for an interface port, None for a plain one
+    is_input: bool  # a plain argument, or an interface port whose argument is .fwd_t
+    whole_return: bool  # it is the whole return value (not a field of a port bundle)
+
+    @property
+    def wire_t(self):
+        """Its field type in the instance's wire: an interface port's flat
+        interface.wire_t (both halves as plain fields), else its own type."""
+        if self.interface is not None:
+            return self.interface.wire_t
+        return self.arg_t if self.arg_t is not None else self.ret_t
+
+
+def _hardware_func(hardware):
+    """The function whose signature gives `hardware`'s ports: an
+    AUTO_PIPELINE tag's function, else `hardware` itself, unwrapped. None
+    when that is not a Python function."""
+    if getattr(hardware, "_is_auto_pipeline_pragma", False):
+        hardware = hardware.func
+    fn = _inspect.unwrap(hardware) if callable(hardware) else None
+    return fn if hasattr(fn, "__code__") else None
+
+
+def _global_inst_ports(fn, fail):
+    """The ports of the hardware function `fn` (unwrapped), as _InstPort
+    records, arguments first in signature order, then return fields:
+
+    - an argument is an input port named like it;
+    - an interface port pairs its .fwd_t or .fb_t argument with the return
+      field of the same name holding the other half; it is an input when its
+      argument is the .fwd_t half (with no argument, when its field is .fb_t);
+    - a return value with at least one interface-half field (a port bundle,
+      like a stream module's) gives each field as a port, a plain field an
+      output port of its own;
+    - any other return value is the one output port "out".
+
+    Calls fail(why), which raises, for an argument without a type, an array
+    of interface port halves (not supported yet), a return field sharing an
+    argument's name without being its other half, an argument named "out"
+    next to a plain return value, and a function with no ports."""
+    ann = getattr(fn, "__annotations__", {})
+    ports = {}
+    for p in _inspect.signature(fn).parameters:
+        t = ann.get(p)
+        if t is None:
+            fail(f"argument {p!r} has no type annotation")
+        intrf, role, is_array = _interface_half_of(t)
+        if is_array:
+            fail(
+                f"argument {p!r} is an array of interface port halves; arrays "
+                f"of interface ports are not supported yet"
+            )
+        ports[p] = _InstPort(p, t, None, intrf, role != "fb", False)
+    ret_t = ann.get("return")
+    fields = getattr(ret_t, "_fields", ()) if ret_t is not None else ()
+    ret_anns = getattr(ret_t, "__annotations__", {})
+    halves = {f: _interface_half_of(ret_anns.get(f)) for f in fields}
+    if any(role is not None for _intrf, role, _is_array in halves.values()):
+        for f, (intrf, role, is_array) in halves.items():
+            if is_array:
+                fail(
+                    f"return field {f!r} is an array of interface port halves; "
+                    f"arrays of interface ports are not supported yet"
+                )
+            prior = ports.get(f)
+            if prior is None:
+                ports[f] = _InstPort(f, None, ret_anns[f], intrf, role == "fb", False)
+            elif (
+                role is None
+                or prior.interface is not intrf
+                or role != ("fb" if prior.is_input else "fwd")
+            ):
+                fail(
+                    f"return field {f!r} and argument {f!r} share a name but "
+                    f"are not the two halves of one interface port"
+                )
+            else:
+                ports[f] = prior._replace(ret_t=ret_anns[f])
+    elif ret_t is not None:
+        if "out" in ports:
+            fail(
+                "argument 'out' has the name of the output port 'out', the "
+                "return value; rename the argument"
+            )
+        ports["out"] = _InstPort("out", None, ret_t, None, False, True)
+    if not ports:
+        fail("it has no ports: no arguments and no return value")
+    return list(ports.values())
+
+
+# id(hardware) -> (hardware, wire struct of Inst[hardware]), built once per hardware
+_global_inst_type_cache: dict = {}
+
+
+def _global_inst_types(hardware, ports):
+    """The wire struct of Inst[hardware]: one field per port (`ports`, from
+    _global_inst_ports), named like it, of its _InstPort.wire_t. Built once
+    per hardware object (keyed by identity: an AUTO_PIPELINE tag need not be
+    hashable)."""
+    cached = _global_inst_type_cache.get(id(hardware))
+    if cached is not None and cached[0] is hardware:
+        return cached[1]
+    wire_t = struct(
+        typing.NamedTuple("global_inst_t", [(p.name, p.wire_t) for p in ports])
+    )
+    _global_inst_type_cache[id(hardware)] = (hardware, wire_t)
+    return wire_t
+
+
+class _GlobalInstType(_WireType):
+    """Base of Inst[f] and Fifo[T]: a global wire holding the ports of one
+    instance of a hardware module, plus the MAIN that holds the instance
+    (_make_global_inst_main). Being a _WireType, the wire takes every
+    global-wire path unchanged (native-sim rewriting and lens writes,
+    elaboration, multi-writer regions, readback). A subclass says how its
+    MAIN is named and how the wire's paths meet the module's ports."""
+
+    kind_name = None  # how messages name a declaration: "global instance"
+    main_suffix = None  # the MAIN's name is the wire's key plus this
+    stem = None  # the generated MAIN's local names start with this
+
+    def hardware(self, wire_name, init):
+        """(module, ports, bindings) of the declaration `wire_name` with
+        initializer `init`: the module its MAIN calls, its _InstPort list in
+        the order the MAIN passes them, and {port name: wire path} for each
+        port whose path is not (its name,)."""
+        raise NotImplementedError
+
+    def arg_alias(self, port):
+        """Base name of the MAIN's local holding `port`'s argument type."""
+        return f"{self.stem}_{port.name}_t"
+
+    def exec_main(self, func_name, src, ns, wire_name, module):
+        """The MAIN's function, exec'd by _exec_generated_func from a frame
+        whose arguments describe it (they become its name info)."""
+        raise NotImplementedError
+
+
+class _InstType(_GlobalInstType):
+    """Produced by Inst[f]: one instance of hardware f, placed at module
+    level. The wire has one field per port of f (_global_inst_ports), and the
+    compiler adds the MAIN <key>_INST calling f with the wire's inputs and
+    driving its outputs."""
+
+    kind_name = "global instance"
+    main_suffix = "_INST"
+    stem = "inst"
+
+    def __init__(self, hardware):
+        fn = _hardware_func(hardware)
+        tag = getattr(hardware, "_is_auto_pipeline_pragma", False)
+        self.name = (
+            f"AUTO_PIPELINE({fn.__name__})" if tag and fn is not None
+            else getattr(fn, "__name__", None) or repr(hardware)
+        )
+
+        def fail(why):
+            raise GlobalInstError(f"Inst[{self.name}]: {why}")
+
+        if getattr(hardware, "_pypeline_main", None) is not None:
+            fail(
+                f"it is a @MAIN, which already is one instance of itself. "
+                f"Inst[f] takes a @hw_func."
+            )
+        if fn is None or not is_hw_func(hardware.func if tag else hardware):
+            fail("f must be a @hw_func, or an AUTO_PIPELINE(f) tag of one")
+        self.module = hardware
+        self.ports = _global_inst_ports(fn, fail)
+        super().__init__(_global_inst_types(hardware, self.ports))
+
+    def __str__(self):
+        return f"Inst[{self.name}]"
+
+    def hardware(self, wire_name, init):
+        if init is not None:
+            raise GlobalInstError(
+                f"global instance '{wire_name}': {self} takes no initializer; "
+                f"write '{wire_name}: {self}'"
+            )
+        return self.module, self.ports, {}
+
+    def exec_main(self, func_name, src, ns, wire_name, module):
+        def global_inst_main(inst, hardware):
+            # The frame _exec_generated_func describes: name, hardware
+            return _exec_generated_func(
+                func_name, src, ns, folder="pypeline_generated_insts"
+            )
+
+        return global_inst_main(wire_name, module)
+
+
+class _InstMeta(type):
+    def __getitem__(cls, item):
+        if isinstance(item, tuple):
+            names = ", ".join(getattr(i, "__name__", None) or repr(i) for i in item)
+            raise GlobalInstError(
+                f"Inst[...] takes one hardware function, Inst[f]; got Inst[{names}]"
+            )
+        return _InstType(item)
+
+
+class Inst(metaclass=_InstMeta):
+    """Marks a module-level variable as a global instance of a hardware
+    function: its ports become one global wire any function can use.
+
+    Usage at module level only, with no initializer:
+        alu0: Inst[alu]               # or Inst[AUTO_PIPELINE(alu)]
+
+    alu0.a is the input port for argument a, alu0.out the return value (a
+    port bundle's fields are ports of their own), and an interface port is
+    one field with both halves, alu0.x_if.stream / alu0.x_if.ready.
+    Functions drive the inputs and read the outputs; the compiler adds the
+    @MAIN alu0_INST holding the instance. Inst[f] inside a function body is
+    an ElaborationError. See pypeline_guide.md "Inst[f] — global instances".
+    """
+
+    pass
+
+
+# data type -> (end type, wire type) of Fifo[data type], built once per type
+_global_fifo_type_cache: dict = {}
+
+
+def _global_fifo_types(data_t):
+    """(end_t, wire_t) for Fifo[data_t]: wire_t is {wr: end_t, rd: end_t} and
+    end_t is {stream: make_stream_t(data_t), ready: uint1_t}. The stream half
+    is the library's make_stream_t, so a stream port's `.stream` assigns to an
+    end in one statement. Imported at first use, not at load: pypeline.py must
+    not depend on include/pypeline (see _make_auto_fsm_stream_t)."""
+    types = _global_fifo_type_cache.get(data_t)
+    if types is None:
+        from stream.stream import make_stream_t
+
+        stream_t = make_stream_t(data_t)
+
+        @struct
+        class global_fifo_end_t(NamedTuple):
+            stream: stream_t
+            ready: uint1_t
+
+        @struct
+        class global_fifo_t(NamedTuple):
+            wr: global_fifo_end_t
+            rd: global_fifo_end_t
+
+        types = (global_fifo_end_t, global_fifo_t)
+        _global_fifo_type_cache[data_t] = types
+    return types
+
+
+class _FifoType(_GlobalInstType):
+    """Produced by Fifo[T]: a global instance of the FIFO hardware (its
+    initializer) whose two stream ports are the wire's ends, wr and rd.
+    Unlike Inst[f], the wire's type is fixed by T, _global_fifo_types(T),
+    and the compiler adds its MAIN <key>_FIFO only after clock assignment."""
+
+    kind_name = "global FIFO"
+    main_suffix = "_FIFO"
+    stem = "fifo"
+
+    def __init__(self, data_t):
+        super().__init__(_global_fifo_types(data_t)[1])
+        self.data_t = data_t
+
+    def __str__(self):
+        return f"Fifo[{_ctype_str(self.data_t)}]"
+
+    def hardware(self, wire_name, init):
+        module = _global_fifo_hardware(self.data_t, init)
+        in_port, out_port = _stream_module_ports(
+            module, self.data_t, f"global FIFO '{wire_name}'"
+        )
+        bindings = {in_port.name: ("wr",), out_port.name: ("rd",)}
+        return module, [in_port, out_port], bindings
+
+    def arg_alias(self, port):
+        return "fifo_in_t" if port.is_input else "fifo_out_t"
+
+    def exec_main(self, func_name, src, ns, wire_name, module):
+        def global_fifo_main(fifo, data_t, hardware):
+            # The frame _exec_generated_func describes: name, data type, hardware
+            return _exec_generated_func(
+                func_name, src, ns, folder="pypeline_generated_fifos"
+            )
+
+        return global_fifo_main(wire_name, self.data_t, module)
+
+    def exec_async_part(self, func_name, src, ns, wire_name, part):
+        """One function of the async FIFO (_make_global_fifo_async_parts),
+        exec'd from a frame whose arguments describe it: name, data type, and
+        which part it is ("write", "read", "write end", "read end")."""
+
+        def global_async_fifo_part(fifo, data_t, part):
+            # The frame _exec_generated_func describes
+            return _exec_generated_func(
+                func_name, src, ns, folder="pypeline_generated_fifos"
+            )
+
+        return global_async_fifo_part(wire_name, self.data_t, part)
+
+
+class _FifoMeta(type):
+    def __getitem__(cls, item):
+        if isinstance(item, tuple):
+            raise TypeError(
+                f"Fifo[...] takes one data type, Fifo[T]; got Fifo{list(item)}"
+            )
+        if (
+            getattr(item, "_pypeline_is_interface", False)
+            or _interface_half_of(item)[0] is not None
+        ):
+            raise TypeError(
+                f"Fifo[T]: T must be a data type, not the interface or port half "
+                f"{getattr(item, '__name__', item)!r}. A global FIFO supplies valid "
+                f"and ready itself: each end is a valid/ready stream of T."
+            )
+        if not (_is_compound_pypeline_type(item) or _is_scalar_pypeline_int(item)):
+            raise TypeError(f"Fifo[T]: T must be a hardware type, got {item!r}")
+        return _FifoType(item)
+
+
+class Fifo(metaclass=_FifoMeta):
+    """Marks a module-level variable as a global FIFO between two functions.
+
+    Usage at module level only, with the FIFO hardware as the initializer:
+        cmds: Fifo[cmd_t] = global_fifo(16)
+
+    One function uses the write end (drives cmds.wr.stream, reads
+    cmds.wr.ready) and one the read end (drives cmds.rd.ready, reads
+    cmds.rd.stream). Fifo[T] inside a function body is an ElaborationError.
+    See pypeline_guide.md "Fifo[T] — global FIFOs".
+    """
+
+    pass
+
+
+# impl= values of an async global FIFO: None picks by synthesis tool
+# (xpm_fifo_async on Vivado, else the built-in pipelinec_async_fifo_fwft)
+_GLOBAL_FIFO_IMPLS = (None, "builtin")
+
+
+class _GlobalFifoInit:
+    """Produced by global_fifo(n) / global_sync_fifo(n) / global_async_fifo(n):
+    a Fifo[T] initializer asking for a FIFO holding at least n words. On one
+    clock that is the library FIFO, make_stream_fifo (_global_fifo_hardware);
+    across two, the back end's async FIFO, chosen by `impl`. `kind` is the
+    function's name, which says which clocks the ends may be on."""
+
+    def __init__(self, kind, n, impl=None):
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise TypeError(f"{kind}(n): n is a number of words, an int; got {n!r}")
+        if n <= 0:
+            raise ValueError(f"{kind}(n): n must be at least 1, got {n}")
+        if impl not in _GLOBAL_FIFO_IMPLS:
+            raise ValueError(
+                f"{kind}(n, impl={impl!r}): impl is None (by synthesis tool: "
+                f"xpm_fifo_async on Vivado, else the built-in async FIFO) or "
+                f"'builtin' (the built-in async FIFO on every tool)"
+            )
+        self.kind = kind
+        self.n = n
+        self.impl = impl  # the async FIFO's hardware (_GLOBAL_FIFO_IMPLS)
+
+    def __repr__(self):
+        impl = "" if self.impl is None else f", impl={self.impl!r}"
+        return f"{self.kind}({self.n}{impl})"
+
+
+def global_fifo(n, impl=None):
+    """Initializer of a Fifo[T] declaration: a FIFO holding at least n words.
+
+        rx: Fifo[uint8_t] = global_fifo(64)
+
+    n is rounded up to a power of two, at least 2. With both ends on one
+    clock this is the library FIFO, make_stream_fifo(T, n); with the ends on
+    two clocks, an async FIFO (at least 4 words, 16 for xpm_fifo_async).
+    impl="builtin" makes that async FIFO the built-in one on every tool.
+    """
+    return _GlobalFifoInit("global_fifo", n, impl)
+
+
+def global_sync_fifo(n):
+    """Like global_fifo(n), stating that the FIFO's ends stay on one clock:
+    ends on two clocks are an error."""
+    return _GlobalFifoInit("global_sync_fifo", n)
+
+
+def global_async_fifo(n, impl=None):
+    """Like global_fifo(n), stating that the FIFO's ends are on two clocks:
+    ends on one clock are an error. impl="builtin" forces the built-in async
+    FIFO on every tool (xpm_fifo_async is Vivado's default)."""
+    return _GlobalFifoInit("global_async_fifo", n, impl)
+
+
+def _global_fifo_hardware(data_t, init):
+    """The single-clock module a Fifo[data_t] initializer stands for: the
+    library FIFO for the global_*fifo(n) initializers, else the initializer
+    itself (any stream module, _stream_module_ports checks it). It is the
+    FIFO's hardware when its ends share a clock, and its native-sim model
+    (native sim runs one clock)."""
+    if not isinstance(init, _GlobalFifoInit):
+        return init
+    from stream.stream_fifo import make_stream_fifo
+
+    return make_stream_fifo(data_t, 1 << (max(init.n, 2) - 1).bit_length())
+
+
+def _stream_module_ports(module, data_t, what):
+    """(input port, output port), as _InstPort records, of a stream module
+    used as `what`'s hardware: its ports (_global_inst_ports) are exactly
+    one valid/ready input port and one output port, each an interface port
+    with both halves, a stream of make_stream_t(data_t) with a uint1_t ready.
+    Raises GlobalFifoError naming the module otherwise."""
+    fn = _hardware_func(module)
+    desc = getattr(fn, "__qualname__", None) or repr(module)
+
+    def fail(why):
+        raise GlobalFifoError(
+            f"{what}: its hardware {desc} must be a single-clock stream module "
+            f"with one valid/ready input port and one output port of "
+            f"{_ctype_str(data_t)} (like make_stream_fifo({_ctype_str(data_t)}, n) "
+            f"or make_skid_buffer({_ctype_str(data_t)})): {why}"
+        )
+
+    if fn is None:
+        fail("it is not a hardware function")
+    ports = _global_inst_ports(fn, fail)
+    for p in ports:
+        if p.interface is None and p.arg_t is not None:
+            fail(f"argument {p.name!r} is not one half of a stream port")
+        if p.interface is None or p.arg_t is None:
+            fail(f"return field {p.name!r} is not the other half of an argument's port")
+    in_ports = [p for p in ports if p.is_input and p.ret_t is not None]
+    out_ports = [p for p in ports if not p.is_input and p.ret_t is not None]
+    if len(in_ports) != 1 or len(out_ports) != 1 or len(ports) != 2:
+        fail(f"its ports are {sorted(p.name for p in ports)}")
+    in_port, out_port = in_ports[0], out_ports[0]
+    stream_t = _global_fifo_types(data_t)[0].__annotations__["stream"]
+    for port, fwd_t, fb_t in (
+        (in_port, in_port.arg_t, in_port.ret_t),
+        (out_port, out_port.ret_t, out_port.arg_t),
+    ):
+        fwd_fields = getattr(fwd_t, "__annotations__", {})
+        fb_fields = getattr(fb_t, "__annotations__", {})
+        if list(fwd_fields) != ["stream"] or _ctype_str(
+            fwd_fields["stream"]
+        ) != _ctype_str(stream_t):
+            fail(
+                f"port {port.name!r} does not carry make_stream_t({_ctype_str(data_t)})"
+            )
+        if list(fb_fields) != ["ready"] or _ctype_str(fb_fields["ready"]) != "uint1_t":
+            fail(f"port {port.name!r} has no uint1_t ready")
+    return in_port, out_port
+
+
+def _global_inst_main_name(module_name, bare_name, ann):
+    """The MAIN name of the global instance or FIFO `bare_name` (annotation
+    `ann`) declared in module `module_name`: its wire's key, module-prefixed
+    and VHDL-safe as PY_TO_LOGIC._discover_global_wires makes it, plus the
+    kind's suffix (rx_FIFO, alu0_INST)."""
+    prefix = _module_prefix(module_name)
+    key = _sanitize_vhdl_name(bare_name)
+    return f"{prefix + '_' if prefix else ''}{key}{ann.main_suffix}"
+
+
+def _make_global_inst_main(
+    func_name, wire_name, ann, hardware, module_globals, reserved=()
+):
+    """The MAIN of one global instance or FIFO declaration `wire_name`
+    (annotation `ann`, a _GlobalInstType): a flat generated hw_func
+    `func_name` making one call of the module in `hardware`, the (module,
+    ports, bindings) that ann.hardware gave. Each argument comes from the
+    wire: a plain input port's whole path, an interface port's argument half
+    built field by field. The module's return value drives the wire: an
+    interface port's returned half field by field, a plain output port's
+    whole path. Native sim and the compiler both build it here, so native
+    sim stays compiler-free.
+
+    It is exec'd in a copy of the declaring module's globals, so its body
+    names the wire by its bare name `wire_name`, like user code in that module
+    (native sim's rewriter and the elaborator resolve wires by module). The
+    injected names and the one local avoid every name of that module and
+    `reserved` (the compiler passes the top design file's globals, which
+    elaboration merges in)."""
+    module, ports, bindings = hardware
+    free = _free_name_picker(module_globals, reserved)
+    hw = free(f"{ann.stem}_hardware")
+    aliases = {
+        p.name: free(ann.arg_alias(p))
+        for p in ports
+        if p.interface is not None and p.arg_t is not None
+    }
+    io = free(f"{ann.stem}_ports")
+
+    def path(port):
+        return ".".join((wire_name,) + bindings.get(port.name, (port.name,)))
+
+    args = []
+    for p in ports:
+        if p.arg_t is None:
+            continue
+        if p.interface is None:
+            args.append(f"{p.name}={path(p)}")
+        else:
+            fields = ", ".join(f"{f}={path(p)}.{f}" for f in p.arg_t._fields)
+            args.append(f"{p.name}={aliases[p.name]}({fields})")
+    drives = []
+    for p in ports:
+        if p.ret_t is None:
+            continue
+        if p.whole_return:
+            drives.append(f"{path(p)} = {io}")
+        elif p.interface is None:
+            drives.append(f"{path(p)} = {io}.{p.name}")
+        else:
+            drives += [f"{path(p)}.{f} = {io}.{p.name}.{f}" for f in p.ret_t._fields]
+    src = (
+        f"def {func_name}():\n"
+        f"    {f'{io} = ' if drives else ''}{hw}(\n"
+        + "".join(f"        {a},\n" for a in args)
+        + "    )\n"
+        + "".join(f"    {d}\n" for d in drives)
+    )
+    ns = dict(module_globals)
+    ns[hw] = module
+    ns.update({aliases[p.name]: p.arg_t for p in ports if p.name in aliases})
+    main = hw_func(ann.exec_main(func_name, src, ns, wire_name, module))
+    # Its kind, which is also why it takes no added latency: the compiler's
+    # reason for it, and ELABORATE_LIVE_ROOTS's when native sim models
+    # pipeline_latency functions (no alignment around one inside it)
+    main._pypeline_global_inst = ann.kind_name
+    return main
+
+
+def _free_name_picker(module_globals, reserved=()):
+    """A function giving names for a generated MAIN's injected globals and
+    locals: `base`, or `base_2`, `base_3`, ..., avoiding every name of the
+    declaring module (its globals and wire annotations), `reserved`, and each
+    name it gave before."""
+    taken = set(module_globals) | set(module_globals.get("__annotations__", {}))
+    taken |= set(reserved)
+
+    def free(base):
+        name, i = base, 1
+        while name in taken:
+            i += 1
+            name = f"{base}_{i}"
+        taken.add(name)
+        return name
+
+    return free
+
+
+# data type -> (word_t, write_t, read_t) of its async global FIFO's crossing
+# functions, built once per type (_global_fifo_async_types)
+_global_fifo_async_type_cache: dict = {}
+
+
+def _global_fifo_async_types(data_t):
+    """(word_t, write_t, read_t) of the crossing functions of an async
+    Fifo[data_t]: word_t is data_t[1], one FIFO word as C's global FIFOs hold
+    it; write_t is {ready}, what <crossing>_WRITE_1 returns; read_t is
+    {data: word_t, valid}, what <crossing>_READ_1 returns. The field names
+    are the ones the back end's clk_cross entity drives."""
+    types = _global_fifo_async_type_cache.get(data_t)
+    if types is None:
+        word_t = data_t[1]
+
+        @struct
+        class global_fifo_write_t(NamedTuple):
+            ready: uint1_t
+
+        @struct
+        class global_fifo_read_t(NamedTuple):
+            data: word_t
+            valid: uint1_t
+
+        types = (word_t, global_fifo_write_t, global_fifo_read_t)
+        _global_fifo_async_type_cache[data_t] = types
+    return types
+
+
+class _GlobalFifoAsyncParts(typing.NamedTuple):
+    """The generated functions of one async global FIFO (_make_global_fifo_async_parts)."""
+
+    write_stub: object  # <crossing>_WRITE_1(write_data, write_enable) -> {ready}
+    read_stub: object  # <crossing>_READ_1(read_enable) -> {data, valid}
+    wr_main: object  # <crossing>_wr: the write end's MAIN, on the write clock
+    rd_main: object  # <crossing>_rd: the read end's MAIN, on the read clock
+
+
+def _make_global_fifo_async_parts(
+    crossing, wire_name, ann, module_globals, reserved=()
+):
+    """The functions of the async global FIFO `wire_name` (a Fifo[T]
+    annotation `ann`), named after `crossing` (<key>_FIFO): the two crossing
+    stubs and the two side MAINs, the shape of PipelineC's GLOBAL_STREAM_FIFO.
+
+    The stubs <crossing>_WRITE_1 and <crossing>_READ_1 have no hardware of
+    their own: the compiler tags them as the clock crossing <crossing>, and
+    the back end connects their calls to its clk_cross_<crossing> entity
+    (xpm_fifo_async, or the built-in pipelinec_async_fifo_fwft). Their names
+    and argument names are that back end's convention. The MAIN <crossing>_wr
+    passes the write end's stream to the write stub and drives wr.ready; the
+    MAIN <crossing>_rd passes rd.ready to the read stub and drives rd.stream.
+
+    Built here, beside _make_global_inst_main, so every generated FIFO
+    source and its name info come from one place; only the compiler calls
+    it, since native simulation runs one clock. Like that function, the side
+    MAINs are exec'd in a copy of the declaring module's globals and name
+    the wire by its bare name."""
+    word_t, write_t, read_t = _global_fifo_async_types(ann.data_t)
+    free = _free_name_picker(module_globals, reserved)
+    word, wr_ret, rd_ret, bit = (
+        free("fifo_word_t"),
+        free("fifo_write_t"),
+        free("fifo_read_t"),
+        free("fifo_uint1_t"),
+    )
+    types = {word: word_t, wr_ret: write_t, rd_ret: read_t, bit: uint1_t}
+    stub_ns = dict(types)
+    w_name, r_name = f"{crossing}_WRITE_1", f"{crossing}_READ_1"
+    unused = free("fifo_unused")
+    write_stub = hw_func(
+        ann.exec_async_part(
+            w_name,
+            f"def {w_name}(write_data: {word}, write_enable: {bit}) -> {wr_ret}:\n"
+            f"    {unused}: {wr_ret}\n"
+            f"    return {unused}\n",
+            stub_ns,
+            wire_name,
+            "write",
+        )
+    )
+    read_stub = hw_func(
+        ann.exec_async_part(
+            r_name,
+            f"def {r_name}(read_enable: {bit}) -> {rd_ret}:\n"
+            f"    {unused}: {rd_ret}\n"
+            f"    return {unused}\n",
+            dict(stub_ns),
+            wire_name,
+            "read",
+        )
+    )
+    w_alias, r_alias = free("fifo_write"), free("fifo_read")
+    data, wrote, read = free("fifo_data"), free("fifo_wrote"), free("fifo_got")
+    ns = dict(module_globals)
+    ns.update(types)
+    ns[w_alias], ns[r_alias] = write_stub, read_stub
+    wr_name, rd_name = f"{crossing}_wr", f"{crossing}_rd"
+    wr_main = hw_func(
+        ann.exec_async_part(
+            wr_name,
+            f"def {wr_name}():\n"
+            f"    {data}: {word}\n"
+            f"    {data}[0] = {wire_name}.wr.stream.data\n"
+            f"    {wrote} = {w_alias}(write_data={data}, "
+            f"write_enable={wire_name}.wr.stream.valid)\n"
+            f"    {wire_name}.wr.ready = {wrote}.ready\n",
+            dict(ns),
+            wire_name,
+            "write end",
+        )
+    )
+    rd_main = hw_func(
+        ann.exec_async_part(
+            rd_name,
+            f"def {rd_name}():\n"
+            f"    {read} = {r_alias}(read_enable={wire_name}.rd.ready)\n"
+            f"    {wire_name}.rd.stream.data = {read}.data[0]\n"
+            f"    {wire_name}.rd.stream.valid = {read}.valid\n",
+            dict(ns),
+            wire_name,
+            "read end",
+        )
+    )
+    for main in (wr_main, rd_main):
+        main._pypeline_global_inst = ann.kind_name
+    return _GlobalFifoAsyncParts(write_stub, read_stub, wr_main, rd_main)
+
+
+# make_clock(mhz, name=, syn_mhz=) — clocks (PipelineC's MAIN_MHZ groups, CLK_MHZ)
+# ────────────────────────────────────────────────────────────────────────────────
+
+# A clock name= is appended to its port name after "_": letters and digits,
+# single underscores between them
+_CLOCK_NAME_RE = _re.compile(r"[A-Za-z0-9]+(_[A-Za-z0-9]+)*")
+
+
+def _clock_text(mhz, name):
+    """The part of a clock's port name after "clk_": 100p0, 25p0_eth_rx,
+    500p0khz, None. Must equal VHDL.CLK_MHZ_GROUP_TEXT(mhz, name), which the
+    back end uses (pypeline.py may not import the compiler; a unit test
+    compares the two)."""
+    if mhz is None:
+        text = "None"
+    else:
+        num, unit = mhz, ""
+        if num < 1.0:
+            num, unit = mhz * 1e3, "khz"
+            if num < 1.0:
+                num, unit = mhz * 1e6, "hz"
+        text = str(num).replace(".", "p") + unit
+    return f"{text}_{name}" if name else text
+
+
+class _Clock:
+    """A clock, made by make_clock(mhz, name=, syn_mhz=); @MAIN(mhz) and
+    @MAIN(mhz=...) make the unnamed clock of that rate.
+
+    Clocks are identified by rate, then name: every unnamed clock of one rate
+    is one clock, two names at one rate are two clocks, and so are two rates.
+    Equality and hashing follow that identity. syn_mhz is a property of the
+    clock, checked for agreement across its objects by the compiler
+    (_clock_conflict). The default clock, (None, None), has no object."""
+
+    def __init__(self, mhz, name=None, syn_mhz=None, origin=None, reset=None):
+        if isinstance(mhz, bool) or not isinstance(mhz, (int, float)):
+            raise TypeError(f"make_clock(mhz): mhz is a rate in MHz, got {mhz!r}")
+        if mhz <= 0:
+            raise ValueError(f"make_clock(mhz) requires mhz > 0, got {mhz}")
+        if name is not None:
+            if not isinstance(name, str) or not _CLOCK_NAME_RE.fullmatch(name):
+                raise ValueError(
+                    f"make_clock(name={name!r}): a clock name becomes part of its "
+                    f"port name, clk_<rate>_<name>: use letters, digits and single "
+                    f"underscores between them"
+                )
+        if syn_mhz is not None:
+            if isinstance(syn_mhz, bool) or not isinstance(syn_mhz, (int, float)):
+                raise TypeError(f"make_clock(syn_mhz=): a rate in MHz, got {syn_mhz!r}")
+            if syn_mhz <= 0:
+                raise ValueError(f"make_clock(syn_mhz=) must be > 0, got {syn_mhz}")
+        self.mhz = float(mhz)  # its rate
+        self.name = name  # tells it apart from other clocks of its rate
+        # Goal of synthesis-only tools (PipelineC's MAIN_SYN_MHZ), None: mhz
+        self.syn_mhz = None if syn_mhz is None else float(syn_mhz)
+        self.origin = origin  # where it was made, for messages: "top.py:12"
+        # Its primary reset (a _Reset), None: none. Not part of its identity;
+        # two resets for one clock are a conflict (_clock_conflict)
+        self._reset = reset
+
+    @property
+    def reset(self):
+        """The clock's primary reset (make_clock(..., reset=)), None if none."""
+        return self._reset
+
+    @property
+    def identity(self):
+        """(mhz, name): what tells two clocks apart."""
+        return (self.mhz, self.name)
+
+    @property
+    def port_name(self):
+        """Its clock's name in the generated design: clk_125p0_eth_rx."""
+        return "clk_" + _clock_text(self.mhz, self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, _Clock) and other.identity == self.identity
+
+    def __hash__(self):
+        return hash(self.identity)
+
+    def __repr__(self):
+        args = [repr(self.mhz)]
+        if self.name is not None:
+            args.append(f"name={self.name!r}")
+        if self.syn_mhz is not None:
+            args.append(f"syn_mhz={self.syn_mhz!r}")
+        if self._reset is not None:
+            args.append(f"reset={self._reset!r}")
+        return f"make_clock({', '.join(args)})"
+
+
+class _Reset:
+    """A reset, made by make_reset(): bound to a module-level Input or Wire,
+    whose name is then the reset's signal (see make_reset)."""
+
+    def __init__(self, kind, active, origin):
+        self.kind = kind  # "sync": a reset edge resets registers at the clock edge
+        self.active = active  # "high": 1 resets
+        self.origin = origin  # where it was made, for messages: "top.py:12"
+
+    def __repr__(self):
+        return f"make_reset() ({self.origin})"
+
+
+def make_reset(kind="sync", active="high"):
+    """A synchronous, active-high reset, bound on the same line to a
+    module-level uint1_t Input (a top-level pin) or Wire (driven by one
+    MAIN)::
+
+        rst: Input[uint1_t] = make_reset()      # the top-level pin rst
+        clk = make_clock(100.0, reset=rst)      # clk's primary reset
+
+        @MAIN(clk, reset_registers="all")       # every register resets with rst
+        def dut(): ...
+
+        gen_rst: Wire[uint1_t] = make_reset()   # made by logic in some MAIN
+        @MAIN(clk, reset=gen_rst, reset_registers="all")
+        def other(): ...
+
+    While the reset is 1 at a rising clock edge, each register it resets
+    takes its initial value (its declaration's `= value`, else zero) instead
+    of its next value. The reset has priority over the clock enable. In
+    hardware code the bound name is an ordinary uint1_t signal: `if rst:`
+    is plain logic. Native and HDL simulation drive a reset Input to 1 in
+    cycle 0 and 0 after it. Only kind="sync", active="high" is supported.
+    """
+    if kind != "sync":
+        raise NotImplementedError(
+            f"make_reset(kind={kind!r}): only synchronous resets (kind=\"sync\") "
+            f"are supported. Synchronize an asynchronous reset with registers on "
+            f"its clock and bind the result to a Wire reset."
+        )
+    if active != "high":
+        raise NotImplementedError(
+            f"make_reset(active={active!r}): only active-high resets "
+            f"(active=\"high\") are supported. Invert an active-low reset in a "
+            f"MAIN that drives a Wire reset: `rst = ~rst_n`."
+        )
+    return _Reset(kind, active, _frame_origin(_sys._getframe(1)))
+
+
+def make_clock(mhz, name=None, syn_mhz=None, reset=None):
+    """A clock of `mhz` MHz, for @MAIN(clk), @MAIN(clock=clk), clock markers
+    (Wire[T, clk], Input[T, clk]) and clock bindings::
+
+        eth_clk = make_clock(125.0, name="eth_rx")  # the clock clk_125p0_eth_rx
+        ETH_RX_CLK: Input[uint1_t] = eth_clk        # arrives on this pin
+        dsp_clk = make_clock(125.0, syn_mhz=147.0)  # clk_125p0, synthesis aims at 147
+
+        @MAIN(eth_clk)
+        def eth_rx(): ...
+
+    name= tells apart two clocks of one rate; without it the clock is the
+    unnamed clock of its rate, the one @MAIN(mhz) runs on, so
+    `pll_clk: Input[uint1_t] = make_clock(85.0)` binds @MAIN(85.0)'s clock.
+    syn_mhz= is the goal of tools that only synthesize. A clock bound to a pin
+    or a wire must be the clock of some @MAIN. reset= (a make_reset() reset)
+    is the clock's primary reset, which its @MAINs use unless they name
+    another (MAIN(reset=)); clk.reset reads it back.
+    """
+    origin = _frame_origin(_sys._getframe(1))
+    if reset is not None and not isinstance(reset, _Reset):
+        raise TypeError(
+            f"make_clock(reset={reset!r}) at {origin}: reset= takes a reset "
+            f"from make_reset() (the name it is bound to)"
+        )
+    return _Clock(mhz, name, syn_mhz, origin, reset)
+
+
+def _clock_conflict(clocks):
+    """The error message for the first conflict among `clocks` (_Clock
+    objects of one design): one clock given two syn_mhz values or two primary
+    resets, or two names of one rate that VHDL, ignoring case, reads as one.
+    None when they agree."""
+    syn = {}
+    resets = {}
+    by_port = {}
+    for clk in clocks:
+        if clk.reset is not None:
+            prior = resets.setdefault(clk.identity, clk)
+            if prior.reset is not clk.reset:
+                return (
+                    f"Clock {clk.port_name} has two primary resets: "
+                    f"{prior.reset!r} (make_clock at {prior.origin}) and "
+                    f"{clk.reset!r} (make_clock at {clk.origin}). A clock has "
+                    f"one primary reset; give a MAIN another with MAIN(reset=)."
+                )
+        if clk.syn_mhz is not None:
+            prior = syn.setdefault(clk.identity, clk)
+            if prior.syn_mhz != clk.syn_mhz:
+                return (
+                    f"Clock {clk.port_name} has two syn_mhz values: "
+                    f"{prior.syn_mhz} ({prior.origin}) and {clk.syn_mhz} "
+                    f"({clk.origin}). A clock has one synthesis goal."
+                )
+        prior = by_port.setdefault(clk.port_name.lower(), clk)
+        if prior.identity != clk.identity:
+            return (
+                f"Clocks {prior.port_name} ({prior.origin}) and {clk.port_name} "
+                f"({clk.origin}) differ only in case, which VHDL ignores: rename "
+                f"one of them"
+            )
+    return None
+
+
+def _clock_primary_resets(clocks):
+    """{clock identity: its primary reset} of `clocks` (_Clock objects of one
+    design, agreeing by _clock_conflict). Elaboration (PY_TO_LOGIC
+    _assign_resets) and native sim build it from the same clocks."""
+    return {c.identity: c.reset for c in clocks if c.reset is not None}
+
+
+def _resolve_main_reset(info, clock_identity, clock_primaries):
+    """(reset, reset_registers) of the @MAIN `info` (a _MainInfo) running on
+    the clock `clock_identity` ((mhz, name)): its MAIN(reset=), else that
+    clock's primary reset in `clock_primaries` (_clock_primary_resets), else
+    None. One rule for elaboration and native sim."""
+    reset = info.reset
+    if reset is _CLOCK_RESET:
+        reset = clock_primaries.get(tuple(clock_identity))
+    return reset, info.reset_registers
+
+
+def _global_inst_main_reset(clock_identity, clock_primaries):
+    """(reset, reset_registers) of a global instance's MAIN (Inst[f]'s
+    <key>_INST, a same-clock Fifo[T]'s <key>_FIFO) on the clock
+    `clock_identity`: every register below it resets with that clock's
+    primary reset, or none when the clock has none. One rule for elaboration
+    and native sim."""
+    return clock_primaries.get(tuple(clock_identity)), "all"
+
+
+# ─────────────────────────────────────────────
+# Bit manipulation primitives
+# (intercepted by PY_TO_LOGIC elaborator; not callable at Python runtime)
+# ─────────────────────────────────────────────
+# Bit slice / select: use subscript syntax on integer wires
+#   y = x[15]       # single bit  → uint1_t
+#   z = x[15:0]     # range       → uint16_t
+
+
+def _bit_manip_width(v):
+    """Infer the bit width of a sim value for the bit-manipulation prims below."""
+    if type(v) is SimVal and v._ctype is not None:
+        return len(v._ctype)
+    if type(v) is int or type(v) is SimVal:
+        return max(1, int(v).bit_length())
+    raise TypeError(f"cannot infer bit width for {v!r}")
+
+
+def _bit_manip_result_ctype(v, width):
+    """Preserve v's own ctype when typed, else synthesize a plain uint<width>_t."""
+    if type(v) is SimVal and v._ctype is not None:
+        return v._ctype
+    return make_uint_t(width)
+
+
+def bit_dup(x, n):
+    """Replicate x n times: bit_dup(uint4_t, 4) → uint16_t."""
+    w = _bit_manip_width(x)
+    xv = int(x) & ((1 << w) - 1)
+    result = 0
+    for _ in range(n):
+        result = (result << w) | xv
+    return SimVal(result, ctype=make_uint_t(w * n))
+
+
+def rotl(x, amount):
+    """Rotate x left by amount bits (constant). Matches VHDL's `x rol amount`."""
+    w = _bit_manip_width(x)
+    xv = int(x) & ((1 << w) - 1)
+    amount %= w
+    result = (
+        xv if amount == 0 else ((xv << amount) | (xv >> (w - amount))) & ((1 << w) - 1)
+    )
+    return SimVal(result, ctype=_bit_manip_result_ctype(x, w))
+
+
+def rotr(x, amount):
+    """Rotate x right by amount bits (constant). Matches VHDL's `x ror amount`."""
+    w = _bit_manip_width(x)
+    xv = int(x) & ((1 << w) - 1)
+    amount %= w
+    result = (
+        xv if amount == 0 else ((xv >> amount) | (xv << (w - amount))) & ((1 << w) - 1)
+    )
+    return SimVal(result, ctype=_bit_manip_result_ctype(x, w))
+
+
+def bswap(x):
+    """Reverse byte order of x."""
+    w = _bit_manip_width(x)
+    if w % 8 != 0:
+        raise ValueError(f"bswap: width {w} is not a multiple of 8")
+    xv = int(x) & ((1 << w) - 1)
+    nbytes = w // 8
+    result = 0
+    for i in range(nbytes):
+        byte = (xv >> (i * 8)) & 0xFF
+        result |= byte << ((nbytes - 1 - i) * 8)
+    return SimVal(result, ctype=_bit_manip_result_ctype(x, w))
+
+
+def bit_assign(base, x, pos):
+    """Assign x into base at bit position pos (constant): base[pos+width-1:pos] = x."""
+    base_w = _bit_manip_width(base)
+    x_w = _bit_manip_width(x)
+    mask = ((1 << x_w) - 1) << pos
+    result = (int(base) & ~mask) | ((int(x) << pos) & mask)
+    result &= (1 << base_w) - 1
+    return SimVal(result, ctype=_bit_manip_result_ctype(base, base_w))
+
+
+def array_to_uint_be(arr):
+    """Pack array elements into a single uint, big-endian (element[0] at MSB)."""
+    result = 0
+    total_w = 0
+    for e in arr:
+        w = _bit_manip_width(e)
+        result = (result << w) | (int(e) & ((1 << w) - 1))
+        total_w += w
+    return SimVal(result, ctype=make_uint_t(total_w))
+
+
+def array_to_uint_le(arr):
+    """Pack array elements into a single uint, little-endian (element[0] at LSB)."""
+    result = 0
+    total_w = 0
+    for e in reversed(list(arr)):
+        w = _bit_manip_width(e)
+        result = (result << w) | (int(e) & ((1 << w) - 1))
+        total_w += w
+    return SimVal(result, ctype=make_uint_t(total_w))
+
+
+def uint_to_array_be(x, elem_w):
+    """Split uint x into array of elem_w-bit elements, big-endian (MSB → element[0])."""
+    w = _bit_manip_width(x)
+    if w % elem_w != 0:
+        raise ValueError(
+            f"uint_to_array_be: width {w} not a multiple of elem_w {elem_w}"
+        )
+    n = w // elem_w
+    xv = int(x) & ((1 << w) - 1)
+    elem_mask = (1 << elem_w) - 1
+    elem_ctype = make_uint_t(elem_w)
+    return [
+        SimVal((xv >> ((n - 1 - i) * elem_w)) & elem_mask, ctype=elem_ctype)
+        for i in range(n)
+    ]
+
+
+def uint_to_array_le(x, elem_w):
+    """Split uint x into array of elem_w-bit elements, little-endian (LSB → element[0])."""
+    w = _bit_manip_width(x)
+    if w % elem_w != 0:
+        raise ValueError(
+            f"uint_to_array_le: width {w} not a multiple of elem_w {elem_w}"
+        )
+    n = w // elem_w
+    xv = int(x) & ((1 << w) - 1)
+    elem_mask = (1 << elem_w) - 1
+    elem_ctype = make_uint_t(elem_w)
+    return [
+        SimVal((xv >> (i * elem_w)) & elem_mask, ctype=elem_ctype) for i in range(n)
+    ]
+
+
+def concat(*args):
+    """Bit concatenation for simulation: first arg = MSBits, last = LSBits.
+
+    Width of each argument is inferred from its SimVal ctype (via len(ctype)) or,
+    for plain Python ints, from max(1, val.bit_length()). The result is a SimVal
+    with ctype = make_uint_t(total_bits).
+
+    In hardware (PY_TO_LOGIC elaboration) this function is intercepted and treated
+    as variadic tuple concat — see the 'concat' branch in _elab_bit_manip_call.
+    """
+    widths = [_bit_manip_width(a) for a in args]
+    total = sum(widths)
+    result = 0
+    for a, w in zip(args, widths):
+        result = (result << w) | (int(a) & ((1 << w) - 1))
+    return SimVal(result, ctype=make_uint_t(total))
+
+
+BIT_MANIP_FUNC_NAMES = frozenset(
+    {
+        "bit_dup",
+        "rotl",
+        "rotr",
+        "bswap",
+        "bit_assign",
+        "array_to_uint_be",
+        "array_to_uint_le",
+        "uint_to_array_be",
+        "uint_to_array_le",
+        "concat",
+    }
+)
+
+
+# ─────────────────────────────────────────────
+# Type <-> bytes conversion (packed, unpadded layout)
+# ─────────────────────────────────────────────
+
+import linecache as _linecache
+
+_ENDIAN_BYTE_SUFFIX = {"little": "le", "big": "be"}
+
+
+def _check_endian(endian: str, func_name: str) -> None:
+    if endian not in _ENDIAN_BYTE_SUFFIX:
+        raise ValueError(
+            f"{func_name}: endian must be 'little' or 'big', got {endian!r}"
+        )
+
+
+def _check_bytes_type(t, func_name: str) -> None:
+    if not (_is_compound_pypeline_type(t) or _is_scalar_pypeline_int(t)):
+        raise TypeError(f"{func_name}: not a pypeline type: {t!r}")
+
+
+def byte_length(t) -> int:
+    """Byte size of a pypeline type t, as a packed-unpadded struct: each leaf
+    scalar field rounds up to a whole byte (ceil(width / 8)); fields/elements
+    are packed back-to-back in declaration order with no further padding
+    (this is NOT C natural alignment). Works for scalars, arrays (any
+    nesting), and @struct types.
+
+    @enum leaves are supported: an enum occupies ceil(enum_bit_width(t) / 8)
+    bytes, the same rule every other scalar leaf follows. (An ARRAY of enums,
+    `some_enum_t[N]`, is not expressible in pypeline at all -- @struct installs
+    __class_getitem__ but @enum does not, so `some_enum_t[4]` hits
+    EnumMeta.__getitem__ (member lookup by name). An enum inside a struct
+    inside an array is fine.)
+
+    Pure Python; no hardware elaboration required (analogous to enum_bit_width()).
+    """
+    # The enum probe must come first: an @enum class has neither _ctype_name
+    # (so _array_elem_ctype would not see it) nor _fields, but it also has no
+    # .width -- its metaclass is EnumMeta, not _CTypeMeta.
+    if getattr(t, "_pypeline_is_enum", False):
+        return (_leaf_bit_width(t) + 7) // 8
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        return byte_length(elem) * _array_len(t)
+    if hasattr(t, "_fields"):
+        return sum(byte_length(t.__annotations__[f]) for f in t._fields)
+    return (t.width + 7) // 8
+
+
+def _leaf_bit_width(t) -> int:
+    """Bit width of a scalar leaf, including @enum leaves. An @enum class's
+    metaclass is EnumMeta, not _CTypeMeta, so it has no `.width` property --
+    its width is enum_bit_width() (min bits for its largest member value),
+    which is exactly the width VHDL.py lowers it to."""
+    if getattr(t, "_pypeline_is_enum", False):
+        return enum_bit_width(t)
+    return t.width
+
+
+def _leaf_uint_ctype(t):
+    """The uint ctype an enum leaf is carried through in generated hardware.
+
+    @enum lowers to `unsigned(N-1 downto 0)` in VHDL (VHDL.C_TYPE_STR_TO_VHDL_TYPE_STR)
+    and TYPE_RESOLVE_ASSIGNMENT_RHS substitutes the enum's int_c_type for both
+    sides' width/signedness -- so an assignment between an enum wire and its
+    same-width uintN_t wire is a width-identical no-op needing no cast entity.
+    That assignment is the ONLY viable enum<->bits mechanism here: casting *to*
+    an enum via `some_enum_t(x)` is unsupported by design (an @enum returns an
+    IntEnum subclass, and `some_enum_t(2)` already means member lookup).
+
+    Non-enum leaves are returned unchanged.
+    """
+    if getattr(t, "_pypeline_is_enum", False):
+        return make_uint_t(enum_bit_width(t))
+    return t
+
+
+def _enumerate_leaves(t, path=()):
+    """Yield (access_path, leaf_ctype) for every scalar leaf of t, in
+    declaration order. access_path tokens are int (array index) or str
+    (struct field name); () for a bare scalar t.
+
+    An @enum is a leaf like any other scalar -- callers must size it with
+    _leaf_bit_width(), not `.width` (an @enum class has no .width)."""
+    if getattr(t, "_pypeline_is_enum", False):
+        yield (path, t)
+        return
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        for i in range(_array_len(t)):
+            yield from _enumerate_leaves(elem, path + (i,))
+        return
+    if hasattr(t, "_fields"):
+        for f in t._fields:
+            yield from _enumerate_leaves(t.__annotations__[f], path + (f,))
+        return
+    yield (path, t)
+
+
+def _access_expr(root: str, path) -> str:
+    """('a', 3, 'b') -> 'root.a[3].b' ; () -> 'root'"""
+    s = root
+    for tok in path:
+        s += f"[{tok}]" if isinstance(tok, int) else f".{tok}"
+    return s
+
+
+def _bytes_type_key(t) -> str:
+    """Raw (not yet length-limited) canonical identifier for a pypeline type,
+    used as the basis for generated to_bytes/from_bytes function names and as
+    the factory memoization cache key. Reuses @struct's own canonical name for
+    structs (already deterministic/hash-collapsed); mangles the C type string
+    for scalars/arrays, e.g. uint32_t[3] -> uint32_t_3."""
+    return getattr(t, "_pypeline_ctype_name", None) or _mangle_type(str(t))
+
+
+def _finalize_hw_name(name: str) -> str:
+    """Collapse a generated hardware function name to fit _MAX_MANGLE_NAME_LEN
+    via collapse_overflow_name (readable prefix trimmed back to a '_'
+    boundary + sha256[:8] of the full name), the same convention @struct/
+    @enum use.
+
+    A fixed-offset truncation (this function's previous implementation) can
+    land mid-token -- e.g. right after the "8" in a trailing 8-hex-digit hash,
+    or mid-word -- producing a valid-but-nonsense identifier like
+    "cast_stream_intrf_..._out_t_8_b1dab4d2" (half of an unrelated hash) or
+    "..._frac_bits_..._1edf40d4" (right after "frac_bits_", which GHDL
+    additionally rejects outright as two consecutive underscores). Both were
+    found in real synthesis output; collapse_overflow_name's boundary-aware
+    trim avoids the whole class.
+    """
+    return collapse_overflow_name(name, name.split("_", 1)[0] or "v", _MAX_MANGLE_NAME_LEN)
+
+
+def _collect_struct_types(t, out=None):
+    """Recursively collect every distinct @struct type reachable from t
+    (including t itself and any nested struct fields/array elements), keyed by
+    canonical name. Used to seed the exec() globals of a generated to_bytes/
+    from_bytes function so PY_TO_LOGIC's live-closure struct auto-registration
+    (which only scans that function's own __globals__ values, not transitively
+    through struct field types) sees every struct shape it needs regardless of
+    whether the caller's design module already registered them."""
+    if out is None:
+        out = {}
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        _collect_struct_types(elem, out)
+        return out
+    if hasattr(t, "_fields"):
+        name = getattr(t, "_pypeline_ctype_name", None)
+        if name is not None and name not in out:
+            out[name] = t
+            for f in t._fields:
+                _collect_struct_types(t.__annotations__[f], out)
+    return out
+
+
+def _collect_enum_types(t, out=None):
+    """Recursively collect every distinct @enum type reachable from t, keyed by
+    canonical name -- the enum twin of _collect_struct_types, and seeded into a
+    generated to_bytes/from_bytes function's exec() globals for the same reason.
+
+    Needed because PY_TO_LOGIC._register_struct_recursive calls
+    _inner_ctype_to_str(annotation) WITHOUT parser_state, so an enum reachable
+    only through a struct field is never _register_enum'd; but PY_TO_LOGIC does
+    scan a generated function's own __globals__ for _pypeline_is_enum, so
+    seeding closes the hole from this side. (Passing parser_state through
+    _register_struct_recursive is the cleaner upstream fix -- separate change.)
+    """
+    if out is None:
+        out = {}
+    if getattr(t, "_pypeline_is_enum", False):
+        name = getattr(t, "_pypeline_ctype_name", None)
+        if name is not None:
+            out[name] = t
+        return out
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        _collect_enum_types(elem, out)
+        return out
+    if hasattr(t, "_fields"):
+        for f in t._fields:
+            _collect_enum_types(t.__annotations__[f], out)
+    return out
+
+
+def _exec_generated_func(
+    func_name: str, src: str, extra_globals: dict, folder: str = "pypeline_generated_bytes"
+):
+    """exec() a single-function source string (a flat, non-nested `def`, so
+    its __qualname__ has no '.<locals>.' and PY_TO_LOGIC's elaborator treats it
+    as an ordinary top-level function rather than a factory closure), patching
+    linecache so inspect.getsource()/getsourcelines() -- used both by the
+    elaborator and by hw_func's own simulation-body analysis -- can recover it.
+
+    The synthetic filename avoids '<', '>', ':' (unlike the common '<string>'-style
+    convention) because PY_TO_LOGIC._loc_str embeds os.path.basename(src_file)
+    verbatim (aside from '.' -> '_') into generated VHDL identifiers for
+    uniqueness -- those characters are legal in a Python/linecache "filename"
+    but not in a VHDL identifier, and only fail once the output actually reaches
+    a VHDL compiler (e.g. via --sim --ghdl), not under plain --no_synth
+    elaboration, which never compiles the generated text.
+
+    `folder` only affects the synthetic path's directory component (cosmetic --
+    where SYN.GET_OUTPUT_DIRECTORY places this entity's generated VHDL); the
+    original caller (make_type_to_bytes/make_type_from_bytes) keeps its default,
+    a different generated-function caller (e.g. a cast) can pass its own.
+    """
+    fake_file = f"/{folder}/{func_name}.py"
+    _linecache.cache[fake_file] = (len(src), None, src.splitlines(True), fake_file)
+    code = compile(src, fake_file, "exec")
+    ns = dict(extra_globals)
+    exec(code, ns)
+    fn = ns[func_name]
+    original = _inspect.unwrap(fn)
+    frame = _sys._getframe(1)
+    symbol = frame.f_code.co_name
+    if symbol.startswith("make_"):
+        symbol = symbol[5:]
+    if folder == "pypeline_generated_casts":
+        symbol = "cast"
+    info = _describe(original, "function")
+    # The signature identifies wrap/unwrap and bytes input/output directions;
+    # settings consumed during generation (e.g. endian) come from the caller.
+    n_args = frame.f_code.co_argcount + frame.f_code.co_kwonlyargcount
+    args = {
+        k: frame.f_locals[k]
+        for k in frame.f_code.co_varnames[:n_args]
+        if k in frame.f_locals
+        # Same rule as capture_factory_args: an unset name= describes nothing
+        and not (k == "name" and frame.f_locals[k] is None)
+    }
+    params = tuple((k, _value_description(v)) for k, v in args.items())
+    params += tuple(
+        (k, _value_description(v)) for k, v in original.__annotations__.items()
+    )
+    info = _replace_name_info(
+        info,
+        symbol=symbol,
+        module=frame.f_globals.get("__name__", ""),
+        qualname=frame.f_code.co_name,
+        source=frame.f_code.co_filename,
+        line=frame.f_lineno,
+        params=params,
+    )
+    fn._pypeline_name_info = original._pypeline_name_info = info
+    fn._pypeline_generated_origin = original._pypeline_generated_origin = True
+    return fn
+
+
+# Directory-name markers of the synthetic "/<marker>/<name>.py" absolute-path
+# convention used by _exec_generated_func (default folder
+# "pypeline_generated_bytes", or "pypeline_generated_casts" -- the
+# lazily-built @cast functions in include/pypeline/stream/stream.py -- or
+# "pypeline_generated_fifos" / "pypeline_generated_insts", the global FIFO and
+# global instance MAINs of _make_global_inst_main, via its folder= override)
+# and AUTO._exec_generated ("pypeline_auto_fsm_gen"); see dump_generated_sources.
+_GENERATED_SOURCE_DIR_MARKERS = (
+    "pypeline_generated_bytes",
+    "pypeline_generated_casts",
+    "pypeline_auto_fsm_gen",
+    "pypeline_generated_fifos",
+    "pypeline_generated_insts",
+)
+
+
+def dump_generated_sources(out_dir):
+    """Write every synthetic pypeline-generated Python source currently
+    registered in linecache to `out_dir`, so a `_py_lNN` location suffix
+    pointing at generated code (a to_bytes/from_bytes cast helper, an
+    AUTO_FSM-opened FSM, an interface function's generated wiring module)
+    resolves to a real file on disk instead of a name nobody can open.
+
+    Covers every synthetic-filename convention in this codebase: the
+    "/<marker>/<name>.py" absolute-path convention (_exec_generated_func,
+    AUTO._exec_generated) and interface_func.py's "ifgen_<...>.py" bare
+    relative filename. Best-effort and read-only against linecache: only
+    entries actually present in linecache.cache at call time are written, so
+    calling this before any design has been elaborated writes nothing.
+
+    Returns the list of file paths written.
+    """
+    import os as _os
+
+    written = []
+    for fake_path, entry in list(_linecache.cache.items()):
+        if not isinstance(fake_path, str):
+            continue
+        rel = fake_path.lstrip("/")
+        is_known_synthetic = rel.startswith("ifgen_") or any(
+            fake_path.startswith(f"/{marker}/")
+            for marker in _GENERATED_SOURCE_DIR_MARKERS
+        )
+        if not is_known_synthetic:
+            continue
+        lines = entry[2] if len(entry) > 2 else None
+        if not lines:
+            continue
+        dest = _os.path.join(out_dir, rel)
+        dest_dir = _os.path.dirname(dest)
+        if dest_dir:
+            _os.makedirs(dest_dir, exist_ok=True)
+        with open(dest, "w") as f:
+            f.writelines(lines)
+        written.append(dest)
+    return written
+
+
+_TYPE_TO_BYTES_CACHE: dict = {}
+_TYPE_FROM_BYTES_CACHE: dict = {}
+
+
+def make_type_to_bytes(t, endian: str = "little"):
+    """Factory: returns a hardware function packing a value of type t into a
+    fixed uint8_t[byte_length(t)] array, matching a packed/unpadded C struct's
+    field order (sub-byte fields round up to 1 byte; no other padding).
+    endian in {"little", "big"} controls per-multi-byte-field byte order
+    (little = least-significant byte first). The returned function is tagged
+    @wires (pure bit rewiring, zero synthesis delay).
+
+    @enum leaves are supported (an enum occupies ceil(enum_bit_width/8) bytes);
+    see _leaf_uint_ctype for why they route through a uintN_t temp.
+
+    Usage:
+        my_struct_to_bytes = make_type_to_bytes(my_struct_t)
+        raw: uint8_t[byte_length(my_struct_t)] = my_struct_to_bytes(x)
+    """
+    _check_endian(endian, "make_type_to_bytes")
+    _check_bytes_type(t, "make_type_to_bytes")
+    # Before the memo check below, so the registration happens on every call
+    # rather than only the one that misses the cache.
+    _host_register(t, endian)
+    raw_name = _bytes_type_key(t)
+    cache_key = (raw_name, endian)
+    cached = _TYPE_TO_BYTES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    n = byte_length(t)
+    out_t = uint8_t[n]
+    func_name = _finalize_hw_name(f"{raw_name}_to_bytes_{_ENDIAN_BYTE_SUFFIX[endian]}")
+
+    leaf_type_names: dict = {}  # ctype-name str -> synthetic global var name
+    extra_globals = {"t": t, "out_t": out_t, "wires": wires}
+
+    def _leaf_type_name(leaf_t) -> str:
+        # Register the leaf's CARRIER type: an enum leaf is materialized into a
+        # same-width uintN_t local (see _leaf_uint_ctype), so an enum leaf and a
+        # plain uint leaf of the same width share one synthetic global.
+        carrier_t = _leaf_uint_ctype(leaf_t)
+        key = str(carrier_t)
+        varname = leaf_type_names.get(key)
+        if varname is None:
+            varname = f"_leaf_t{len(leaf_type_names)}"
+            leaf_type_names[key] = varname
+            extra_globals[varname] = carrier_t
+        return varname
+
+    lines = ["@wires", f"def {func_name}(x: t) -> out_t:", "    rv: out_t"]
+    base = 0
+    for path, leaf_t in _enumerate_leaves(t):
+        w = _leaf_bit_width(leaf_t)
+        k = (w + 7) // 8
+        access = _access_expr("x", path)
+        is_enum = getattr(leaf_t, "_pypeline_is_enum", False)
+        if k == 1 and not is_enum:
+            lines.append(f"    rv[{base}] = {access}")
+        elif k == 1:
+            # An enum leaf ALWAYS materializes through a same-width uintN_t
+            # local, even for a single byte: `rv[i] = x.some_enum_field` would
+            # assign an enum-typed wire straight into a uint8_t array element,
+            # a width mismatch (enum width is rarely 8). The temp makes the
+            # enum->uint step an explicit width-identical assignment, and the
+            # uint->uint8_t element assignment then zero-extends as usual.
+            tmp = f"tmp{base}"
+            lines.append(f"    {tmp}: {_leaf_type_name(leaf_t)} = {access}")
+            lines.append(f"    rv[{base}] = {tmp}")
+        else:
+            # Bit-slicing is only elaborator-supported on a bare Name or a
+            # single struct-attribute chain (PY_TO_LOGIC._try_elab_bit_slice),
+            # not on an array-indexed base -- so any leaf reached via an array
+            # index (a bare array element, or an array-typed struct field)
+            # must first be materialized into a plain local, mirroring the
+            # existing hand-written idiom (e.g. wireguard-fpga's
+            # `word: uint32_t = block.state[i]` before slicing `word`).
+            tmp = f"tmp{base}"
+            lines.append(f"    {tmp}: {_leaf_type_name(leaf_t)} = {access}")
+            for j in range(k):
+                hi = min(w - 1, j * 8 + 7)
+                lo = j * 8
+                dst = base + j if endian == "little" else base + (k - 1 - j)
+                sel = f"{tmp}[{hi}]" if hi == lo else f"{tmp}[{hi}:{lo}]"
+                lines.append(f"    rv[{dst}] = {sel}")
+        base += k
+    lines.append("    return rv")
+    src = "\n".join(lines) + "\n"
+
+    extra_globals.update(_collect_struct_types(t))
+    extra_globals.update(_collect_enum_types(t))
+    fn = _exec_generated_func(func_name, src, extra_globals)
+    _TYPE_TO_BYTES_CACHE[cache_key] = fn
+    return fn
+
+
+def make_type_from_bytes(t, endian: str = "little"):
+    """Factory: returns a hardware function unpacking a uint8_t[byte_length(t)]
+    array into a value of type t. Exact inverse of make_type_to_bytes(t, endian)
+    for the same t/endian. The returned function is tagged @wires (pure bit
+    rewiring, zero synthesis delay).
+
+    @enum leaves are supported (an enum occupies ceil(enum_bit_width/8) bytes);
+    see _leaf_uint_ctype for why they route through a uintN_t temp.
+
+    Usage:
+        my_struct_from_bytes = make_type_from_bytes(my_struct_t)
+        x: my_struct_t = my_struct_from_bytes(raw)
+    """
+    _check_endian(endian, "make_type_from_bytes")
+    _check_bytes_type(t, "make_type_from_bytes")
+    # Before the memo check below, so the registration happens on every call
+    # rather than only the one that misses the cache.
+    _host_register(t, endian)
+    raw_name = _bytes_type_key(t)
+    cache_key = (raw_name, endian)
+    cached = _TYPE_FROM_BYTES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    n = byte_length(t)
+    in_t = uint8_t[n]
+    func_name = _finalize_hw_name(
+        f"{raw_name}_from_bytes_{_ENDIAN_BYTE_SUFFIX[endian]}"
+    )
+
+    leaf_type_names: dict = {}  # ctype-name str -> synthetic global var name
+    extra_globals = {"t": t, "in_t": in_t, "concat": concat, "wires": wires}
+
+    def _leaf_type_name(leaf_t) -> str:
+        carrier_t = _leaf_uint_ctype(leaf_t)
+        key = str(carrier_t)
+        varname = leaf_type_names.get(key)
+        if varname is None:
+            varname = f"_leaf_t{len(leaf_type_names)}"
+            leaf_type_names[key] = varname
+            extra_globals[varname] = carrier_t
+        return varname
+
+    lines = ["@wires", f"def {func_name}(src: in_t) -> t:", "    rv: t"]
+    base = 0
+    for path, leaf_t in _enumerate_leaves(t):
+        w = _leaf_bit_width(leaf_t)
+        k = (w + 7) // 8
+        access = _access_expr("rv", path)
+        if k == 1:
+            rhs = f"src[{base}]"
+        else:
+            chunks = []
+            for j in range(k - 1, -1, -1):
+                dst = base + j if endian == "little" else base + (k - 1 - j)
+                chunks.append(f"src[{dst}]")
+            rhs = f"concat({', '.join(chunks)})"
+        if getattr(leaf_t, "_pypeline_is_enum", False):
+            # Route an enum leaf through a same-width uintN_t local. The byte
+            # (or concat) is WIDER than the enum, and only an enum<->uint
+            # assignment of IDENTICAL width is the width-identical no-op that
+            # VHDL's TYPE_RESOLVE_ASSIGNMENT_RHS turns into plain wiring; the
+            # narrowing has to happen on the uint side first. (`some_enum_t(x)`
+            # is not an option -- that spelling means IntEnum member lookup.)
+            tmp = f"tmp{base}"
+            lines.append(f"    {tmp}: {_leaf_type_name(leaf_t)} = {rhs}")
+            lines.append(f"    {access} = {tmp}")
+        else:
+            lines.append(f"    {access} = {rhs}")
+        base += k
+    lines.append("    return rv")
+    src = "\n".join(lines) + "\n"
+
+    extra_globals.update(_collect_struct_types(t))
+    extra_globals.update(_collect_enum_types(t))
+    fn = _exec_generated_func(func_name, src, extra_globals)
+    _TYPE_FROM_BYTES_CACHE[cache_key] = fn
+    return fn
+
+
+# ─────────────────────────────────────────────
+# Software-side type <-> bytes conversion
+#
+# The plain-Python twin of make_type_to_bytes/make_type_from_bytes, for code
+# that has bytes rather than hardware: a testbench scoreboard, a host script
+# driving a real device, anything with readStream/writeStream functions that
+# take and return byte arrays. No elaboration, no sim_call, no generated
+# module -- just int.to_bytes over the same leaf walk.
+#
+# Consistency with the hardware is structural, not by convention: both sides
+# walk _enumerate_leaves(t) and size each leaf with _leaf_bit_width(), so they
+# cannot disagree about field order, leaf byte count, or where padding lands.
+# (src/tests/pypeline_tests/inst/type_bytes_sw_test.py asserts the two agree
+# for every fixture type and both endians.)
+# ─────────────────────────────────────────────
+
+
+def _sw_leaf_get(value, path):
+    """Read the leaf at `path` out of a Python/sim value (str tokens are struct
+    attributes, int tokens are array indices) -- the runtime twin of the
+    _access_expr() string the hardware generator emits for the same path."""
+    v = value
+    for tok in path:
+        v = v[tok] if isinstance(tok, int) else getattr(v, tok)
+    return v
+
+
+def _sw_leaf_value(raw: int, leaf_t):
+    """Turn a decoded unsigned leaf integer into the value shape native sim
+    would produce for that leaf ctype."""
+    if getattr(leaf_t, "_pypeline_is_enum", False):
+        # A SimVal of the enum's carrier uint, NOT the IntEnum member -- because
+        # that is what native sim itself holds: @struct's _typed_new casts every
+        # scalar field to its declared width, so even `r_t(s=state_t.RUNNING)`
+        # stores a SimVal, and so does every sim_call return value. Returning a
+        # member here would make type_from_bytes results structurally different
+        # from sim_call results, defeating the point of building them with
+        # sim_zero/_sim_lens_set. Comparisons still read naturally, since
+        # SimVal == state_t.RUNNING compares by integer value.
+        return _sim_cast(raw, _leaf_uint_ctype(leaf_t))
+    return _sim_cast(raw, leaf_t)
+
+
+def _sw_finish(value, t):
+    """Wrap char arrays as CharArray so str(rv) works, matching what sim_call
+    returns for a char_t[N]. Recurses so a char array nested in a struct/array
+    is wrapped too."""
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        inner = [_sw_finish(v, elem) for v in value]
+        if getattr(elem, "_ctype_name", None) == "char":
+            return CharArray(inner)
+        return inner
+    if hasattr(t, "_fields"):
+        return t(*(_sw_finish(getattr(value, f), t.__annotations__[f]) for f in t._fields))
+    return value
+
+
+def type_to_bytes(t, value, endian: str = "little") -> bytes:
+    """Pack a Python/simulation value of pypeline type `t` into byte_length(t)
+    bytes, in the identical layout the generated hardware function
+    make_type_to_bytes(t, endian) produces.
+
+    Pure Python: no hardware elaboration, no sim_call.
+
+    Accepted `value` shapes -- anything native sim produces or accepts:
+        scalar t   int, bool, SimVal, or (for an @enum t) an IntEnum member
+        array t    list, tuple, CharArray, bytes, bytearray
+        @struct t  an instance of t (fields may be SimVal, plain int, list,
+                   or nested struct instances)
+
+    Each leaf is masked to its own bit width, then emitted as ceil(width / 8)
+    bytes in `endian` order; a ragged-width leaf's top byte carries width % 8
+    significant bits, zero-extended -- exactly the `rv[dst] = tmp[hi:lo]`
+    assignments the hardware generator emits.
+
+    Usage:
+        raw = type_to_bytes(header_t, h)      # -> bytes, len == byte_length(header_t)
+        write_stream(raw)
+    """
+    _check_endian(endian, "type_to_bytes")
+    _check_bytes_type(t, "type_to_bytes")
+    out = bytearray()
+    for path, leaf_t in _enumerate_leaves(t):
+        w = _leaf_bit_width(leaf_t)
+        k = (w + 7) // 8
+        v = int(_sw_leaf_get(value, path)) & ((1 << w) - 1)
+        out += v.to_bytes(k, endian)
+    return bytes(out)
+
+
+def type_from_bytes(t, data, endian: str = "little"):
+    """Unpack `data` into a value of pypeline type `t`. Exact inverse of
+    type_to_bytes(t, value, endian), and layout-identical to the hardware
+    make_type_from_bytes(t, endian).
+
+    `data` is any bytes-like (bytes/bytearray/memoryview) or an iterable of
+    ints -- so a uint8_t[N] value straight out of sim_call round-trips without
+    conversion. len(data) must equal byte_length(t).
+
+    Returns the same value shape native sim would produce:
+        scalar t   SimVal typed to t (signed leaves come back negative)
+        @enum t    a SimVal of the enum's carrier uint (what native sim holds
+                   for an enum too -- compare against members directly, e.g.
+                   `rv.state == state_t.RUNNING`)
+        char_t[N]  CharArray, so str(rv) gives the string
+        array t    list
+        @struct t  an instance of t
+
+    Because it builds the result with sim_zero() + _sim_lens_set() -- the very
+    functions native sim uses -- the returned value can be handed straight back
+    to sim_call() as an argument.
+
+    Usage:
+        h = type_from_bytes(header_t, read_stream(byte_length(header_t)))
+    """
+    _check_endian(endian, "type_from_bytes")
+    _check_bytes_type(t, "type_from_bytes")
+    buf = bytes(bytearray(int(b) & 0xFF for b in data))
+    n = byte_length(t)
+    if len(buf) != n:
+        raise ValueError(
+            f"type_from_bytes({_bytes_type_key(t)}): expected {n} bytes "
+            f"(byte_length), got {len(buf)}"
+        )
+    rv = sim_zero(t)
+    base = 0
+    for path, leaf_t in _enumerate_leaves(t):
+        w = _leaf_bit_width(leaf_t)
+        k = (w + 7) // 8
+        raw = int.from_bytes(buf[base : base + k], endian) & ((1 << w) - 1)
+        rv = _sim_lens_set(rv, list(path), _sw_leaf_value(raw, leaf_t))
+        base += k
+    return _sw_finish(rv, t)
+
+
+# ─────────────────────────────────────────────
+# Host-side export registry
+#
+# What gets written into a build's `<out_dir>/host/pypeline_host_types.py` --
+# the standalone, stdlib-only module a host program copies to a machine that
+# has no Pypeline checkout (see src/pypeline_host.py for the generator, and
+# docs/pypeline_guide.md's "Host-Side Generated Types").
+#
+# Registration is automatic at the choke point EVERY hardware serialization
+# path already goes through: make_type_to_bytes / make_type_from_bytes. The
+# layered stream factories (make_type_to_byte_stream, make_byte_stream_to_type,
+# make_type_to_axis, make_axis_to_type) all call one of those, so any struct
+# the hardware actually puts on a wire registers itself with no design edit --
+# which is the point, since a struct that has been serialized to bytes IS by
+# construction a wire format that something on the other end must parse.
+#
+# host_export() covers the rest: types the design never streams itself, and
+# named constant VALUES (a defaults struct, a flags bitmask) that a host would
+# otherwise have to transcribe by hand.
+# ─────────────────────────────────────────────
+
+# canonical name -> {"type": t, "endians": set of str}. Insertion-ordered, so
+# generated output is a pure function of the design source (see
+# docs/pypeline_DESIGN.md on canonical-name determinism).
+_HOST_EXPORTS: dict = {}
+# exported constant name -> value, insertion-ordered.
+_HOST_VALUES: dict = {}
+
+
+def _host_register(t, endian: str = "little") -> None:
+    """Record `t` as a host-facing wire format, serialized with `endian`.
+
+    Called from make_type_to_bytes/make_type_from_bytes, so it must stay cheap
+    and must never raise for a type those already accepted.
+
+    Both endians for one type is legal (a testbench commonly exercises both),
+    so this accumulates a SET rather than conflicting: the generated module
+    defaults that type to the hardware's endian when there is exactly one, and
+    to "little" when a design genuinely used both -- with the ambiguity spelled
+    out in the generated file rather than hidden. Either way the generated
+    to_bytes/from_bytes still take an explicit `endian` override.
+    """
+    if not (_is_compound_pypeline_type(t) or _is_scalar_pypeline_int(t)):
+        return
+    name = _bytes_type_key(t)
+    entry = _HOST_EXPORTS.get(name)
+    if entry is None:
+        _HOST_EXPORTS[name] = {"type": t, "endians": {endian}}
+    else:
+        entry["endians"].add(endian)
+
+
+def host_export(*types, **values) -> None:
+    """Explicitly add types and named constants to the generated host module.
+
+    For anything the design does not itself serialize -- and for the constants
+    a host would otherwise hand-transcribe alongside the layout:
+
+        host_export(pdw_ctrl_t,
+                    CTRL_DEFAULTS=CTRL_DEFAULTS,
+                    CTRL_FLAG_LOOPBACK_EN=1)
+
+    Values may be @struct instances, @enum members, int/bool/float/str, lists of
+    those, or a pypeline TYPE (which emits an alias, `NAME = canonical_t`, and
+    is how to give a factory-derived type a friendlier host-side name). A struct
+    or enum value implicitly exports its own type, so naming the type separately
+    is never required.
+
+    Idempotent, and safe to call at module import time -- which is where it
+    belongs, since a build registers whatever the design's import produced.
+    """
+    for t in types:
+        if not (_is_compound_pypeline_type(t) or _is_scalar_pypeline_int(t)):
+            raise TypeError(f"host_export: not a pypeline type: {t!r}")
+        _host_register(t)
+    for name, value in values.items():
+        _host_export_value(name, value)
+
+
+def _host_export_value(name: str, value) -> None:
+    """Register one named constant, exporting whatever type it implies."""
+    if isinstance(value, type) or getattr(value, "_pypeline_is_enum", False):
+        # A type object exported under a name: an alias.
+        if not (_is_compound_pypeline_type(value) or _is_scalar_pypeline_int(value)):
+            raise TypeError(f"host_export({name}=...): not a pypeline type: {value!r}")
+        _host_register(value)
+        _HOST_VALUES[name] = value
+        return
+    t = _host_value_type(value)
+    if t is not None:
+        _host_register(t)
+    _HOST_VALUES[name] = value
+
+
+def _host_value_type(value):
+    """The pypeline type a constant VALUE implies, or None for a plain Python
+    literal (int/bool/float/str/list) that needs no layout to be emitted."""
+    cls = type(value)
+    if getattr(cls, "_pypeline_is_enum", False):
+        return cls
+    if hasattr(cls, "_fields") and hasattr(cls, "_pypeline_ctype_name"):
+        return cls
+    return None
+
+
+def host_exports():
+    """Snapshot of what a build should generate: (types, values).
+
+    `types` maps canonical name -> {"type": t, "endians": set}; `values` maps
+    exported constant name -> value. Copies, so the generator cannot perturb
+    the registry it is reading.
+    """
+    return (
+        {k: dict(v, endians=set(v["endians"])) for k, v in _HOST_EXPORTS.items()},
+        dict(_HOST_VALUES),
+    )
+
+
+def _host_reset() -> None:
+    """Drop every registration. For tests that need a clean registry, and for
+    repeated in-process PARSE_FILE runs (which already evict sys.modules --
+    see docs on canonical-name determinism)."""
+    _HOST_EXPORTS.clear()
+    _HOST_VALUES.clear()
+
+
+# ─────────────────────────────────────────────
+# Raw VHDL passthrough
+# (intercepted by PY_TO_LOGIC elaborator; not callable at Python runtime)
+# ─────────────────────────────────────────────
+
+
+def vhdl(vhdl_text, reset=None):
+    """Raw VHDL passthrough: replaces the entire calling function's body with
+    literal VHDL text spliced into the generated entity's architecture. Must be
+    the only statement in the function body. Equivalent to C's __vhdl__("...").
+
+    reset="sync": the text may use RESET (std_logic, active high, synchronous
+    to clk) to reset its registers. It is the entity's RESET port under a
+    MAIN(reset_registers="all") with a reset, else a constant '0'. Without
+    reset=, the text keeps its state across a reset.
+
+    Unlike the bit manipulation primitives above, there is no general way to
+    simulate arbitrary user-supplied VHDL text in Python, so this function has
+    no dual-mode simulation behavior: it always raises when actually called
+    (i.e. outside hardware elaboration, which recognizes vhdl(...) structurally
+    by AST and never executes this body). To simulate a vhdl(...)-bodied
+    function, attach a Python simulation model to it with @sim_model (below).
+    """
+    raise NotImplementedError(
+        "vhdl(...) has no attached simulation model. It can only be used inside "
+        "hardware-elaborated functions — to call a vhdl(...)-bodied function via "
+        "sim_call() or pypeline_sim.py, attach a Python simulation model to it "
+        "with @sim_model(target)."
+    )
+
+
+def sim_model(target, copy_state=True):
+    """Attach a Python simulation model to a hardware function.
+
+    Returns a decorator that registers the model as the native-simulation
+    implementation of `target` (an @hw_func/@MAIN-decorated function). Whenever
+    target is called during simulation, the model runs instead of target's own
+    body; hardware elaboration is completely unaffected (models are invisible
+    to the elaborator). This is how vhdl(...)-bodied functions become
+    simulable, and it can equally override an ordinary hardware function with
+    a faster or higher-level model.
+
+    Exactly one model per target, of either form (a second attachment raises
+    ValueError):
+
+    Form 1 -- an @hw_func delegate (synthesizable Pypeline, same signature)::
+
+        @sim_model(accum)
+        @hw_func
+        def accum_model(din: uint32_t) -> uint32_t:
+            total: Reg[uint32_t]
+            total = total + din
+            return total
+
+    Form 2 -- an arbitrary Python class (sim-only; any state in __init__)::
+
+        @sim_model(accum)
+        class AccumModel:
+            def __init__(self):
+                self.samples = np.array([], dtype=np.uint64)
+            def __call__(self, din):
+                self.samples = np.append(self.samples, int(din))
+                return int(self.samples.sum())
+
+    One class instance is created lazily per hardware instance (per call site,
+    the same keying as Reg[T] state), so two call sites of target hold
+    independent model state. A pre-constructed callable instance may also be
+    attached; with copy_state=True it serves as the per-instance power-on
+    template.
+
+    State timing for class/callable models is Reg-like: each evaluation runs
+    on a copy.deepcopy of the instance committed at the last clock edge and
+    commits through the buffered register-write path, so outputs are a pure
+    function of (cycle-start state, current inputs) and pypeline_sim.py
+    wire-convergence re-evaluation cannot double-step state. Model __call__
+    bodies may run several times per cycle during convergence -- keep them
+    side-effect-free, or gate side effects on `not pypeline._sim_converging`
+    (the same rule @sim_output exists to solve).
+
+    copy_state=False skips the deepcopy: the instance is created once and
+    mutated in place -- faster for heavy state, but NOT convergence-safe (only
+    sound when the model's inputs are already final the first time it runs
+    each cycle, e.g. plain single-call sim_call() use). Ignored for hw_func
+    delegates, whose Reg[T] state already commits through the register path.
+
+    Model outputs are cast to target's declared return type at the call
+    boundary, exactly like any hw_func result.
+    """
+    cell = getattr(target, "_sim_model_cell", None)
+    if cell is None:
+        raise TypeError(
+            f"sim_model target {getattr(target, '__name__', target)!r} is not a "
+            f"hardware function — apply @hw_func (or @MAIN) to it first"
+        )
+
+    def _attach(model):
+        if cell[0] is not None:
+            raise ValueError(
+                f"{target.__name__!r} already has a sim model attached "
+                f"({cell[0][0]!r}); exactly one model (of either form) per "
+                f"hardware function"
+            )
+        if is_hw_func(model):
+            kind = "hw_func"
+            model_ret = _inspect.unwrap(model).__annotations__.get("return")
+            target_ret = _inspect.unwrap(target).__annotations__.get("return")
+            if hw_arg_types(model) != hw_arg_types(target) or model_ret != target_ret:
+                raise TypeError(
+                    f"sim model {model.__name__!r} signature does not match "
+                    f"target {target.__name__!r}: an @hw_func delegate must "
+                    f"take and return the same hardware types"
+                )
+        elif isinstance(model, type):
+            kind = "class"
+            if not any("__call__" in vars(c) for c in model.__mro__):
+                raise TypeError(
+                    f"sim model class {model.__name__!r} must define __call__"
+                )
+        elif callable(model):
+            kind = "callable"
+        else:
+            raise TypeError(
+                f"sim model must be an @hw_func delegate, a class, or a "
+                f"callable instance, not {type(model).__name__}"
+            )
+        cell[0] = (model, kind, copy_state)
+        cell[1] = _raw_vhdl_keeps_state(target)
+        return model
+
+    return _attach
+
+
+# ─────────────────────────────────────────────
+# hex -- printf-style hex formatting for sim_print/sim_assert f-strings
+# (intercepted structurally by PY_TO_LOGIC as a %X marker; this is the real
+# callable used when the surrounding code actually runs in native simulation)
+# ─────────────────────────────────────────────
+
+_builtin_hex = hex
+
+
+def hex(value):
+    """hex(x) for use inside sim_print/sim_assert f-strings: renders zero-padded
+    hex digits with no "0x" prefix, matching VHDL's %X rendering of the same
+    value -- e.g. hex(uint8_t value 7) -> "07", not Python's default "0x7".
+
+    Width is taken from the value's ctype (SimVal instances, including bit-slice
+    results like x[hi:lo] -- see SimVal.__getitem__) when known; otherwise (a
+    plain Python int with no ctype) falls back to Python's own hex(), matching
+    the pre-existing behavior for non-hardware values.
+    """
+    ctype = getattr(value, "_ctype", None)
+    if ctype is None:
+        return _builtin_hex(value)
+    try:
+        width = ctype.width
+    except (AttributeError, NotImplementedError):
+        return _builtin_hex(value)
+    nibbles = (width + 3) // 4
+    return f"{int(value):0{nibbles}X}"
+
+
+# ─────────────────────────────────────────────
+# sim_print -- printf-style console output
+# (intercepted by PY_TO_LOGIC elaborator; also a real callable for simulation)
+# ─────────────────────────────────────────────
+
+
+def sim_print(s, *, debug=False):
+    """printf-style console output: prints during simulation (once per cycle, using
+    converged wire values -- same @sim_output-style semantics) and elaborates to a real
+    VHDL write(output, ...) statement in hardware.
+
+    Takes exactly one positional argument, matching how it's normally written -- an
+    f-string or a plain string literal (debug is keyword-only, so a C-printf-style
+    sim_print("n", n) is a TypeError in simulation just as it is an elaboration
+    error, instead of binding n to debug), e.g.::
+
+        sim_print(f"n={n} hex={hex(n)} ch={chr(n)}")
+        sim_print("starting up")
+
+    A trailing newline is appended automatically, like real print(). Unlike PipelineC's C
+    printf(fmt, ...), there is no separate %-style multi-argument form -- ordinary Python
+    interpolation is used instead; the elaborator reconstructs an equivalent internal
+    format string from the f-string's AST (see PY_TO_LOGIC.py's _elab_sim_print_stmt).
+    Since Python evaluates the f-string before this function is ever called, the
+    simulation side is just a plain print() of the already-formatted text.
+
+    debug=True (must be a compile-time-constant literal True/False) prefixes the message
+    with a "[SIM DEBUG PRINT: <abs file path>:<N>]" tag identifying the call site, for use
+    with pypeline_sim_debug.py (a tool that diffs sim_print(debug=True) output cycle-by-cycle
+    between native and VHDL sim -- ordinary sim_print(...) output, debug=False, is not
+    compared by that tool). The tag uses an absolute path + ":<line>" (not just a basename)
+    so terminals/editors that recognize "path:line" text can turn it into a clickable jump
+    to the call site. The tag is deliberately just file+line, no type info: the format
+    string is already shared between native and VHDL rendering (see hex() above and
+    PY_TO_LOGIC.py's _build_sim_fmt_string), so the two sims' output for identical source is
+    guaranteed to render identically -- no per-type normalization is needed downstream.
+    """
+    if _sim_converging:
+        return SimVal(0)
+    if debug:
+        import os as _os
+        import sys as _sys2
+
+        frame = _sys2._getframe(1)
+        tag = f"[SIM DEBUG PRINT: {_os.path.abspath(frame.f_code.co_filename)}:{frame.f_lineno}]"
+        # A debug=True print exists only to be cycle-compared against VHDL by
+        # pypeline_sim_debug.py. If it fires from inside pipelined combinational
+        # logic -- a naturally-pipelined pure MAIN, or an AUTO_PIPELINE core --
+        # its cycle CANNOT match: native sim runs that comb at stage-0 timing
+        # while the VHDL fires it at whatever pipeline stage retiming placed it.
+        # Fail loudly rather than emit a print that will silently mis-compare
+        # (see pypeline_sim_DESIGN.md's Limitations). Only triggers under a
+        # pipelined build; plain native/--comb sim has no pipelined context.
+        _sim_check_debug_probe_not_in_pipeline(
+            f"{frame.f_code.co_filename}:{frame.f_lineno}"
+        )
+        s = f"{tag}: {s}"
+    print(s)
+    return SimVal(0)
+
+
+def _sim_check_debug_probe_not_in_pipeline(loc: str) -> None:
+    """Raise if a sim_print(debug=True) is executing inside pipelined comb
+    (a pipelined pure MAIN, or an AUTO_PIPELINE core's func evaluation)."""
+    in_pipelined_main = (
+        _sim_current_main is not None and _sim_current_main in _sim_pipelined_main_info
+    )
+    in_auto_pipeline_core = any(
+        isinstance(entry[0], str) and entry[0].startswith("AUTO_PIPELINE:")
+        for entry in _sim_inst_stack
+    )
+    if in_pipelined_main or in_auto_pipeline_core:
+        where = "a pipelined pure MAIN" if in_pipelined_main else "an AUTO_PIPELINE core"
+        raise RuntimeError(
+            f"sim_print(debug=True) at {loc} executed inside {where}. Its cycle "
+            f"cannot be compared against VHDL: native sim runs pipelined comb at "
+            f"stage-0 timing while the VHDL fires it at its retimed pipeline "
+            f"stage. Move debug=True probes into a stateful (0-latency) MAIN "
+            f"that reads the pipeline's output wires (plain sim_print(...) "
+            f"without debug=True is fine anywhere -- it is not cycle-compared)."
+        )
+
+
+sim_print._is_sim_print = True
+
+
+# ─────────────────────────────────────────────
+# sim_assert -- simulation-only condition check
+# (intercepted by PY_TO_LOGIC elaborator; also a real callable for simulation)
+# ─────────────────────────────────────────────
+
+
+def sim_assert(cond, msg=None):
+    """Simulation-only assertion: checks `cond` during simulation (once per cycle, using
+    converged wire values -- same semantics as sim_print) and elaborates to a real VHDL
+    `assert ... report ... severity failure;` statement in hardware, which halts GHDL
+    simulation immediately on failure.
+
+    `msg` is optional, an f-string or plain string literal like sim_print's argument.
+    """
+    if _sim_converging:
+        return SimVal(0)
+    assert cond, msg if msg is not None else "sim_assert failed"
+    return SimVal(0)
+
+
+sim_assert._is_sim_assert = True
+
+
+# ─────────────────────────────────────────────
+# sim_finish -- simulation-only stop signal
+# (intercepted by PY_TO_LOGIC elaborator; also a real callable for simulation)
+# ─────────────────────────────────────────────
+
+
+class SimFinish(Exception):
+    """Raised by sim_finish() to signal that simulation should stop now."""
+
+
+def sim_finish():
+    """Simulation-only stop signal: raises SimFinish during simulation (caught by the
+    native-sim run loop to end the run cleanly) and elaborates to a real VHDL
+    `std.env.finish;` statement in hardware, halting GHDL simulation.
+    """
+    if _sim_converging:
+        return SimVal(0)
+    raise SimFinish()
+
+
+sim_finish._is_sim_finish = True
+
+
+# ─────────────────────────────────────────────
+# Sim infrastructure: _sim_cast, _sim_type_wrap / hw_func, sim_call
+# ─────────────────────────────────────────────
+
+import copy as _copy
+import functools as _functools
+import inspect as _inspect
+import sys as _sys
+import dis as _dis
+import ast as _ast
+import textwrap as _textwrap
+import types as _types
+
+
+# ─────────────────────────────────────────────
+# Sim register state: instance path tracking and per-instance register storage
+# ─────────────────────────────────────────────
+
+# Stack of instance-path entries tracking the current simulation hierarchy.
+# Hardware-function entries are (func_qualname, call_loc), where call_loc =
+# (filename, lineno, col_offset, end_col_offset).  The simulation AST loop
+# rewriter also contributes synthetic ("FOR_<target>_ITER_<n>" / "WHILE_ITER_<n>",
+# loop_loc) entries while a source-loop iteration is executing.  This mirrors
+# PY_TO_LOGIC.py's per-unrolled-iteration hierarchy so stateful calls from one
+# physical source line get separate register banks in native simulation too.
+# pypeline_sim._call_main pushes a root entry (_SIM_MAIN_FRAME_PREFIX + MAIN
+# name, None) around each @MAIN, so no two MAINs share any state below it.
+_sim_inst_stack = []
+# First element of a MAIN's root entry, before its name
+_SIM_MAIN_FRAME_PREFIX = "MAIN:"
+
+# Register state keyed by instance path tuple.
+# _sim_reg_state[inst_path][reg_name] = current integer value (0 = reset default).
+_sim_reg_state = {}
+
+# Reset mode of the _sim_reg_state entries that do not follow their MAIN's
+# reset_registers policy: _sim_reg_modes[inst_path][reg_name] = "reset"
+# (Reg[T, RESET]) or "no_reset" (Reg[T, NO_RESET], a raw vhdl() model without
+# reset=). Written with the register (_sim_reg_write); read by _sim_apply_resets.
+_sim_reg_modes = {}
+
+# A pypeline_sim run's resets: root frame name (_SIM_MAIN_FRAME_PREFIX + MAIN
+# name) -> (its reset wire's sim name, its reset_registers policy), for each
+# MAIN with a reset (pypeline_sim._sim_reset_table). Empty outside a run, and
+# under sim_call: every reset inactive.
+_sim_root_resets = {}
+
+# A pypeline_sim run's reset Input pins: sim name -> True once Python code
+# (a @sim_input, a testbench MAIN) has written it. A pin nothing writes gets
+# the default pulse: 1 in cycle 0, 0 after (pypeline_sim.run_sim).
+_sim_reset_inputs = {}
+
+# Maximum convergence iterations for Feedback[T] simulation.
+# Combinatorial feedback must reach a fixed point in far fewer iterations than this.
+_SIM_FEEDBACK_MAX_ITER = 1000
+
+# Simulation accuracy mode flags.
+# These are normally set together by pypeline_sim.py --sim-mode before the
+# design is imported (decorators read them at decoration time).
+#
+# strict (default): SIM_STRICT_ARITH=True,  SIM_RAW_INTS=False
+#   Full hardware accuracy. Every arithmetic op masks to declared bit width.
+#   Slowest, but results match hardware exactly.
+#
+# loose:            SIM_STRICT_ARITH=False, SIM_RAW_INTS=False
+#   Values stay as typed SimVal objects so bit-indexing (x[n], x[hi:lo])
+#   works everywhere, but arithmetic uses Python-precision (no masking).
+#
+# raw:              SIM_STRICT_ARITH=False, SIM_RAW_INTS=True
+#   Maximum speed. Arithmetic returns plain Python ints; function boundaries
+#   do no casting. Bit-indexing on arithmetic results will not work
+#   (struct field access x.field[n] still works).
+
+# When True, SimVal arithmetic applies hardware type-promotion and _sim_cast,
+# matching hardware wrap-on-overflow. Set False for faster Python-precision sim.
+SIM_STRICT_ARITH: bool = True
+
+# When True, bypass ALL SimVal wrapping, type casting, and bit-width masking.
+# SIM_RAW_INTS=True implies SIM_STRICT_ARITH is irrelevant (casting is skipped).
+# Read at @hw_func decoration time — must be set before importing the design.
+SIM_RAW_INTS: bool = False
+
+# When True, @hw_func wrappers capture exact call-site column numbers via
+# co_positions() for uniquely naming multi-instance register hierarchies.
+# False (default) uses only filename+lineno, skipping the O(instructions) co_positions
+# scan and bypassing frame capture entirely for pure-combinatorial functions.
+# Enable when simulating designs where the same Reg[T] function is instantiated
+# at multiple call sites (i.e. multi-instance register hierarchies).
+SIM_TRACE_LOCATIONS: bool = False
+
+# Global wire simulation state.
+_sim_wire_state: dict = {}  # wire name → current value (int or struct/array instance)
+_sim_wire_ctype: dict = {}  # wire name → inner ctype (for zero defaults / leaf casting)
+# claim_key (writer function's qualified name plus a per-function serial) →
+# {wire name → set of concrete written path tuples} -- runtime-recorded driven
+# leaves, reset to zero at the top of each of that function's invocations
+# (see _sim_wire_reset_claims).
+_sim_wire_claims: dict = {}
+# Serial in each claim key: closures of one def (one MAIN per lane, say) share
+# a qualified name but write their own leaves
+_wire_claim_serial = _itertools.count()
+_sim_converging: bool = False  # True during delta-cycle convergence passes
+
+
+def _sim_set_converging(value: bool) -> bool:
+    """Set _sim_converging, returning its previous value -- a save/restore helper
+    used by _build_reg_sim_func's generated Feedback[T] convergence loop (which
+    execs into its own separate globals dict, so a bare assignment there would
+    not reach this module's real flag) to suppress sim_print/sim_assert/
+    sim_finish/@sim_output during the loop's non-final internal iterations,
+    matching the top-level per-cycle driver's own convergence-then-final-pass
+    behavior one level deeper.
+    """
+    global _sim_converging
+    old = _sim_converging
+    _sim_converging = value
+    return old
+
+
+_sim_reg_write_buffer = None  # None = direct commit; dict = buffered mode
+_sim_current_main = None  # MAIN fn currently executing (for reader tracking)
+# Naturally-pipelined pure MAINs (sliced by the sweep without AUTO_PIPELINE)
+# under pipelinec non---comb --sim: main_fn -> {"latency": int, "queue":
+# deque of per-cycle write-set lists, "collector": this cycle's list of
+# (wire_name, lens_path_tuple, value) entries}. Populated only by
+# pypeline_sim.run_sim when the driver hands it a nonzero main latency;
+# empty dict = feature off (one truthiness test on the wire-write hot paths).
+# Such a MAIN's global-wire writes are diverted into "collector" and applied
+# to _sim_wire_state N cycles later (write-side latency emulation: the wire
+# values other MAINs read at cycle t are what the MAIN computed at t-N,
+# matching hardware where its outputs cross N pipeline register stages).
+_sim_pipelined_main_info: dict = {}
+_sim_wire_readers: dict = {}  # wire name → set of MAINs that have read it
+# Pipelined regions native sim is evaluating, innermost last: a pipelined pure
+# MAIN (its _sim_pipelined_main_info entry) or an AUTO_PIPELINE call with
+# latency > 0 (_sim_delay_line). Each is a dict: "root" (the hw_func wrapper
+# whose own body may use global wires), "name" (for messages), "collector"
+# (this evaluation's delayed write entries, (wire, lens path, value)) and
+# "overlay" (wire -> this invocation's own view of the wires it writes). Hardware
+# aligns a pipelined function's global reads with its arguments and its global
+# writes with its return value, so native sim evaluates the root at entry and
+# publishes the collected writes with the delayed return. Empty list = feature
+# off (one truthiness test on the wire hot paths).
+_sim_regions: list = []
+# The hw_func wrapper whose rewritten sim body is executing -- tracked only while
+# a region is active (see _sim_type_wrap); _SIM_ONLY_BODY for @sim_input/@sim_output.
+_sim_body_owner = None
+_SIM_ONLY_BODY = object()
+_sim_wire_volatile: set = set()  # sim keys of Wire/Input/Output[T, VOLATILE]
+# AUTO_PIPELINE call sites (instance paths) holding delayed global writes,
+# replayed at each cycle start by _sim_apply_ap_delayed_writes.
+_sim_ap_write_sites: set = set()
+_SIM_AP_WRITES_KEY = "__sim_auto_pipeline_writes__"
+
+
+class SimPipelineModelError(RuntimeError):
+    """Native sim cannot reproduce the hardware timing of a global wire use
+    inside pipelined logic (see _sim_region_for)."""
+
+
+def _sim_run_in_region(region, func, *args, **kwargs):
+    """Evaluate a pipelined region's root with its global-wire writes diverted
+    into region["collector"] and an empty per-invocation overlay."""
+    region["collector"] = region.get("collector", [])
+    region["overlay"] = {}
+    _sim_regions.append(region)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        _sim_regions.pop()
+
+
+def _sim_region_for(name, action):
+    """The innermost pipelined region a global wire access belongs to. Raises
+    SimPipelineModelError unless native sim models it exactly: a non-VOLATILE
+    wire used in the region root's own body, no pipelined region around it.
+    Hardware wires a global directly to the function that uses it and aligns
+    it with that function's own arguments/return; for a function called inside
+    a pipeline that alignment happens at the stage it is placed, which native
+    sim (whole-body evaluation at entry) does not know."""
+    region = _sim_regions[-1]
+    owner = _sim_body_owner
+    if owner is _SIM_ONLY_BODY:
+        return region
+    if name in _sim_wire_volatile:
+        reason = (
+            "it is declared VOLATILE (hardware reads it at each consumer's "
+            "pipeline stage and drives it as soon as its value is ready)"
+        )
+    elif owner is not region["root"]:
+        owner_name = getattr(owner, "__qualname__", repr(owner))
+        reason = (
+            f"'{owner_name}' is called inside the pipeline, at a stage native "
+            f"sim does not model (hardware aligns the wire with "
+            f"'{owner_name}''s own arguments/return at that stage)"
+        )
+    elif len(_sim_regions) > 1:
+        reason = (
+            f"'{region['name']}' is itself called inside pipelined "
+            f"'{_sim_regions[-2]['name']}', at a stage native sim does not model"
+        )
+    else:
+        return region
+    raise SimPipelineModelError(
+        f"Native sim cannot model global wire {name!r} {action} inside "
+        f"pipelined '{region['name']}': {reason}. Native sim only models "
+        f"non-VOLATILE global wires used directly in the body of the pipelined "
+        f"function itself (the @MAIN or the AUTO_PIPELINE-tagged function). "
+        f"Simulate the generated hardware instead (--cocotb --ghdl), or move "
+        f"the wire access into "
+        f"'{getattr(region['root'], '__qualname__', region['name'])}' and pass "
+        f"the value as an argument/return value. See pypeline_guide.md 'Global "
+        f"wires in pipelined code'."
+    )
+
+
+def _sim_owned_body_call(owner, body, args, kwargs):
+    """Run a rewritten sim body with `owner` recorded as _sim_body_owner. Only
+    used while a pipelined region is active (the wrappers test _sim_regions)."""
+    global _sim_body_owner
+    prev = _sim_body_owner
+    _sim_body_owner = owner
+    try:
+        return body(*args, **kwargs)
+    finally:
+        _sim_body_owner = prev
+
+
+def _sim_apply_ap_delayed_writes() -> None:
+    """At a cycle start, publish each AUTO_PIPELINE call site's global writes
+    from N cycles ago (its committed write line, see _sim_delay_line) --
+    alongside the N-cycles-old return value the call returns this cycle."""
+    for inst_path in _sim_ap_write_sites:
+        pending = _sim_reg_read(inst_path, _SIM_AP_WRITES_KEY, None)
+        if pending:
+            _sim_apply_delayed_writes(pending[0])
+_sim_active: bool = False  # True only while pypeline_sim.py is driving a simulation run
+# True from a pypeline_sim run's @initial(sim) hooks to the end of its
+# @final(sim) hooks, when its @MAINs are already collected (MAIN() refuses).
+# Unlike _sim_active, it is reset when the run ends.
+_sim_run_in_progress: bool = False
+_sim_input_cache: dict = {}  # id(@sim_input wrapper) → cached result for the current cycle
+# True only while an expression is being evaluated as a constant: HDL
+# elaboration's PY_TO_LOGIC._try_eval_const, and native sim's decoration-time
+# local-constant scan in _build_reg_sim_func. A @sim_input/@sim_output reached
+# then raises SimOnlyCallInElab instead of running: its value is never a
+# constant, and running it there would fire its side effects (a counter step,
+# a queue pop) outside any simulated cycle.
+_const_folding: bool = False
+
+
+class SimOnlyCallInElab(Exception):
+    """Raised by a @sim_input/@sim_output wrapper called while _const_folding.
+    PY_TO_LOGIC turns it into an ElaborationError; native sim's scan treats the
+    expression as not constant. .fn is the wrapper that was called."""
+
+    def __init__(self, fn):
+        super().__init__(fn.__name__)
+        self.fn = fn
+
+
+class _ConstFolding:
+    """`with _ConstFolding():` around a speculative constant eval (see
+    _const_folding). Re-entrant: restores the previous value."""
+
+    def __enter__(self):
+        global _const_folding
+        self._prev = _const_folding
+        _const_folding = True
+
+    def __exit__(self, *exc):
+        global _const_folding
+        _const_folding = self._prev
+
+
+def _sim_current_inst_path():
+    """Return the current simulation instance path as an immutable tuple."""
+    return tuple(_sim_inst_stack)
+
+
+def _sim_loop_enter(label, loop_loc, ordinal):
+    """Push one source-loop iteration onto the native simulation hierarchy.
+
+    ``label`` is readable diagnostic context (``FOR_i``/``WHILE``); ``loop_loc``
+    identifies the loop source span; and ``ordinal`` is the zero-based iteration
+    number.  This intentionally matches the elaborator's value-independent
+    unrolled-loop identity: duplicate iterator values and runtime-gated calls
+    must not merge otherwise-distinct hardware instances.
+    """
+    frame = (f"{label}_ITER_{ordinal}", loop_loc)
+    _sim_inst_stack.append(frame)
+    return frame
+
+
+def _sim_loop_exit(frame):
+    """Pop the exact iteration frame entered by ``_sim_loop_enter``.
+
+    A mismatched stack is a simulator implementation error, not a recoverable
+    design condition: continuing would key all later register accesses beneath
+    the wrong hierarchy.
+    """
+    if not _sim_inst_stack or _sim_inst_stack[-1] != frame:
+        raise RuntimeError("native sim loop-instance stack corruption")
+    _sim_inst_stack.pop()
+
+
+def _is_compound_pypeline_type(ctype):
+    """True for struct (NamedTuple) or array ctypes; False for scalars and the
+    Reg/Feedback/Wire/Input/Output descriptor objects (none of which carry
+    _fields or _ctype_name)."""
+    if hasattr(ctype, "_fields"):
+        return True
+    if hasattr(ctype, "_ctype_name") and "[" in ctype._ctype_name:
+        return True
+    return False
+
+
+def _array_elem_ctype(ctype):
+    """Return the element ctype of an array ctype (preferring _elem_ctype, falling back
+    to stripping the leading [N] from _ctype_name -- the array's own/outer dimension is
+    always the *first* bracket, matching C's `T x[A][B]` and PY_TO_LOGIC.py's
+    _array_elem_type), or None if ctype is not an array."""
+    if not hasattr(ctype, "_ctype_name") or "[" not in ctype._ctype_name:
+        return None
+    elem_ctype = getattr(ctype, "_elem_ctype", None)
+    if elem_ctype is not None:
+        return elem_ctype
+    m = _re_ctype.search(r"\[(\d+)\]", ctype._ctype_name)
+    return _make_ctype(ctype._ctype_name[: m.start()] + ctype._ctype_name[m.end() :])
+
+
+def _array_len(ctype):
+    """Return an array ctype's own (outer/first, leftmost-bracket) dimension, or None if
+    not an array."""
+    if not hasattr(ctype, "_ctype_name"):
+        return None
+    arr_len = getattr(ctype, "_arr_len", None)
+    if arr_len is not None:
+        return arr_len
+    m = _re_ctype.search(r"\[(\d+)\]", ctype._ctype_name)
+    return int(m.group(1)) if m else None
+
+
+def _make_sim_zero(ctype):
+    """Return a zero-initialized simulation value for the given pypeline ctype."""
+    if hasattr(ctype, "_fields"):
+        return ctype(*(_make_sim_zero(ctype.__annotations__[f]) for f in ctype._fields))
+    elem_ctype = _array_elem_ctype(ctype)
+    if elem_ctype is not None:
+        n = _array_len(ctype)
+        return [_make_sim_zero(elem_ctype) for _ in range(n)]
+    return _sim_cast(0, ctype)
+
+
+def sim_zero(ctype):
+    """Return a zero-initialized simulation value for a pypeline ctype (scalar,
+    struct, or array) -- the same "power-on" value Reg[T] uses for its reset
+    default. For sim_model authors who need a correctly-typed placeholder for
+    an arbitrary caller-supplied type before any real data exists yet (e.g. an
+    empty queue/buffer's output slot).
+    """
+    return _make_sim_zero(ctype)
+
+
+class CharArray(list):
+    """Sim-mode representation of a char_t[N] value: a list of SimVal(char_t) that also
+    behaves like the Python str it represents, mirroring hardware's %s/strlen display
+    convention (stops at the first NUL byte). This is what lets sim_call args/kwargs,
+    sim_call return values, and sim_print interpolation all accept/produce plain Python
+    str transparently, with no user-facing conversion helpers required."""
+
+    def __str__(self):
+        chars = []
+        for v in self:
+            iv = int(v)
+            if iv == 0:
+                break
+            chars.append(chr(iv))
+        return "".join(chars)
+
+    def __repr__(self):
+        return f"CharArray({str(self)!r})"
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return str(self) == other
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = None
+
+
+def _str_to_scalar_message(value, ctype):
+    """Shared error text (native sim and PY_TO_LOGIC) for a Python str assigned
+    or passed to a non-array type: a str is not an integer, so "A" is not
+    char_t 65 -- ord("A") is."""
+    hint = f"use ord({value!r}) for its character code, or " if len(value) == 1 else ""
+    return (
+        f"string {value!r} cannot be used as a value of non-array type "
+        f"'{_ctype_str(ctype)}': a Python str is not an integer -- {hint}"
+        f"declare a char_t[N] array to hold a string"
+    )
+
+
+def _sim_cast_deep(value, ctype):
+    """Cast value to ctype, recursing through arrays so every scalar leaf becomes a
+    typed SimVal -- mirrors hardware where an array's elements all share one declared
+    bit width. Structs are left as-is: struct construction already types scalar (and,
+    via _typed_new, array-of-scalar) fields at construction time.
+
+    A char_t[N] (or nested char_t[..][N]) target also accepts a bare Python str here,
+    zero-padded/length-checked and wrapped in CharArray -- this is the single mechanism
+    behind every sim-side string-literal boundary (sim_call args/kwargs/return, Reg[T]
+    init, struct-field construction, local var/field assignment inside a simulated
+    function body). uint8_t[N] targets accept a str too (matching the elaboration side's
+    parity between char/uint8_t string-literal targets) but are not wrapped in CharArray,
+    since raw byte arrays aren't meant to behave like display strings."""
+    if hasattr(ctype, "_fields"):
+        return value
+    elem_ctype = _array_elem_ctype(ctype)
+    if elem_ctype is None:
+        if isinstance(value, str):
+            raise TypeError(_str_to_scalar_message(value, ctype))
+        return _sim_cast(value, ctype)
+    elem_name = getattr(elem_ctype, "_ctype_name", None)
+    if isinstance(value, str):
+        if elem_name not in ("char", "uint8_t"):
+            raise TypeError(f"string value not valid for array type {ctype!r}")
+        n = _array_len(ctype)
+        if len(value) > n:
+            raise ValueError(
+                f"string {value!r} (len {len(value)}) exceeds array size {n}"
+            )
+        codes = [ord(c) for c in value] + [0] * (n - len(value))
+        elems = [_sim_cast(c, elem_ctype) for c in codes]
+        return CharArray(elems) if elem_name == "char" else elems
+    elems = [_sim_cast_deep(v, elem_ctype) for v in value]
+    return CharArray(elems) if elem_name == "char" else elems
+
+
+def _is_char_like_array(ctype):
+    """True if ctype is an array (at any nesting depth) whose ultimate scalar element
+    is char or uint8_t -- used to narrowly gate sim_call arg/kwarg/return casting to
+    char-array-shaped values, leaving other array types (e.g. uint32_t[N]) passing
+    through sim_call untouched, exactly as they do today."""
+    elem = _array_elem_ctype(ctype)
+    while elem is not None and _array_elem_ctype(elem) is not None:
+        elem = _array_elem_ctype(elem)
+    return elem is not None and getattr(elem, "_ctype_name", None) in (
+        "char",
+        "uint8_t",
+    )
+
+
+def strlen(arr) -> int:
+    """Simulation-mode strlen(): returns the declared array length (element count) of
+    arr, matching the hardware elaborator's constant-fold semantics -- NOT a runtime scan
+    for a NUL terminator. This mirrors PipelineC's own strlen() exactly (see
+    C_AST_STRLEN_FUNC_CALL_TO_LOGIC in C_TO_LOGIC.py), which is intentionally "declared
+    capacity", not "content length". Use str(arr) for content-length string display
+    instead."""
+    return len(arr)
+
+
+def _sim_lens_set(obj, path, value):
+    """Return a copy of obj with the nested element at path replaced by value.
+
+    Handles NamedTuple structs (immutable -> _replace) and lists (copy + index set).
+    path is a list of field-name strings (struct attribute) or ints (array index),
+    root-to-leaf order.
+    """
+    if not path:
+        return value
+    head, rest = path[0], path[1:]
+    if isinstance(head, str):
+        child = getattr(obj, head)
+        return obj._replace(**{head: _sim_lens_set(child, rest, value)})
+    new_list = list(obj)
+    idx = int(head)
+    new_list[idx] = _sim_lens_set(new_list[idx], rest, value)
+    return new_list
+
+
+def _sim_reg_read(inst_path, reg_name, default=0):
+    """Return the current register value for this instance (default if never written)."""
+    return _sim_reg_state.get(inst_path, {}).get(reg_name, default)
+
+
+def _sim_reg_write(inst_path, reg_name, value, reset_mode=None):
+    """Update the register value, routing to buffer if buffering is active.
+    reset_mode: "reset" (Reg[T, RESET]) or "no_reset" (Reg[T, NO_RESET]) for a
+    register that does not follow its MAIN's reset_registers policy."""
+    if reset_mode is not None:
+        _sim_note_reset_mode(inst_path, reg_name, reset_mode)
+    if _sim_reg_write_buffer is not None:
+        _sim_reg_write_buffer.setdefault(inst_path, {})[reg_name] = value
+    else:
+        _sim_reg_state.setdefault(inst_path, {})[reg_name] = value
+
+
+def _sim_note_reset_mode(inst_path, reg_name, reset_mode):
+    """Record a register's reset mode (_sim_reg_modes). A Reg[T, RESET] in a
+    pypeline_sim run whose MAIN has no reset is an error, as in hardware
+    (PY_TO_LOGIC._assign_resets)."""
+    modes = _sim_reg_modes.setdefault(inst_path, {})
+    if reg_name in modes:
+        return
+    modes[reg_name] = reset_mode
+    if (
+        reset_mode == "reset"
+        and _sim_run_in_progress
+        and inst_path
+        and str(inst_path[0][0]).startswith(_SIM_MAIN_FRAME_PREFIX)
+        and inst_path[0][0] not in _sim_root_resets
+    ):
+        main = inst_path[0][0][len(_SIM_MAIN_FRAME_PREFIX) :]
+        raise RuntimeError(
+            f"Register '{reg_name}' is Reg[T, RESET], but @MAIN '{main}' has no "
+            f"reset: its clock has no primary reset and it names none. Give one "
+            f"with make_clock(..., reset=rst) or MAIN(..., reset=rst)."
+        )
+
+
+def _sim_apply_resets():
+    """The synchronous resets of one clock edge, right after the register
+    writes commit (_sim_reg_flush_buffer): below each MAIN whose reset wire
+    converged to 1 this cycle, the registers that reset go back to their
+    initial value -- their _sim_reg_state entry is deleted, so the next read
+    returns the declaration's initializer. Reg[T, RESET] registers always
+    reset; plain registers and the simulator's own state (delay lines,
+    AUTO_FSM state, sim models) only under reset_registers="all"; NO_RESET
+    entries never. A model with on_reset() has it called instead of being
+    recreated.
+
+    Under "all" a pipelined region's delayed global writes are replaced by
+    typed zeros, as hardware's stage registers hold null after the edge: an
+    AUTO_PIPELINE call site's committed write line, and a pipelined pure
+    MAIN's queue together with this cycle's collector, which pypeline_sim
+    pushes into the queue after this call. Both publish zeros for the next N
+    cycles; the writes of the reset cycle itself never appear."""
+    if not _sim_root_resets:
+        return
+    active = {}
+    for root, (wire, policy) in _sim_root_resets.items():
+        value = _sim_wire_state.get(wire)
+        if value is not None and int(value) == 1:
+            active[root] = policy
+    if not active:
+        return
+    for inst_path in list(_sim_reg_state):
+        policy = active.get(inst_path[0][0]) if inst_path else None
+        if policy is None:
+            continue
+        regs = _sim_reg_state[inst_path]
+        modes = _sim_reg_modes.get(inst_path, {})
+        for name in list(regs):
+            mode = modes.get(name)
+            if mode == "no_reset" or (mode is None and policy != "all"):
+                continue
+            if name == _SIM_MODEL_REG_KEY:
+                on_reset = getattr(regs[name], "on_reset", None)
+                if callable(on_reset):
+                    on_reset()
+                    continue
+            if name == _SIM_AP_WRITES_KEY:
+                zeros = _sim_zero_write_set(*regs[name])
+                regs[name] = [_copy.deepcopy(zeros) for _ in regs[name]]
+                continue
+            del regs[name]
+    for info in _sim_pipelined_main_info.values():
+        if active.get(_SIM_MAIN_FRAME_PREFIX + info["name"]) == "all":
+            zeros = _sim_zero_write_set(info["collector"], *info["queue"])
+            info["queue"].clear()
+            info["queue"].extend(
+                _copy.deepcopy(zeros) for _ in range(info["latency"] - 1)
+            )
+            info["collector"][:] = zeros
+
+
+def _sim_zero_write_set(*write_sets):
+    """A write-set of typed zeros for every (wire, lens path) these
+    write-sets write, in first-written order: what a pipelined region
+    publishes while its stage registers hold their null reset value."""
+    paths = {}
+    for entries in write_sets:
+        for name, path, _value in entries:
+            paths.setdefault((name, path), None)
+    zeros = []
+    for name, path in paths:
+        ctype = _sim_ctype_at_path(_sim_wire_ctype.get(name), path)
+        if ctype is not None:
+            zeros.append((name, path, _make_sim_zero(ctype)))
+    return zeros
+
+
+def _sim_wire_read(name: str):
+    """Return the current global wire value.
+    Records the calling MAIN as a reader of this wire for dependency tracking.
+    """
+    if _sim_current_main is not None:
+        _sim_wire_readers.setdefault(name, set()).add(_sim_current_main)
+    if _sim_regions:
+        overlay = _sim_region_for(name, "read")["overlay"]
+        if name in overlay:
+            return overlay[name]
+    if name not in _sim_wire_state:
+        raise RuntimeError(
+            f"Wire {name!r} was read but never discovered/initialized by "
+            f"pypeline_sim's wire scan (_discover_wire_names) -- its declaring "
+            f"module may not be reachable from the top design file's import graph."
+        )
+    return _sim_wire_state[name]
+
+
+def _sim_wire_write(name: str, value, claim_key=None) -> None:
+    """Set the current global wire value (struct types preserved, not converted to int).
+    claim_key (the writing function's qualified name, baked in by
+    _GlobalWireRewriter) records a whole-wire () claim for that function's
+    per-invocation zero-reset (see _sim_wire_reset_claims).
+
+    Inside a pipelined region (_sim_regions: a pipelined pure MAIN or an
+    AUTO_PIPELINE call with latency), the write is diverted into the region's
+    collector, published N cycles later with its return value, and recorded
+    in the region's overlay for this invocation's own reads. Claim recording
+    still happens: the diverted reset-claims path relies on _sim_wire_claims
+    to know which leaves to zero."""
+    if _sim_regions:
+        region = _sim_region_for(name, "written")
+        region["collector"].append((name, (), value))
+        region["overlay"][name] = value
+        if claim_key is not None:
+            _sim_wire_claims.setdefault(claim_key, {}).setdefault(name, set()).add(())
+        return
+    _sim_wire_state[name] = value
+    if claim_key is not None:
+        _sim_wire_claims.setdefault(claim_key, {}).setdefault(name, set()).add(())
+    if name in _sim_reset_inputs:
+        _sim_reset_inputs[name] = True
+
+
+def _sim_wire_current_or_zero(name: str):
+    """Return the wire's current value, or its typed zero if never written yet this
+    run (e.g. a compound wire read/written leaf-by-leaf before any whole-wire write
+    has occurred) -- mirrors hardware's implicit zero-init base wire."""
+    if name in _sim_wire_state:
+        return _sim_wire_state[name]
+    ctype = _sim_wire_ctype.get(name)
+    return _make_sim_zero(ctype) if ctype is not None else None
+
+
+def _sim_wire_lens_read(name: str, path: list):
+    """Read a nested field/index of a global wire's current value (or its zero
+    default if unwritten so far), registering the calling MAIN as a reader exactly
+    like _sim_wire_read (needed so convergence requeues on a foreign writer's
+    leaf change)."""
+    if _sim_current_main is not None:
+        _sim_wire_readers.setdefault(name, set()).add(_sim_current_main)
+    obj = None
+    if _sim_regions:
+        obj = _sim_region_for(name, "read")["overlay"].get(name)
+    if obj is None:
+        obj = _sim_wire_current_or_zero(name)
+    for elem in path:
+        obj = getattr(obj, elem) if isinstance(elem, str) else obj[int(elem)]
+    return obj
+
+
+def _sim_wire_lens_write(name: str, path: list, value, claim_key=None) -> None:
+    """Write a nested field/index of a global wire's value, preserving every other
+    leaf (own or another writer's) untouched -- the sim-side flattened-leaf model
+    for compound-type Wire[T]/Output[T] partial/field writes.
+    claim_key (the writing function's qualified name, baked in by
+    _GlobalWireRewriter) records the concrete path written -- field names as
+    strs, indices normalized to ints, so dynamic indices claim exactly the
+    element(s) actually touched -- for that function's per-invocation
+    zero-reset (see _sim_wire_reset_claims).
+
+    Diverted into a pipelined region's collector and overlay exactly like
+    _sim_wire_write (lens path preserved so partial/field writes replay
+    leaf-wise N cycles later without clobbering other writers' leaves)."""
+    norm_path = tuple(p if isinstance(p, str) else int(p) for p in path)
+    if _sim_regions:
+        region = _sim_region_for(name, "written")
+        region["collector"].append((name, norm_path, value))
+        overlay = region["overlay"]
+        base = overlay.get(name)
+        if base is None:
+            base = _sim_wire_current_or_zero(name)
+        overlay[name] = _sim_lens_set(base, path, value)
+        if claim_key is not None:
+            _sim_wire_claims.setdefault(claim_key, {}).setdefault(name, set()).add(
+                norm_path
+            )
+        return
+    base = _sim_wire_current_or_zero(name)
+    _sim_wire_state[name] = _sim_lens_set(base, path, value)
+    if claim_key is not None:
+        _sim_wire_claims.setdefault(claim_key, {}).setdefault(name, set()).add(
+            norm_path
+        )
+
+
+def _sim_ctype_at_path(ctype, path):
+    """Walk a wire's ctype along a claim path (field strs / index ints); None if
+    any step can't be resolved (unannotated field etc.)."""
+    for p in path:
+        if ctype is None:
+            return None
+        if isinstance(p, str):
+            ctype = ctype.__annotations__.get(p) if hasattr(ctype, "_fields") else None
+        else:
+            ctype = _array_elem_ctype(ctype)
+    return ctype
+
+
+def _sim_wire_reset_claims(claim_key) -> None:
+    """Zero every (wire, path) this function has ever written, at the start of
+    each invocation -- the sim-side equivalent of elaboration's implicit
+    zero-init first alias, scoped to exactly the leaves this function drives.
+
+    Needed because _sim_wire_state is one persistent dict shared across
+    repeated invocations of the same function within a cycle (the convergence
+    pass, then the final @sim_output pass): without this, a "read own wire
+    before this invocation's write" would see the *previous* invocation's
+    already-written value instead of zero, and a conditionally-skipped write
+    would leave last cycle's value latched instead of reading zero. Claims are
+    recorded at runtime by _sim_wire_write/_sim_wire_lens_write with the
+    concrete paths actually written (so unrolled loops, nested paths, and
+    dynamic indices all reset exactly what they touched), and grow
+    monotonically -- matching hardware, where the mux-to-zero structure exists
+    for every leaf the function ever writes, every cycle. Resetting only this
+    function's own claimed paths (never the whole wire) is essential so one
+    writer's reset can't transiently clobber a different writer's
+    already-committed leaves of the same wire within one cycle's convergence
+    loop.
+
+    Inside a pipelined region (_sim_regions), the zeroing diverts into the
+    region's collector as zero-valued entries and into its overlay, instead
+    of touching _sim_wire_state -- otherwise each invocation would wipe the
+    N-cycles-old write-set published at the start of this cycle. Ordered
+    replay of the collector (zeros first, then this invocation's writes;
+    later invocations append again) reproduces the reset -> write ->
+    final-pass-wins semantics inside the delayed view; the overlay gives
+    this invocation's own reads the same zeros."""
+    for wire_name, paths in _sim_wire_claims.get(claim_key, {}).items():
+        region = _sim_region_for(wire_name, "written") if _sim_regions else None
+        ctype = _sim_wire_ctype.get(wire_name)
+        if () in paths:
+            if ctype is not None:
+                if region is not None:
+                    region["collector"].append((wire_name, (), _make_sim_zero(ctype)))
+                    region["overlay"][wire_name] = _make_sim_zero(ctype)
+                else:
+                    _sim_wire_state[wire_name] = _make_sim_zero(ctype)
+            continue
+        for path in paths:
+            leaf_ctype = _sim_ctype_at_path(ctype, path)
+            if leaf_ctype is None:
+                continue
+            if region is not None:
+                region["collector"].append((wire_name, path, _make_sim_zero(leaf_ctype)))
+                overlay = region["overlay"]
+                base = overlay.get(wire_name)
+                if base is None:
+                    base = _sim_wire_current_or_zero(wire_name)
+                overlay[wire_name] = _sim_lens_set(
+                    base, list(path), _make_sim_zero(leaf_ctype)
+                )
+                continue
+            base = _sim_wire_current_or_zero(wire_name)
+            _sim_wire_state[wire_name] = _sim_lens_set(
+                base, list(path), _make_sim_zero(leaf_ctype)
+            )
+
+
+def _sim_apply_delayed_writes(entries) -> None:
+    """Replay one pipelined region's write-set (list of (wire_name,
+    lens_path, value) entries, in recorded order) onto _sim_wire_state --
+    called at the start of the cycle N cycles after the set was collected
+    (pypeline_sim for MAINs, _sim_apply_ap_delayed_writes for AUTO_PIPELINE
+    call sites). Ordered replay reproduces the original invocation
+    sequence (reset zeros, then writes; final pass last), so the net state
+    equals what the region would have written live."""
+    for name, path, value in entries:
+        if path == ():
+            _sim_wire_state[name] = value
+        else:
+            base = _sim_wire_current_or_zero(name)
+            _sim_wire_state[name] = _sim_lens_set(base, list(path), value)
+
+
+def sim_reset():
+    """Clear all simulated register and wire state."""
+    _sim_reg_state.clear()
+    _sim_reg_modes.clear()
+    _sim_root_resets.clear()
+    _sim_reset_inputs.clear()
+    _sim_wire_state.clear()
+    _sim_wire_claims.clear()
+    _sim_input_cache.clear()
+    _sim_ap_write_sites.clear()
+
+
+def _sim_reg_begin_buffer():
+    """Switch register writes into buffered mode; writes accumulate until flush."""
+    global _sim_reg_write_buffer
+    _sim_reg_write_buffer = {}
+
+
+def _sim_reg_flush_buffer():
+    """Commit buffered register writes to _sim_reg_state and exit buffer mode."""
+    global _sim_reg_write_buffer
+    if _sim_reg_write_buffer:
+        for inst_path, regs in _sim_reg_write_buffer.items():
+            _sim_reg_state.setdefault(inst_path, {}).update(regs)
+    _sim_reg_write_buffer = None
+
+
+def sim_wire_reset():
+    """Clear all global wire simulation state."""
+    _sim_wire_state.clear()
+    _sim_wire_claims.clear()
+
+
+class GlobalWireNameError(Exception):
+    """A function inside the module that declares a global Wire/Input/Output binds
+    that wire's name (or the alias of an imported module that declares wires) as a
+    local: a parameter, an annotated declaration, a loop/comprehension variable, ...
+
+    Pypeline has no `global` statement: inside its declaring module a wire's name
+    always IS the wire, so `acc = x` writes it and `acc` reads it. A local binding
+    of the same name is ambiguous -- native sim and elaboration used to resolve
+    it differently, silently -- so it is rejected outright, by both layers.
+    """
+
+
+def _local_name_bindings(func_def):
+    """(name, node, kind) for every name func_def's body binds as a LOCAL (never
+    a plain/augmented/unpacking assignment -- those are wire writes when the name
+    is a wire). Shared by native sim (_check_no_local_binds_wire_name) and
+    PY_TO_LOGIC's FuncElaborator so both layers reject exactly the same set."""
+
+    def target_names(target):
+        return [n for n in _ast.walk(target) if isinstance(n, _ast.Name)]
+
+    out = []
+    for node in _ast.walk(func_def):
+        if isinstance(node, _ast.arg):
+            out.append((node.arg, node, "parameter"))
+        elif isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+            if node is not func_def:
+                out.append((node.target.id, node, "annotated local"))
+        elif isinstance(node, (_ast.For, _ast.AsyncFor)):
+            out += [(n.id, n, "for-loop variable") for n in target_names(node.target)]
+        elif isinstance(node, _ast.comprehension):
+            out += [
+                (n.id, n, "comprehension variable") for n in target_names(node.target)
+            ]
+        elif isinstance(node, _ast.NamedExpr):
+            out.append((node.target.id, node, "':=' target"))
+        elif isinstance(node, _ast.withitem) and node.optional_vars is not None:
+            out += [
+                (n.id, n, "'with ... as' name")
+                for n in target_names(node.optional_vars)
+            ]
+        elif isinstance(node, _ast.ExceptHandler) and node.name:
+            out.append((node.name, node, "'except ... as' name"))
+        elif (
+            isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
+            and node is not func_def
+        ):
+            out.append((node.name, node, "nested definition"))
+        elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound != "*":
+                    out.append((bound, node, "import"))
+    return out
+
+
+def _wire_name_bind_message(func_name, name, kind, what):
+    """Shared error text; `what` is e.g. "global Wire 'acc'"."""
+    return (
+        f"{kind} '{name}' in '{func_name}' reuses the name of {what} declared in "
+        f"this module. Inside its declaring module a wire's name always refers to "
+        f"the wire (Pypeline has no 'global' statement), so a local of the same "
+        f"name is ambiguous -- rename the local, or write the wire with a plain "
+        f"'{name} = ...' assignment."
+    )
+
+
+def _check_no_local_binds_wire_name(
+    fn, func_def, src_file, wire_names, wire_module_aliases
+):
+    """Native-sim side of the rule (see GlobalWireNameError). wire_names: bare wire
+    names declared in fn's module; wire_module_aliases: names in fn's module that
+    are imported modules declaring wires. func_def's line numbers must already be
+    the real ones in src_file."""
+    for name, node, kind in _local_name_bindings(func_def):
+        if name in wire_names:
+            what = f"global wire '{name}'"
+        elif name in wire_module_aliases:
+            what = f"imported module '{name}' (which declares global wires)"
+        else:
+            continue
+        raise GlobalWireNameError(
+            _wire_name_bind_message(fn.__qualname__, name, kind, what)
+            + f" (at {src_file}:{getattr(node, 'lineno', func_def.lineno)})"
+        )
+
+
+class SimOnlyCallSiteError(Exception):
+    """A @sim_input/@sim_output call whose value would reach hardware other than
+    through a module-level wire: assigned to a local (plain, annotated, a field
+    of one, an unpacking target) or nested inside an expression.
+
+    Its value exists only in simulation. Elaboration rejects the same set
+    (PY_TO_LOGIC.ElaborationError); before that, it RAN the function and built
+    the value into hardware as a constant. Raised at decoration time, so a
+    testbench that passes --sim --comb can't fail only once a pipelined run
+    elaborates it."""
+
+
+def _sim_only_kind(callee):
+    """'@sim_input' / '@sim_output' for a sim-only function, else None."""
+    if getattr(callee, "_is_sim_input", False):
+        return "@sim_input"
+    if getattr(callee, "_is_sim_output", False):
+        return "@sim_output"
+    return None
+
+
+def _sim_only_target_desc(target):
+    """How a sim-only-call error names a non-wire assignment target."""
+    if isinstance(target, _ast.Name):
+        return f"local '{target.id}'"
+    if isinstance(target, (_ast.Tuple, _ast.List)):
+        names = [n.id for n in _ast.walk(target) if isinstance(n, _ast.Name)]
+        return f"unpacking target '{', '.join(names)}'"
+    root = target
+    while isinstance(root, (_ast.Attribute, _ast.Subscript)):
+        root = root.value
+    if isinstance(root, _ast.Name):
+        return f"a field/element of local '{root.id}'"
+    return "a local"
+
+
+def _sim_only_call_message(func_name, callee_name, kind, target_desc=None):
+    """Shared error text (native sim and elaboration). target_desc names the
+    local the call is assigned to; None means the call is used as a value."""
+    where = (
+        f"storing it in {target_desc}" if target_desc else "using it as a value"
+    )
+    if kind == "@sim_input":
+        fix = (
+            f"Assign the call, as its own statement, to a module-level wire -- "
+            f"`in0: Input[T]` at module level, then `in0 = {callee_name}()` -- "
+            f"which becomes a real input port in HDL."
+        )
+    else:
+        fix = (
+            f"Call a @sim_output as its own statement; it returns nothing to "
+            f"hardware. To feed a value into hardware, assign a @sim_input to a "
+            f"module-level Input[T]."
+        )
+    return (
+        f"'{callee_name}()' is a {kind} function: its value exists only in "
+        f"simulation, so {where} in '{func_name}' leaves hardware nothing to "
+        f"build from it. {fix}"
+    )
+
+
+def _iter_body_nodes(func_def):
+    """ast.walk over func_def's own body, not descending into nested function,
+    lambda or class definitions (plain Python, not this function's hardware)."""
+    stack = list(func_def.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in _ast.iter_child_nodes(node):
+            if not isinstance(
+                child,
+                (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.Lambda, _ast.ClassDef),
+            ):
+                stack.append(child)
+
+
+def _check_sim_only_call_sites(
+    fn, func_def, src_file, eval_ns, wire_names, wire_module_attrs
+):
+    """Native-sim side of the sim-only call rule (see SimOnlyCallSiteError).
+
+    A @sim_input/@sim_output call is allowed only as a bare statement, or as the
+    whole right-hand side of an assignment to a module-level wire: `w = f()`,
+    `w.field = f()`, `w[i] = f()`, `alias.w.field = f()`. wire_names: bare wire
+    names declared in fn's module; wire_module_attrs: {(alias, wire): key} for
+    imported modules. Callees are resolved best-effort from eval_ns (globals +
+    closure); an unresolvable callee is skipped, as is a call hidden inside a
+    plain-Python helper -- elaboration still catches those."""
+    shadowed = {name for name, _node, _kind in _local_name_bindings(func_def)}
+    for node in _iter_body_nodes(func_def):
+        if isinstance(node, _ast.Assign):
+            shadowed.update(
+                n.id
+                for t in node.targets
+                for n in _ast.walk(t)
+                if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Store)
+            )
+
+    def resolve(func_expr):
+        attrs = []
+        while isinstance(func_expr, _ast.Attribute):
+            attrs.append(func_expr.attr)
+            func_expr = func_expr.value
+        if not isinstance(func_expr, _ast.Name) or func_expr.id in shadowed:
+            return None
+        if func_expr.id not in eval_ns:
+            return None
+        obj = eval_ns[func_expr.id]
+        for attr in reversed(attrs):
+            try:
+                obj = getattr(obj, attr)
+            except Exception:
+                return None
+        return obj
+
+    def is_wire_target(target):
+        node = target
+        while isinstance(node, (_ast.Attribute, _ast.Subscript)):
+            if (
+                isinstance(node, _ast.Attribute)
+                and isinstance(node.value, _ast.Name)
+                and (node.value.id, node.attr) in wire_module_attrs
+            ):
+                return True
+            node = node.value
+        return isinstance(node, _ast.Name) and node.id in wire_names
+
+    allowed = set()  # id(Call) in a sanctioned position
+    local_target = {}  # id(Call) -> the non-wire target it is assigned to
+    for node in _iter_body_nodes(func_def):
+        if isinstance(node, _ast.Expr) and isinstance(node.value, _ast.Call):
+            allowed.add(id(node.value))
+        elif isinstance(node, _ast.Assign) and isinstance(node.value, _ast.Call):
+            if len(node.targets) == 1 and is_wire_target(node.targets[0]):
+                allowed.add(id(node.value))
+            else:
+                local_target[id(node.value)] = node.targets[0]
+        elif isinstance(node, _ast.AnnAssign) and isinstance(node.value, _ast.Call):
+            local_target[id(node.value)] = node.target
+    for node in _iter_body_nodes(func_def):
+        if not isinstance(node, _ast.Call) or id(node) in allowed:
+            continue
+        callee = resolve(node.func)
+        kind = _sim_only_kind(callee)
+        if kind is None:
+            continue
+        target = local_target.get(id(node))
+        raise SimOnlyCallSiteError(
+            _sim_only_call_message(
+                fn.__qualname__,
+                callee.__name__,
+                kind,
+                _sim_only_target_desc(target) if target is not None else None,
+            )
+            + f" (at {src_file}:{node.lineno})"
+        )
+
+
+class _GlobalWireRewriter(_ast.NodeTransformer):
+    """AST transformer that rewrites global wire reads/writes in hw_func bodies.
+
+    Replaces:
+      - Name(id='wire', ctx=Load)      →  _sim_wire_read('<mod>.wire')
+      - wire = expr                    →  _sim_wire_write('<mod>.wire', expr)   (Expr stmt)
+      - wire, x = a, b                 →  tmp = (a, b); wire = tmp[0]; x = tmp[1]  (each leaf
+                                          then rewritten as above; see _lower_unpack)
+      - module.wire  (Load)            →  _sim_wire_read('<mod>.wire')          (cross-module read)
+      - module.wire = expr             →  _sim_wire_write('<mod>.wire', expr)   (cross-module write)
+
+    `wire: T = expr` (and any other local binding of a wire's name) never reaches
+    this class: _check_no_local_binds_wire_name rejects it first.
+
+    Sim keys are module-qualified ('<declaring module name>.<wire name>'), not bare
+    attribute names -- two different modules declaring a same-named Wire[T] (e.g. both
+    calling it "key" for unrelated purposes) must not collide in _sim_wire_state.
+
+    wire_names: {bare_name: qualified_sim_key} for wires declared in the function's own
+    defining module. module_wire_attrs: {(alias_name, attr_name): qualified_sim_key} for
+    wires in imported modules.
+
+    `self.modified` tracks whether this specific function body actually referenced any
+    wire (as opposed to `wire_names`/`module_wire_attrs` being non-empty merely because
+    the defining *module* declares wires somewhere else) -- `_build_reg_sim_func` uses
+    this to decide whether the function needs the detached-globals rebuilt-body path at
+    all. Without a function-specific flag, any function living in a wire-bearing module
+    would get rebuilt even if its own body never touches a wire.
+    """
+
+    def __init__(
+        self,
+        wire_names,
+        module_wire_attrs=None,
+        wire_ctypes=None,
+        module_wire_ctypes=None,
+        leaf_ctypes_out=None,
+        claim_key=None,
+    ):
+        self._wire_names = dict(wire_names)
+        self._module_wire_attrs = module_wire_attrs or {}
+        self._wire_ctypes = wire_ctypes or {}  # bare_name -> inner_ctype
+        self._module_wire_ctypes = (
+            module_wire_ctypes or {}
+        )  # (alias, attr) -> inner_ctype
+        # leaf_ctypes_out: filled in-place, synthetic __wire_leaf_ctype_L_C__ name ->
+        # ctype object -- ctype objects can't be embedded directly as ast.Constant
+        # values (Python's compiler only accepts literal types there), so field/index
+        # lens writes reference a synthetic global name instead, exactly like
+        # _TypedAnnAssignRewriter's __sim_ann_L_C__ mechanism.
+        self._leaf_ctypes_out = leaf_ctypes_out if leaf_ctypes_out is not None else {}
+        # written_wire_names: qualified sim keys of every wire this function
+        # writes anywhere in its body (whole-wire or any field/index lens write).
+        # Non-empty => the decoration site injects a one-line
+        # `_sim_wire_reset_claims(<claim_key>)` prologue at the top of the
+        # rewritten body. The actual per-leaf reset bookkeeping happens at
+        # RUNTIME: every rewritten write call carries claim_key (this function's
+        # qualified name) and records the concrete path it wrote into
+        # _sim_wire_claims, so the prologue zeros exactly the leaves this
+        # function has driven -- static fields, nested paths, unrolled-loop or
+        # dynamic indices alike -- never a whole compound wire another writer
+        # partially owns (see _sim_wire_reset_claims for the full semantics).
+        self.written_wire_names: set = set()
+        self._claim_key = claim_key
+        self.modified = False
+
+    def _record_whole_write(self, wire_name, ctype):
+        self.written_wire_names.add(wire_name)
+
+    def _record_field_write(self, wire_name, path_nodes, leaf_ctype, root_ctype):
+        self.written_wire_names.add(wire_name)
+
+    def _claim_key_const(self):
+        return _ast.Constant(value=self._claim_key)
+
+    def _leaf_ctype_name(self, ctype, node):
+        key = f"__wire_leaf_ctype_{node.lineno}_{node.col_offset}__"
+        self._leaf_ctypes_out[key] = ctype
+        return _ast.Name(id=key, ctx=_ast.Load())
+
+    def visit_Name(self, node):
+        if node.id in self._wire_names and isinstance(node.ctx, _ast.Load):
+            self.modified = True
+            return _ast.copy_location(
+                _ast.Call(
+                    func=_ast.Name(id="_sim_wire_read", ctx=_ast.Load()),
+                    args=[_ast.Constant(value=self._wire_names[node.id])],
+                    keywords=[],
+                ),
+                node,
+            )
+        return node
+
+    def visit_Attribute(self, node):
+        if (
+            isinstance(node.value, _ast.Name)
+            and isinstance(node.ctx, _ast.Load)
+            and (node.value.id, node.attr) in self._module_wire_attrs
+        ):
+            self.modified = True
+            wire_name = self._module_wire_attrs[(node.value.id, node.attr)]
+            return _ast.copy_location(
+                _ast.Call(
+                    func=_ast.Name(id="_sim_wire_read", ctx=_ast.Load()),
+                    args=[_ast.Constant(value=wire_name)],
+                    keywords=[],
+                ),
+                node,
+            )
+        return self.generic_visit(node)
+
+    def _wire_root(self, node):
+        """If node is exactly a bare wire Name or a module.wire Attribute (the two
+        whole-wire root shapes), return (qualified_sim_key, inner_ctype). Else None.
+        """
+        if isinstance(node, _ast.Name) and node.id in self._wire_names:
+            return self._wire_names[node.id], self._wire_ctypes.get(node.id)
+        if isinstance(node, _ast.Attribute) and isinstance(node.value, _ast.Name):
+            key = (node.value.id, node.attr)
+            if key in self._module_wire_attrs:
+                return self._module_wire_attrs[key], self._module_wire_ctypes.get(key)
+        return None
+
+    def _wire_chain_to_path(self, target):
+        """Walk a Store-context Attribute/Subscript chain down to its base and, if
+        the base is a global wire (bare name or module.wire), return
+        (qualified_sim_key, path_nodes, leaf_ctype, root_ctype). path_nodes are AST
+        nodes (Constant(field_name) for attribute steps, the raw slice for subscript
+        steps), root-to-leaf order, mirroring _TypedAnnAssignRewriter._chain_to_path.
+        Returns (None, None, None, None) if the chain isn't rooted at a wire (e.g. a
+        plain local compound variable -- left untouched for _TypedAnnAssignRewriter
+        to handle in the pass that runs after this one).
+        """
+        path = []
+        kinds = []
+        node = target
+        while isinstance(node, (_ast.Attribute, _ast.Subscript)):
+            root = self._wire_root(node.value)
+            if root is not None:
+                if isinstance(node, _ast.Attribute):
+                    path.append(_ast.Constant(value=node.attr))
+                    kinds.append(("attr", node.attr))
+                else:
+                    slc = node.slice
+                    if isinstance(slc, _ast.Index):  # py3.8 compat
+                        slc = slc.value
+                    path.append(slc)
+                    kinds.append(("idx", None))
+                path.reverse()
+                kinds.reverse()
+                leaf_ctype = root[1]
+                for kind, field_name in kinds:
+                    if leaf_ctype is None:
+                        break
+                    if kind == "attr":
+                        leaf_ctype = (
+                            leaf_ctype.__annotations__.get(field_name)
+                            if hasattr(leaf_ctype, "_fields")
+                            else None
+                        )
+                    else:
+                        leaf_ctype = _array_elem_ctype(leaf_ctype)
+                return root[0], path, leaf_ctype, root[1]
+            if isinstance(node, _ast.Attribute):
+                path.append(_ast.Constant(value=node.attr))
+                kinds.append(("attr", node.attr))
+                node = node.value
+            else:
+                slc = node.slice
+                if isinstance(slc, _ast.Index):  # py3.8 compat
+                    slc = slc.value
+                path.append(slc)
+                kinds.append(("idx", None))
+                node = node.value
+        return None, None, None, None
+
+    def _build_lens_write(
+        self, wire_name, path_nodes, leaf_ctype, value_node, ref_node
+    ):
+        """Build `_sim_wire_lens_write(wire_name, [path...], value)` (optionally
+        _sim_cast_deep-wrapped), (re-)visiting path_nodes/value_node from scratch so
+        nested wire reads are rewritten and no AST node is shared between call sites.
+        """
+        visited_path = [self.visit(_copy.deepcopy(p)) for p in path_nodes]
+        visited_value = self.visit(value_node)
+        if leaf_ctype is not None:
+            visited_value = _ast.Call(
+                func=_ast.Name(id="_sim_cast_deep", ctx=_ast.Load()),
+                args=[visited_value, self._leaf_ctype_name(leaf_ctype, ref_node)],
+                keywords=[],
+            )
+        return _ast.Expr(
+            value=_ast.Call(
+                func=_ast.Name(id="_sim_wire_lens_write", ctx=_ast.Load()),
+                args=[
+                    _ast.Constant(value=wire_name),
+                    _ast.List(elts=visited_path, ctx=_ast.Load()),
+                    visited_value,
+                    self._claim_key_const(),
+                ],
+                keywords=[],
+            )
+        )
+
+    def _build_lens_read(self, wire_name, path_nodes):
+        visited_path = [self.visit(_copy.deepcopy(p)) for p in path_nodes]
+        return _ast.Call(
+            func=_ast.Name(id="_sim_wire_lens_read", ctx=_ast.Load()),
+            args=[
+                _ast.Constant(value=wire_name),
+                _ast.List(elts=visited_path, ctx=_ast.Load()),
+            ],
+            keywords=[],
+        )
+
+    def _has_wire_leaf(self, target):
+        if isinstance(target, (_ast.Tuple, _ast.List)):
+            return any(
+                self._has_wire_leaf(e.value if isinstance(e, _ast.Starred) else e)
+                for e in target.elts
+            )
+        if self._wire_root(target) is not None:
+            return True
+        if isinstance(target, (_ast.Attribute, _ast.Subscript)):
+            return self._wire_chain_to_path(target)[0] is not None
+        return False
+
+    def _lower_unpack(self, node, target):
+        """`a, wire = rhs` -> `tmp = rhs; a = tmp[0]; wire = tmp[1]`, each per-leaf
+        Assign then visited normally (so a wire leaf becomes a claimed
+        _sim_wire_write / lens write, a plain leaf stays an Assign that
+        _TypedAnnAssignRewriter can still cast). The RHS is evaluated once, before
+        any target -- Python's own order, and elaboration's (_elab_unpack_assign).
+        Nested targets recurse through visit_Assign."""
+        if any(isinstance(e, _ast.Starred) for e in target.elts):
+            raise NotImplementedError(
+                f"starred unpacking into a global wire is not supported "
+                f"(line {node.lineno})"
+            )
+        tmp = f"__wire_unpack_{node.lineno}_{node.col_offset}_{id(target)}__"
+        stmts = [
+            _ast.copy_location(
+                _ast.Assign(
+                    targets=[_ast.Name(id=tmp, ctx=_ast.Store())],
+                    value=self.visit(node.value),
+                ),
+                node,
+            )
+        ]
+        for i, elt in enumerate(target.elts):
+            leaf = _ast.copy_location(
+                _ast.Assign(
+                    targets=[elt],
+                    value=_ast.Subscript(
+                        value=_ast.Name(id=tmp, ctx=_ast.Load()),
+                        slice=_ast.Index(value=_ast.Constant(value=i))
+                        if _sys.version_info < (3, 9)
+                        else _ast.Constant(value=i),
+                        ctx=_ast.Load(),
+                    ),
+                ),
+                node,
+            )
+            _ast.fix_missing_locations(leaf)
+            visited = self.visit_Assign(leaf)
+            stmts += visited if isinstance(visited, list) else [visited]
+        return stmts
+
+    def visit_Assign(self, node):
+        if len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, (_ast.Tuple, _ast.List)) and self._has_wire_leaf(
+                target
+            ):
+                self.modified = True
+                return self._lower_unpack(node, target)
+            root = self._wire_root(target)
+            if root is not None:
+                # Whole-wire write: wire = expr  /  module.wire = expr
+                self.modified = True
+                wire_name = root[0]
+                self._record_whole_write(wire_name, root[1])
+                new_node = _ast.Expr(
+                    value=_ast.Call(
+                        func=_ast.Name(id="_sim_wire_write", ctx=_ast.Load()),
+                        args=[
+                            _ast.Constant(value=wire_name),
+                            self.visit(node.value),
+                            self._claim_key_const(),
+                        ],
+                        keywords=[],
+                    )
+                )
+                return _ast.copy_location(new_node, node)
+            if isinstance(target, (_ast.Attribute, _ast.Subscript)):
+                wire_name, path_nodes, leaf_ctype, root_ctype = (
+                    self._wire_chain_to_path(target)
+                )
+                if wire_name is not None:
+                    # Field/index write on a global wire: wire.x = expr, wire.arr[i] = expr,
+                    # module.wire.field = expr, ... -- flattened-leaf lens write, preserving
+                    # every other leaf (own earlier writes or another writer's leaves).
+                    self.modified = True
+                    self._record_field_write(
+                        wire_name, path_nodes, leaf_ctype, root_ctype
+                    )
+                    return _ast.copy_location(
+                        self._build_lens_write(
+                            wire_name, path_nodes, leaf_ctype, node.value, node
+                        ),
+                        node,
+                    )
+        return self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        target = node.target
+        root = self._wire_root(target)
+        if root is not None:
+            # wire += expr  /  module.wire += expr
+            self.modified = True
+            wire_name = root[0]
+            self._record_whole_write(wire_name, root[1])
+            new_val = _ast.BinOp(
+                left=_ast.Call(
+                    func=_ast.Name(id="_sim_wire_read", ctx=_ast.Load()),
+                    args=[_ast.Constant(value=wire_name)],
+                    keywords=[],
+                ),
+                op=node.op,
+                right=self.visit(node.value),
+            )
+            new_node = _ast.Expr(
+                value=_ast.Call(
+                    func=_ast.Name(id="_sim_wire_write", ctx=_ast.Load()),
+                    args=[
+                        _ast.Constant(value=wire_name),
+                        new_val,
+                        self._claim_key_const(),
+                    ],
+                    keywords=[],
+                )
+            )
+            return _ast.copy_location(new_node, node)
+        if isinstance(target, (_ast.Attribute, _ast.Subscript)):
+            wire_name, path_nodes, leaf_ctype, root_ctype = self._wire_chain_to_path(
+                target
+            )
+            if wire_name is not None:
+                self.modified = True
+                self._record_field_write(wire_name, path_nodes, leaf_ctype, root_ctype)
+                read_call = self._build_lens_read(wire_name, path_nodes)
+                new_val = _ast.BinOp(
+                    left=read_call, op=node.op, right=self.visit(node.value)
+                )
+                # new_val already fully built (embeds a lens-read call, not a raw
+                # source expr) -- build the write directly instead of routing through
+                # _build_lens_write's self.visit(value_node), which is only meant for
+                # unvisited source expressions.
+                visited_path = [self.visit(_copy.deepcopy(p)) for p in path_nodes]
+                cast_val = (
+                    _ast.Call(
+                        func=_ast.Name(id="_sim_cast_deep", ctx=_ast.Load()),
+                        args=[new_val, self._leaf_ctype_name(leaf_ctype, node)],
+                        keywords=[],
+                    )
+                    if leaf_ctype is not None
+                    else new_val
+                )
+                new_node = _ast.Expr(
+                    value=_ast.Call(
+                        func=_ast.Name(id="_sim_wire_lens_write", ctx=_ast.Load()),
+                        args=[
+                            _ast.Constant(value=wire_name),
+                            _ast.List(elts=visited_path, ctx=_ast.Load()),
+                            cast_val,
+                            self._claim_key_const(),
+                        ],
+                        keywords=[],
+                    )
+                )
+                return _ast.copy_location(new_node, node)
+        return self.generic_visit(node)
+
+
+class _TypedAnnAssignRewriter(_ast.NodeTransformer):
+    """Rewrites typed assignments to call _sim_cast, mirroring hardware truncation.
+
+    Two rewrite rules:
+    1. `var: scalar_int_type = expr`  →  `var = _sim_cast(expr, T)` (AnnAssign with value)
+    2. `var = expr` (plain Assign) where `var` was previously declared with a scalar
+       integer annotation  →  `var = _sim_cast(expr, T)` using the declared type
+
+    Rule 2 matches hardware semantics: a signal's type is declared once and every
+    subsequent write to it truncates, even bare re-assignments (`t = t + d` in a loop
+    behaves identically to `t: int16_t = t + d` when `t: int16_t` was declared earlier).
+
+    Must be applied AFTER _GlobalWireRewriter: wire AnnAssigns have already been
+    converted to Expr(Call) nodes by that pass, so this rewriter only sees non-wire
+    annotations.
+
+    A third rule handles bare struct/array locals (the canonical `rv: T` then
+    `rv.field = ...` / `rv[i] = ...` idiom carried over from C PipelineC):
+    3. `var: struct_or_array_type` (no value)  →  `var = _make_sim_zero(T)`, so the
+       name is bound to a zero-valued instance instead of raising UnboundLocalError.
+    4. `var.field = expr` / `var[i] = expr` (and nested chains thereof) where `var` was
+       declared via rule 3 (or via `var: T = ...`)  →  `var = _sim_lens_set(var,
+       [path...], expr)`, since struct instances are immutable NamedTuples and can't
+       be mutated with plain attribute assignment.
+
+    Reg[T]/Feedback[T] descriptor objects carry neither `_fields` nor `_ctype_name`
+    themselves, but when their `inner_ctype` is a struct/array, the variable is
+    tracked in `_compound_declared` (rule 4) exactly like a bare compound local —
+    `_build_reg_sim_func` handles their read/zero-init separately, but nested
+    `.field=`/`[i]=` writes on them go through the same `_sim_lens_set` rewrite.
+    Wire[T]/Input[T]/Output[T] still fall through both checks untouched.
+
+    5. `target op= expr` on a tracked target  →  `target = target op expr`, then
+       rule 2 or 4 -- exactly PY_TO_LOGIC._elab_aug_assign's desugaring. Left as
+       plain Python, `reg_arr[i] += 1` edited the committed register list in
+       place (visible to every later evaluation before the clock edge), and
+       scalar `x += 1` skipped the declared-width cast.
+    6. Typed parameters are tracked like locals (see track_params): hardware
+       ports are pass-by-value, so `arr_param[i] = x` must not edit the
+       caller's object, and a scalar parameter truncates like a typed local.
+    """
+
+    def __init__(self, eval_ns, ann_ctypes_out):
+        self._eval_ns = eval_ns
+        self._ann_ctypes_out = ann_ctypes_out  # filled in-place: key → ctype_obj
+        self._declared_types = {}  # var_name → ctype, populated by AnnAssign visits
+        self._compound_declared = {}  # var_name → ctype, bare/typed struct or array locals
+        self.modified = False  # True if any compound zero-init/lens rewrite happened
+
+    def track_params(self, func_def, sig_anns):
+        """Rule 6: track typed parameters (resolved annotation objects from the
+        function's __annotations__) exactly like declared locals."""
+        for arg in func_def.args.args + func_def.args.kwonlyargs:
+            ann_val = sig_anns.get(arg.arg)
+            if _is_compound_pypeline_type(ann_val):
+                self._compound_declared[arg.arg] = ann_val
+            elif _is_scalar_pypeline_int(ann_val):
+                self._declared_types[arg.arg] = ann_val
+
+    def _make_cast(self, value_node, ctype, ref_node):
+        """Return a _sim_cast(value_node, __sim_ann_L_C__) Call node. A str
+        literal goes to _sim_cast_deep instead, whose clear "use ord(...)"
+        error the hot-path _sim_cast deliberately doesn't check for."""
+        key = f"__sim_ann_{ref_node.lineno}_{ref_node.col_offset}__"
+        self._ann_ctypes_out[key] = ctype
+        is_str_literal = isinstance(value_node, _ast.Constant) and isinstance(
+            value_node.value, str
+        )
+        return _ast.Call(
+            func=_ast.Name(
+                id="_sim_cast_deep" if is_str_literal else "_sim_cast", ctx=_ast.Load()
+            ),
+            args=[value_node, _ast.Name(id=key, ctx=_ast.Load())],
+            keywords=[],
+        )
+
+    def _make_zero_call(self, ctype, ref_node):
+        """Return a _make_sim_zero(__sim_ann_L_C__) Call node."""
+        key = f"__sim_ann_{ref_node.lineno}_{ref_node.col_offset}__"
+        self._ann_ctypes_out[key] = ctype
+        return _ast.Call(
+            func=_ast.Name(id="_make_sim_zero", ctx=_ast.Load()),
+            args=[_ast.Name(id=key, ctx=_ast.Load())],
+            keywords=[],
+        )
+
+    def _make_deep_cast(self, value_node, ctype, ref_node):
+        """Return a _sim_cast_deep(value_node, __sim_ann_L_C__) Call node -- casts a
+        Rule-4 partial-write value (scalar or array-of-scalar) to the statically-resolved
+        leaf ctype before it's threaded through _sim_lens_set."""
+        key = f"__sim_ann_{ref_node.lineno}_{ref_node.col_offset}__deep__"
+        self._ann_ctypes_out[key] = ctype
+        return _ast.Call(
+            func=_ast.Name(id="_sim_cast_deep", ctx=_ast.Load()),
+            args=[value_node, _ast.Name(id=key, ctx=_ast.Load())],
+            keywords=[],
+        )
+
+    def _chain_to_path(self, target):
+        """Walk an Attribute/Subscript chain to (root_name, [path_node, ...], [kind, ...]),
+        root-to-leaf order. path nodes are ast.Constant(field_name) for attribute
+        access or the raw slice node for subscript access -- used to build the runtime
+        _sim_lens_set path list. kinds is a parallel list of ('attr', field_name_str) or
+        ('idx', None), used at rewrite time (not runtime) to statically resolve the leaf
+        ctype, since an array's elements all share one declared ctype regardless of the
+        (possibly dynamic) index expression. Returns (None, None, None) if the chain
+        doesn't bottom out in a plain Name."""
+        path = []
+        kinds = []
+        node = target
+        while isinstance(node, (_ast.Attribute, _ast.Subscript)):
+            if isinstance(node, _ast.Attribute):
+                path.append(_ast.Constant(value=node.attr))
+                kinds.append(("attr", node.attr))
+                node = node.value
+            else:
+                slc = node.slice
+                if isinstance(slc, _ast.Index):  # py3.8 compat
+                    slc = slc.value
+                path.append(slc)
+                kinds.append(("idx", None))
+                node = node.value
+        path.reverse()
+        kinds.reverse()
+        if isinstance(node, _ast.Name):
+            return node.id, path, kinds
+        return None, None, None
+
+    def _resolve_leaf_ctype(self, root_ctype, kinds):
+        """Walk root_ctype through a _chain_to_path 'kinds' list to the statically-known
+        leaf ctype, or None if it can't be resolved (defensive -- callers fall back to
+        today's uncast behavior rather than erroring)."""
+        ctype = root_ctype
+        for kind, field_name in kinds:
+            if kind == "attr":
+                if not hasattr(ctype, "_fields"):
+                    return None
+                ann = ctype.__annotations__.get(field_name)
+                if ann is None:
+                    return None
+                ctype = ann
+            else:
+                elem_ctype = _array_elem_ctype(ctype)
+                if elem_ctype is None:
+                    return None
+                ctype = elem_ctype
+        return ctype
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        if not isinstance(node.target, _ast.Name):
+            return node  # tuple-unpack or subscript target, skip
+        try:
+            ann_val = eval(
+                compile(_ast.Expression(body=node.annotation), "<ann>", "eval"),
+                self._eval_ns,
+            )
+        except Exception:
+            return node
+        if _is_compound_pypeline_type(ann_val):
+            # Bare struct/array local: track it (with its ctype, so later .field=/[i]=
+            # writes can resolve the leaf ctype for casting) so subsequent writes get
+            # lens-rewritten, and zero-init it if declared without a value.
+            self._compound_declared[node.target.id] = ann_val
+            if node.value is None:
+                self.modified = True
+                new_node = _ast.Assign(
+                    targets=[node.target],
+                    value=self._make_zero_call(ann_val, node),
+                )
+                return _ast.copy_location(new_node, node)
+            # `var: T = value` -- always deep-cast so every scalar leaf (at any
+            # array nesting depth) becomes a properly width-tagged SimVal. `value`
+            # is not always already shaped that way: it may be a string literal, a
+            # bare Name referencing an external plain-int list/tuple constant (e.g.
+            # a testbench sourcing test vectors from another module), a list
+            # literal/comprehension of raw ints, etc. Without this, per-element
+            # width has to be *guessed* from each raw int's value wherever the
+            # array is later consumed (e.g. array_to_uint_be/le's bit_length()
+            # fallback) -- wrong for any element whose value doesn't happen to set
+            # its type's MSB. _sim_cast_deep is idempotent on already-typed values
+            # and passes structs through unchanged (its own `_fields` fast path),
+            # so this is safe to apply unconditionally.
+            self.modified = True
+            new_node = _ast.Assign(
+                targets=[node.target],
+                value=self._make_deep_cast(node.value, ann_val, node),
+            )
+            return _ast.copy_location(new_node, node)
+        if isinstance(ann_val, (_RegType, _FeedbackType)):
+            if _is_compound_pypeline_type(ann_val.inner_ctype):
+                # Reg[T]/Feedback[T] where T is a struct/array: the read-back value is
+                # an immutable NamedTuple (or plain list), exactly like a bare compound
+                # local, so nested .field=/[i]= writes need the same lens-rewrite. The
+                # AnnAssign itself is left untouched — _build_reg_sim_func handles
+                # Reg/Feedback read/zero-init separately.
+                self._compound_declared[node.target.id] = ann_val.inner_ctype
+            elif _is_scalar_pypeline_int(ann_val.inner_ctype):
+                # Reg[T]/Feedback[T] where T is scalar: the read-back value is a
+                # plain int/SimVal, exactly like a bare scalar local, so a later
+                # plain `var = expr` reassignment in the same body needs the same
+                # _sim_cast wrap. Without this, `var` can become an untyped/
+                # unmasked raw Python int on a later cycle, which then poisons any
+                # bitwise op combining it with a properly-typed sibling operand.
+                # The AnnAssign itself is left untouched — _build_reg_sim_func
+                # handles the actual read/zero-init separately.
+                self._declared_types[node.target.id] = ann_val.inner_ctype
+            return node
+        if not _is_scalar_pypeline_int(ann_val):
+            return node  # Wire, Input, Output — skip
+        # Always record: bare `var: T` declarations also type subsequent plain assigns.
+        self._declared_types[node.target.id] = ann_val
+        if node.value is None:
+            return node  # declaration-only: type recorded, nothing to rewrite
+        new_node = _ast.Assign(
+            targets=[node.target],
+            value=self._make_cast(node.value, ann_val, node),
+        )
+        return _ast.copy_location(new_node, node)
+
+    def visit_Assign(self, node):
+        self.generic_visit(node)
+        if len(node.targets) != 1:
+            return node  # tuple-unpack target, skip
+        target = node.targets[0]
+        if isinstance(target, _ast.Name):
+            ctype = self._declared_types.get(target.id)
+            if ctype is None:
+                return node  # not a previously-declared scalar-typed variable
+            new_node = _ast.Assign(
+                targets=node.targets,
+                value=self._make_cast(node.value, ctype, node),
+            )
+            return _ast.copy_location(new_node, node)
+        if isinstance(target, (_ast.Attribute, _ast.Subscript)):
+            root, path, kinds = self._chain_to_path(target)
+            if root is not None and root in self._compound_declared:
+                self.modified = True
+                leaf_ctype = self._resolve_leaf_ctype(
+                    self._compound_declared[root], kinds
+                )
+                value_node = node.value
+                if leaf_ctype is not None:
+                    # _sim_cast_deep accepts a str RHS directly for a char/uint8_t
+                    # array leaf type, so a string-literal write like `n.name = "id"`
+                    # is handled by the same deep-cast call as every other write.
+                    value_node = self._make_deep_cast(value_node, leaf_ctype, node)
+                path_list = _ast.List(elts=path, ctx=_ast.Load())
+                lens_call = _ast.Call(
+                    func=_ast.Name(id="_sim_lens_set", ctx=_ast.Load()),
+                    args=[
+                        _ast.Name(id=root, ctx=_ast.Load()),
+                        path_list,
+                        value_node,
+                    ],
+                    keywords=[],
+                )
+                new_node = _ast.Assign(
+                    targets=[_ast.Name(id=root, ctx=_ast.Store())],
+                    value=lens_call,
+                )
+                return _ast.copy_location(new_node, node)
+        return node
+
+    def visit_AugAssign(self, node):
+        """Rule 5: `target op= expr` on a tracked target is `target = target op
+        expr` (the same target expression on both sides, as the elaborator does),
+        then rule 2's cast or rule 4's lens write. Untracked targets -- e.g. a
+        plain Python loop counter -- keep Python semantics."""
+        self.generic_visit(node)
+        target = node.target
+        if isinstance(target, _ast.Name):
+            tracked = (
+                target.id in self._declared_types or target.id in self._compound_declared
+            )
+        else:
+            root, _, _ = self._chain_to_path(target)
+            tracked = root is not None and root in self._compound_declared
+        if not tracked:
+            return node
+        self.modified = True
+        read = _copy.deepcopy(target)
+        read.ctx = _ast.Load()
+        synth = _ast.copy_location(
+            _ast.Assign(
+                targets=[target],
+                value=_ast.BinOp(left=read, op=node.op, right=node.value),
+            ),
+            node,
+        )
+        return self.visit_Assign(synth)
+
+
+class _SimLoopInstanceRewriter(_ast.NodeTransformer):
+    """Give every source-loop iteration a stable native-simulation identity.
+
+    PY_TO_LOGIC unrolls a hardware ``for``/``while`` loop and prefixes every
+    emitted instance inside iteration *n* with that iteration's ordinal.  A
+    native-sim call instead executes the source loop as Python, so stateful
+    calls made from one physical source line need a temporary instance-stack
+    entry while each iteration body runs.  The entry is structural -- source
+    span plus ordinal -- rather than based on the iterator value or the count
+    of calls that happened to execute.  This remains correct for duplicate
+    values and runtime-gated call sites.
+
+    The generated ``try/finally`` is intentional: ``continue``, ``break``,
+    ``return``, and exceptions must all pop the frame before control leaves the
+    loop body.  Source functions are the only scope rewritten; nested Python
+    function definitions (which are not Pypeline hardware bodies) are left
+    untouched.
+    """
+
+    def __init__(self, src_file):
+        self._src_file = src_file
+        self._used_names = set()
+        self._next_name_id = 0
+        self._at_root = False
+        self.modified = False
+
+    def _new_name(self, hint):
+        while True:
+            name = f"__pypeline_sim_{hint}_{self._next_name_id}__"
+            self._next_name_id += 1
+            if name not in self._used_names:
+                self._used_names.add(name)
+                return name
+
+    @staticmethod
+    def _for_target_label(target):
+        """Return the readable, value-independent portion of a for-loop frame.
+
+        Pypeline's elaborator accepts Name/Tuple/List targets.  Preserve those
+        names in the native key to make debugging paths familiar, while the
+        source location below remains the actual disambiguator for unusual
+        Python-only targets.
+        """
+        if isinstance(target, _ast.Name):
+            return target.id
+        if isinstance(target, (_ast.Tuple, _ast.List)):
+            labels = [
+                _SimLoopInstanceRewriter._for_target_label(elt)
+                for elt in target.elts
+            ]
+            labels = [label for label in labels if label]
+            return "_".join(labels) or "v"
+        return "v"
+
+    def _loop_loc(self, node):
+        """Make an immutable loop source descriptor for a stack entry."""
+        return _ast.Tuple(
+            elts=[
+                _ast.Constant(value=self._src_file),
+                _ast.Constant(value=node.lineno),
+                _ast.Constant(value=getattr(node, "col_offset", None)),
+                _ast.Constant(value=getattr(node, "end_lineno", None)),
+                _ast.Constant(value=getattr(node, "end_col_offset", None)),
+            ],
+            ctx=_ast.Load(),
+        )
+
+    def _enter_stmt(self, frame_name, label, node, ordinal_name):
+        stmt = _ast.Assign(
+            targets=[_ast.Name(id=frame_name, ctx=_ast.Store())],
+            value=_ast.Call(
+                func=_ast.Name(id="_sim_loop_enter", ctx=_ast.Load()),
+                args=[
+                    _ast.Constant(value=label),
+                    self._loop_loc(node),
+                    _ast.Name(id=ordinal_name, ctx=_ast.Load()),
+                ],
+                keywords=[],
+            ),
+        )
+        return _ast.copy_location(stmt, node)
+
+    @staticmethod
+    def _exit_stmt(frame_name, node):
+        stmt = _ast.Expr(
+            value=_ast.Call(
+                func=_ast.Name(id="_sim_loop_exit", ctx=_ast.Load()),
+                args=[_ast.Name(id=frame_name, ctx=_ast.Load())],
+                keywords=[],
+            )
+        )
+        return _ast.copy_location(stmt, node)
+
+    def _iteration_body(self, body, frame_name, label, node, ordinal_name, postlude=()):
+        """Return entry + exception-safe source body + exit/postlude."""
+        finalbody = [self._exit_stmt(frame_name, node)] + list(postlude)
+        guarded_body = _ast.Try(
+            body=body,
+            handlers=[],
+            orelse=[],
+            finalbody=finalbody,
+        )
+        guarded_body = _ast.copy_location(guarded_body, node)
+        return [
+            self._enter_stmt(frame_name, label, node, ordinal_name),
+            guarded_body,
+        ]
+
+    def _visit_stmt_list(self, stmts):
+        """Visit statements and flatten a rewritten ``while`` into its setup/body."""
+        out = []
+        for stmt in stmts:
+            rewritten = self.visit(stmt)
+            if rewritten is None:
+                continue
+            if isinstance(rewritten, list):
+                out.extend(rewritten)
+            else:
+                out.append(rewritten)
+        return out
+
+    def visit_FunctionDef(self, node):
+        # ``visit(func_def)`` starts here.  Do not descend into a nested Python
+        # function definition encountered while transforming its parent body.
+        if self._at_root:
+            return node
+        self._at_root = True
+        self._used_names = {
+            n.id for n in _ast.walk(node) if isinstance(n, _ast.Name)
+        }
+        self._used_names.update(
+            arg.arg for arg in _ast.walk(node) if isinstance(arg, _ast.arg)
+        )
+        node.body = self._visit_stmt_list(node.body)
+        self._at_root = False
+        return node
+
+    def visit_For(self, node):
+        # Transform nested loops in the original body first, then guard this
+        # iteration.  The injected Try is never revisited, so its synthetic
+        # statements cannot be transformed a second time.
+        node.target = self.visit(node.target)
+        node.iter = self.visit(node.iter)
+        node.body = self._visit_stmt_list(node.body)
+        node.orelse = self._visit_stmt_list(node.orelse)
+
+        ordinal_name = self._new_name("for_ordinal")
+        frame_name = self._new_name("for_frame")
+        label = f"FOR_{self._for_target_label(node.target)}"
+        original_target = node.target
+        node.target = _ast.Tuple(
+            elts=[
+                _ast.Name(id=ordinal_name, ctx=_ast.Store()),
+                original_target,
+            ],
+            ctx=_ast.Store(),
+        )
+        node.iter = _ast.Call(
+            func=_ast.Name(id="_sim_enumerate", ctx=_ast.Load()),
+            args=[node.iter],
+            keywords=[],
+        )
+        node.body = self._iteration_body(
+            node.body, frame_name, label, node, ordinal_name
+        )
+        self.modified = True
+        return node
+
+    def visit_While(self, node):
+        node.test = self.visit(node.test)
+        node.body = self._visit_stmt_list(node.body)
+        node.orelse = self._visit_stmt_list(node.orelse)
+
+        ordinal_name = self._new_name("while_ordinal")
+        frame_name = self._new_name("while_frame")
+        ordinal_init = _ast.Assign(
+            targets=[_ast.Name(id=ordinal_name, ctx=_ast.Store())],
+            value=_ast.Constant(value=0),
+        )
+        ordinal_init = _ast.copy_location(ordinal_init, node)
+        ordinal_advance = _ast.AugAssign(
+            target=_ast.Name(id=ordinal_name, ctx=_ast.Store()),
+            op=_ast.Add(),
+            value=_ast.Constant(value=1),
+        )
+        ordinal_advance = _ast.copy_location(ordinal_advance, node)
+        node.body = self._iteration_body(
+            node.body,
+            frame_name,
+            "WHILE",
+            node,
+            ordinal_name,
+            postlude=[ordinal_advance],
+        )
+        self.modified = True
+        return [ordinal_init, node]
+
+
+def _build_reg_sim_func(fn):
+    """Build a simulation-mode function body for fn that manages Reg[T] and Feedback[T].
+
+    Scans and rewrites the function body's AST for register/feedback annotations,
+    typed locals, global wires, and source-loop instance frames. Returns None only
+    when none of those simulation transformations are needed (or source extraction
+    fails).
+
+    Unified transformation — each section is emitted only when the corresponding
+    collection is non-empty:
+
+        # only when reg_names non-empty:
+        __ip__ = _sim_current_inst_path()
+        <reg> = _sim_reg_read(__ip__, "<reg>")   # per register
+        <__reg_init_reg> = <reg>                 # snapshot for convergence reset
+
+        # only when feedback_names non-empty:
+        <fb> = 0                                 # per feedback var, zero-init
+        __fb_iters = 0
+
+        # try/finally wraps the while when reg_names non-empty; bare while otherwise:
+        [try:]
+            while True:
+                # only when feedback_names non-empty:
+                __fb_iters += 1
+                if __fb_iters > _SIM_FEEDBACK_MAX_ITER: raise RuntimeError(...)
+                # only when BOTH reg and feedback non-empty:
+                <reg> = <__reg_init_reg>         # reset reg to initial each pass
+                # only when feedback_names non-empty:
+                <__fb_snap_fb> = <fb>            # snapshot per feedback var
+                <original body minus stripped AnnAssigns>
+                # when feedback_names non-empty — convergence check:
+                if <fb> == <__fb_snap_fb> [and ...]: break
+                # when feedback_names IS empty — always run body once:
+                break
+        [finally:]
+            # only when reg_names non-empty:
+            _sim_reg_write(__ip__, "<reg>", <reg>)  # per register
+
+    When feedback_names is empty the while degenerates to a single pass
+    (unconditional break) — equivalent to the former plain try/finally.
+    Registers held at their initial read values across all convergence
+    iterations so that feedback resolves combinatorially before any state commit.
+
+    Note: local variable annotations (var: T inside a function body) are NOT
+    stored in fn.__annotations__ by Python, so annotations must be discovered
+    by evaluating the AnnAssign nodes against the function's globals.
+    """
+    orig_fn = _inspect.unwrap(fn)
+    try:
+        _src_lines, _first_lineno = _inspect.getsourcelines(orig_fn)
+        src = _textwrap.dedent("".join(_src_lines))
+    except (OSError, TypeError):
+        return None, False
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return None, False
+    # getsourcelines numbers the snippet from 1, but `src_file` below is the real file
+    # on disk — shift every node's lineno to match its true position there so
+    # tracebacks raised from the exec'd body point at the actual failing line instead
+    # of whatever happens to sit at that line number near the top of the real file.
+    _ast.increment_lineno(tree, _first_lineno - 1)
+
+    func_def = next((n for n in tree.body if isinstance(n, _ast.FunctionDef)), None)
+    if func_def is None:
+        return None, False
+    _sim_src_file = getattr(
+        getattr(orig_fn, "__code__", None), "co_filename", "<sim_reg>"
+    )
+
+    # Build eval namespace: globals + closure variables (for closures like make_vga_timing).
+    # Closure variables (e.g. h_uint, V_MAX) appear in Reg[T] annotations and body
+    # expressions but are not in fn.__globals__ — they live in fn.__closure__.
+    _eval_ns = dict(fn.__globals__)
+    if fn.__code__.co_freevars and fn.__closure__:
+        for _cv, _cell in zip(fn.__code__.co_freevars, fn.__closure__):
+            try:
+                _eval_ns[_cv] = _cell.cell_contents
+            except ValueError:
+                pass
+
+    # Discover global wire names from the function's defining module and rewrite
+    # all reads/writes in the function body to go through _sim_wire_read/write.
+    # Sim keys are module-qualified ("<module>.<wire>") so two unrelated modules
+    # declaring a same-named Wire[T] (e.g. both calling it "key") don't collide in
+    # the single global _sim_wire_state dict.
+    _own_mod_name = fn.__module__
+    global_wire_names = {
+        name: f"{_own_mod_name}.{name}"
+        for name, ann in fn.__globals__.get("__annotations__", {}).items()
+        if isinstance(ann, (_WireType, _InputType, _OutputType))
+    }
+    global_wire_ctypes = {
+        name: _wire_ann_inner_ctype(ann)
+        for name, ann in fn.__globals__.get("__annotations__", {}).items()
+        if isinstance(ann, (_WireType, _InputType, _OutputType))
+    }
+    # Also build a map for cross-module wire access (module_alias.wire_name).
+    # Scans all module objects in fn.__globals__ for wire annotations.
+    module_wire_attrs = {}
+    module_wire_ctypes = {}
+    for _alias, _obj in fn.__globals__.items():
+        if not isinstance(_obj, _types.ModuleType):
+            continue
+        for _wname, _ann in getattr(_obj, "__annotations__", {}).items():
+            if isinstance(_ann, (_WireType, _InputType, _OutputType)):
+                module_wire_attrs[(_alias, _wname)] = f"{_obj.__name__}.{_wname}"
+                module_wire_ctypes[(_alias, _wname)] = _wire_ann_inner_ctype(_ann)
+                if _ann.volatile:
+                    _sim_wire_volatile.add(f"{_obj.__name__}.{_wname}")
+    for _name, _ann in fn.__globals__.get("__annotations__", {}).items():
+        if isinstance(_ann, (_WireType, _InputType, _OutputType)) and _ann.volatile:
+            _sim_wire_volatile.add(f"{_own_mod_name}.{_name}")
+    # Register every discovered wire's ctype globally (keyed by qualified sim name)
+    # so _sim_wire_lens_read/_sim_wire_lens_write can build a typed zero default for
+    # a compound wire before any whole-wire write has ever landed in _sim_wire_state.
+    for _bare_name, _qual_key in global_wire_names.items():
+        _sim_wire_ctype[_qual_key] = global_wire_ctypes[_bare_name]
+    for _mod_key, _qual_key in module_wire_attrs.items():
+        _sim_wire_ctype[_qual_key] = module_wire_ctypes[_mod_key]
+    _check_no_local_binds_wire_name(
+        fn,
+        func_def,
+        _sim_src_file,
+        global_wire_names,
+        {alias for alias, _ in module_wire_attrs},
+    )
+    if not getattr(orig_fn, "_pypeline_sim_only", False):
+        _check_sim_only_call_sites(
+            fn,
+            func_def,
+            _sim_src_file,
+            _eval_ns,
+            global_wire_names,
+            module_wire_attrs,
+        )
+    wire_leaf_ctypes_out: dict = {}
+    _wire_rewriter_modified = False
+    if global_wire_names or module_wire_attrs:
+        _wire_claim_key = (
+            f"{fn.__module__}.{fn.__qualname__}#{next(_wire_claim_serial)}"
+        )
+        _wire_rewriter = _GlobalWireRewriter(
+            global_wire_names,
+            module_wire_attrs,
+            global_wire_ctypes,
+            module_wire_ctypes,
+            wire_leaf_ctypes_out,
+            _wire_claim_key,
+        )
+        _wire_rewriter.visit(func_def)
+        # If this function writes any wire, inject a one-line prologue that zeros
+        # every (wire, path) this function has claimed so far
+        # (_sim_wire_reset_claims) -- each invocation starts from the same
+        # implicit zero-init elaboration gives it, scoped to exactly this
+        # function's own driven leaves so the reset can never clobber a
+        # different writer's already-committed leaves of a shared wire within
+        # one cycle's convergence loop. The claimed-path bookkeeping itself is
+        # runtime: every rewritten write call carries _wire_claim_key and
+        # records the concrete path written (static fields, nested paths,
+        # unrolled-loop and dynamic indices all land as the exact elements
+        # touched).
+        if _wire_rewriter.written_wire_names:
+            func_def.body[0:0] = [
+                _ast.Expr(
+                    value=_ast.Call(
+                        func=_ast.Name(id="_sim_wire_reset_claims", ctx=_ast.Load()),
+                        args=[_ast.Constant(value=_wire_claim_key)],
+                        keywords=[],
+                    )
+                )
+            ]
+        _ast.fix_missing_locations(func_def)
+        _wire_rewriter_modified = _wire_rewriter.modified
+
+    # Rewrite typed local annotations AFTER _GlobalWireRewriter (wire AnnAssigns are
+    # already converted to Expr nodes) and BEFORE orig_body is sliced, so orig_body
+    # picks up the rewritten Assign nodes.
+    # Skipped in SIM_RAW_INTS mode: no _sim_cast calls injected, plain Python
+    # arithmetic flows through unchanged.
+    ann_ctypes_out: dict = {}
+    _typed_rewriter_modified = False
+    if not SIM_RAW_INTS:
+        _typed_rewriter = _TypedAnnAssignRewriter(_eval_ns, ann_ctypes_out)
+        _typed_rewriter.track_params(
+            func_def, getattr(orig_fn, "__annotations__", {})
+        )
+        _typed_rewriter.visit(func_def)
+        _ast.fix_missing_locations(func_def)
+        _typed_rewriter_modified = _typed_rewriter.modified
+
+    # Native simulation executes source loops as ordinary Python, while the
+    # hardware elaborator unrolls them into one independent hierarchy per
+    # ordinal. Give each source iteration a temporary stack frame before
+    # deciding whether this function needs an exec-built sim body: a pure
+    # wrapper can contain a loop that calls a stateful descendant even when it
+    # declares no Reg[T]/Feedback[T] itself.
+    _loop_rewriter = _SimLoopInstanceRewriter(_sim_src_file)
+    _loop_rewriter.visit(func_def)
+    _ast.fix_missing_locations(func_def)
+    _loop_rewriter_modified = _loop_rewriter.modified
+
+    # Discover register and feedback variable names by evaluating each AnnAssign
+    # annotation against the function's eval namespace.
+    # Typed local AnnAssigns (e.g. x: int16_t = 512) were already rewritten to plain
+    # Assign nodes by _TypedAnnAssignRewriter above, so only Reg[T]/Feedback[T] remain.
+    reg_names = []
+    reg_zeros = {}  # name → power-on default value, computed once at decoration time
+    reg_reset_modes = {}  # name → "reset" / "no_reset" (Reg[T, RESET] / NO_RESET)
+    feedback_names = []
+    feedback_zeros = {}  # name → typed zero bootstrap value (struct/array-aware)
+    # Locals assigned via plain `name = expr` earlier in the body (e.g.
+    # `MC = MULTI_CYCLE[32]`) aren't in _eval_ns (built before the function ran), but
+    # Reg[T, MC.start] annotations reference them. Accumulate pure-Python-evaluable
+    # locals here, in source order, mirroring the elaborator's const_env.
+    _local_const_ns = {}
+    for stmt in func_def.body:
+        if (
+            isinstance(stmt, _ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], _ast.Name)
+        ):
+            try:
+                with _ConstFolding():
+                    _local_const_ns[stmt.targets[0].id] = eval(
+                        compile(
+                            _ast.Expression(body=stmt.value), "<local_const>", "eval"
+                        ),
+                        {**_eval_ns, **_local_const_ns},
+                    )
+            except Exception:
+                pass
+            continue
+        if not (
+            isinstance(stmt, _ast.AnnAssign) and isinstance(stmt.target, _ast.Name)
+        ):
+            continue
+        _merged_ns = {**_eval_ns, **_local_const_ns}
+        try:
+            ann_val = eval(
+                compile(_ast.Expression(body=stmt.annotation), "<ann>", "eval"),
+                _merged_ns,
+            )
+        except Exception as _ann_exc:
+            if (
+                isinstance(stmt.annotation, _ast.Subscript)
+                and isinstance(stmt.annotation.value, _ast.Name)
+                and stmt.annotation.value.id in ("Reg", "Feedback")
+            ):
+                raise NotImplementedError(
+                    f"Could not resolve {stmt.annotation.value.id}[...] annotation type "
+                    f"for '{stmt.target.id}': {_ast.dump(stmt.annotation)}"
+                ) from _ann_exc
+            continue
+        if isinstance(ann_val, _RegType):
+            reg_names.append(stmt.target.id)
+            if ann_val.reset_mode is not None:
+                reg_reset_modes[stmt.target.id] = ann_val.reset_mode
+            if stmt.value is not None:
+                # Reg[T] = val: evaluate the init expression for the power-on default.
+                try:
+                    with _ConstFolding():
+                        init_val = eval(
+                            compile(
+                                _ast.Expression(body=stmt.value), "<reg_init>", "eval"
+                            ),
+                            _merged_ns,
+                        )
+                    # Dict-style struct init {"field": val} → convert to NamedTuple
+                    # so that field access (pt.x) works in the simulated body; this
+                    # must happen before _sim_cast_deep below, whose struct fast path
+                    # (`hasattr(ctype, "_fields")`) passes an already-NamedTuple value
+                    # through unchanged.
+                    if isinstance(init_val, dict) and hasattr(
+                        ann_val.inner_ctype, "_fields"
+                    ):
+                        init_val = ann_val.inner_ctype(**init_val)
+                    # Always deep-cast: turns a scalar/array-of-scalar literal init
+                    # (e.g. `have: Reg[uint1_t] = 1`) into a properly width-masked,
+                    # typed SimVal instead of leaving it as a bare Python int/list —
+                    # otherwise it starts life on cycle 0 untyped and can poison a
+                    # bitwise op combining it with a typed sibling operand. Also
+                    # accepts a bare str for a char/uint8_t-array target (zero-padded),
+                    # subsuming the previous str-only special case. Idempotent/safe
+                    # for structs (passes through via the `_fields` fast path).
+                    init_val = _sim_cast_deep(init_val, ann_val.inner_ctype)
+                    reg_zeros[stmt.target.id] = init_val
+                except Exception:
+                    reg_zeros[stmt.target.id] = _make_sim_zero(ann_val.inner_ctype)
+            else:
+                reg_zeros[stmt.target.id] = _make_sim_zero(ann_val.inner_ctype)
+        elif isinstance(ann_val, _FeedbackType) and stmt.value is None:
+            feedback_names.append(stmt.target.id)
+            feedback_zeros[stmt.target.id] = _make_sim_zero(ann_val.inner_ctype)
+
+    if (
+        not reg_names
+        and not feedback_names
+        and not _wire_rewriter_modified
+        and not ann_ctypes_out
+        and not _typed_rewriter_modified
+        and not _loop_rewriter_modified
+    ):
+        return None, False
+
+    # Strip Reg[T] annotations (with or without init value) and Feedback[T]
+    # annotation-only stmts from the body — init values are handled via
+    # __reg_zero_<name>__ injected into new_globals; the AnnAssign itself must not
+    # remain or it would overwrite the _sim_reg_read result.
+    _reg_set = set(reg_names)
+    _fb_set = set(feedback_names)
+    orig_body = [
+        stmt
+        for stmt in func_def.body
+        if not (
+            isinstance(stmt, _ast.AnnAssign)
+            and isinstance(stmt.target, _ast.Name)
+            and (
+                stmt.target.id in _reg_set
+                or (stmt.target.id in _fb_set and stmt.value is None)
+            )
+        )
+    ]
+
+    # --- Build transformed function body ---
+
+    new_stmts = []
+
+    # Register reads and initial-value snapshots (only when reg_names non-empty).
+    if reg_names:
+        new_stmts.append(_ast.parse("__ip__ = _sim_current_inst_path()").body[0])
+        for name in reg_names:
+            new_stmts.append(
+                _ast.parse(
+                    f'{name} = _sim_reg_read(__ip__, "{name}", __reg_zero_{name}__)'
+                ).body[0]
+            )
+            new_stmts.append(_ast.parse(f"__reg_init_{name} = {name}").body[0])
+
+    # Feedback zero-init and iteration counter (only when feedback_names non-empty).
+    if feedback_names:
+        for name in feedback_names:
+            new_stmts.append(_ast.parse(f"{name} = __fb_zero_{name}__").body[0])
+        new_stmts.append(_ast.parse("__fb_iters = 0").body[0])
+        new_stmts.append(_ast.parse("__fb_final_pass = False").body[0])
+        # Suppress sim_print/sim_assert/sim_finish/@sim_output (via the shared
+        # _sim_converging flag) for every convergence iteration except the
+        # final, already-settled one -- see _sim_set_converging's docstring.
+        # __fb_entry_converging remembers what the flag actually was on entry
+        # (may already be True if this call is itself nested inside an outer
+        # suppressed pass), restored below before the real final iteration and
+        # unconditionally on exit.
+        new_stmts.append(
+            _ast.parse("__fb_entry_converging = _sim_set_converging(True)").body[0]
+        )
+
+    # When feedback is present, the return statement must live OUTSIDE the
+    # convergence loop so that the loop can iterate to a fixed point before
+    # returning.  Hardware functions have exactly one return (the final
+    # top-level statement); extract it here.
+    if feedback_names and orig_body and isinstance(orig_body[-1], _ast.Return):
+        loop_stmts = orig_body[:-1]
+        trailing_return = orig_body[-1]
+    else:
+        loop_stmts = orig_body
+        trailing_return = None
+
+    # Build the while loop body.
+    loop_body = []
+
+    if feedback_names:
+        # Safety iteration limit check.
+        loop_body.append(_ast.parse("__fb_iters += 1").body[0])
+        fn_name = orig_fn.__name__
+        loop_body.append(
+            _ast.parse(
+                f"if __fb_iters > _SIM_FEEDBACK_MAX_ITER: "
+                f"raise RuntimeError(\"Feedback[T] sim: convergence failed in '{fn_name}'\")"
+            ).body[0]
+        )
+        # Reset registers to their initial values at the start of each iteration
+        # so they act as constant inputs throughout combinatorial convergence.
+        if reg_names:
+            for name in reg_names:
+                loop_body.append(_ast.parse(f"{name} = __reg_init_{name}").body[0])
+        # Snapshot all feedback variables before running the body this pass.
+        for name in feedback_names:
+            loop_body.append(_ast.parse(f"__fb_snap_{name} = {name}").body[0])
+        # Only unsuppress (restore the caller's real flag) on the extra,
+        # already-converged final iteration -- see comment at __fb_entry_converging.
+        loop_body.append(
+            _ast.parse(
+                "if __fb_final_pass: _sim_set_converging(__fb_entry_converging)"
+            ).body[0]
+        )
+
+    # Original function body (both Reg[T] and Feedback[T] AnnAssigns removed;
+    # trailing return extracted above when feedback is present).
+    loop_body.extend(loop_stmts)
+
+    # Convergence check (feedback present) or unconditional single-pass break.
+    if feedback_names:
+        # Two-phase: once the snapshot matches (fixed point reached), don't
+        # break immediately -- loop back for exactly one more, now-unsuppressed
+        # iteration (numerically a no-op, since the feedback vars are already
+        # settled) so side-effecting calls in the body see the real flag.
+        loop_body.append(_ast.parse("if __fb_final_pass: break").body[0])
+        conditions = " and ".join(
+            f"{name} == __fb_snap_{name}" for name in feedback_names
+        )
+        loop_body.append(_ast.parse(f"if {conditions}: __fb_final_pass = True").body[0])
+    else:
+        loop_body.append(_ast.parse("break").body[0])
+
+    while_loop = _ast.While(
+        test=_ast.Constant(value=True),
+        body=loop_body,
+        orelse=[],
+    )
+
+    # Wrap in try/finally for register commits (reg_names non-empty) and/or to
+    # unconditionally restore _sim_converging (feedback_names non-empty) --
+    # e.g. on the _SIM_FEEDBACK_MAX_ITER RuntimeError path, which must not
+    # leave the flag stuck suppressed for the rest of the simulation.
+    finally_stmts = [
+        _ast.parse(
+            f'_sim_reg_write(__ip__, "{name}", {name}, "{reg_reset_modes[name]}")'
+            if name in reg_reset_modes
+            else f'_sim_reg_write(__ip__, "{name}", {name})'
+        ).body[0]
+        for name in reg_names
+    ]
+    if feedback_names:
+        finally_stmts.append(
+            _ast.parse("_sim_set_converging(__fb_entry_converging)").body[0]
+        )
+    if finally_stmts:
+        new_stmts.append(
+            _ast.Try(body=[while_loop], handlers=[], orelse=[], finalbody=finally_stmts)
+        )
+    else:
+        new_stmts.append(while_loop)
+
+    # Emit the trailing return after the loop/try block (feedback case only).
+    if trailing_return is not None:
+        new_stmts.append(trailing_return)
+
+    func_def.body = new_stmts
+    func_def.decorator_list = []  # strip decorators to avoid re-wrapping on exec
+
+    # Annotations are re-evaluated by the exec below, but a name that appears
+    # *only* in an annotation is not a free variable, so a factory-local type
+    # would not be in scope here (e.g. `x: some_fb_t[n]` -> NameError on some_fb_t).
+    # Bind each already-resolved annotation object to a generated name and refer
+    # to that, which works for every annotation form, not just bare names.
+    _sig_anns = getattr(orig_fn, "__annotations__", {})
+    _ann_objs = {}
+    for _arg in func_def.args.args:
+        if _arg.annotation is not None and _arg.arg in _sig_anns:
+            _nm = f"__ann_arg_{_arg.arg}__"
+            _ann_objs[_nm] = _sig_anns[_arg.arg]
+            _arg.annotation = _ast.Name(id=_nm, ctx=_ast.Load())
+    if func_def.returns is not None and "return" in _sig_anns:
+        _ann_objs["__ann_return__"] = _sig_anns["return"]
+        func_def.returns = _ast.Name(id="__ann_return__", ctx=_ast.Load())
+
+    _ast.fix_missing_locations(tree)
+
+    try:
+        code = compile(tree, _sim_src_file, "exec")
+    except Exception:
+        return None, bool(reg_names or feedback_names)
+
+    new_globals = _eval_ns.copy()  # includes globals + closure vars
+    new_globals.update(
+        _sim_cast=_sim_cast,
+        _sim_cast_deep=_sim_cast_deep,
+        _make_sim_zero=_make_sim_zero,
+        _sim_lens_set=_sim_lens_set,
+        _sim_current_inst_path=_sim_current_inst_path,
+        _sim_loop_enter=_sim_loop_enter,
+        _sim_loop_exit=_sim_loop_exit,
+        _sim_enumerate=enumerate,
+        _sim_reg_read=_sim_reg_read,
+        _sim_reg_write=_sim_reg_write,
+        _SIM_FEEDBACK_MAX_ITER=_SIM_FEEDBACK_MAX_ITER,
+        _sim_wire_read=_sim_wire_read,
+        _sim_wire_write=_sim_wire_write,
+        _sim_wire_lens_read=_sim_wire_lens_read,
+        _sim_wire_lens_write=_sim_wire_lens_write,
+        _sim_wire_reset_claims=_sim_wire_reset_claims,
+        _sim_set_converging=_sim_set_converging,
+    )
+    for _name, _zero in reg_zeros.items():
+        new_globals[f"__reg_zero_{_name}__"] = _zero
+    for _name, _zero in feedback_zeros.items():
+        new_globals[f"__fb_zero_{_name}__"] = _zero
+    for _key, _ctype_obj in ann_ctypes_out.items():
+        new_globals[_key] = _ctype_obj
+    for _key, _ctype_obj in wire_leaf_ctypes_out.items():
+        new_globals[_key] = _ctype_obj
+    new_globals.update(_ann_objs)  # the pre-resolved signature annotations
+    exec(code, new_globals)  # noqa: S102
+    return new_globals.get(orig_fn.__name__), bool(reg_names or feedback_names)
+
+
+@_functools.lru_cache(maxsize=None)
+def _sim_cast_params(ctype):
+    """Pre-compute mask, sign_bit, and is_signed for a ctype (cached per unique type object)."""
+    if getattr(ctype, "_pypeline_is_enum", False):
+        n = _enum_bit_width(ctype)
+        return (1 << n) - 1, 1 << (n - 1), False  # enums are unsigned
+    n = len(ctype)
+    mask = (1 << n) - 1
+    is_signed = str(ctype).startswith("int")
+    return mask, 1 << (n - 1), is_signed
+
+
+# Direct dict replacing the lru_cache function call in the _sim_cast hot path.
+# Avoids Python function call overhead (~0.1µs) for each of the 4M+ casts per 1K cycles.
+_sim_cast_param_cache: dict = {}
+
+
+def _sim_type_init(ctype):
+    """Initialize both caches for a ctype on first use. Returns (mask, sign_bit, is_signed).
+
+    Called only in the cold `except KeyError` path — never the hot path.
+    Populates _sim_cast_param_cache and pre-builds the flyweight constants 0..15.
+    """
+    mask, sign_bit, is_signed = _sim_cast_params(ctype)
+    _sim_cast_param_cache[ctype] = (mask, sign_bit, is_signed)
+    limit = min(16, mask + 1)
+    for const_v in range(limit):
+        obj = _int_new(SimVal, const_v)
+        _obj_setattr(obj, "_ctype", ctype)
+        _SIM_CONST_CACHE[(const_v, ctype)] = obj
+    return mask, sign_bit, is_signed
+
+
+def _sim_cast(val, ctype):
+    """Cast a Python int/SimVal to a pypeline ctype: mask to n bits, handle signedness.
+
+    This is the sim equivalent of a hardware type assignment. It implements unsigned
+    wrap-on-overflow and signed two's complement masking.
+    """
+    if SIM_RAW_INTS:
+        return val
+    if type(val) is SimVal and val._ctype is ctype:
+        return val
+    try:
+        mask, sign_bit, is_signed = _sim_cast_param_cache[ctype]
+    except KeyError:
+        mask, sign_bit, is_signed = _sim_type_init(ctype)
+    v = int(val) & mask
+    if is_signed and v >= sign_bit:
+        v -= mask + 1  # sign-extend to Python negative
+    return _sim_val_make(v, ctype)
+
+
+def _sim_cast_call_arg(pt, v):
+    """Cast a hw_func call argument to its declared parameter ctype pt, for
+    simulation. Scalar int/SimVal args get bit-accurate truncation (existing
+    behavior); a char/uint8_t-array-shaped param (at any nesting depth) is routed
+    through _sim_cast_deep, which accepts either a bare Python str or a (possibly
+    nested) list, mirroring the elaboration-side string-literal-argument handling
+    in PY_TO_LOGIC._elab_call."""
+    if pt is None:
+        return v
+    if (type(v) is int or type(v) is SimVal) and _is_scalar_pypeline_int(pt):
+        return _sim_cast(v, pt)
+    if _is_char_like_array(pt):
+        return _sim_cast_deep(v, pt)
+    if isinstance(v, str) and _is_scalar_pypeline_int(pt):
+        raise TypeError(_str_to_scalar_message(v, pt))
+    return v
+
+
+# ─────────────────────────────────────────────
+# Simulation models (sim_model): per-instance storage and evaluation
+# ─────────────────────────────────────────────
+
+# Reserved _sim_reg_state key holding a hardware instance's committed
+# class/callable model instance (a name no real register can have).
+_SIM_MODEL_REG_KEY = "__sim_model__"
+
+# Reserved _sim_reg_state key holding an AUTO_PIPELINE call site's committed
+# output delay line: a list of the last N results, oldest first (see
+# AUTO_PIPELINE._sim_delay_line).
+_SIM_AP_DELAY_KEY = "__sim_auto_pipeline_delay__"
+
+
+def _sim_capture_call_loc(caller_f):
+    """Capture a call-site location tuple from a caller frame, honoring
+    SIM_TRACE_LOCATIONS (same convention as the register-aware wrapper).
+    Only used on model-attached paths, never the no-model hot path."""
+    if SIM_TRACE_LOCATIONS and hasattr(caller_f.f_code, "co_positions"):
+        instr_idx = caller_f.f_lasti // 2
+        positions = list(caller_f.f_code.co_positions())
+        if 0 <= instr_idx < len(positions):
+            pos = positions[instr_idx]
+            if pos[2] is not None:
+                return (caller_f.f_code.co_filename, caller_f.f_lineno, pos[2], pos[3])
+    return (caller_f.f_code.co_filename, caller_f.f_lineno, None, None)
+
+
+def _raw_vhdl_keeps_state(fn):
+    """True if fn's body is a vhdl(text) call without reset=: its hardware
+    keeps its state when its MAIN resets, so its sim model does too
+    (_call_sim_model records it "no_reset")."""
+    try:
+        src = _textwrap.dedent(_inspect.getsource(_inspect.unwrap(fn)))
+        tree = _ast.parse(src)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    func_def = next((n for n in tree.body if isinstance(n, _ast.FunctionDef)), None)
+    for stmt in func_def.body if func_def is not None else ():
+        call = stmt.value if isinstance(stmt, _ast.Expr) else None
+        if not isinstance(call, _ast.Call):
+            continue
+        callee = call.func
+        name = callee.id if isinstance(callee, _ast.Name) else getattr(callee, "attr", None)
+        if name == "vhdl":
+            return not any(kw.arg == "reset" for kw in call.keywords)
+    return False
+
+
+def _call_sim_model(model_entry, args, kwargs, keeps_state=False):
+    """Evaluate an attached simulation model for the current hardware instance.
+
+    hw_func delegates are simply called: the delegate's own wrapper manages its
+    Reg[T]/Feedback[T] state, pushing its own entry on top of the target's
+    already-pushed instance-stack entry, so delegate state stays per-instance
+    of the *target*.
+
+    Class/callable models get Reg-like commit timing: every evaluation computes
+    outputs from a deepcopy of the instance committed at the last clock edge,
+    then commits the mutated copy through the buffered register-write path.
+    Under pypeline_sim.py wire convergence the committed instance never moves
+    mid-cycle, so re-evaluations with changing inputs are idempotent — a
+    combinational input→output path through the model converges exactly like
+    ordinary comb logic, and state advances exactly once per cycle (the final
+    converged pass's buffered copy is what _sim_reg_flush_buffer commits).
+    Under plain sim_call, the outermost call now also opens a register-write
+    buffer for its whole duration (see sim_call's docstring), so a Feedback[T]
+    convergence loop's re-invocations of a model (or a nested Reg[T] hw_func)
+    are convergence-safe there too: every pass reads the state committed at
+    the last real clock edge, and only the final pass's buffered write lands
+    in _sim_reg_state once the outermost sim_call returns.
+
+    keeps_state: the target is raw vhdl() without reset= (its model cell's
+    second item, _raw_vhdl_keeps_state): a reset leaves the model alone, as
+    it leaves the hardware (_sim_apply_resets).
+    """
+    model, kind, copy_state = model_entry
+    reset_mode = "no_reset" if keeps_state else None
+    if kind == "hw_func":
+        return model(*args, **kwargs)
+    inst_path = _sim_current_inst_path()
+    committed = _sim_reg_read(inst_path, _SIM_MODEL_REG_KEY, None)
+    if committed is None:
+        # First evaluation for this hardware instance: fresh power-on state
+        # (sim_reset() clears _sim_reg_state, re-triggering this).
+        committed = model() if kind == "class" else model
+        if not copy_state:
+            # In-place mode commits the instance itself directly, bypassing any
+            # write buffer — otherwise re-evaluations within the creation cycle
+            # would re-instantiate (and in-place mutation is not
+            # convergence-safe regardless).
+            _sim_reg_state.setdefault(inst_path, {})[_SIM_MODEL_REG_KEY] = committed
+            if reset_mode is not None:
+                _sim_note_reset_mode(inst_path, _SIM_MODEL_REG_KEY, reset_mode)
+    if not copy_state:
+        return committed(*args, **kwargs)
+    working = _copy.deepcopy(committed)
+    result = working(*args, **kwargs)
+    _sim_reg_write(inst_path, _SIM_MODEL_REG_KEY, working, reset_mode)
+    return result
+
+
+class InterfacePortError(Exception):
+    """A hw_func declares one half of an interface port but not its matching
+    other half. The two halves of a port share the port's name -- the
+    feedforward half on one side of the signature (an argument or a return
+    field) and the reverse half on the other -- so a lone half is (almost)
+    always an unfinished port, and this is a hard error.
+
+    The one legitimate lone-half shape is an intentional valid-only /
+    data-only signal (a stream with no backpressure). Build that with a
+    genuinely one-directional type instead of a lone half of a with-ready
+    interface -- e.g. `stream.make_stream_t(data_t)` / `axi.make_axis_t(n)`,
+    which have no reverse half at all and so are exempt by construction.
+    """
+
+
+def _interface_half_of(t):
+    """`(interface, role, is_array)` if `t` is a derived interface half (or an
+    array of one), else `(None, None, False)`.
+
+    getattr-only on the tags the interface library stamps on its derived structs
+    (`_pypeline_interface_role` = "fwd"/"fb", `_pypeline_interface` = the source
+    interface), so pypeline.py keeps its zero dependency on that library."""
+    if t is None:
+        return None, None, False
+    role = getattr(t, "_pypeline_interface_role", None)
+    if role is not None:
+        return getattr(t, "_pypeline_interface", None), role, False
+    elem = _array_elem_ctype(t)
+    if elem is not None:
+        role = getattr(elem, "_pypeline_interface_role", None)
+        if role is not None:
+            return getattr(elem, "_pypeline_interface", None), role, True
+    return None, None, False
+
+
+def _check_partial_interface_ports(fn, ann, params, ret_t):
+    """Raise `InterfacePortError` for the first interface port that declares
+    only one of its two halves.
+
+    Presence-based and side-aware: an input port's feedforward half is an
+    argument and its reverse half a return field (an output port is the
+    reverse), so the missing half's side follows from where the present half
+    sits. One-directional interfaces (no reverse fields at all, or no forward
+    fields) are complete with a single half and never error -- checked via the
+    interface's own `_pypeline_iface_derived` memo. A genuinely valid-only
+    stream (e.g. `stream.make_stream_t(...)`) has no reverse half to pair, so
+    it falls into that exemption.
+
+    A @cast function (fn._pypeline_is_cast, stamped by cast() BEFORE this
+    check runs -- see cast()'s docstring for why the ordering matters) is
+    exempt entirely: a cast converts between one interface half and its
+    payload, not a port crossing, so there is no second half to pair and no
+    '_if' naming convention to enforce either."""
+    if getattr(fn, "_pypeline_is_cast", False):
+        return
+    ports = {}  # name -> {"fwd": side|None, "fb": side|None, "iface": iface}
+
+    def note(name, t, side):
+        iface, role, _ = _interface_half_of(t)
+        if iface is not None:
+            ports.setdefault(name, {"fwd": None, "fb": None, "iface": iface})[role] = side
+
+    for p in params:
+        note(p, ann.get(p), "arg")
+    ret_fields = getattr(ret_t, "_fields", ()) if ret_t is not None else ()
+    ret_anns = getattr(ret_t, "__annotations__", {}) if ret_fields else {}
+    for f in ret_fields:
+        note(f, ret_anns.get(f), "ret")
+
+    for name, e in ports.items():
+        if not name.endswith("_if"):
+            _warnings.warn(
+                f"hw_func {getattr(fn, '__qualname__', fn)!r}: interface port "
+                f"{name!r} does not end in '_if' -- by convention, an "
+                "arg/return-field name that pairs a port's two halves should "
+                "(e.g. 'stream_in_if')",
+                stacklevel=3,
+            )
+        derived = getattr(e["iface"], "_pypeline_iface_derived", {})
+        if derived.get("fwd") is None or derived.get("fb") is None:
+            continue  # one-directional interface: a single half is complete
+        if (e["fwd"] is None) == (e["fb"] is None):
+            continue  # both halves present (or, wrongly, both on one side)
+        present_role = "fwd" if e["fwd"] is not None else "fb"
+        present_side = e[present_role]
+        # the missing half travels the opposite way, so it sits on the other side
+        where = "return field" if present_side == "arg" else "argument"
+        present_word = "feedforward" if present_role == "fwd" else "reverse"
+        missing_word = "reverse" if present_role == "fwd" else "feedforward"
+        iname = getattr(e["iface"], "__name__", repr(e["iface"]))
+        raise InterfacePortError(
+            f"hw_func {getattr(fn, '__qualname__', fn)!r}: interface port {name!r} "
+            f"(interface {iname}) declares only its {present_word} half; add its "
+            f"{missing_word} half as a {where} named {name!r}. If {name!r} is "
+            "meant to be an intentional valid-only / data-only signal, build it "
+            "as a genuinely one-directional type instead (e.g. "
+            "stream.make_stream_t(...) / axi.make_axis_t(...))."
+        )
+
+
+def _sim_type_wrap(fn):
+    """Wrap a pypeline hardware function for bit-accurate simulation.
+
+    On each call: records the call-site location for register instance identity,
+    casts positional arguments to their annotated input types, pushes any scoped
+    operator registrations, calls the original function (or a register-aware
+    simulation body for Reg[T] functions), pops registrations, then casts the
+    return value to the annotated return type.
+
+    Transparent to the hardware elaborator: _elaborate_live_func uses
+    inspect.unwrap() to recover the original function for source analysis.
+    functools.wraps copies __annotations__, so hw_arg_types()/hw_return_type()
+    (see below) work the same whether called on the wrapped or original function.
+
+    Idempotent: if `fn` is already hw_func-wrapped (e.g. `@MAIN`/`@wires`/`@hw_func`
+    stacked on the same function in either order -- `wires`'s docstring promises
+    "stacks with @MAIN in either order"), returns it unchanged instead of wrapping
+    again. Re-wrapping an already-wrapped function is never correct: the outer call
+    would rebuild the simulation body from `fn.__globals__`/`fn.__closure__`, but for
+    an already-wrapped `fn` those reflect wherever *this* wrapper function is defined
+    (pypeline.py itself), not the original function's module -- silently dropping
+    every module-level name (e.g. a testbench's own imported constants) the original
+    body actually needs, raising NameError deep inside the rewritten sim body.
+    """
+    if is_hw_func(fn):
+        return fn
+    # Real argument values of every enclosing factory in fn's '.<locals>.'
+    # chain, captured NOW while the live call stack still has them -- this is
+    # the only point in time they're available. Stashed on both fn and the
+    # wrapper below so PY_TO_LOGIC._canonical_func_name can use the true
+    # values (e.g. make_fifo's depth/mode) instead of hashing whatever
+    # derived locals happen to survive into the closure.
+    _factory_args = capture_factory_args(fn.__qualname__, _sys._getframe(1))
+    fn._pypeline_name_info = _describe(fn, "function", _factory_args)
+    ann = fn.__annotations__
+    try:
+        params = list(_inspect.signature(fn).parameters.keys())
+    except (ValueError, TypeError):
+        params = []
+    ret_t = ann.get("return")
+
+    # Factory callers obtain the complete result type from the callable itself.
+    # Set it before functools.wraps copies fn.__dict__ into every wrapper variant.
+    fn.return_t = ret_t
+
+    # Hard error if a port declares only one of its two interface halves.
+    _check_partial_interface_ports(fn, ann, params, ret_t)
+
+    # Scan source for Reg[T]/Feedback[T] annotations and build a simulation body.
+    # Returns (fn_or_None, has_state), where has_state=True means the body owns
+    # persistent Reg/Feedback state and therefore needs a function stack frame.
+    # A stateless transformed source loop maintains only temporary iteration
+    # frames inside sim_body_fn and keeps the wrapper fast path.
+    sim_body_fn, has_state = _build_reg_sim_func(fn)
+    # Whose body a wire access runs in, while a pipelined region is active
+    # (_sim_region_for): this wrapper, or exempt for @sim_input/@sim_output.
+    _sim_only_body = getattr(fn, "_pypeline_sim_only", False)
+
+    # sim_model routing cell: sim_model(target) fills its first item with
+    # (model, kind, copy_state) and its second with whether the model keeps
+    # its state across a reset (_raw_vhdl_keeps_state); every wrapper variant
+    # checks the first per call (one is-None test on the no-model hot path).
+    _model_cell = [None, False]
+
+    # Helper: cast args and kwargs to their annotated types, run the body, cast result.
+    # Extracted so both wrapper variants share the same arg-casting logic.
+    def _run_body(new_args, kwargs):
+        new_kwargs = dict(kwargs)
+        for k, v in kwargs.items():
+            pt = ann.get(k)
+            if (
+                pt is not None
+                and isinstance(v, int)  # covers int, SimVal, IntEnum members
+                and _is_scalar_pypeline_int(pt)
+            ):
+                new_kwargs[k] = _sim_cast(v, pt)
+            elif pt is not None and _is_char_like_array(pt):
+                new_kwargs[k] = _sim_cast_deep(v, pt)
+            elif isinstance(v, str) and _is_scalar_pypeline_int(pt):
+                raise TypeError(_str_to_scalar_message(v, pt))
+        # Scope key must be `wrapper` (the object register_operator(...,
+        # scope=...) was actually called with -- registration happens after
+        # `@hw_func` has already wrapped the function, so the name in the
+        # defining scope refers to the wrapper, not `fn`), not the pre-wrap
+        # `fn` this closure captured. Using `fn` here would never match any
+        # scope key, silently disabling this function's own scoped
+        # NEGATE/SR/SL registrations for every nested (non-sim_call) call --
+        # only working by accident when an *outer* sim_call(wrapper, ...)
+        # happened to push the same entries first.
+        saved = _push_scoped_registrations(wrapper)
+        try:
+            if _model_cell[0] is not None:
+                if _sim_regions:
+                    result = _sim_owned_body_call(
+                        wrapper, _call_sim_model,
+                        (_model_cell[0], new_args, new_kwargs, _model_cell[1]),
+                        {},
+                    )
+                else:
+                    result = _call_sim_model(
+                        _model_cell[0], new_args, new_kwargs, _model_cell[1]
+                    )
+            elif sim_body_fn is not None:
+                if _sim_regions:
+                    result = _sim_owned_body_call(
+                        _SIM_ONLY_BODY if _sim_only_body else wrapper,
+                        sim_body_fn,
+                        new_args,
+                        new_kwargs,
+                    )
+                else:
+                    result = sim_body_fn(*new_args, **new_kwargs)
+            else:
+                result = fn(*new_args, **new_kwargs)
+        finally:
+            _pop_scoped_registrations(saved)
+        if (
+            ret_t is not None
+            and isinstance(result, int)  # covers int, SimVal, IntEnum members
+            and _is_scalar_pypeline_int(ret_t)
+        ):
+            result = _sim_cast(result, ret_t)
+        elif ret_t is not None and _is_char_like_array(ret_t):
+            result = _sim_cast_deep(result, ret_t)
+        elif isinstance(result, str) and _is_scalar_pypeline_int(ret_t):
+            raise TypeError(_str_to_scalar_message(result, ret_t))
+        return result
+
+    if SIM_RAW_INTS:
+        # ── Raw-int mode: zero casting, zero SimVal creation ─────────────────
+        # No arg/result casting. Values are plain Python ints throughout.
+        # Decoration-time check means zero per-call overhead for the mode branch.
+        if not has_state:
+
+            @_functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                if not _sim_active:
+                    return fn(*args, **kwargs)
+                if _model_cell[0] is not None:
+                    # Class models key their state by instance path, so this
+                    # otherwise stateless path must maintain the stack. Raw
+                    # mode: model args/results are not cast.
+                    _sim_inst_stack.append(
+                        (fn.__qualname__, _sim_capture_call_loc(_sys._getframe(1)))
+                    )
+                    try:
+                        if _sim_regions:
+                            return _sim_owned_body_call(
+                                wrapper, _call_sim_model, (_model_cell[0], args, kwargs), {}
+                            )
+                        return _call_sim_model(_model_cell[0], args, kwargs, _model_cell[1])
+                    finally:
+                        _sim_inst_stack.pop()
+                # See the matching comment in _run_body: scope key must be
+                # `wrapper`, not the pre-wrap `fn` this closure captured.
+                saved = _push_scoped_registrations(wrapper)
+                try:
+                    if sim_body_fn is None:
+                        return fn(*args, **kwargs)
+                    if _sim_regions:
+                        return _sim_owned_body_call(
+                            _SIM_ONLY_BODY if _sim_only_body else wrapper,
+                            sim_body_fn,
+                            args,
+                            kwargs,
+                        )
+                    return sim_body_fn(*args, **kwargs)
+                finally:
+                    _pop_scoped_registrations(saved)
+        else:
+
+            @_functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                if not _sim_active:
+                    # State-bearing hw_funcs must be called via sim_call() so the
+                    # register state dict is active.  Raising here prevents the
+                    # elaborator's _try_eval_const from accidentally treating a
+                    # Reg[T]=init_val function as a compile-time constant.
+                    raise TypeError(
+                        f"{fn.__qualname__!r} has Reg[T]/Feedback[T] state and "
+                        f"cannot be called outside sim_call()"
+                    )
+                caller_f = _sys._getframe(1)
+                call_loc = (caller_f.f_code.co_filename, caller_f.f_lineno, None, None)
+                _sim_inst_stack.append((fn.__qualname__, call_loc))
+                # See the matching comment in _run_body: scope key must be
+                # `wrapper`, not the pre-wrap `fn` this closure captured.
+                saved = _push_scoped_registrations(wrapper)
+                try:
+                    if _model_cell[0] is not None:
+                        if _sim_regions:
+                            return _sim_owned_body_call(
+                                wrapper, _call_sim_model, (_model_cell[0], args, kwargs), {}
+                            )
+                        return _call_sim_model(_model_cell[0], args, kwargs, _model_cell[1])
+                    if sim_body_fn is None:
+                        return fn(*args, **kwargs)
+                    if _sim_regions:
+                        return _sim_owned_body_call(
+                            _SIM_ONLY_BODY if _sim_only_body else wrapper,
+                            sim_body_fn,
+                            args,
+                            kwargs,
+                        )
+                    return sim_body_fn(*args, **kwargs)
+                finally:
+                    _pop_scoped_registrations(saved)
+                    _sim_inst_stack.pop()
+
+        wrapper._is_hw_func = True
+        wrapper._sim_model_cell = _model_cell
+        wrapper._pypeline_has_state = has_state
+        wrapper._pypeline_factory_args = _factory_args
+        fn._pypeline_factory_args = _factory_args
+        return wrapper
+
+    if not has_state:
+        # ── Fast path: no Reg[T] / Feedback[T] in this function ─────────────
+        # The body owns no persistent instance-keyed state, so a function frame
+        # and _getframe capture are pure overhead. A transformed source loop may
+        # still push its own short-lived iteration frame around its body.
+        # Functions with typed locals but no registers take this path.
+        # Multi-instance register designs should set SIM_TRACE_LOCATIONS=True
+        # to restore full ancestor-path tracking.
+        @_functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not _sim_active:
+                return fn(*args, **kwargs)
+            new_args = list(args)
+            for i, a in enumerate(args):
+                if i < len(params):
+                    new_args[i] = _sim_cast_call_arg(ann.get(params[i]), a)
+            if _model_cell[0] is None:
+                return _run_body(new_args, kwargs)
+            # A model is attached: class models key their state by instance
+            # path, so this otherwise stateless fast path must maintain the
+            # stack (the no-model hot path pays only the is-None check above).
+            _sim_inst_stack.append(
+                (fn.__qualname__, _sim_capture_call_loc(_sys._getframe(1)))
+            )
+            try:
+                return _run_body(new_args, kwargs)
+            finally:
+                _sim_inst_stack.pop()
+    else:
+        # ── Register-aware path (has Reg[T] / Feedback[T]) ───────────────────
+        # Must push to _sim_inst_stack so _sim_current_inst_path() returns a
+        # unique path for each hardware instance.
+        # SIM_TRACE_LOCATIONS=False (default): filename+lineno only (fast).
+        # SIM_TRACE_LOCATIONS=True: also captures column via co_positions() for
+        # designs with multiple hardware instances of the same Reg[T] function.
+        @_functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not _sim_active:
+                # State-bearing hw_funcs must be called via sim_call() so the
+                # register state dict is active.  Raising here prevents the
+                # elaborator's _try_eval_const from accidentally treating a
+                # Reg[T]=init_val function as a compile-time constant.
+                raise TypeError(
+                    f"{fn.__qualname__!r} has Reg[T]/Feedback[T] state and "
+                    f"cannot be called outside sim_call()"
+                )
+            caller_f = _sys._getframe(1)
+            if SIM_TRACE_LOCATIONS:
+                filename = caller_f.f_code.co_filename
+                lineno = caller_f.f_lineno
+                col, end_col = None, None
+                if hasattr(caller_f.f_code, "co_positions"):
+                    lasti = caller_f.f_lasti
+                    instr_idx = lasti // 2
+                    positions = list(caller_f.f_code.co_positions())
+                    if 0 <= instr_idx < len(positions):
+                        pos = positions[instr_idx]
+                        if pos[2] is not None:
+                            col, end_col = pos[2], pos[3]
+                call_loc = (
+                    caller_f.f_code.co_filename,
+                    caller_f.f_lineno,
+                    col,
+                    end_col,
+                )
+            else:
+                call_loc = (caller_f.f_code.co_filename, caller_f.f_lineno, None, None)
+            _sim_inst_stack.append((fn.__qualname__, call_loc))
+            try:
+                new_args = list(args)
+                for i, a in enumerate(args):
+                    if i < len(params):
+                        new_args[i] = _sim_cast_call_arg(ann.get(params[i]), a)
+                return _run_body(new_args, kwargs)
+            finally:
+                _sim_inst_stack.pop()
+
+    wrapper._is_hw_func = True
+    wrapper._sim_model_cell = _model_cell
+    wrapper._pypeline_has_state = has_state
+    wrapper._pypeline_factory_args = _factory_args
+    fn._pypeline_factory_args = _factory_args
+    return wrapper
+
+
+def hw_func(fn=None, *, name=None):
+    """Decorator that marks an inner pypeline hardware function for bit-accurate simulation.
+    Apply to inner function definitions inside make_* factory functions:
+
+        def make_negate(value_t, out_t):
+            @hw_func
+            def negate(a: value_t) -> out_t:
+                ...
+            return negate
+
+    Transparent to the hardware elaborator (inspect.unwrap recovers the original).
+    The original function and its wrapper expose .return_t: the declared return
+    annotation, or None when no return type is declared. This is the complete
+    call result, including feedback fields on functions with interface ports.
+
+    name="..." gives a factory-produced function a name of your choosing
+    instead of the automatic description of its factory arguments:
+
+        def make_quarter_round(a, b, c, d):
+            @hw_func(name=f"quarter_round_{a}_{b}_{c}_{d}")
+            def quarter_round(s: state_t) -> state_t:
+                ...
+
+    The function's logical key becomes "<name>_s<digest>" (the digest of the
+    key it would have had, so specializations stay distinct) and its VHDL
+    entity name starts with the name. Only factory-produced functions take a
+    name: a top-level function's own Python name already is its name.
+    """
+    if fn is None:
+        return lambda f: hw_func(f, name=name)
+    if name is None:
+        return _sim_type_wrap(fn)
+    _check_user_name(name, "@hw_func")
+    if is_hw_func(fn):
+        raise TypeError(
+            f"@hw_func(name={name!r}): {getattr(fn, '__qualname__', fn)!r} is "
+            "already a hardware function; give name= on its own @hw_func"
+        )
+    if ".<locals>." not in getattr(fn, "__qualname__", ""):
+        raise TypeError(
+            f"@hw_func(name={name!r}): {getattr(fn, '__qualname__', fn)!r} is a "
+            "top-level function, whose Python name already is its hardware "
+            "name; name= is for functions a factory produces"
+        )
+    fn._pypeline_user_name = name
+    wrapper = _sim_type_wrap(fn)
+    info = _replace_name_info(fn._pypeline_name_info, user_name=name)
+    fn._pypeline_name_info = wrapper._pypeline_name_info = info
+    wrapper._pypeline_user_name = name
+    return wrapper
+
+
+def hw_arg_types(func):
+    """Returns a hardware function's parameter types, in declaration order, as a tuple.
+
+    For user-facing code that needs to introspect an already-annotated hardware
+    function (e.g. a factory wrapping a caller-supplied function), instead of reaching
+    into func.__annotations__ directly.
+    """
+    fn = _inspect.unwrap(func)
+    return tuple(v for k, v in fn.__annotations__.items() if k != "return")
+
+
+def hw_return_type(func):
+    """Returns a hardware function's declared return type.
+
+    See hw_arg_types — the return-type counterpart for the same introspection use case.
+    """
+    fn = _inspect.unwrap(func)
+    return fn.__annotations__["return"]
+
+
+def is_hw_func(func):
+    """Returns True if func is already @hw_func-decorated (or @MAIN, which implies
+    @hw_func).
+
+    For factories that accept a caller-supplied function (see hw_arg_types/
+    hw_return_type) and need to validate it's been decorated before using it inside
+    their own hardware function body — an undecorated func's own Reg[T]/Feedback[T]
+    and bare struct/array locals won't be simulated correctly otherwise.
+    """
+    return getattr(func, "_is_hw_func", False)
+
+
+def wires(func):
+    """Mark a function as "just wires" (equivalent to PipelineC's
+    `#pragma FUNC_WIRES <func_name>`): pure rewiring/bit-casting logic with no
+    real combinational delay, so the synthesizer skips timing estimation for
+    its whole hierarchy.
+
+    Implies @hw_func: inputs/outputs are type-cast for simulation and the
+    function can be passed to sim_call() directly — no separate @hw_func
+    needed. Stacks with @MAIN in either order.
+    """
+    wrapped = _sim_type_wrap(func)
+    wrapped._is_func_wires_pragma = True
+    return wrapped
+
+
+# No compiler/model import on the ordinary simulation path. The decorator opens
+# this gate; root reachability is checked separately by the lazy preparation code.
+_pipeline_latency_declared = False
+_pipeline_latency_preparing = False
+
+
+def _pipeline_latency_reachable(func):
+    """Inspect live callable dependencies without importing the compiler.
+
+    Only names referenced by the body are followed, so an unused decorated
+    helper in the same module does not change an unrelated root's execution.
+    Closures, module attributes and callable containers cover factory dispatch.
+    """
+    seen = set()
+
+    def visit(value):
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if getattr(value, "_sim_clocked_pipeline_boundary", False):
+            # A library handshake controller already executes once per clock;
+            # its internal fixed pipeline is not a latency of its interface.
+            return False
+        if getattr(value, "_pipeline_latency", 0) > 0:
+            return True
+        if isinstance(value, (AUTO_PIPELINE, AUTO_FSM, AUTO_COMB_AREA_OPT)):
+            return visit(value.func)
+        if isinstance(value, dict):
+            return any(visit(v) for v in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(visit(v) for v in value)
+        if not _inspect.isfunction(value):
+            return False
+        source = _inspect.unwrap(value)
+        # Runtime helpers have no user hardware dependencies. Do not traverse
+        # sim_call/Reg/type constructors into the runtime's global registries.
+        if source.__module__ == __name__:
+            return False
+        names = source.__code__.co_names
+        for name in names:
+            item = source.__globals__.get(name)
+            if _inspect.ismodule(item):
+                if any(visit(vars(item).get(attr)) for attr in names):
+                    return True
+            elif visit(item):
+                return True
+        for cell in source.__closure__ or ():
+            try:
+                if visit(cell.cell_contents):
+                    return True
+            except ValueError:  # empty closure cell
+                pass
+        return False
+
+    return visit(func)
+
+
+def _prepare_pipeline_latency_sim(func):
+    if isinstance(func, AUTO_PIPELINE):
+        func = func.func
+    if (
+        _pipeline_latency_preparing
+        or getattr(func, "_pipeline_latency", None) is not None
+    ):
+        return
+    if not _pipeline_latency_reachable(func):
+        return
+    import PY_TO_LOGIC
+
+    PY_TO_LOGIC.PREPARE_PIPELINE_LATENCY_SIM([func])
+
+
+def pipeline_latency(cycles):
+    """Declare an existing, immutable user pipeline of ``cycles`` clocks.
+
+    Equivalent to PipelineC's FUNC_LATENCY. The body supplies the registers;
+    this decorator supplies timing metadata, not additional registers. Implies
+    @hw_func and stacks with @MAIN in either order. Callers align their other
+    paths with this pipeline, including in standalone native simulation.
+    """
+    if not isinstance(cycles, int) or isinstance(cycles, bool):
+        raise TypeError("pipeline_latency(cycles): cycles must be an int")
+    if cycles < 0:
+        raise ValueError("pipeline_latency(cycles): cycles must be nonnegative")
+
+    def decorate(func):
+        global _pipeline_latency_declared
+        previous = getattr(func, "_pipeline_latency", cycles)
+        if previous != cycles:
+            raise ValueError(
+                f"Conflicting pipeline_latency declarations for "
+                f"{func.__qualname__}: {previous} and {cycles}"
+            )
+        wrapped = _sim_type_wrap(func)
+        wrapped._pipeline_latency = cycles
+        if cycles:
+            _pipeline_latency_declared = True
+        return wrapped
+
+    return decorate
+
+
+def sim_call(func, *args, **kwargs):
+    """Call a pypeline function in simulation mode with scoped operators active.
+
+    Pushes scoped operator registrations keyed on func's id before calling.
+    When @hw_func is applied to the function, scoped ops are registered under
+    id(wrapped_func), so func must be passed as-is (not unwrapped).
+    The @hw_func wrapper itself calls _push_scoped_registrations(original),
+    which is a no-op for the original, so there is no double-push conflict.
+
+    Also activates _sim_active for the duration of the call so that @hw_func
+    wrappers run their sim bodies (Reg[T] handling) rather than falling through
+    to the raw function. The raw-function fallback exists only for the elaborator's
+    _try_eval_const probe, which calls functions directly without sim_call.
+
+    Each top-level (non-reentrant) sim_call() represents one clock cycle for
+    Layer-1 simulation, so @sim_input's once-per-cycle result cache is cleared
+    here on the outermost call only (prev_active is already True on a nested/
+    reentrant sim_call(), so mid-cycle helper calls don't spuriously reset it).
+
+    The outermost call also opens a register-write buffer (the same
+    _sim_reg_begin_buffer/_sim_reg_flush_buffer machinery pypeline_sim.py uses
+    per clock cycle) so the whole call tree commits Reg[T]/@sim_model writes
+    atomically, once, after the call returns -- matching one hardware clock
+    edge. This is what makes a Feedback[T] convergence loop's re-invocations
+    of a stateful child safe: _sim_reg_read always reads the last *committed*
+    value regardless of how many buffered writes have piled up this call, so
+    every convergence pass (including the first) sees the true cycle-start
+    state for every descendant register, not a mix of this-call passes.
+    pypeline_sim.py is unaffected: it sets _sim_active once before its cycle
+    loop and never resets it per-MAIN-call, so prev_active is already True by
+    the time it calls sim_call(main_fn), and this branch is skipped there --
+    pypeline_sim.py's own per-cycle begin/flush bracket already covers it.
+    """
+    global _sim_active
+    prev_active = _sim_active
+    if not prev_active:
+        if _pipeline_latency_declared:
+            _prepare_pipeline_latency_sim(func)
+        _sim_input_cache.clear()
+        _sim_apply_ap_delayed_writes()
+        _sim_reg_begin_buffer()
+    _sim_active = True
+    saved = _push_scoped_registrations(func)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        _pop_scoped_registrations(saved)
+        _sim_active = prev_active
+        if not prev_active:
+            _sim_reg_flush_buffer()

@@ -1,0 +1,4 @@
+Chisel SCORE snapshot (chipsalliance/chisel)
+Commit: 2a75ff94
+Dataset: /home/yongfu/proj/score/datasets/chisel/2a75ff94
+Snapshot files: 18

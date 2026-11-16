@@ -1,0 +1,9881 @@
+#!/usr/bin/env python
+"""
+Throughput sweeps: using the synthesis API (SYN.py) to iterate toward a timing
+goal. This is the machinery common to every temporal AUTO feature -- the
+planned sweep (a static delay model, the "slice landscape", plus synthesis
+feedback attribution), the coarse sweep, the seeded confirm-or-sweep used by
+the `.latency` pin-and-confirm loop, hotspot mini-sweeps, and
+sweep_history.json. Feature-specific feedback lives with its feature:
+AUTO_PIPELINE.py (independent tag regions), AUTO_MULTI_CYCLE.py (cycle counts),
+AUTO_FSM.py (schedule-and-confirm).
+
+Terminology (see docs/SWEEP_DESIGN.md):
+  cut         - a planned register position along a module's combinational
+                delay. Cuts select typed physical placements: an operation's
+                output boundary or a genuine bit-internal leaf split. The
+                number of cuts requested and the pipeline latency that
+                results are related but intentionally NOT the same number.
+  cut subtree - a maximal subtree of the instance hierarchy that can accept
+                added latency: either a sliceable pure-comb function, or a
+                region reached through AUTO_PIPELINE tagged call sites
+                underneath stateful (feedback/state reg) containers.
+  landscape   - the flattened delay axis of one cut subtree, each delay unit
+                tagged legal (a cut resolves to an operation-output boundary
+                or a true bit-splittable raw-leaf site) or illegal (only
+                unsliceable/locked logic here), with weights used for stage
+                budgeting and calibration.
+  floor       - the predicted maximum achievable fmax of a subtree: set by its
+                longest run of illegal (unsliceable) delay. Reported up front,
+                before any synthesis runs.
+
+The refinement loop runs ONE full-design synthesis per iteration and reacts
+using approximate attribution of the critical path (function name fragments in
+register/netlist names - post synthesis names below the top level MAIN are
+mangled differently by every tool, so exact hierarchical matching is
+intentionally never attempted).
+"""
+
+import copy
+import hashlib
+import json
+import bisect
+import math
+import os
+import re
+import sys
+from multiprocessing.pool import ThreadPool
+
+import AUTO_MULTI_CYCLE
+import AUTO_PIPELINE
+import DEVICE_MODELS
+import LOGIC
+import OPEN_TOOLS
+import RAW_VHDL
+import SYN
+import VHDL
+
+# Max full-design synthesis runs in the refinement loop
+# (generous: budgets start at the fewest-stages guess and converge from
+#  below, which takes more, cheaper-to-accept iterations than overshooting)
+MAX_SWEEP_ITERS = 12
+# Calibration clip ranges: how much a single iteration may scale delay weights
+FUNC_SCALE_MIN_STEP = 1.05
+FUNC_SCALE_MAX_STEP = 3.0
+GLOBAL_SCALE_MIN_STEP = 1.05
+GLOBAL_SCALE_MAX_STEP = 2.0
+# Consecutive same-hotspot attributions before an isolated mini sweep.
+#
+# A repeatedly blamed hierarchical helper is stronger evidence than the
+# current top-level geometry: its isolated sweep measures the helper before
+# choosing any lock, while another global densify step can jump over the
+# short, repeatable solution (Wireguard's ten block-step helpers are the
+# motivating case).  Two independent full-design failures are enough to
+# justify that bounded, measured probe.  The mini sweep remains capped and
+# falls back to ordinary densification if it cannot produce an internal cut.
+MINISWEEP_HOTSPOT_STREAK = 2
+MAX_MINISWEEPS = 2
+# Extra single-latency syn runs spent bisecting a mini sweep result down to
+# its proven-minimal latency before locking it
+MINISWEEP_TRIM_PROBES = 3
+# Achieved fmax within this fraction of the predicted floor counts as
+# "at the floor" (can't do better by adding registers)
+FLOOR_TOLERANCE = 0.95
+# Consecutive unmet measured results, flat within noise while the cut count
+# grew, that stop the sweep as a plateau (see AT_PLATEAU)
+PLATEAU_STREAK = 3
+# Pinned confirmation: bounded MCP-count repairs (each is a full synthesis).
+# Counts jump straight to ceil(raw/period), so one or two normally suffice.
+MAX_CONFIRMATION_MCP_REPAIRS = 4
+
+# Coarse sweep: multiplier limit for individual module coarse register insertion
+# (the coarse sweep's give-up point)
+MAX_ALLOWED_LATENCY_MULT = 5.0
+# Plan the pipelining once from the delay model, write it, and stop -- no
+# sweep synthesis iterations verify it meets timing. --no_sweep cmd line flag.
+NO_SWEEP = False
+# How many extra full-design synthesis iterations the throughput sweep may
+# spend reducing pipeline stages after timing is already met (hunting the
+# fewest-registers solution). 0 = accept the first met result (fastest).
+# --pipeline_min_effort cmd line flag.
+PIPELINE_MIN_EFFORT = 2
+
+
+def AT_PREDICTED_FLOOR(curr_mhz, floor, target_mhz, tolerance=FLOOR_TOLERANCE):
+    """True if curr_mhz has plateaued NEAR a predicted floor - a symmetric
+    band, not merely "at or above" it. A curr_mhz far ABOVE a stale or
+    under-predicted floor (seen for real: 124.18 MHz measured against a
+    ~71.6 MHz predicted floor, 73% above it) means the prediction was
+    simply wrong, not that a real ceiling was reached; without the upper
+    bound this mislabeled a real, still-improvable result as a floor
+    plateau and stopped the sweep short of goals it was already exceeding
+    toward. `floor` must additionally sit below `target_mhz` (a floor above
+    the goal is not a reason to stop)."""
+    return (
+        floor is not None
+        and floor < target_mhz
+        and curr_mhz >= tolerance * floor
+        and curr_mhz <= floor / tolerance
+    )
+
+
+def FAILING_PATH_REACHES_SPAN(path_report, blame, plan, parser_state):
+    """Could this measured path run through the blamed unsliceable span?
+
+    The span's containing function must appear in an endpoint or netlist
+    resource name (the substring rule of RANK_PATH_FUNC_CANDIDATES). When
+    that can't discriminate (no names, no container, or the container is
+    the MAIN or a subtree root, which prefix every name), answer True.
+    """
+    marker = LOGIC.SUBMODULE_MARKER
+    inst = getattr(blame, "inst_path", None)
+    if inst is None or marker not in inst:
+        return True
+    container = parser_state.LogicInstLookupTable.get(inst.rsplit(marker, 1)[0])
+    if container is None:
+        return True
+    roots = {plan.main_inst} | set(plan.subtrees)
+    if container.func_name in {parser_state.LogicInstLookupTable[r].func_name for r in roots}:
+        return True
+    names = [n.lower() for n in (path_report.start_reg_name, path_report.end_reg_name) if n]
+    names += [r.lower() for r in getattr(path_report, "netlist_resources", ()) or ()]
+    if not names:
+        return True
+    return any(container.func_name.lower() in n for n in names)
+
+
+def AT_EVIDENCED_HARD_FLOOR(plan, curr_mhz, target_mhz, path_report, parser_state, delays_measured):
+    """Stop at a predicted hard floor only with evidence for it.
+
+    The floor is an estimate (seen for real: a 46.5 MHz WireGuard "hard"
+    ceiling while the same design measured 81.5 MHz). Being near it counts
+    only if the measured failing path can run through the blamed span, or,
+    as for soft floors, once delays are measured and the result repeated.
+    See AT_PREDICTED_FLOOR for the tolerance band.
+    """
+    floor, blame = plan.predicted_hard_floor()
+    if not AT_PREDICTED_FLOOR(curr_mhz, floor, target_mhz):
+        return False
+    if FAILING_PATH_REACHES_SPAN(path_report, blame, plan, parser_state):
+        return True
+    if plan.same_mhz_count >= 1 and delays_measured:
+        return True
+    print(
+        f"[sweep] Near the estimated ~{floor:.1f} MHz ceiling, but the failing path "
+        "does not run through its blamed span; continuing.",
+        flush=True,
+    )
+    return False
+
+
+def AT_PLATEAU(prev_history, curr_mhz, curr_cuts, target_mhz, streak=PLATEAU_STREAK):
+    """True if the last `streak` unmet results (the tail of prev_history
+    plus the current one) are flat within noise - max-min under 1% of the
+    target, the same rule same_mhz_count uses - while the cut count grew
+    from the first of them to the current one: more registers bought
+    nothing. Unlike the floor stops this never consults a prediction, so it
+    still ends a sweep whose soft-floor estimate is simply wrong (seen for
+    real under sky130: a flat 51.42 MHz plateau against a ~37 MHz predicted
+    soft floor, outside AT_PREDICTED_FLOOR's band, swept to the iteration
+    limit with 64 cuts). A result still improving past noise never matches,
+    which keeps the band's protection for under-predicted floors.
+    prev_history holds sweep_history iteration records ("achieved_mhz",
+    "cuts", "met"); the caller passes only records since the last structural
+    reset of the window."""
+    if streak < 2:
+        return False
+    window = list(prev_history[-(streak - 1) :])
+    if len(window) < streak - 1:
+        return False
+    for h in window:
+        if h.get("met") or h.get("achieved_mhz") is None or h.get("cuts") is None:
+            return False
+    mhz = [h["achieved_mhz"] for h in window] + [curr_mhz]
+    if max(mhz) - min(mhz) >= 0.01 * target_mhz:
+        return False
+    return curr_cuts > window[0]["cuts"]
+
+
+def BEST_SNAPSHOT_MET_ALL_GOALS(best_score):
+    """True if best_score - the worst-case achieved/target ratio from
+    whichever iteration best_tpl/best_plan_cuts were captured from (both
+    are only ever updated together, at the same point in the sweep loop) -
+    shows every reported clock group in that snapshot actually met its
+    goal. Used when restoring best_tpl as the final result: without this
+    check, a build could restore a snapshot that measured well above its
+    goal (seen for real: 244.72 MHz against a 147.00 MHz target) and still
+    report TIMING NOT MET, because met_timing was last written by a later,
+    worse iteration (e.g. one a floor-stop landed on afterward) and never
+    re-checked against the snapshot actually being written out."""
+    return best_score is not None and best_score >= 1.0
+# NOTE on trimming: reported slack is NOT used to detect over-pipelining -
+# synthesis tools stop optimizing as soon as slack crosses zero, so a met
+# design shows near-zero slack no matter how over-registered it is. Instead
+# the trim uses cut-count history: bisect between the last known FAILING cut
+# count and the met cut count, or probe below a met count that never had a
+# failing data point (minimality unproven).
+
+
+def WHY_NOT_SLICEABLE(logic, parser_state):
+    # Mirror of LOGIC.Logic.CAN_HAVE_ADDED_LATENCY clause by clause
+
+    if logic.func_name in parser_state.func_fixed_latency:
+        return "fixed_latency"
+    no_added_latency = getattr(parser_state, "func_no_added_latency", {})
+    if logic.func_name in no_added_latency:
+        return no_added_latency[logic.func_name]
+    if logic.vhdl_module_text is not None:
+        return "vhdl_module_text"
+    if logic.is_vhdl_func:
+        return "vhdl_func"
+    if logic.is_vhdl_expr:
+        return "vhdl_expr"
+    if logic.is_clock_crossing:
+        return "clock_crossing"
+    if logic.uses_nonvolatile_state_regs:
+        return "state_regs"
+    if LOGIC.IS_MEM(logic):
+        return "memory"
+    if logic.func_name in parser_state.func_marked_blackbox:
+        return "blackbox"
+    if len(logic.feedback_vars) > 0:
+        return "feedback_vars"
+    return "not_sliceable"
+
+
+# Atomic segment reasons that make only a SOFT floor: a stateful module's
+# measured delay mixes internal reg-to-reg paths (uncuttable) with IO paths
+# that pipeline registers at the module's boundary CAN cut - so its span is
+# not a guaranteed fmax ceiling (the wireguard append_auth_tag case: 31 ns
+# module delay yet the design met 12.5 ns). Hard floors are pure comb spans
+# no register can ever land in (raw VHDL text leaves, comb logic trapped
+# inside a stateful container between its registers). Estimated widths are
+# always soft, regardless of their reason.
+#
+# "mux_packed_bank" (a SPLIT_KIND_MUX_BITS leaf's SLICEABLE_1LL span) is
+# soft for a different reason than the others: it is not stateful, but its
+# floor is only the *unchunked* estimate. CHUNK_SELECTED_MUX_OUTPUT_BANKS
+# beats it at the same cut count (measured 105.95 -> 292.48 MHz on a real
+# 64-bit bank chunked alone, unchanged depth), so it must not stop the
+# sweep the way a genuine comb span does. A plain SPLIT_KIND_1LL span
+# (AND/OR/XOR/NOT/NEGATE/MULT) has no such escape and stays hard.
+SOFT_FLOOR_REASONS = ("state_regs", "feedback_vars", "fixed_latency", "mux_packed_bank")
+
+
+class Segment:
+    """One leaf-most piece of a cut subtree's delay axis."""
+
+    # kind values
+    SLICEABLE = "sliceable"  # raw HDL leaf that can hold added registers anywhere
+    # raw HDL leaf whose own generator only ever places its logic in ONE
+    # stage no matter the latency (RAW_VHDL.SPLIT_KIND_1LL: MUX/AND/OR/XOR/
+    # NOT/NEGATE/MULT). The typed planner exposes its output boundary; its
+    # interior is atomic like a genuinely unsliceable span. The legacy raw
+    # VHDL splitter can still represent input/output boundary slices when
+    # used directly outside this planner. See SliceLandscape.finalize().
+    SLICEABLE_1LL = "sliceable_1ll"
+    ATOMIC = "atomic"  # unsliceable logic, cuts cannot land inside
+    LOCKED = "locked"  # params_are_fixed (ex. mini sweep result), no new cuts
+
+    def __init__(self, inst_path, func_name, start, end, kind, reason=""):
+        self.inst_path = inst_path
+        self.func_name = func_name
+        self.start = start  # float, subtree root zero clk pipeline map units
+        self.end = end  # float, exclusive
+        self.kind = kind
+        self.reason = reason
+        self.hard = reason not in SOFT_FLOOR_REASONS
+        # func names of this segment's ancestors within the subtree (incl. own)
+        # used for approximate attribution and calibration
+        self.ancestor_funcs = set()
+        # SLICEABLE only: RAW_VHDL.GET_LEAF_BIT_WIDTH(sub_logic, ...), or
+        # None if unavailable (uncapped, matching pre-existing behavior).
+        # An N-bit leaf can hold at most N-1 interior registers (N stages) -
+        # SliceLandscape.finalize() uses this to cap how many of this
+        # segment's units are ever marked legal, so PLAN_CUTS can't request
+        # more cuts than GET_BITS_PER_STAGE_DICT can usefully honor without
+        # producing interior zero-bit (bare register, no logic) stages.
+        self.max_legal_units = None
+        # Optional planner-only relative delay (e.g. isolated combinational
+        # component instead of full clk-to-q + logic + setup).  It is
+        # normalized across the landscape before feedback scales are applied,
+        # so the measured frontier total and initial cut-count budget stay
+        # unchanged while relative placement geometry may move.
+        self.planner_scale = 1.0
+        # Exact leaf timing decomposition, when supplied by the active backend.
+        # Kept separate from Logic.delay so DEVICE_MODELS remains untouched.
+        self.delay_components = None
+        self.registered_bits = None
+
+    def __str__(self):
+        return f"[{self.start:.1f},{self.end:.1f}) {self.kind} {self.inst_path.split(LOGIC.SUBMODULE_MARKER)[-1]}({self.reason})"
+
+
+class PipelinePlacement:
+    """One concrete, physically lowerable pipeline-register position.
+
+    The old landscape planner returned only an integer position on a flattened
+    delay axis.  Lowering that position recursively projected a fractional cut
+    through every descendant overlapping the axis position.  That is useful as
+    a fallback representation, but it loses the distinction between two very
+    different pieces of hardware:
+
+      * a register on a combinational operation instance's outputs; and
+      * a genuine internal split in a bit-splittable raw-HDL leaf.
+
+    A PipelinePlacement preserves that distinction all the way through
+    lowering.  ``fixed`` means the placement was supplied by the internal
+    experiment hook and must be retained while the remaining positions are
+    planned; it does *not* freeze the whole instance subtree.
+    """
+
+    INSTANCE_INPUT = "instance_input"
+    INSTANCE_OUTPUT = "instance_output"
+    BIT_INTERNAL = "bit_internal"
+
+    def __init__(
+        self,
+        kind,
+        inst_path,
+        func_name,
+        axis_unit,
+        axis_position,
+        local_slice=None,
+        registered_bits=None,
+        hierarchy_depth=0,
+        span_units=0.0,
+        coherent_boundary=False,
+        ancestor_funcs=None,
+        fixed=False,
+        source="planner",
+        bit_width=None,
+        bit_split_ordinal=None,
+        bit_split_count=None,
+        bit_boundary=None,
+        bit_boundary_mode="equal_width",
+        bit_boundaries=None,
+        leaf_axis_start=None,
+        leaf_axis_end=None,
+        requested_axis_unit=None,
+        requested_axis_position=None,
+        requested_local_slice=None,
+        placement_group_id=None,
+        placement_group_kind=None,
+        placement_group_members=None,
+        placement_group_registered_bits=None,
+        placement_group_axis_unit=None,
+    ):
+        if kind not in (
+            self.INSTANCE_INPUT,
+            self.INSTANCE_OUTPUT,
+            self.BIT_INTERNAL,
+        ):
+            raise ValueError(f"Unknown pipeline placement kind: {kind}")
+        if kind == self.BIT_INTERNAL:
+            required = {
+                "bit_width": bit_width,
+                "bit_split_ordinal": bit_split_ordinal,
+                "bit_split_count": bit_split_count,
+                "bit_boundary": bit_boundary,
+                "leaf_axis_start": leaf_axis_start,
+                "leaf_axis_end": leaf_axis_end,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "Physical BIT_INTERNAL placement requires "
+                    + ", ".join(missing)
+                )
+            bit_width = int(bit_width)
+            bit_split_ordinal = int(bit_split_ordinal)
+            bit_split_count = int(bit_split_count)
+            bit_boundary = int(bit_boundary)
+            if bit_boundary_mode not in ("equal_width", "exact"):
+                raise ValueError(
+                    f"Unknown bit-boundary mode: {bit_boundary_mode}"
+                )
+            if bit_width <= 0 or bit_split_count <= 0:
+                raise ValueError(
+                    f"Invalid physical bit split width/count: "
+                    f"{bit_width}/{bit_split_count}"
+                )
+            if not 1 <= bit_split_ordinal <= bit_split_count:
+                raise ValueError(
+                    f"Invalid physical bit split ordinal "
+                    f"{bit_split_ordinal}/{bit_split_count}"
+                )
+            if bit_boundary_mode == "exact":
+                if bit_boundaries is None:
+                    raise ValueError(
+                        "Exact BIT_INTERNAL placement requires bit_boundaries"
+                    )
+                expected_boundaries = tuple(int(b) for b in bit_boundaries)
+                if (
+                    len(expected_boundaries) != bit_split_count
+                    or expected_boundaries != tuple(sorted(set(expected_boundaries)))
+                    or any(b <= 0 or b >= bit_width for b in expected_boundaries)
+                ):
+                    raise ValueError(
+                        f"Invalid exact bit-boundary group {expected_boundaries} "
+                        f"for {bit_width}-bit leaf"
+                    )
+            else:
+                expected_boundaries = tuple(
+                    RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(
+                        bit_width, bit_split_count
+                    )
+                )
+            expected_boundary = expected_boundaries[bit_split_ordinal - 1]
+            if bit_boundary != expected_boundary:
+                raise ValueError(
+                    f"BIT_INTERNAL boundary {bit_boundary} does not match "
+                    f"{bit_boundary_mode} boundary {expected_boundary} for ordinal "
+                    f"{bit_split_ordinal}/{bit_split_count} of {bit_width} bits"
+                )
+            expected_local_slice = bit_boundary / float(bit_width)
+            if (
+                local_slice is not None
+                and not math.isclose(
+                    float(local_slice), expected_local_slice, rel_tol=0.0, abs_tol=1e-15
+                )
+            ):
+                raise ValueError(
+                    f"BIT_INTERNAL local slice {local_slice} does not match "
+                    f"emitted bit boundary {bit_boundary}/{bit_width}"
+                )
+            local_slice = expected_local_slice
+            leaf_axis_start = float(leaf_axis_start)
+            leaf_axis_end = float(leaf_axis_end)
+            if leaf_axis_end <= leaf_axis_start:
+                raise ValueError(
+                    f"Invalid BIT_INTERNAL leaf axis span "
+                    f"[{leaf_axis_start}, {leaf_axis_end})"
+                )
+            expected_axis_position = leaf_axis_start + local_slice * (
+                leaf_axis_end - leaf_axis_start
+            )
+            expected_axis_unit = int(math.ceil(expected_axis_position)) - 1
+            if not math.isclose(
+                float(axis_position), expected_axis_position, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"BIT_INTERNAL axis position {axis_position} does not match "
+                    f"physical boundary position {expected_axis_position}"
+                )
+            if int(axis_unit) != expected_axis_unit:
+                raise ValueError(
+                    f"BIT_INTERNAL axis unit {axis_unit} does not contain "
+                    f"physical boundary position {expected_axis_position} "
+                    f"(expected unit {expected_axis_unit})"
+                )
+        self.kind = kind
+        self.inst_path = inst_path
+        self.func_name = func_name
+        self.axis_unit = int(axis_unit)
+        self.axis_position = float(axis_position)
+        self.local_slice = (
+            None if local_slice is None else float(local_slice)
+        )
+        self.registered_bits = registered_bits
+        self.hierarchy_depth = int(hierarchy_depth)
+        self.span_units = float(span_units)
+        self.coherent_boundary = bool(coherent_boundary)
+        self.ancestor_funcs = tuple(sorted(ancestor_funcs or ()))
+        self.fixed = bool(fixed)
+        self.source = source
+        self.bit_width = bit_width
+        self.bit_split_ordinal = bit_split_ordinal
+        self.bit_split_count = bit_split_count
+        self.bit_boundary = bit_boundary
+        self.bit_boundary_mode = bit_boundary_mode
+        self.bit_boundaries = (
+            None if bit_boundaries is None else tuple(int(b) for b in bit_boundaries)
+        )
+        self.leaf_axis_start = leaf_axis_start
+        self.leaf_axis_end = leaf_axis_end
+        self.requested_axis_unit = requested_axis_unit
+        self.requested_axis_position = requested_axis_position
+        self.requested_local_slice = requested_local_slice
+        self.placement_group_id = placement_group_id
+        self.placement_group_kind = placement_group_kind
+        self.placement_group_members = (
+            None
+            if placement_group_members is None
+            else tuple(sorted(placement_group_members))
+        )
+        self.placement_group_registered_bits = placement_group_registered_bits
+        self.placement_group_axis_unit = placement_group_axis_unit
+
+    @property
+    def is_physical(self):
+        return True
+
+    @property
+    def bits_per_stage(self):
+        if self.kind != self.BIT_INTERNAL:
+            return None
+        if self.bit_boundary_mode == "exact":
+            previous = 0
+            chunks = []
+            for boundary in self.bit_boundaries + (self.bit_width,):
+                chunks.append(boundary - previous)
+                previous = boundary
+            return tuple(chunks)
+        return tuple(RAW_VHDL.GET_EQUAL_WIDTH_BITS_PER_STAGE_DICT(
+            self.bit_width, self.bit_split_count
+        ).values())
+
+    @property
+    def candidate_id(self):
+        # Instance paths are elaboration-stable.  Use a decimal representation
+        # with enough precision to distinguish every legal local slice while
+        # remaining byte-stable across runs/Python versions.
+        rv = f"{self.kind}:{self.inst_path}"
+        if self.kind == self.BIT_INTERNAL:
+            rv += (
+                f"#{self.bit_split_ordinal}/{self.bit_split_count}"
+                f"@bit{self.bit_boundary}/{self.bit_width}"
+            )
+        elif self.local_slice is not None:
+            rv += f"@{self.local_slice:.15g}"
+        return rv
+
+    def copy_with(self, fixed=None, source=None):
+        rv = copy.copy(self)
+        if fixed is not None:
+            rv.fixed = bool(fixed)
+        if source is not None:
+            rv.source = source
+        return rv
+
+    def to_dict(self):
+        rv = {
+            "candidate_id": self.candidate_id,
+            "kind": self.kind,
+            "placement_role": "physical",
+            "physical": True,
+            "instance_path": self.inst_path,
+            "function": self.func_name,
+            "axis_unit": self.axis_unit,
+            "axis_position": round(self.axis_position, 12),
+            "local_slice": (
+                None if self.local_slice is None else round(self.local_slice, 12)
+            ),
+            "registered_bits": self.registered_bits,
+            "registered_bits_scope": (
+                "leaf_width_proxy"
+                if self.kind == self.BIT_INTERNAL
+                else (
+                    "local_input_bank"
+                    if self.kind == self.INSTANCE_INPUT
+                    else "local_output_bank"
+                )
+            ),
+            "hierarchy_depth": self.hierarchy_depth,
+            "span_units": round(self.span_units, 6),
+            "coherent_boundary": self.coherent_boundary,
+            "ancestor_functions": list(self.ancestor_funcs),
+            "fixed": self.fixed,
+            "source": self.source,
+        }
+        if self.kind == self.BIT_INTERNAL:
+            rv.update(
+                {
+                    "bit_width": self.bit_width,
+                    "bit_boundary": self.bit_boundary,
+                    "bit_boundary_mode": self.bit_boundary_mode,
+                    "bit_boundaries": (
+                        None
+                        if self.bit_boundaries is None
+                        else list(self.bit_boundaries)
+                    ),
+                    "bit_split_ordinal": self.bit_split_ordinal,
+                    "bit_split_count": self.bit_split_count,
+                    "bits_per_stage": list(self.bits_per_stage),
+                    "leaf_axis_start": round(self.leaf_axis_start, 12),
+                    "leaf_axis_end": round(self.leaf_axis_end, 12),
+                    "requested_axis_unit": self.requested_axis_unit,
+                    "requested_axis_position": (
+                        None
+                        if self.requested_axis_position is None
+                        else round(self.requested_axis_position, 12)
+                    ),
+                    "requested_local_slice": (
+                        None
+                        if self.requested_local_slice is None
+                        else round(self.requested_local_slice, 12)
+                    ),
+                }
+            )
+        if self.placement_group_id is not None:
+            rv.update(
+                {
+                    "placement_group_id": self.placement_group_id,
+                    "placement_group_kind": self.placement_group_kind,
+                    "placement_group_members": list(self.placement_group_members),
+                    "placement_group_member_count": len(self.placement_group_members),
+                    "placement_group_registered_bits": self.placement_group_registered_bits,
+                    "placement_group_axis_unit": self.placement_group_axis_unit,
+                }
+            )
+        return rv
+
+    def __repr__(self):
+        return f"PipelinePlacement({self.candidate_id})"
+
+
+class BitPlacementRequest:
+    """A provisional raster site used only while choosing a stage budget.
+
+    A raw bit-splittable leaf does not honor an arbitrary fractional slice:
+    its VHDL generator balances the *final count* of selected splits into
+    equal-width chunks.  Consequently a raster crossing cannot truthfully be
+    called a physical placement until all requests for that leaf are known.
+    PLAN_PIPELINE_PLACEMENTS materializes these requests into ordinal/count-
+    aware :class:`PipelinePlacement` objects before returning to lowering.
+    """
+
+    kind = PipelinePlacement.BIT_INTERNAL
+
+    def __init__(
+        self,
+        inst_path,
+        func_name,
+        axis_unit,
+        axis_position,
+        requested_local_slice,
+        bit_width,
+        leaf_axis_start,
+        leaf_axis_end,
+        registered_bits=None,
+        hierarchy_depth=0,
+        span_units=0.0,
+        coherent_boundary=False,
+        ancestor_funcs=None,
+        fixed=False,
+        source="planner",
+        placement_group_id=None,
+        placement_group_kind=None,
+        placement_group_members=None,
+        placement_group_registered_bits=None,
+        placement_group_axis_unit=None,
+    ):
+        self.inst_path = inst_path
+        self.func_name = func_name
+        self.axis_unit = int(axis_unit)
+        self.axis_position = float(axis_position)
+        self.local_slice = None
+        self.requested_local_slice = float(requested_local_slice)
+        self.bit_width = None if bit_width is None else int(bit_width)
+        self.leaf_axis_start = float(leaf_axis_start)
+        self.leaf_axis_end = float(leaf_axis_end)
+        self.registered_bits = registered_bits
+        self.hierarchy_depth = int(hierarchy_depth)
+        self.span_units = float(span_units)
+        self.coherent_boundary = bool(coherent_boundary)
+        self.ancestor_funcs = tuple(sorted(ancestor_funcs or ()))
+        self.fixed = bool(fixed)
+        self.source = source
+        self.placement_group_id = placement_group_id
+        self.placement_group_kind = placement_group_kind
+        self.placement_group_members = (
+            None
+            if placement_group_members is None
+            else tuple(sorted(placement_group_members))
+        )
+        self.placement_group_registered_bits = placement_group_registered_bits
+        self.placement_group_axis_unit = placement_group_axis_unit
+
+    @property
+    def is_physical(self):
+        return False
+
+    @property
+    def candidate_id(self):
+        return (
+            f"bit_internal_request:{self.inst_path}"
+            f"@{self.requested_local_slice:.15g}"
+        )
+
+    def copy_with(self, fixed=None, source=None):
+        rv = copy.copy(self)
+        if fixed is not None:
+            rv.fixed = bool(fixed)
+        if source is not None:
+            rv.source = source
+        return rv
+
+    def to_dict(self):
+        rv = {
+            "candidate_id": self.candidate_id,
+            "kind": self.kind,
+            "placement_role": "planning_site",
+            "physical": False,
+            "instance_path": self.inst_path,
+            "function": self.func_name,
+            "requested_axis_unit": self.axis_unit,
+            "requested_axis_position": round(self.axis_position, 12),
+            "requested_local_slice": round(self.requested_local_slice, 12),
+            "bit_width": self.bit_width,
+            "registered_bits": self.registered_bits,
+            "registered_bits_scope": "leaf_width_proxy",
+            "hierarchy_depth": self.hierarchy_depth,
+            "span_units": round(self.span_units, 6),
+            "coherent_boundary": self.coherent_boundary,
+            "ancestor_functions": list(self.ancestor_funcs),
+            "fixed": self.fixed,
+            "source": self.source,
+        }
+        if self.placement_group_id is not None:
+            rv.update(
+                {
+                    "placement_group_id": self.placement_group_id,
+                    "placement_group_kind": self.placement_group_kind,
+                    "placement_group_members": list(self.placement_group_members),
+                    "placement_group_member_count": len(self.placement_group_members),
+                    "placement_group_registered_bits": self.placement_group_registered_bits,
+                    "placement_group_axis_unit": self.placement_group_axis_unit,
+                }
+            )
+        return rv
+
+    def __repr__(self):
+        return f"BitPlacementRequest({self.candidate_id})"
+
+
+class SliceLandscape:
+    """Flattened delay axis of one cut subtree with per-unit legality/weight."""
+
+    def __init__(
+        self,
+        subtree_root_inst,
+        total_units,
+        units_to_ns,
+        root_delay_components=None,
+    ):
+        self.subtree_root_inst = subtree_root_inst
+        self.total_units = total_units  # int number of delay units
+        self.units_to_ns = units_to_ns  # ns per (unweighted) delay unit
+        self.root_delay_components = root_delay_components
+        self.uses_combinational_stage_budget = False
+        self.stage_overhead_ns = 0.0
+        self.segments = []
+        # Rasterized per delay unit (filled by finalize()):
+        self.legal = None  # bool per unit: cut here produces >= 1 register
+        self.weight = None  # float per unit: stage budget cost (calibrated)
+        self.blame = None  # Segment or None per unit (atomic cause)
+        self.floor_ns = 0.0  # predicted min stage delay = worst illegal run
+        self.floor_blame = None  # Segment causing the floor
+        # Hard floor: worst illegal run of HARD atomic units only (soft
+        # stateful spans break the run - their boundaries can take registers)
+        self.hard_floor_ns = 0.0
+        self.hard_floor_blame = None
+        # Candidate inventory. Operation outputs are concrete physical
+        # placements. Bit-internal entries are explicitly provisional raster
+        # requests: their physical equal-width boundaries depend on how many
+        # requests ultimately target the same leaf.
+        self.candidates = []
+        self.candidates_by_unit = {}
+
+    def add_candidate(self, placement):
+        if not isinstance(placement, (PipelinePlacement, BitPlacementRequest)):
+            raise TypeError(type(placement))
+        self.candidates.append(placement)
+
+    def _add_segment_candidates(self, seg, lo, hi, bits_cap_units):
+        if hi <= lo or seg.kind in (Segment.ATOMIC, Segment.LOCKED):
+            return
+        depth = seg.inst_path.count(LOGIC.SUBMODULE_MARKER) - (
+            self.subtree_root_inst.count(LOGIC.SUBMODULE_MARKER)
+        )
+        # Every sliceable operation has a deterministic output boundary.
+        # For raw 1LL leaves this is the one useful side of the old two-edge
+        # representation; the other side is normally the preceding
+        # operation's output boundary (or an enclosing function's input).
+        out_u = hi - 1
+        self.add_candidate(
+            PipelinePlacement(
+                PipelinePlacement.INSTANCE_OUTPUT,
+                seg.inst_path,
+                seg.func_name,
+                out_u,
+                out_u + 0.5,
+                registered_bits=seg.registered_bits,
+                hierarchy_depth=max(0, depth),
+                span_units=max(0.0, seg.end - seg.start),
+                coherent_boundary=False,
+                ancestor_funcs=seg.ancestor_funcs,
+            )
+        )
+        if seg.kind != Segment.SLICEABLE:
+            return
+        # Without a resolved leaf width there is no way to name or validate
+        # the equal-width bit boundary RAW VHDL will emit. Keep the concrete
+        # operation-output boundary above, but do not fabricate internal
+        # physical candidates from an arbitrary fractional raster position.
+        if seg.max_legal_units is None:
+            return
+        for u in range(lo, hi):
+            if bits_cap_units is not None and u not in bits_cap_units:
+                continue
+            span = seg.end - seg.start
+            if span <= 0.0:
+                continue
+            local_slice = ((u + 0.5) - seg.start) / span
+            # It must describe logic on both sides.  Rounding at a segment's
+            # raster edge can otherwise produce exactly 0/1, which is a
+            # boundary register rather than a genuine bit-internal cut.
+            local_slice = max(1.0e-12, min(1.0 - 1.0e-12, local_slice))
+            self.add_candidate(
+                BitPlacementRequest(
+                    seg.inst_path,
+                    seg.func_name,
+                    u,
+                    u + 0.5,
+                    requested_local_slice=local_slice,
+                    bit_width=seg.max_legal_units,
+                    leaf_axis_start=seg.start,
+                    leaf_axis_end=seg.end,
+                    registered_bits=seg.max_legal_units,
+                    hierarchy_depth=max(0, depth),
+                    span_units=max(0.0, span),
+                    coherent_boundary=False,
+                    ancestor_funcs=seg.ancestor_funcs,
+                )
+            )
+
+    def finalize(self, func_delay_scale):
+        n = self.total_units
+        component_segments = [
+            seg
+            for seg in self.segments
+            if seg.kind != Segment.LOCKED and seg.end > seg.start
+        ]
+        self.uses_combinational_stage_budget = bool(component_segments) and all(
+            seg.delay_components is not None for seg in component_segments
+        )
+        if self.uses_combinational_stage_budget:
+            overhead_source = self.root_delay_components
+            if overhead_source is None:
+                self.stage_overhead_ns = max(
+                    float(seg.delay_components["launch_clock_to_q_ns"])
+                    + float(seg.delay_components["setup_ns"])
+                    for seg in component_segments
+                )
+            else:
+                self.stage_overhead_ns = (
+                    float(overhead_source["launch_clock_to_q_ns"])
+                    + float(overhead_source["setup_ns"])
+                )
+        self.legal = [False] * n
+        covered = [False] * n
+        locked_only = [True] * n
+        self.blame = [None] * n
+        # Zero while covered segments contribute their relative component
+        # weights.  Starting at 1.0 would clamp every normal comb/full ratio
+        # (<1) back to 1 and make the experiment a no-op.
+        planner_scale = [0.0] * n
+        feedback_scale = [1.0] * n
+        for seg in self.segments:
+            lo = max(0, int(math.floor(seg.start)))
+            hi = min(n, int(math.ceil(seg.end)))
+            # An N-bit SLICEABLE leaf can hold at most N-1 interior
+            # registers (N stages) - more legal positions than that lets
+            # PLAN_CUTS request cuts GET_BITS_PER_STAGE_DICT can only honor
+            # with interior zero-bit (bare register, no logic) stages.
+            # Evenly spread the allowed cap across the segment's own span
+            # (None = uncapped: width unavailable, or no cap needed).
+            bits_cap_units = None
+            if (
+                seg.kind == Segment.SLICEABLE
+                and seg.max_legal_units is not None
+                and seg.max_legal_units - 1 < hi - lo
+            ):
+                # The width cap applies to INTERNAL bit boundaries only:
+                # W input bits permit W-1 nonempty interior splits.  The
+                # operation-output boundary is an additional graph boundary
+                # after all W bits and can separate downstream logic; counting
+                # it against the interior cap incorrectly leaves a two-bit
+                # adder with no legal midpoint at all.
+                cap = max(0, seg.max_legal_units - 1)
+                span = hi - lo
+                bits_cap_units = set()
+                for k in range(1, cap + 1):
+                    u = lo + int(round(k * span / float(cap + 1))) - 1
+                    bits_cap_units.add(max(lo, min(hi - 1, u)))
+            self._add_segment_candidates(seg, lo, hi, bits_cap_units)
+            seg_scale = 1.0
+            for f in seg.ancestor_funcs:
+                if f in func_delay_scale:
+                    seg_scale = max(seg_scale, func_delay_scale[f])
+            for u in range(lo, hi):
+                covered[u] = True
+                if seg.kind != Segment.LOCKED:
+                    locked_only[u] = False
+                if seg.kind == Segment.SLICEABLE:
+                    # Legal positions are finalized from concrete candidates
+                    # below.  Keep only the atomic-floor attribution here.
+                    pass
+                elif seg.kind == Segment.SLICEABLE_1LL:
+                    # The whole operation remains atomic; only its output
+                    # boundary is exposed as a typed position.
+                    if u != hi - 1 and self.blame[u] is None:
+                        self.blame[u] = seg
+                elif seg.kind == Segment.ATOMIC and self.blame[u] is None:
+                    self.blame[u] = seg
+                if self.uses_combinational_stage_budget:
+                    seg_planner_scale = seg.planner_scale
+                elif (
+                    seg.delay_components is None
+                    or SYN.USE_COMBINATIONAL_PLANNER_WEIGHTS
+                ):
+                    # Preserve explicit/test-only relative scales. Real partial
+                    # sidecar coverage remains legacy unless the old opt-in is set.
+                    seg_planner_scale = seg.planner_scale
+                else:
+                    seg_planner_scale = 1.0
+                planner_scale[u] = max(planner_scale[u], seg_planner_scale)
+                feedback_scale[u] = max(feedback_scale[u], seg_scale)
+        # Deduplicate positions added both as hierarchical child boundaries
+        # and leaf-segment boundaries, then make legality derive from what the
+        # typed lowering can actually materialize.
+        by_id = {}
+        for candidate in self.candidates:
+            if 0 <= candidate.axis_unit < n:
+                old = by_id.get(candidate.candidate_id)
+                if old is None or candidate.coherent_boundary:
+                    by_id[candidate.candidate_id] = candidate
+        self.candidates = sorted(
+            by_id.values(), key=lambda p: (p.axis_unit, p.candidate_id)
+        )
+        # A candidate is only a real stage boundary if NOTHING uncuttable
+        # straddles its position. Segments on the axis are not a serial
+        # chain: parallel branches overlap (the divider's UNARY_OP_NOT reads
+        # BIN_OP_MINUS's output and feeds q_out, so it runs alongside the MUX
+        # that feeds remainder, not after it). Registering the NOT's output
+        # therefore lands strictly INSIDE the parallel MUX's atomic span -
+        # the NOT branch gets a register while the MUX path crosses the same
+        # depth uncut, so no pipeline stage is actually created. Left
+        # unchecked this silently inflates the cut count without deepening
+        # the pipeline: the real divider planned 48 cuts and built 32 slices,
+        # 16 of them wasted on NOT outputs. Compare exact positions, not
+        # units - a preceding operation's output boundary rounds into the
+        # same unit as the next segment's start and must stay legal.
+        # (start, end, boundary_unit). A blocker never blocks a candidate
+        # sitting at its OWN end boundary: that candidate is this operation's
+        # output register (its own, or an enclosing function's whose last
+        # child it is), not a cut through its middle. Keyed on the rounded
+        # end unit rather than instance paths so it holds regardless of how
+        # a segment's span rounds onto the raster - a 1LL segment [lo, hi)
+        # places its own output boundary at hi - 0.5, i.e. inside itself.
+        blockers = sorted(
+            (
+                seg.start,
+                seg.end,
+                min(n, int(math.ceil(seg.end))) - 1,
+            )
+            for seg in self.segments
+            if seg.kind in (Segment.ATOMIC, Segment.SLICEABLE_1LL)
+            and seg.end > seg.start
+        )
+        blocker_starts = [s for s, _, _ in blockers]
+        max_end = []
+        running = float("-inf")
+        for _, e, _u in blockers:
+            running = max(running, e)
+            max_end.append(running)
+
+        def _straddled(candidate):
+            position = candidate.axis_position
+            i = bisect.bisect_left(blocker_starts, position)
+            for j in range(i - 1, -1, -1):
+                if max_end[j] <= position:
+                    break  # nothing starting this early reaches past it
+                start, end, boundary_unit = blockers[j]
+                # One raster unit of slack at the near edge. A candidate's
+                # nominal position is its unit + 0.5, while the boundary it
+                # stands for is the segment's exact .end - so an operation
+                # output whose true edge is where this blocker BEGINS can
+                # round to a hair inside it. Without the slack that deletes
+                # a legitimate boundary (both branches start there, so a
+                # register at that depth cuts every path): on the divider it
+                # removed half of the BIN_OP_MINUS outputs and left the
+                # planner nothing to use between whole iterations.
+                if (
+                    start + 1.0 < position < end
+                    and candidate.axis_unit != boundary_unit
+                ):
+                    return True
+            return False
+
+        self.candidates = [c for c in self.candidates if not _straddled(c)]
+        self.candidates_by_unit = {}
+        for candidate in self.candidates:
+            self.candidates_by_unit.setdefault(candidate.axis_unit, []).append(
+                candidate
+            )
+            self.legal[candidate.axis_unit] = True
+        planner_weight = [0.0] * n
+        for u in range(n):
+            if covered[u] and locked_only[u]:
+                # Internally pipelined already - costs no stage budget
+                planner_weight[u] = 0.0
+            else:
+                planner_weight[u] = planner_scale[u] if covered[u] else 1.0
+        # With complete component evidence, stage packing uses the measured
+        # combinational path and reserves launch/setup once per proposed stage.
+        # A measured root supplies the exact combinational frontier total;
+        # otherwise the leaf graph composes it. Incomplete evidence retains
+        # the legacy full register-to-register cost byte-for-byte.
+        old_total = sum(1.0 for w in planner_weight if w > 0.0)
+        planner_total = sum(planner_weight)
+        if self.uses_combinational_stage_budget:
+            root_components = self.root_delay_components
+            if root_components is None:
+                target_total = planner_total
+            else:
+                target_total = (
+                    float(root_components["combinational_delay_ns"])
+                    / self.units_to_ns
+                )
+        else:
+            target_total = old_total
+        planner_norm = (
+            target_total / planner_total if planner_total > 0.0 else 1.0
+        )
+        self.weight = [
+            planner_weight[u] * planner_norm * feedback_scale[u]
+            for u in range(n)
+        ]
+        # Predicted floor = worst weighted run of illegal units
+        # (and the hard-only variant used for the give-up decision)
+        run_w = 0.0
+        run_blame = None
+        best_w = 0.0
+        best_blame = None
+        hard_run_w = 0.0
+        hard_run_blame = None
+        hard_best_w = 0.0
+        hard_best_blame = None
+        for u in range(n):
+            if (not self.legal[u] and self.weight[u] > 0.0
+                    and not getattr(self.blame[u], "adjustable_mcp", False)):
+                run_w += self.weight[u]
+                if self.blame[u] is not None:
+                    run_blame = self.blame[u]
+                if run_w > best_w:
+                    best_w = run_w
+                    best_blame = run_blame
+                if self.blame[u] is not None and self.blame[u].hard:
+                    hard_run_w += self.weight[u]
+                    hard_run_blame = self.blame[u]
+                    if hard_run_w > hard_best_w:
+                        hard_best_w = hard_run_w
+                        hard_best_blame = hard_run_blame
+                else:
+                    hard_run_w = 0.0
+                    hard_run_blame = None
+            else:
+                run_w = 0.0
+                run_blame = None
+                hard_run_w = 0.0
+                hard_run_blame = None
+        self.floor_ns = best_w * self.units_to_ns
+        if best_w > 0.0:
+            self.floor_ns += self.stage_overhead_ns
+        self.floor_blame = best_blame
+        self.hard_floor_ns = hard_best_w * self.units_to_ns
+        if hard_best_w > 0.0:
+            self.hard_floor_ns += self.stage_overhead_ns
+        self.hard_floor_blame = hard_best_blame
+
+    def budget_units_for_period(self, period_ns):
+        combinational_ns = float(period_ns) - self.stage_overhead_ns
+        return max(0.0, combinational_ns) / self.units_to_ns
+
+    def floor_mhz(self):
+        if self.floor_ns <= 0.0:
+            return None
+        return 1000.0 / self.floor_ns
+
+    def hard_floor_mhz(self):
+        if self.hard_floor_ns <= 0.0:
+            return None
+        return 1000.0 / self.hard_floor_ns
+
+
+def BUILD_SLICE_LANDSCAPE(
+    subtree_root_inst, parser_state, TimingParamsLookupTable, func_delay_scale
+):
+    root_logic = parser_state.LogicInstLookupTable[subtree_root_inst]
+    if root_logic.delay is None or root_logic.delay <= 0:
+        return None
+    root_map = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_PIPELINE_MAP(
+        subtree_root_inst, root_logic, parser_state
+    )
+    total_units_f = float(root_map.zero_clk_max_delay)
+    if total_units_f <= 0.0:
+        return None
+    # SLICE_DOWN maps fraction f to offset floor(f*map_total); real time size of
+    # one map unit follows from the root's (possibly measured) delay
+    units_to_ns = (root_logic.delay / SYN.DELAY_UNIT_MULT) / total_units_f
+    landscape = SliceLandscape(
+        subtree_root_inst,
+        int(round(total_units_f)),
+        units_to_ns,
+        root_delay_components=getattr(root_logic, "delay_components", None),
+    )
+
+    def output_register_bits(logic):
+        bits = 0
+        try:
+            for output in logic.outputs:
+                bits += VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(
+                    logic.wire_to_c_type[output], parser_state
+                )
+        except Exception:
+            return None
+        return bits
+
+    def rec(inst, logic, abs_start, unit_scale, ancestor_funcs, absorbing, blocker):
+        pm = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_PIPELINE_MAP(inst, logic, parser_state)
+        for sub_inst_local in pm.zero_clk_submodule_start_offset:
+            start_off = pm.zero_clk_submodule_start_offset[sub_inst_local]
+            sub_func = logic.submodule_instances[sub_inst_local]
+            sub_logic = parser_state.FuncLogicLookupTable[sub_func]
+            if sub_logic.delay is None or sub_logic.delay <= 0:
+                continue
+            child_inst = inst + LOGIC.SUBMODULE_MARKER + sub_inst_local
+            s = abs_start + unit_scale * start_off
+            e = s + unit_scale * sub_logic.delay
+            child_ancestors = ancestor_funcs | {sub_logic.func_name}
+
+            child_timing_params = TimingParamsLookupTable[child_inst]
+            # Traversal toward a deeper tag does not authorize registers in
+            # this child's own logic. Only a direct tag resets the context.
+            child_can = sub_logic.CAN_HAVE_ADDED_LATENCY(parser_state)
+            tagged = sub_inst_local in getattr(
+                logic, "sub_inst_to_auto_pipeline_latency", {}
+            )
+            child_absorbing = child_can and (tagged or absorbing)
+            child_blocker = (
+                None if child_absorbing else child_inst if not child_can else blocker
+            )
+            descend_ok = logic.SUB_HAS_AUTO_PIPELINE_IN_HIER(
+                sub_inst_local, parser_state
+            ) or (absorbing and child_can)
+
+            # A child output is a concrete legal stage boundary in its own
+            # right.  Record this before deciding whether the child is a raw
+            # leaf or a hierarchy to recurse through: helper-function
+            # boundaries (one whole divider step, for example) are exactly
+            # what disappeared when the old fractional cut was recursively
+            # pushed into all of the helper's descendants.  Flat user code is
+            # covered too because each elaborated operator is itself a child.
+            if (
+                child_absorbing
+                and not child_timing_params.params_are_fixed
+                and len(sub_logic.outputs) > 0
+            ):
+                axis_u = min(
+                    landscape.total_units - 1,
+                    max(0, int(math.ceil(e)) - 1),
+                )
+                depth = child_inst.count(LOGIC.SUBMODULE_MARKER) - (
+                    subtree_root_inst.count(LOGIC.SUBMODULE_MARKER)
+                )
+                landscape.add_candidate(
+                    PipelinePlacement(
+                        PipelinePlacement.INSTANCE_OUTPUT,
+                        child_inst,
+                        sub_logic.func_name,
+                        axis_u,
+                        axis_u + 0.5,
+                        registered_bits=output_register_bits(sub_logic),
+                        hierarchy_depth=max(0, depth),
+                        span_units=max(0.0, e - s),
+                        coherent_boundary=len(sub_logic.submodule_instances) > 0,
+                        ancestor_funcs=child_ancestors,
+                    )
+                )
+
+            seg = None
+            if child_timing_params.params_are_fixed:
+                seg = Segment(child_inst, sub_logic.func_name, s, e, Segment.LOCKED)
+            elif not descend_ok:
+                # Child may itself be sliceable comb but blocked by its
+                # stateful container (which can't absorb the added latency)
+                if child_can:
+                    reason, _ = AUTO_PIPELINE.DESCRIBE_ADDED_LATENCY_BLOCKER(
+                        child_inst, child_blocker, parser_state
+                    )
+                else:
+                    reason = WHY_NOT_SLICEABLE(sub_logic, parser_state)
+                seg = Segment(
+                    child_inst,
+                    sub_logic.func_name,
+                    s,
+                    e,
+                    Segment.ATOMIC,
+                    reason,
+                )
+            elif len(sub_logic.submodule_instances) == 0:
+                # Raw HDL leaf
+                if child_absorbing:
+                    split_kind = RAW_VHDL.GET_LEAF_SPLIT_KIND(sub_logic)
+                    seg_kind = (
+                        Segment.SLICEABLE_1LL
+                        if split_kind
+                        in (
+                            RAW_VHDL.SPLIT_KIND_1LL,
+                            RAW_VHDL.SPLIT_KIND_MUX_BITS,
+                        )
+                        else Segment.SLICEABLE
+                    )
+                    # A real reason string, not "" -- PRINT_FLOOR_REPORT and
+                    # SOFT_FLOOR_REASONS both key off this. A packed MUX
+                    # bank's floor is beatable by chunking (see
+                    # CHUNK_SELECTED_MUX_OUTPUT_BANKS); a genuine 1LL span
+                    # is not.
+                    seg_reason = (
+                        "mux_packed_bank"
+                        if split_kind == RAW_VHDL.SPLIT_KIND_MUX_BITS
+                        else "1ll_atomic"
+                        if seg_kind == Segment.SLICEABLE_1LL
+                        else ""
+                    )
+                    seg = Segment(
+                        child_inst, sub_logic.func_name, s, e, seg_kind, seg_reason
+                    )
+                    if seg_kind == Segment.SLICEABLE:
+                        seg.max_legal_units = RAW_VHDL.GET_LEAF_BIT_WIDTH(
+                            sub_logic, parser_state
+                        )
+                else:
+                    seg = Segment(
+                        child_inst,
+                        sub_logic.func_name,
+                        s,
+                        e,
+                        Segment.ATOMIC,
+                        AUTO_PIPELINE.DESCRIBE_ADDED_LATENCY_BLOCKER(
+                            child_inst, child_blocker, parser_state
+                        )[0],
+                    )
+            elif sub_logic.vhdl_module_text is not None:
+                seg = Segment(
+                    child_inst,
+                    sub_logic.func_name,
+                    s,
+                    e,
+                    Segment.ATOMIC,
+                    "vhdl_module_text",
+                )
+            else:
+                # Hierarchical - recurse with rescale into child map coordinates
+                child_map = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_PIPELINE_MAP(
+                    child_inst, sub_logic, parser_state
+                )
+                child_total = float(child_map.zero_clk_max_delay)
+                if child_total <= 0.0:
+                    continue
+                rec(
+                    child_inst,
+                    sub_logic,
+                    s,
+                    unit_scale * sub_logic.delay / child_total,
+                    child_ancestors,
+                    child_absorbing,
+                    child_blocker,
+                )
+                continue
+            # An estimated atomic width guides placement, but cannot prove a
+            # hard timing floor (including comb helpers in blocked callers).
+            if sub_logic.delay_is_estimated:
+                seg.hard = False
+            # A scalar delay for a stateful MCP wrapper mixes cycle-normalized
+            # data paths with single-cycle control. It cannot bound stage Fmax.
+            seg.adjustable_mcp = any(getattr(parser_state.FuncLogicLookupTable[name], "auto_multi_cycle_tuples", None)
+                                     for name in SUBTREE_FUNCTIONS(child_inst, parser_state))
+            seg.ancestor_funcs = child_ancestors
+            seg.registered_bits = output_register_bits(sub_logic)
+            components = getattr(sub_logic, "delay_components", None)
+            if (
+                components is not None
+                and sub_logic.delay is not None
+                and sub_logic.delay > 0
+            ):
+                full_delay_ns = sub_logic.delay / float(SYN.DELAY_UNIT_MULT)
+                combinational_ns = float(components["combinational_delay_ns"])
+                seg.delay_components = dict(components)
+                seg.planner_scale = combinational_ns / full_delay_ns
+            landscape.segments.append(seg)
+
+    root_blocker = AUTO_PIPELINE.ADDED_LATENCY_BLOCKER(subtree_root_inst, parser_state)
+    rec(
+        subtree_root_inst,
+        root_logic,
+        0.0,
+        1.0,
+        {root_logic.func_name},
+        root_blocker is None,
+        root_blocker,
+    )
+    landscape.finalize(func_delay_scale)
+    return landscape
+
+
+def _RUN_BOUNDARY_UNITS(landscape):
+    """Unit positions marking 'just before the next wide SLICEABLE ("bits")
+    leaf begins' - i.e. one unit before each SLICEABLE segment's own start.
+    Deliberately NOT derived by walking landscape.segments in list order:
+    that list is appended in a structural/recursive traversal order, not
+    sorted by position, and real designs have PARALLEL branches (e.g. one
+    divider loop iteration's NOT and MUX both read MINUS's output directly
+    and don't depend on each other, so their segments overlap on the axis
+    instead of following one another) - "the next segment in the list"
+    is not reliably "the next thing at this position". Anchoring on
+    SLICEABLE segment START positions instead sidesteps that entirely: it
+    doesn't matter how many small (SLICEABLE_1LL/ATOMIC/LOCKED) segments,
+    serial or parallel/overlapping, occupy the gap before the next wide
+    leaf - only where that next wide leaf itself begins. The very end of
+    the landscape also always qualifies (nothing further to skip)."""
+    n = landscape.total_units
+    starts = sorted(
+        seg.start for seg in landscape.segments if seg.kind == Segment.SLICEABLE
+    )
+    units = set()
+    for s in starts:
+        # ceil(s) - 1, not floor(s) - 1: a segment's own legal boundary
+        # unit (finalize()'s "hi - 1") is built from ceil(that segment's
+        # OWN .end), and a directly-adjacent preceding segment's .end
+        # equals this SLICEABLE segment's .start - so matching finalize()'s
+        # own rounding (ceil, not floor) here is what makes the two line
+        # up bit-for-bit instead of landing one unit apart.
+        b = min(int(math.ceil(s)) - 1, n - 1)
+        while b >= 0 and not landscape.legal[b]:
+            b -= 1
+        if b >= 0:
+            units.add(b)
+    # A coherent hierarchical operation output is an even stronger physical
+    # boundary than the leaf-run heuristic above: it registers the helper as
+    # a unit instead of projecting a diagonal fractional cut through all of
+    # its descendants.  This is what makes repeated one-step helpers and
+    # ordinary flat operation chains use the same typed mechanism.
+    coherent_outputs = [
+        p
+        for p in landscape.candidates
+        if p.kind == PipelinePlacement.INSTANCE_OUTPUT and p.coherent_boundary
+    ]
+    for p in coherent_outputs:
+        units.add(p.axis_unit)
+    if coherent_outputs:
+        # Also retain direct sibling operations immediately before/after each
+        # coherent helper region (setup/result muxes are a common shape).
+        # Grouping by the helper's PARENT instance is important: an outer
+        # wrapper is often shallower than both the repeated helpers and their
+        # setup op.  Comparing everything with one global minimum hierarchy
+        # depth would then hide precisely that setup boundary.  Do not admit
+        # primitive boundaries *inside* a coherent helper; those would
+        # reintroduce the diagonal/mid-helper choices this representation is
+        # designed to avoid.
+        outputs = [
+            p
+            for p in landscape.candidates
+            if p.kind == PipelinePlacement.INSTANCE_OUTPUT
+        ]
+        marker = LOGIC.SUBMODULE_MARKER
+
+        def parent_inst(placement):
+            return placement.inst_path.rsplit(marker, 1)[0]
+
+        coherent_spans_by_parent = {}
+        for p in coherent_outputs:
+            coherent_spans_by_parent.setdefault(parent_inst(p), []).append(
+                (p.axis_position - p.span_units, p.axis_position)
+            )
+        for p in outputs:
+            coherent_spans = coherent_spans_by_parent.get(parent_inst(p))
+            if coherent_spans is None:
+                continue
+            inside_helper = any(lo < p.axis_position <= hi for lo, hi in coherent_spans)
+            if not inside_helper:
+                units.add(p.axis_unit)
+    # A completely flat function has no hierarchical helper boundary.  Its
+    # shallowest operation outputs are the coherent boundaries available.
+    else:
+        outputs = [
+            p
+            for p in landscape.candidates
+            if p.kind == PipelinePlacement.INSTANCE_OUTPUT
+        ]
+        if outputs:
+            shallowest = min(p.hierarchy_depth for p in outputs)
+            units.update(p.axis_unit for p in outputs if p.hierarchy_depth == shallowest)
+    if n - 1 >= 0 and landscape.legal[n - 1]:
+        units.add(n - 1)
+    return sorted(units)
+
+
+def _OP_OUTPUT_UNITS(landscape):
+    """Units carrying a real operation-output boundary (an INSTANCE_OUTPUT
+    candidate) as opposed to only a provisional bit-internal raster site.
+
+    The distinction is physical, not cosmetic. A BitPlacementRequest is later
+    snapped by MATERIALIZE_BIT_PLACEMENT_REQUESTS to an EQUAL-WIDTH bit
+    boundary of its leaf, so a request landing one delay unit past an
+    operation's edge does not become a register on that edge - it becomes a
+    split through the MIDDLE of the next operation. See PLAN_CUTS pass 3.
+    """
+    return {
+        unit
+        for unit, candidates in landscape.candidates_by_unit.items()
+        if any(
+            getattr(c, "kind", None) == PipelinePlacement.INSTANCE_OUTPUT
+            for c in candidates
+        )
+    }
+
+
+def _GREEDY_CUTS(landscape, budget, required_units, op_output_units=None):
+    """Pass 1 of PLAN_CUTS: the FEWEST cuts that keep every stage within
+    ``budget``.
+
+    Walk the delay axis and cut at the FURTHEST legal unit whose stage still
+    fits the budget; overshoot only when no legal unit fits at all (a genuine
+    atomic run - that stage sets the floor, exactly as before). This is the
+    classic exchange-argument greedy and is optimal for the cut COUNT:
+    starting a stage later can never make the remainder easier, so there is
+    nothing to gain from cutting earlier than necessary and no lookahead is
+    needed.
+    """
+    n = landscape.total_units
+    legal = landscape.legal
+    weight = landscape.weight
+    cuts = []
+    start = 0
+    while start < n:
+        acc = 0.0
+        best = None
+        best_op_output = None
+        u = start
+        while u < n:
+            acc += weight[u]
+            if u in required_units:
+                # A fixed physical placement ends the stage regardless of
+                # whether the budget has filled yet.
+                best = u
+                best_op_output = u
+                break
+            if legal[u]:
+                if acc <= budget:
+                    best = u  # fits - remember it and keep looking further
+                    if op_output_units is not None and u in op_output_units:
+                        best_op_output = u
+                elif best is None:
+                    best = u  # nothing fits: forced overshoot (the floor)
+                    break
+                else:
+                    break
+            elif acc > budget and best is not None:
+                break
+            u += 1
+        chosen = best if best_op_output is None else best_op_output
+        if chosen is None:
+            break  # no legal position remains anywhere ahead
+        cuts.append(chosen)
+        start = chosen + 1
+    return cuts
+
+
+def PLAN_CUTS(landscape, budget_units, required_units=None):
+    """Place cuts along the landscape, in three passes.
+
+    Pass 1 (``_GREEDY_CUTS``) finds the fewest cuts K that keep every stage
+    within the budget. Pass 2 then binary-searches the SMALLEST budget W that
+    still needs only K cuts, and returns pass 1's plan at W - "use no more
+    registers than the goal requires, then make the stages as tight as that
+    number of registers allows, for free". Cut count is monotone
+    non-increasing in W, so the predicate is monotone and the search is valid;
+    ``hi`` only moves down when the predicate holds, so the returned plan
+    always satisfies it.
+
+    Pass 3 prefers an operation-output position when doing so preserves both
+    the tightened budget and cut count.
+
+    Pass 2 is not polish, it is what makes pass 1 safe to use. Pass 1 alone
+    minimizes the cut COUNT but not the worst stage AT that count, and the
+    difference is real hardware: on the radix-2 divider at a 7.4 ns budget the
+    furthest fitting position sits ~0.23 ns PAST the iteration boundary (a
+    legal bit-internal site 2 bits into a 34-bit subtractor), so pass 1 alone
+    would keep the same 32 cuts but place them as ragged mid-operation
+    register banks instead of on the clean MUX boundary. Pass 2 recovers the
+    boundary by itself, with no notion of "boundary" in it.
+
+    This replaced a walk that cut when the budget filled and then, via a
+    ``PLAN_CUTS_BOUNDARY_SNAP_FRAC`` tolerance, allowed itself to accumulate
+    up to 0.85 of an EXTRA budget in order to reach a ``_RUN_BOUNDARY_UNITS``
+    position. That tolerance existed for a real reason - without any snap, a
+    low cut count left a SLICEABLE_1LL segment (a MUX between two repeated
+    loop iterations) with no cut near it and merged one iteration's tail, the
+    MUX, and the next iteration's head into a single ~11 ns stage. But being
+    a fraction of the budget, it scaled with the budget, and in the regime
+    where the budget is SMALLER than one repeated unit it did the opposite of
+    its job: on that divider a 4.7 ns budget (214 MHz) snapped forward to the
+    7.119 ns iteration boundary - a 51% overrun - and reported 33 cuts where
+    64 were needed. Every target from 167 to 250 MHz produced the identical
+    33-cut plan. The rule here cannot do that: a stage is never allowed to
+    exceed the budget when a legal position inside it would have fit, so the
+    ~11 ns merge is forbidden outright rather than by tolerance, and the
+    budget genuinely maps onto a cut count again.
+    """
+    n = landscape.total_units
+    if n <= 0:
+        return []
+    required_units = set(required_units or ())
+    for u in required_units:
+        if u < 0 or u >= n or not landscape.legal[u]:
+            raise ValueError(
+                f"Required cut unit {u} is not a legal typed placement in "
+                f"{landscape.subtree_root_inst}"
+            )
+    if budget_units == math.inf:
+        # A zero-density trim probes no optional registers, including before
+        # an atomic tail. Explicit placements remain part of the contract.
+        return sorted(required_units)
+    budget = max(budget_units, 0.5)
+
+    cuts = _GREEDY_CUTS(landscape, budget, required_units)
+    if len(cuts) > 0:
+        # Pass 2: tighten the budget as far as it goes at no extra cost in
+        # cuts. 50 bisections resolves W far finer than one delay unit.
+        target_count = len(cuts)
+        lo = 0.0
+        hi = budget
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            if mid <= lo or mid >= hi:
+                break
+            tightened = _GREEDY_CUTS(landscape, mid, required_units)
+            if len(tightened) <= target_count:
+                hi = mid
+                cuts = tightened
+            else:
+                lo = mid
+        # Pass 3: among positions that fit the TIGHTENED budget, prefer a
+        # real operation-output boundary over a provisional bit-internal
+        # raster site. Both can be equally good on the worst-stage metric
+        # while being completely different hardware: on the divider at a
+        # 7.4 ns goal, pass 2's furthest-fitting choice sat ONE delay unit
+        # past each MUX boundary, and a bit-internal request there does not
+        # become a register on the MUX edge - MATERIALIZE_BIT_PLACEMENT_
+        # REQUESTS snaps it to the equal-width MIDDLE of the following
+        # 34-bit subtractor instead. Guarded by the cut count so it can
+        # never trade registers for tidiness: an op boundary is taken only
+        # when preferring them costs no extra cuts, which is what keeps the
+        # intermediate plans (the whole point of the first two passes) from
+        # collapsing back onto operation boundaries.
+        preferred = _GREEDY_CUTS(
+            landscape,
+            hi,
+            required_units,
+            op_output_units=_OP_OUTPUT_UNITS(landscape),
+        )
+        if 0 < len(preferred) <= target_count:
+            cuts = preferred
+
+    # Drop a trailing cut that leaves a nearly empty final stage
+    if (
+        len(cuts) > 0
+        and cuts[-1] >= n - 1
+        and cuts[-1] not in required_units
+    ):
+        cuts = cuts[:-1]
+    return cuts
+
+
+def _PLACEMENT_RANK_KEY(placement):
+    """Deterministic tie-break among physical candidates at one axis point.
+
+    PLAN_CUTS has already minimized predicted worst-stage delay by choosing
+    the axis unit.  At that unit prefer a coherent/high-level operation
+    boundary before consulting the *local* output width.  Local width is not
+    the materialized register cost: a one-bit leaf boundary can force a huge
+    bank of alignment registers in its parent, while one helper-output bank
+    keeps all of those values coherent.  Until the graph-wide live-bit cost is
+    available, treating local width as the primary score recreates exactly
+    that pathology.  It remains a useful tie-break among equally coherent
+    candidates; unknown widths sort last.
+    """
+    bits = placement.registered_bits
+    if bits is None:
+        bits = float("inf")
+    return (
+        0 if placement.coherent_boundary else 1,
+        placement.hierarchy_depth,
+        -placement.span_units,
+        bits,
+        0 if placement.kind == PipelinePlacement.INSTANCE_OUTPUT else 1,
+        placement.candidate_id,
+    )
+
+
+def _IS_INST_ANCESTOR(ancestor, descendant):
+    """True when ``ancestor`` is a strict instance-path ancestor."""
+    marker = LOGIC.SUBMODULE_MARKER
+    return descendant.startswith(ancestor + marker)
+
+
+def _PARALLEL_BIT_FRONTIER(candidates, axis_unit):
+    """Return one synchronized bit-cut group for a parallel timing frontier.
+
+    A delay-axis unit is one *logical* stage boundary, but multiple independent
+    operations can cross it.  Choosing only one such operation is not a cut of
+    the graph frontier: the unsliced peers retain the old critical path.  Group
+    every genuine bit-internal request that strictly crosses the unit center
+    when all members' one-cut physical boundaries materialize in that same
+    unit.  Serial operations cannot both strictly cross one point, so this is
+    an antichain without requiring design- or operator-specific knowledge.
+
+    A coherent instance-output boundary that contains every member already
+    cuts the complete frontier with one register bank and remains preferable.
+    """
+    frontier = axis_unit + 0.5
+    requests_by_inst = {}
+    for candidate in candidates:
+        if not isinstance(candidate, BitPlacementRequest):
+            continue
+        if not (
+            candidate.leaf_axis_start < frontier < candidate.leaf_axis_end
+        ):
+            continue
+        requests_by_inst.setdefault(candidate.inst_path, candidate)
+    requests = sorted(requests_by_inst.values(), key=lambda p: p.candidate_id)
+    if len(requests) < 2:
+        return None
+
+    # Defensive antichain check. Leaves normally make this automatic, but keep
+    # it explicit so future candidate kinds cannot silently turn one logical
+    # frontier into multiple serial stages.
+    paths = [request.inst_path for request in requests]
+    for index, left in enumerate(paths):
+        for right in paths[index + 1:]:
+            if _IS_INST_ANCESTOR(left, right) or _IS_INST_ANCESTOR(right, left):
+                return None
+
+    physical_units = set()
+    for request in requests:
+        if request.bit_width is None or request.bit_width < 2:
+            return None
+        boundary = RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(
+            request.bit_width, 1
+        )[0]
+        local_slice = boundary / float(request.bit_width)
+        position = request.leaf_axis_start + local_slice * (
+            request.leaf_axis_end - request.leaf_axis_start
+        )
+        physical_units.add(int(math.ceil(position)) - 1)
+    # The raster site is only a request.  Equal-width lowering can move every
+    # member to another unit (for example, a provisional crossing can round
+    # into the unit before the leaf's exact equal-width midpoint). That
+    # movement is safe when the whole frontier
+    # moves together to one physical unit; requiring it to remain in the
+    # provisional unit silently reduced the frontier to one arbitrary leaf.
+    #
+    # This check (and placement_group_axis_unit below) assume each leaf
+    # collects exactly one request -- the only count known at formation time.
+    # A leaf that goes on to collect more than one (this group's own sibling
+    # group, e.g.) moves ALL of its requests together to a different but
+    # still common equal-width boundary once MATERIALIZE_BIT_PLACEMENT_
+    # REQUESTS sees the real count. That later, better-informed move is
+    # legitimate; SUMMARIZE_PLACEMENT_GROUPS records it (moved_from_planned)
+    # but does not require the realized unit to match this one-cut guess.
+    if len(physical_units) != 1:
+        return None
+    physical_axis_unit = next(iter(physical_units))
+
+    # Do not replace a cheaper coherent boundary that encloses the whole
+    # frontier. A branch-local helper boundary encloses only some members and
+    # therefore cannot stand in for this synchronized cut.
+    for candidate in candidates:
+        if not (
+            isinstance(candidate, PipelinePlacement)
+            and candidate.kind == PipelinePlacement.INSTANCE_OUTPUT
+            and candidate.coherent_boundary
+        ):
+            continue
+        if all(
+            candidate.inst_path == request.inst_path
+            or _IS_INST_ANCESTOR(candidate.inst_path, request.inst_path)
+            for request in requests
+        ):
+            return None
+
+    member_ids = tuple(request.candidate_id for request in requests)
+    digest = hashlib.sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:16]
+    group_id = f"parallel_bit_frontier:{physical_axis_unit}:{digest}"
+    registered_bits = sum(
+        request.bit_width
+        if request.registered_bits is None
+        else request.registered_bits
+        for request in requests
+    )
+    selected = []
+    for request in requests:
+        grouped = request.copy_with(source="parallel_bit_frontier")
+        grouped.placement_group_id = group_id
+        grouped.placement_group_kind = "parallel_bit_frontier"
+        grouped.placement_group_members = member_ids
+        grouped.placement_group_registered_bits = registered_bits
+        grouped.placement_group_axis_unit = physical_axis_unit
+        selected.append(grouped)
+    return selected
+
+def _PARALLEL_OUTPUT_FRONTIER(candidates, axis_unit, landscape):
+    """Return synchronized raw-operation outputs for one graph frontier.
+
+    Multiple parallel gates may end in the same delay-axis unit. Registering
+    only one leaves a reconvergent sibling combinational, so it is not a graph
+    cut. Group the largest set whose real segment intervals overlap strictly;
+    strict overlap excludes serial operations merely quantized into one unit.
+    A coherent ancestor output that covers the set remains the cheaper choice.
+    """
+    segments_by_inst = {
+        seg.inst_path: seg
+        for seg in landscape.segments
+        if seg.end > seg.start
+    }
+    outputs = {
+        candidate.inst_path: candidate
+        for candidate in candidates
+        if (
+            isinstance(candidate, PipelinePlacement)
+            and candidate.kind == PipelinePlacement.INSTANCE_OUTPUT
+            and candidate.inst_path in segments_by_inst
+        )
+    }
+    if len(outputs) < 2:
+        return None
+
+    groups = []
+    for end in sorted(
+        {segments_by_inst[inst].end for inst in outputs}
+    ):
+        probe = end - max(1.0e-12, abs(end) * 1.0e-12)
+        group = [
+            outputs[inst]
+            for inst in sorted(outputs)
+            if (
+                segments_by_inst[inst].start < probe
+                and probe < segments_by_inst[inst].end
+                and int(math.ceil(segments_by_inst[inst].end)) - 1 == axis_unit
+            )
+        ]
+        if len(group) >= 2:
+            groups.append(group)
+    if not groups:
+        return None
+
+    def group_rank(group):
+        known_bits = sum(
+            candidate.registered_bits or 0 for candidate in group
+        )
+        return (-len(group), known_bits, tuple(p.candidate_id for p in group))
+
+    selected = min(groups, key=group_rank)
+    for candidate in candidates:
+        if not (
+            isinstance(candidate, PipelinePlacement)
+            and candidate.kind == PipelinePlacement.INSTANCE_OUTPUT
+            and candidate.coherent_boundary
+        ):
+            continue
+        if all(
+            candidate.inst_path == member.inst_path
+            or _IS_INST_ANCESTOR(candidate.inst_path, member.inst_path)
+            for member in selected
+        ):
+            return [candidate]
+
+    member_ids = tuple(member.candidate_id for member in selected)
+    digest = hashlib.sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:16]
+    group_id = f"parallel_output_frontier:{axis_unit}:{digest}"
+    registered_bits = None
+    if all(member.registered_bits is not None for member in selected):
+        registered_bits = sum(member.registered_bits for member in selected)
+    grouped_outputs = []
+    for member in selected:
+        grouped = member.copy_with(source="parallel_output_frontier")
+        grouped.placement_group_id = group_id
+        grouped.placement_group_kind = "parallel_output_frontier"
+        grouped.placement_group_members = member_ids
+        grouped.placement_group_registered_bits = registered_bits
+        grouped.placement_group_axis_unit = axis_unit
+        grouped_outputs.append(grouped)
+    return grouped_outputs
+
+
+def MATERIALIZE_BIT_PLACEMENT_REQUESTS(
+    placements, landscape, exact_requested=False
+):
+    """Convert provisional bit raster sites to emitted equal-width boundaries.
+
+    RAW VHDL chooses bit chunks from the final number of slices in a leaf, not
+    from the fractional values stored in ``TimingParams``. Grouping first is
+    therefore essential: for K selected sites on a W-bit leaf, the only
+    truthful physical placements are ordinals 1..K of the K+1 equal-width
+    chunks. The requested raster coordinates remain diagnostic metadata.
+    """
+    physical = []
+    requests_by_inst = {}
+    for placement in placements:
+        if isinstance(placement, BitPlacementRequest):
+            requests_by_inst.setdefault(placement.inst_path, []).append(placement)
+        elif isinstance(placement, PipelinePlacement):
+            physical.append(placement)
+        else:
+            raise TypeError(type(placement))
+
+    for inst_path in sorted(requests_by_inst):
+        requests = sorted(
+            requests_by_inst[inst_path],
+            key=lambda p: (p.axis_position, p.candidate_id),
+        )
+        unique = []
+        seen_ids = set()
+        for request in requests:
+            if request.candidate_id not in seen_ids:
+                unique.append(request)
+                seen_ids.add(request.candidate_id)
+        requests = unique
+        count = len(requests)
+        widths = {request.bit_width for request in requests}
+        if None in widths or len(widths) != 1:
+            raise ValueError(
+                f"Cannot materialize bit placements for {inst_path}: "
+                f"inconsistent/unresolved widths {sorted(str(w) for w in widths)}"
+            )
+        width = widths.pop()
+        if count >= width:
+            raise ValueError(
+                f"Cannot materialize {count} internal bit placements in "
+                f"{width}-bit leaf {inst_path}; at least one bit of logic is "
+                "required in every emitted chunk"
+            )
+        starts = {request.leaf_axis_start for request in requests}
+        ends = {request.leaf_axis_end for request in requests}
+        if len(starts) != 1 or len(ends) != 1:
+            raise ValueError(
+                f"Cannot materialize bit placements for {inst_path}: "
+                "requests disagree on the leaf's delay-axis span"
+            )
+        leaf_start = starts.pop()
+        leaf_end = ends.pop()
+        if exact_requested:
+            # Honor the planner's requested physical coordinates.  Clamp in
+            # sorted order so every chunk retains at least one bit even when
+            # two nearby raster requests round to the same integer boundary.
+            boundaries = []
+            for index, request in enumerate(requests):
+                remaining = count - index - 1
+                boundary = int(round(request.requested_local_slice * width))
+                minimum = 1 if not boundaries else boundaries[-1] + 1
+                maximum = width - remaining - 1
+                boundaries.append(max(minimum, min(maximum, boundary)))
+            boundary_mode = "exact"
+        else:
+            boundaries = RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(width, count)
+            boundary_mode = "equal_width"
+        boundary_group = tuple(boundaries)
+        for ordinal, (request, boundary) in enumerate(
+            zip(requests, boundaries), start=1
+        ):
+            local_slice = boundary / float(width)
+            axis_position = leaf_start + local_slice * (leaf_end - leaf_start)
+            axis_unit = int(math.ceil(axis_position)) - 1
+            if not 0 <= axis_unit < landscape.total_units:
+                raise ValueError(
+                    f"Physical bit boundary for {inst_path} fell outside "
+                    f"landscape: unit {axis_unit} of {landscape.total_units}"
+                )
+            physical.append(
+                PipelinePlacement(
+                    PipelinePlacement.BIT_INTERNAL,
+                    request.inst_path,
+                    request.func_name,
+                    axis_unit,
+                    axis_position,
+                    local_slice=local_slice,
+                    registered_bits=(
+                        width
+                        if request.registered_bits is None
+                        else request.registered_bits
+                    ),
+                    hierarchy_depth=request.hierarchy_depth,
+                    span_units=request.span_units,
+                    coherent_boundary=request.coherent_boundary,
+                    ancestor_funcs=request.ancestor_funcs,
+                    fixed=request.fixed,
+                    source=request.source,
+                    bit_width=width,
+                    bit_split_ordinal=ordinal,
+                    bit_split_count=count,
+                    bit_boundary=boundary,
+                    bit_boundary_mode=boundary_mode,
+                    bit_boundaries=(
+                        boundary_group if exact_requested else None
+                    ),
+                    leaf_axis_start=leaf_start,
+                    leaf_axis_end=leaf_end,
+                    requested_axis_unit=request.axis_unit,
+                    requested_axis_position=request.axis_position,
+                    requested_local_slice=request.requested_local_slice,
+                    placement_group_id=request.placement_group_id,
+                    placement_group_kind=request.placement_group_kind,
+                    placement_group_members=request.placement_group_members,
+                    placement_group_registered_bits=(
+                        request.placement_group_registered_bits
+                    ),
+                    placement_group_axis_unit=request.placement_group_axis_unit,
+                )
+            )
+    return sorted(physical, key=lambda p: (p.axis_position, p.candidate_id))
+
+
+def _LANDSCAPE_WITH_EQUAL_WIDTH_BIT_SITES(landscape, counts_by_inst):
+    """Landscape view whose bit sites are the boundaries RAW VHDL will emit.
+
+    The planner's raster bit sites are provisional fictions: a leaf with K
+    selected cuts emits ordinals 1..K of K+1 EQUAL-WIDTH chunks, wherever the
+    requests actually were. So a plan costed on raster positions can be a
+    different pipeline once lowered - on the divider a 50-cut plan costed at
+    5.20ns had 20 of its 31 bit cuts relocated (unit 142 -> 161, ~1.9ns) and
+    realized 7.20ns, blowing the budget it was chosen to meet. Every
+    intermediate depth between "one cut per loop iteration" and "two" died
+    that way, which is why the fmax goal could only reach 32 or 64 cuts.
+
+    Given how many cuts the previous round put in each leaf, this rebuilds
+    that leaf's sites AT the equal-width boundaries for that count, so the
+    next round plans against positions that survive lowering unchanged.
+    Leaves the caller iterates to a fixed point; two or three rounds is
+    plenty because the count per leaf is almost always 1 or 2.
+    """
+    view = copy.copy(landscape)
+    kept = []
+    for candidate in landscape.candidates:
+        if not isinstance(candidate, BitPlacementRequest):
+            kept.append(candidate)
+    for inst_path, count in sorted(counts_by_inst.items()):
+        template = next(
+            (
+                c
+                for c in landscape.candidates
+                if isinstance(c, BitPlacementRequest)
+                and c.inst_path == inst_path
+            ),
+            None,
+        )
+        if template is None or count <= 0 or count >= template.bit_width:
+            continue
+        span = template.leaf_axis_end - template.leaf_axis_start
+        if span <= 0.0:
+            continue
+        for boundary in RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(
+            template.bit_width, count
+        ):
+            local_slice = boundary / float(template.bit_width)
+            position = template.leaf_axis_start + local_slice * span
+            unit = int(math.ceil(position)) - 1
+            if not 0 <= unit < landscape.total_units:
+                continue
+            kept.append(
+                BitPlacementRequest(
+                    template.inst_path,
+                    template.func_name,
+                    unit,
+                    position,
+                    requested_local_slice=local_slice,
+                    bit_width=template.bit_width,
+                    leaf_axis_start=template.leaf_axis_start,
+                    leaf_axis_end=template.leaf_axis_end,
+                    registered_bits=template.registered_bits,
+                    hierarchy_depth=template.hierarchy_depth,
+                    span_units=template.span_units,
+                    coherent_boundary=template.coherent_boundary,
+                    ancestor_funcs=template.ancestor_funcs,
+                )
+            )
+    view.candidates = sorted(
+        {c.candidate_id: c for c in kept}.values(),
+        key=lambda c: (c.axis_unit, c.candidate_id),
+    )
+    view.legal = [False] * landscape.total_units
+    view.candidates_by_unit = {}
+    for candidate in view.candidates:
+        view.candidates_by_unit.setdefault(candidate.axis_unit, []).append(
+            candidate
+        )
+        view.legal[candidate.axis_unit] = True
+    return view
+
+
+def _PLAN_RANK(cuts, landscape, budget_ns):
+    """Sort key for choosing between two lowered plans. Lower is better.
+
+    Meeting the goal is the whole point of a budget, so a plan that meets it
+    is never beaten by one that is merely faster: among plans that meet it,
+    the fewest cuts wins (registers are cost, and the extra speed was not
+    asked for). Only when NOTHING meets the budget - the goal sits below the
+    design's floor - does raw speed decide, and cut count breaks that tie.
+
+    Ranking on worst stage first instead is what collapsed the divider's
+    entire 32..64 cut range onto 64: a 48-cut plan meeting a 190 MHz goal at
+    5.19ns kept losing to a 64-cut plan at 3.85ns.
+    """
+    worst = PREDICTED_STAGE_NS(cuts, landscape)
+    meets = worst <= budget_ns + 1e-9
+    if meets:
+        return (0, len(cuts), worst)
+    return (1, worst, len(cuts))
+
+
+def _LANDSCAPE_WITHOUT_BIT_SITES(landscape):
+    """Shallow view of ``landscape`` offering only real operation-output
+    boundaries - no provisional bit-internal raster sites.
+
+    Used to sanity-check a bit-splitting plan against the simpler plan that
+    uses only physical operation boundaries. See PLAN_PIPELINE_PLACEMENTS.
+    """
+    view = copy.copy(landscape)
+    view.candidates = [
+        c
+        for c in landscape.candidates
+        if getattr(c, "kind", None) == PipelinePlacement.INSTANCE_OUTPUT
+    ]
+    view.legal = [False] * landscape.total_units
+    view.candidates_by_unit = {}
+    for candidate in view.candidates:
+        view.candidates_by_unit.setdefault(candidate.axis_unit, []).append(
+            candidate
+        )
+        view.legal[candidate.axis_unit] = True
+    return view
+
+
+def PLAN_PIPELINE_PLACEMENTS(landscape, budget_units, fixed_placements=None):
+    """Plan concrete physical placements while retaining PLAN_CUTS's budget.
+
+    ``fixed_placements`` is used only by the internal experiment hook.  Their
+    axis units become required stage boundaries; the budget walk fills any
+    remaining long intervals with normal typed candidates.  Multiple fixed
+    placements at one unit are all retained (the axis has one logical cut,
+    while the graph may need more than one physical register bank there).
+
+    Returns ``(cuts, placements)``.  Keeping cuts explicit preserves the
+    existing prediction/history machinery while callers lower placements.
+    """
+    fixed_placements = list(fixed_placements or ())
+    fixed_by_unit = {}
+    for placement in fixed_placements:
+        candidates = {
+            p.candidate_id: p
+            for p in landscape.candidates_by_unit.get(placement.axis_unit, ())
+        }
+        if placement.candidate_id not in candidates:
+            raise ValueError(
+                f"Fixed pipeline placement is not legal in this landscape: "
+                f"{placement.candidate_id}"
+            )
+        fixed_by_unit.setdefault(placement.axis_unit, []).append(placement)
+
+    def _lower_at(view, budget, exact_requested=False):
+        cuts = PLAN_CUTS(
+            view,
+            budget,
+            required_units=set(fixed_by_unit),
+        )
+        placements = []
+        used_ids = set()
+        for unit in cuts:
+            if unit in fixed_by_unit:
+                selected = sorted(
+                    fixed_by_unit[unit], key=lambda p: p.candidate_id
+                )
+            else:
+                candidates = [
+                    p
+                    for p in view.candidates_by_unit.get(unit, ())
+                    if p.candidate_id not in used_ids
+                ]
+                if not candidates:
+                    raise RuntimeError(
+                        f"PLAN_CUTS chose legal unit {unit} in "
+                        f"{view.subtree_root_inst}, but no typed physical "
+                        "candidate exists there"
+                    )
+                selected = None
+                if not exact_requested:
+                    selected = _PARALLEL_OUTPUT_FRONTIER(
+                        candidates, unit, view
+                    )
+                    if selected is None:
+                        selected = _PARALLEL_BIT_FRONTIER(candidates, unit)
+                if selected is None:
+                    selected = [min(candidates, key=_PLACEMENT_RANK_KEY)]
+            for placement in selected:
+                if placement.candidate_id in used_ids:
+                    continue
+                used_ids.add(placement.candidate_id)
+                placements.append(placement)
+        placements = MATERIALIZE_BIT_PLACEMENT_REQUESTS(
+            placements, view, exact_requested=exact_requested
+        )
+        # Bit boundaries can move from their provisional raster crossing to
+        # the actual equal-width bit boundary. Return/report the physical
+        # axis units, never the nominal request units PLAN_CUTS used to
+        # choose the count.
+        cuts = sorted(set(placement.axis_unit for placement in placements))
+        return cuts, placements
+
+    def _lower(view):
+        return _lower_at(view, budget_units)
+
+    if os.environ.get("PIPELINEC_INTERNAL_EXACT_REQUESTED_BITS") == "1":
+        return _lower_at(
+            landscape, budget_units, exact_requested=True
+        )
+
+    cuts, placements = _lower(landscape)
+
+    # Judge the plan on where its registers ACTUALLY land, not where they
+    # were requested. MATERIALIZE_BIT_PLACEMENT_REQUESTS emits EQUAL-WIDTH
+    # bit boundaries chosen from how many requests hit a leaf, so a lone
+    # request anywhere in a 34-bit operation becomes a split at bit 17 - the
+    # real divider asked for cuts at 3.9%, 11.8% and 51.3% of its subtractors
+    # and got the midpoint for all three. The stage structure the planner
+    # costed then does not exist, and the extra registers can buy nothing: at
+    # a 190 MHz goal that produced 48 cuts whose realized worst stage was
+    # 7.00ns - identical to the 32-cut boundary-only plan, for 16 more
+    # register banks. So also lower the plan that uses only real operation
+    # boundaries (whose positions cannot move) and keep whichever is better
+    # once realized. Bit splitting is kept whenever it genuinely pays, and
+    # dropped when it only looked like it would on the raster.
+    #
+    # "Better" is ranked by _PLAN_RANK: MEET THE BUDGET FIRST, then use the
+    # fewest cuts. Ranking on worst stage first (an earlier version of this)
+    # is wrong and silently destroys every intermediate pipeline depth: on
+    # the divider a 190 MHz goal has a real 48-cut plan at 5.19ns (cut at
+    # MINUS's output, the next MINUS's midpoint, then that MUX's output - 3
+    # cuts per 2 iterations), which comfortably meets the goal, but the
+    # boundary-only plan realizes 3.85ns with 64 cuts and won on "lower worst
+    # stage" - 33% more registers to beat a target that was already met. That
+    # collapsed the whole 32..64 range onto 64 and left the fmax goal unable
+    # to ask for anything in between.
+    budget_ns = (
+        budget_units * landscape.units_to_ns + landscape.stage_overhead_ns
+    )
+
+    def _consider(candidate_cuts, candidate_placements):
+        nonlocal cuts, placements
+        if len(candidate_cuts) == 0:
+            return False
+        if _PLAN_RANK(candidate_cuts, landscape, budget_ns) < _PLAN_RANK(
+            cuts, landscape, budget_ns
+        ):
+            cuts, placements = candidate_cuts, candidate_placements
+            return True
+        return False
+
+    # Round 2+: re-plan against the equal-width boundaries this plan's own
+    # per-leaf cut counts imply, so the positions survive lowering unchanged
+    # instead of being relocated out from under the budget that chose them.
+    # Iterated to a fixed point (the per-leaf count is almost always 1 or 2,
+    # so this settles immediately); every round is ranked, so a round can
+    # only ever replace the incumbent with a strictly better plan.
+    seen_counts = []
+    for _ in range(3):
+        counts_by_inst = {}
+        for placement in placements:
+            if getattr(placement, "kind", None) == PipelinePlacement.BIT_INTERNAL:
+                counts_by_inst[placement.inst_path] = (
+                    counts_by_inst.get(placement.inst_path, 0) + 1
+                )
+        if not counts_by_inst or counts_by_inst in seen_counts:
+            break
+        seen_counts.append(dict(counts_by_inst))
+        _consider(
+            *_lower(
+                _LANDSCAPE_WITH_EQUAL_WIDTH_BIT_SITES(landscape, counts_by_inst)
+            )
+        )
+
+    # A restriction derived from one plan only explores that plan's own
+    # family, which leaves the result depending on where the first raster
+    # plan happened to land - two nearby goals could pick different families
+    # and the LOOSER goal end up with MORE registers (92 MHz took 26 cuts
+    # where 96 MHz's 23-cut plan met it too). The families that matter are
+    # few and structural ("split every wide leaf once", "twice"), so probe
+    # them directly and let the rank decide.
+    bit_insts = {
+        c.inst_path
+        for c in landscape.candidates
+        if isinstance(c, BitPlacementRequest)
+    }
+    if bit_insts:
+        for uniform_count in (1, 2):
+            _consider(
+                *_lower(
+                    _LANDSCAPE_WITH_EQUAL_WIDTH_BIT_SITES(
+                        landscape,
+                        {inst: uniform_count for inst in bit_insts},
+                    )
+                )
+            )
+
+    if any(
+        getattr(p, "kind", None) == PipelinePlacement.BIT_INTERNAL
+        for p in placements
+    ):
+        _consider(*_lower(_LANDSCAPE_WITHOUT_BIT_SITES(landscape)))
+
+    # Finally, never keep a register the plan did not earn. PLAN_CUTS'
+    # pass 2 makes the stages as tight as a given cut COUNT allows; this is
+    # its mirror, on realized positions: re-plan at the worst stage actually
+    # achieved and keep the result if it reaches the same speed with fewer
+    # cuts. The budget the caller asked for can be unreachable (the goal sits
+    # below the design's floor), and then a tighter budget only buys extra
+    # register banks that shorten nothing - the reported bug's 33rd cut,
+    # which measured the identical 169.57 MHz the 32-cut plan already had.
+    for _ in range(4):
+        realized = PREDICTED_STAGE_NS(cuts, landscape)
+        if realized <= 0.0 or len(cuts) == 0:
+            break
+        # Epsilon: the relaxed budget is reconstructed by dividing a ns
+        # value back into units, so the very stage weight it came from can
+        # land a few ULPs above it and be rejected as not fitting.
+        relaxed_cuts, relaxed_placements = _lower_at(
+            landscape,
+            (
+                max(0.0, realized - landscape.stage_overhead_ns)
+                / landscape.units_to_ns
+            )
+            + 1e-6,
+        )
+        if len(relaxed_cuts) == 0:
+            break
+        if _PLAN_RANK(relaxed_cuts, landscape, budget_ns) < _PLAN_RANK(
+            cuts, landscape, budget_ns
+        ):
+            cuts, placements = relaxed_cuts, relaxed_placements
+        else:
+            break
+    return cuts, placements
+
+
+def _IS_CHUNKABLE_MUX_OUTPUT(placement, parser_state):
+    if not isinstance(placement, PipelinePlacement):
+        return False
+    if placement.kind != PipelinePlacement.INSTANCE_OUTPUT:
+        return False
+    logic = parser_state.LogicInstLookupTable.get(placement.inst_path)
+    return (
+        logic is not None
+        and len(logic.submodule_instances) == 0
+        and RAW_VHDL.GET_LEAF_SPLIT_KIND(logic) == RAW_VHDL.SPLIT_KIND_MUX_BITS
+    )
+
+
+def _LOWER_CHUNKED_MUX_TARGETS(targets, placements, landscape, parser_state):
+    """Shared lowering for both chunking paths below: replace each targeted
+    packed-MUX INSTANCE_OUTPUT placement with its same-depth bit-chunk
+    BIT_INTERNAL placement -- same latency contribution, half the select
+    fanout, but note the reported axis position moves to the leaf's own
+    geometric midpoint (a same-depth chunk is a physically different
+    lowering than the leaf's plain output boundary, not a cosmetic
+    relabeling of the same one). Returns (cuts, placements) or None if
+    nothing changed or a target's own geometry can't be resolved
+    (source="planner" callers
+    then keep what they already had).
+
+    A synchronized placement group (see _PARALLEL_OUTPUT_FRONTIER /
+    _PARALLEL_BIT_FRONTIER) must be materialized or removed atomically
+    (docs/VHDL_DESIGN.md). Chunking only some of a group's members would
+    leave the rest at their old, unchunked geometry while the group identity
+    still claims they form one synchronized frontier -- so a target is
+    dropped whenever a placement_group sibling of it (present in
+    ``placements``) is not also a target, e.g. a wide MUX output grouped
+    with a narrower one that does not itself clear the chunking width gate.
+    """
+    targets = dict(targets)
+    group_members = {}
+    for p in placements:
+        if p.placement_group_id is not None:
+            group_members.setdefault(p.placement_group_id, set()).add(
+                p.inst_path
+            )
+    target_paths = set(targets)
+    for member_paths in group_members.values():
+        if member_paths & target_paths and not member_paths <= target_paths:
+            for inst_path in member_paths:
+                targets.pop(inst_path, None)
+    if not targets:
+        return None
+    segments = {segment.inst_path: segment for segment in landscape.segments}
+    refined = [
+        p
+        for p in placements
+        if not (_IS_CHUNKABLE_MUX_OUTPUT(p, parser_state) and p.inst_path in targets)
+    ]
+    for inst_path, output in sorted(
+        targets.items(), key=lambda item: item[1].axis_position
+    ):
+        logic = parser_state.LogicInstLookupTable[inst_path]
+        width = RAW_VHDL.GET_LEAF_BIT_WIDTH(logic, parser_state)
+        segment = segments.get(inst_path)
+        if width is None or width < 2 or segment is None:
+            return None
+        boundary = int(round(width / 2.0))
+        local_slice = boundary / float(width)
+        axis_position = segment.start + local_slice * (
+            segment.end - segment.start
+        )
+        refined.append(
+            PipelinePlacement(
+                PipelinePlacement.BIT_INTERNAL,
+                inst_path,
+                logic.func_name,
+                int(math.ceil(axis_position)) - 1,
+                axis_position,
+                local_slice=local_slice,
+                registered_bits=width,
+                hierarchy_depth=output.hierarchy_depth,
+                span_units=output.span_units,
+                coherent_boundary=False,
+                ancestor_funcs=output.ancestor_funcs,
+                fixed=False,
+                source="same_depth_mux_refinement",
+                bit_width=width,
+                bit_split_ordinal=1,
+                bit_split_count=1,
+                bit_boundary=boundary,
+                bit_boundary_mode="exact",
+                bit_boundaries=(boundary,),
+                leaf_axis_start=segment.start,
+                leaf_axis_end=segment.end,
+                placement_group_id=output.placement_group_id,
+                placement_group_kind=output.placement_group_kind,
+                placement_group_members=output.placement_group_members,
+                placement_group_registered_bits=(
+                    output.placement_group_registered_bits
+                ),
+                placement_group_axis_unit=output.placement_group_axis_unit,
+            )
+        )
+    refined.sort(key=lambda p: (p.axis_position, p.candidate_id))
+    old_ids = tuple(p.candidate_id for p in placements)
+    new_ids = tuple(p.candidate_id for p in refined)
+    if new_ids == old_ids:
+        return None
+    return sorted(set(p.axis_unit for p in refined)), refined
+
+
+# Minimum packed-MUX output-bank width chunked by default at plan-build
+# time (see CHUNK_SELECTED_MUX_OUTPUT_BANKS). The measured select-fanout
+# cliff is on 64-bit banks (a real chacha20 decrypt path's funnel-shift
+# muxes, soft_shift_rot's 64-bit concat mux -- both 105.95 -> 292.48 MHz
+# chunked, unchanged cut count); narrow banks have far less fanout to shed
+# and should not be churned for no measured benefit -- wireguard's own MUX
+# candidates are all 8-bit. See the mux select-fanout cliff in docs/SWEEP_DESIGN.md.
+DEFAULT_MUX_CHUNK_MIN_WIDTH = 32
+
+
+def CHUNK_SELECTED_MUX_OUTPUT_BANKS(placements, landscape, parser_state):
+    """(i) alone: chunk every already-selected packed-MUX INSTANCE_OUTPUT
+    placement of width >= DEFAULT_MUX_CHUNK_MIN_WIDTH into its same-depth
+    bit-chunk lowering -- same cut count, same latency, strictly lower
+    select fanout, so this is safe as the ordinary lowering applied when a
+    plan is built (including under --no_sweep, which never reaches
+    BUILD_CHUNKED_MUX_REFINEMENT's measured-failure escalation below).
+
+    Returns ``placements`` itself (the same object) when nothing qualifies,
+    so callers can cheaply test whether anything changed with ``is``.
+    """
+
+    def _is_target(p):
+        if not _IS_CHUNKABLE_MUX_OUTPUT(p, parser_state):
+            return False
+        logic = parser_state.LogicInstLookupTable[p.inst_path]
+        width = RAW_VHDL.GET_LEAF_BIT_WIDTH(logic, parser_state)
+        return width is not None and width >= DEFAULT_MUX_CHUNK_MIN_WIDTH
+
+    targets = {p.inst_path: p for p in placements if _is_target(p)}
+    if not targets:
+        return placements
+    result = _LOWER_CHUNKED_MUX_TARGETS(targets, placements, landscape, parser_state)
+    if result is None:
+        return placements
+    _cuts, refined = result
+    return refined
+
+
+def BUILD_CHUNKED_MUX_REFINEMENT(placements, landscape, parser_state):
+    """(ii): also split the terminal packed MUX when it was the deliberately
+    unregistered tail of the plan; this costs one additional slice and
+    prevents the output-only tail from retaining the old full fanout.
+
+    (i) (already-selected wide banks) is applied unconditionally when the
+    plan is built now -- see CHUNK_SELECTED_MUX_OUTPUT_BANKS -- so by the
+    time this measured-failure escalation runs, most selected banks have
+    typically already been chunked; this only adds the terminal one (plus
+    any selected bank narrower than DEFAULT_MUX_CHUNK_MIN_WIDTH the default
+    pass skipped). Nothing here recognizes a design or function name beyond
+    the generic raw-HDL MUX split kind.
+    """
+    placements = list(placements)
+    selected_mux_outputs = [
+        p for p in placements if _IS_CHUNKABLE_MUX_OUTPUT(p, parser_state)
+    ]
+    mux_candidates = [
+        p for p in landscape.candidates if _IS_CHUNKABLE_MUX_OUTPUT(p, parser_state)
+    ]
+    if not selected_mux_outputs or not mux_candidates:
+        return None
+    targets = {p.inst_path: p for p in selected_mux_outputs}
+    terminal = max(
+        mux_candidates, key=lambda p: (p.axis_position, p.candidate_id)
+    )
+    targets.setdefault(terminal.inst_path, terminal)
+    return _LOWER_CHUNKED_MUX_TARGETS(targets, placements, landscape, parser_state)
+
+
+def PIPELINE_PLACEMENT_FINGERPRINT(placements_by_subtree, locks=None):
+    """Return a deterministic identity for one realized physical schedule.
+
+    Mini-sweep boundary banks are physical registers too.  They must be in
+    the identity or a ``--continue``/in-process dedupe can mistake an
+    output-only serial schedule for the historical both-I/O schedule.
+    """
+    fields = []
+    for subtree_root, placements in sorted(placements_by_subtree.items()):
+        fields.append(subtree_root)
+        fields.extend(
+            placement.candidate_id
+            for placement in sorted(
+                placements,
+                key=lambda placement: (
+                    placement.axis_position,
+                    placement.candidate_id,
+                ),
+            )
+        )
+    if locks:
+        fields.append("--mini-sweep-locks--")
+        for inst_path, lock in sorted(locks.items()):
+            fields.append(inst_path)
+            fields.append(
+                json.dumps(lock.to_dict(), sort_keys=True, separators=(",", ":"))
+            )
+    return hashlib.sha256("\n".join(fields).encode("utf-8")).hexdigest()
+
+
+# Intentionally not a command-line/source interface.  The opt-in QoR harness
+# uses this hook to pin known physical placements for controlled A/B builds.
+INTERNAL_PLACEMENT_FILE_ENV = "PIPELINEC_INTERNAL_PLACEMENT_FILE"
+INTERNAL_PLACEMENT_SCHEMA_VERSION = 1
+
+
+def LOAD_INTERNAL_PLACEMENT_CONFIG(environ=None):
+    environ = os.environ if environ is None else environ
+    path = environ.get(INTERNAL_PLACEMENT_FILE_ENV)
+    if not path:
+        return None
+    with open(path, "r") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"{INTERNAL_PLACEMENT_FILE_ENV} JSON must be an object")
+    version = config.get("version")
+    if version != INTERNAL_PLACEMENT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported internal placement schema version {version}; "
+            f"expected {INTERNAL_PLACEMENT_SCHEMA_VERSION}"
+        )
+    mode = config.get("mode", "seed")
+    if mode not in ("seed", "replace"):
+        raise ValueError(f"Internal placement mode must be seed or replace: {mode}")
+    selectors = config.get("selectors", [])
+    exact = config.get("placements", [])
+    exact_bit_groups = config.get("exact_bit_boundaries", [])
+    if (
+        not isinstance(selectors, list)
+        or not isinstance(exact, list)
+        or not isinstance(exact_bit_groups, list)
+    ):
+        raise ValueError("Internal placement selectors/placements must be lists")
+    # Exact candidate IDs use the same resolver and therefore get identical
+    # unmatched/ambiguous checking.
+    for item in exact:
+        if not isinstance(item, dict) or "candidate_id" not in item:
+            raise ValueError(
+                "Each internal placements[] entry requires candidate_id"
+            )
+        selectors.append(dict(item))
+    for item in exact_bit_groups:
+        if (
+            not isinstance(item, dict)
+            or "instance_path" not in item
+            or "boundaries" not in item
+            or not isinstance(item["boundaries"], list)
+        ):
+            raise ValueError(
+                "Each internal exact_bit_boundaries[] entry requires an "
+                "instance_path and a boundaries list"
+            )
+    if not selectors and not exact_bit_groups:
+        raise ValueError(
+            "Internal placement request must contain at least one selector "
+            "or exact bit-boundary group"
+        )
+    config = dict(config)
+    config["mode"] = mode
+    config["selectors"] = selectors
+    config["exact_bit_boundaries"] = exact_bit_groups
+    config["source_path"] = os.path.abspath(path)
+    return config
+
+
+def RESOLVE_INTERNAL_PIPELINE_PLACEMENTS(config, plans, parser_state):
+    """Resolve generic selectors against this iteration's candidate inventory.
+
+    The resolver is intentionally strict: a typo that matches nothing or an
+    unqualified selector that matches multiple positions is an error, never a
+    silently-different forced benchmark.
+    """
+    inventory = []
+    for plan in plans.values():
+        main_func = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+        for subtree_root, landscape in plan.landscapes.items():
+            if landscape is None:
+                continue
+            subtree_func = parser_state.LogicInstLookupTable[
+                subtree_root
+            ].func_name
+            for placement in landscape.candidates:
+                inventory.append(
+                    (plan, subtree_root, main_func, subtree_func, placement)
+                )
+    inventory.sort(key=lambda x: (x[4].axis_position, x[4].candidate_id))
+    resolved = {plan.main_inst: {} for plan in plans.values()}
+    allowed_keys = {
+        "candidate_id",
+        "kind",
+        "func_name",
+        "ancestor_func",
+        "instance_path",
+        "instance_path_regex",
+        "main_function",
+        "subtree_function",
+        "hierarchy_depth",
+        "coherent_boundary",
+        "axis_unit_min",
+        "axis_unit_max",
+        "all",
+        "limit",
+        "fixed",
+    }
+    for selector_i, selector in enumerate(config.get("selectors", ())):
+        if not isinstance(selector, dict):
+            raise ValueError(f"Internal placement selector {selector_i} is not an object")
+        unknown = set(selector) - allowed_keys
+        if unknown:
+            raise ValueError(
+                f"Unknown internal placement selector field(s): {sorted(unknown)}"
+            )
+        pattern = selector.get("instance_path_regex")
+        regex = re.compile(pattern) if pattern is not None else None
+        matches = []
+        for item in inventory:
+            _plan, _root, main_func, subtree_func, placement = item
+            if (
+                "candidate_id" in selector
+                and placement.candidate_id != selector["candidate_id"]
+            ):
+                continue
+            if "kind" in selector and placement.kind != selector["kind"]:
+                continue
+            if (
+                "func_name" in selector
+                and placement.func_name != selector["func_name"]
+            ):
+                continue
+            if (
+                "ancestor_func" in selector
+                and selector["ancestor_func"] not in placement.ancestor_funcs
+            ):
+                continue
+            if (
+                "instance_path" in selector
+                and placement.inst_path != selector["instance_path"]
+            ):
+                continue
+            if regex is not None and regex.search(placement.inst_path) is None:
+                continue
+            if (
+                "main_function" in selector
+                and main_func != selector["main_function"]
+            ):
+                continue
+            if (
+                "subtree_function" in selector
+                and subtree_func != selector["subtree_function"]
+            ):
+                continue
+            if (
+                "hierarchy_depth" in selector
+                and placement.hierarchy_depth != selector["hierarchy_depth"]
+            ):
+                continue
+            if (
+                "coherent_boundary" in selector
+                and placement.coherent_boundary
+                != bool(selector["coherent_boundary"])
+            ):
+                continue
+            if (
+                "axis_unit_min" in selector
+                and placement.axis_unit < selector["axis_unit_min"]
+            ):
+                continue
+            if (
+                "axis_unit_max" in selector
+                and placement.axis_unit > selector["axis_unit_max"]
+            ):
+                continue
+            matches.append(item)
+        if not matches:
+            raise ValueError(
+                f"Internal placement selector {selector_i} matched no legal "
+                f"candidate: {selector}"
+            )
+        all_matches = bool(selector.get("all", False))
+        limit = selector.get("limit")
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                raise ValueError("Internal placement selector limit must be > 0")
+            matches = matches[:limit]
+        elif not all_matches and len(matches) != 1:
+            raise ValueError(
+                f"Internal placement selector {selector_i} is ambiguous: "
+                f"matched {len(matches)} candidates; use all=true, limit, or "
+                "an exact candidate_id"
+            )
+        for plan, subtree_root, _main_func, _subtree_func, placement in matches:
+            selected = placement.copy_with(
+                fixed=selector.get("fixed", True), source="internal_forced"
+            )
+            bucket = resolved[plan.main_inst].setdefault(subtree_root, {})
+            bucket[selected.candidate_id] = selected
+
+    # Exact physical bit groups deliberately bypass the provisional raster
+    # resolver.  They remain an internal experiment interface: the caller
+    # must name a single elaborated raw-HDL leaf, while this resolver obtains
+    # its legal width and delay-axis span from the normal candidate inventory.
+    for group_i, spec in enumerate(config.get("exact_bit_boundaries", ())):
+        unknown = set(spec) - {"instance_path", "boundaries", "fixed"}
+        if unknown:
+            raise ValueError(
+                f"Unknown exact bit-boundary field(s): {sorted(unknown)}"
+            )
+        inst_path = spec["instance_path"]
+        boundaries = tuple(int(boundary) for boundary in spec["boundaries"])
+        raster_templates = []
+        output_templates = []
+        seen_raster_locations = set()
+        seen_output_locations = set()
+        for plan, subtree_root, _main_func, _subtree_func, placement in inventory:
+            if placement.inst_path != inst_path:
+                continue
+            location = (plan.main_inst, subtree_root)
+            if isinstance(placement, BitPlacementRequest):
+                if location in seen_raster_locations:
+                    continue
+                seen_raster_locations.add(location)
+                raster_templates.append((plan, subtree_root, placement))
+            elif (
+                isinstance(placement, PipelinePlacement)
+                and placement.kind == PipelinePlacement.INSTANCE_OUTPUT
+            ):
+                logic = parser_state.LogicInstLookupTable.get(inst_path)
+                if (
+                    logic is None
+                    or RAW_VHDL.GET_LEAF_SPLIT_KIND(logic)
+                    != RAW_VHDL.SPLIT_KIND_MUX_BITS
+                    or location in seen_output_locations
+                ):
+                    continue
+                seen_output_locations.add(location)
+                output_templates.append((plan, subtree_root, placement))
+        templates = raster_templates or output_templates
+        if len(templates) != 1:
+            raise ValueError(
+                f"Internal exact bit-boundary group {group_i} for {inst_path} "
+                f"matched {len(templates)} bit-splittable leaves; expected one"
+            )
+        plan, subtree_root, template = templates[0]
+        if isinstance(template, BitPlacementRequest):
+            width = template.bit_width
+            leaf_axis_start = template.leaf_axis_start
+            leaf_axis_end = template.leaf_axis_end
+        else:
+            width = RAW_VHDL.GET_LEAF_BIT_WIDTH(
+                parser_state.LogicInstLookupTable[inst_path], parser_state
+            )
+            matching_segments = [
+                segment
+                for segment in plan.landscapes[subtree_root].segments
+                if segment.inst_path == inst_path
+            ]
+            if len(matching_segments) != 1:
+                raise ValueError(
+                    f"Internal exact bit-boundary group {group_i} for "
+                    f"{inst_path} matched {len(matching_segments)} segments; "
+                    "expected one"
+                )
+            leaf_axis_start = matching_segments[0].start
+            leaf_axis_end = matching_segments[0].end
+        if (
+            width is None
+            or not boundaries
+            or boundaries != tuple(sorted(set(boundaries)))
+            or any(boundary <= 0 or boundary >= width for boundary in boundaries)
+        ):
+            raise ValueError(
+                f"Invalid exact bit boundaries {boundaries} for {width}-bit "
+                f"leaf {inst_path}"
+            )
+        count = len(boundaries)
+        bucket = resolved[plan.main_inst].setdefault(subtree_root, {})
+        for ordinal, boundary in enumerate(boundaries, start=1):
+            local_slice = boundary / float(width)
+            axis_position = leaf_axis_start + local_slice * (
+                leaf_axis_end - leaf_axis_start
+            )
+            selected = PipelinePlacement(
+                PipelinePlacement.BIT_INTERNAL,
+                inst_path,
+                template.func_name,
+                int(math.ceil(axis_position)) - 1,
+                axis_position,
+                local_slice=local_slice,
+                registered_bits=(
+                    width
+                    if template.registered_bits is None
+                    else template.registered_bits
+                ),
+                hierarchy_depth=template.hierarchy_depth,
+                span_units=template.span_units,
+                coherent_boundary=template.coherent_boundary,
+                ancestor_funcs=template.ancestor_funcs,
+                fixed=spec.get("fixed", True),
+                source="internal_exact",
+                bit_width=width,
+                bit_split_ordinal=ordinal,
+                bit_split_count=count,
+                bit_boundary=boundary,
+                bit_boundary_mode="exact",
+                bit_boundaries=boundaries,
+                leaf_axis_start=leaf_axis_start,
+                leaf_axis_end=leaf_axis_end,
+                requested_axis_unit=None,
+                requested_axis_position=None,
+                requested_local_slice=None,
+            )
+            bucket[selected.candidate_id] = selected
+
+    for plan in plans.values():
+        by_root = resolved[plan.main_inst]
+        plan.fixed_placements = {
+            root: sorted(items.values(), key=lambda p: (p.axis_unit, p.candidate_id))
+            for root, items in by_root.items()
+        }
+        if plan.fixed_placements:
+            plan.placement_mode = config["mode"]
+    return resolved
+
+
+def SUMMARIZE_SUBTREE_PIPELINE(
+    main_inst, subtrees, TimingParamsLookupTable, parser_state
+):
+    """Describe how many slices the sweep built into a
+    main's cut subtrees, and where.
+
+    A main's own GET_TOTAL_LATENCY only counts registers on its *monolithic*
+    (non-decoupled) input-to-output path: a flow-controlled/AUTO_PIPELINE
+    submodule reports latency 0 to its container by design
+    (GET_SUBMODULE_LATENCY), so its stages are invisible there. Reporting only
+    the main latency (0 for a pure stream) or only the deepest single instance
+    (one block_step, not the whole chacha pipeline) both understate the depth.
+
+    So walk the subtrees and add up every decoupled region's own
+    latency alongside the monolithic part:
+      monolithic  = slices inserted directly into the cut subtree roots
+                    (the disjoint maximal sliceable regions - a pure-comb main
+                    is its own subtree; unlabeled naturally-pipelinable logic is
+                    sliced here too). A subtree root's own latency already
+                    excludes any decoupled child it contains.
+      regions     = func_name -> {count, latency, total} for each decoupled
+                    (auto-pipeline-tagged) region instance carrying latency
+      total_stages= monolithic + sum of every decoupled region instance's
+                    latency = total slices inserted for the
+                    main (== input-to-output depth when the regions sit in
+                    series, as in a stream pipeline)
+    Returns (monolithic, regions, total_stages)."""
+    marker = LOGIC.SUBMODULE_MARKER
+    # Cut subtrees are disjoint maximal sliceable subtrees, so summing their
+    # own latencies never double counts. (A decoupled child inside a subtree
+    # root reports 0 to it and is added separately below.)
+    monolithic = sum(
+        TimingParamsLookupTable[d].GET_TOTAL_LATENCY(
+            parser_state, TimingParamsLookupTable
+        )
+        for d in subtrees
+    )
+
+    def in_subtree(inst):
+        return any(inst == d or inst.startswith(d + marker) for d in subtrees)
+
+    regions = {}
+    for inst_name, logic in parser_state.LogicInstLookupTable.items():
+        if not logic.sub_inst_to_auto_pipeline_latency:
+            continue
+        if not in_subtree(inst_name):
+            continue
+        for local_sub in logic.sub_inst_to_auto_pipeline_latency:
+            sub_inst = inst_name + marker + local_sub
+            sub_timing_params = TimingParamsLookupTable.get(sub_inst)
+            if sub_timing_params is None:
+                continue
+            latency = sub_timing_params.GET_TOTAL_LATENCY(
+                parser_state, TimingParamsLookupTable
+            )
+            if latency <= 0:
+                continue
+            sub_func = parser_state.LogicInstLookupTable[sub_inst].func_name
+            region = regions.setdefault(
+                sub_func, {"count": 0, "latency": latency, "total": 0}
+            )
+            region["count"] += 1
+            region["latency"] = max(region["latency"], latency)
+            region["total"] += latency
+
+    total_stages = monolithic + sum(r["total"] for r in regions.values())
+    return monolithic, regions, total_stages
+
+
+def GET_SUBTREE_PIPELINE_STAGES(plan, TimingParamsLookupTable, parser_state):
+    # NOTE despite the name (kept for call-site compatibility), this returns
+    # total SLICES built into the plan's subtrees, not comb-region
+    # pipeline stage count (= slices + 1) - the physically meaningful
+    # "how deep did this get pipelined" number - see
+    # SUMMARIZE_SUBTREE_PIPELINE for why the main's own latency alone is
+    # not it. Callers that
+    # report a "pipeline_stages" figure to the user must add 1 themselves
+    # (see the sweep iteration print/history entry).
+    _monolithic, _regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+        plan.main_inst, plan.subtrees, TimingParamsLookupTable, parser_state
+    )
+    return total_stages
+
+
+def PRINT_PIPELINE_DEPTH_SUMMARY(parser_state, TimingParamsLookupTable):
+    """Print, for every main, how deeply the FINAL emitted design was
+    auto-pipelined: total slices and the decoupled regions
+    that carry them. Runs at 'Writing Results' on the actually-written table,
+    so it reflects the design as built regardless of which path produced it -
+    a full sweep, an AUTO_PIPELINE confirmation pass, or the coarse sweep - and
+    picks up any deepening the pin-and-confirm re-elaboration introduced.
+    Recomputes each main's cut subtrees (path-independent). Mains with nothing
+    auto-pipelinable are noted in one line each."""
+    printed_header = False
+    for main_inst in parser_state.main_mhz:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        main_func = main_logic.func_name
+        # Zero-delay mains (FUNC_WIRES rewiring, bit manipulation, clock
+        # crossing, ...) carry no pipeline - omit them so the summary isn't
+        # buried under dozens of pmod-wire "connect" mains.
+        if SYN.LOGIC_IS_ZERO_DELAY(main_logic, parser_state, allow_none_delay=True):
+            continue
+        subtrees, monolithic, regions, total_stages = MAIN_PIPELINE_DEPTH(
+            main_inst, parser_state, TimingParamsLookupTable
+        )
+        if not printed_header:
+            print("[sweep] Pipeline depth summary:", flush=True)
+            printed_header = True
+        if len(subtrees) == 0:
+            print(
+                f"[sweep]   {main_func}: not auto-pipelined "
+                "(nothing sliceable; meets its goal as written if at all)",
+                flush=True,
+            )
+            continue
+        print(
+            f"[sweep]   {main_func}: {total_stages} slice(s) total "
+            f"({total_stages + 1} pipeline stages: comb regions separated by "
+            "those slices)",
+            flush=True,
+        )
+        if monolithic > 0 and regions:
+            print(
+                f"[sweep]     {monolithic} in the subtree's own (monolithic) pipeline",
+                flush=True,
+            )
+        for region_func in sorted(regions):
+            r = regions[region_func]
+            lat_str = (
+                f"{r['latency']}"
+                if r["total"] == r["latency"] * r["count"]
+                else f"up to {r['latency']}"
+            )
+            print(
+                f"[sweep]     {region_func}: {lat_str} clk(s) deep "
+                f"x {r['count']} instance(s) = {r['total']} stage(s)",
+                flush=True,
+            )
+        if regions:
+            print(
+                "[sweep]     (decoupled regions above sum to the end-to-end "
+                "pipeline depth when in series, as in a stream pipeline)",
+                flush=True,
+            )
+
+
+# An AUTO_PIPELINE region whose measured delay, split evenly over its built
+# stages, still exceeds this many clock periods cannot be what met timing
+# (WARN_UNTIMED_REGIONS)
+UNTIMED_REGION_PERIODS = 1.25
+
+
+def WARN_UNTIMED_REGIONS(parser_state, multimain_timing_params):
+    """One warning per AUTO_PIPELINE region whose MAIN met timing at a depth the
+    region's own measured delay rules out: even split evenly over its built
+    stages it needs over UNTIMED_REGION_PERIODS clock periods per stage. The
+    synthesized design then never timed the region's paths: synthesis removed
+    its logic (constant inputs, unused outputs) or left it between unconstrained
+    ports. The met result says nothing about it, and the sweep may have removed
+    stages it needs. Estimated delays are skipped, and builds without a sweep
+    (--comb) leave regions unpipelined on purpose. Returns {warned key: its
+    MAIN instance}: the latency memory remembers none of them
+    (BUILD_LATENCY_PIECES)."""
+    import pypeline
+
+    if pypeline.AUTO_PIPELINE_BUILD_MODE() != "sweep":
+        return {}
+    tpl = multimain_timing_params.TimingParamsLookupTable
+    failing = {
+        failure[0]
+        for failure in getattr(multimain_timing_params, "sweep_timing_failures", None) or []
+    }
+    warned = {}
+    for inst, logic in sorted(parser_state.LogicInstLookupTable.items()):
+        for local_sub, key in sorted((logic.sub_inst_to_auto_pipeline_key or {}).items()):
+            if key is None or key in warned or AUTO_PIPELINE._PINNED_AUTO_FSM_UNIT(logic, local_sub):
+                continue
+            sub_inst = inst + LOGIC.SUBMODULE_MARKER + local_sub
+            region = parser_state.LogicInstLookupTable.get(sub_inst)
+            params = tpl.get(sub_inst)
+            main = sub_inst.split(LOGIC.SUBMODULE_MARKER)[0]
+            mhz = parser_state.main_mhz.get(main)
+            if (
+                region is None
+                or params is None
+                or region.delay is None
+                or region.delay_is_estimated
+                or not mhz
+                or main in failing
+            ):
+                continue
+            period_ns = 1000.0 / mhz
+            delay_ns = region.delay / SYN.DELAY_UNIT_MULT
+            stages = params.GET_TOTAL_LATENCY(parser_state, tpl) + 1
+            if delay_ns / stages <= UNTIMED_REGION_PERIODS * period_ns:
+                continue
+            warned[key] = main
+            print(
+                f"[sweep] WARNING: AUTO_PIPELINE {key} met {mhz} MHz with {stages} "
+                f"pipeline stage(s), but its measured delay of {delay_ns:.1f} ns needs "
+                f"about {math.ceil(delay_ns / period_ns)} stages. Synthesis never timed its "
+                "paths: it removed the logic (constant inputs, unused outputs) or "
+                "left it between unconstrained ports, so this result says nothing "
+                "about it, and the latency memory will not remember it. Build a top "
+                "that drives and uses it through real ports.",
+                flush=True,
+            )
+    return warned
+
+
+def PRINT_TIMING_FAILURES(parser_state, multimain_timing_params) -> bool:
+    """Print one ERROR line per main that missed its timing goal, a global
+    instance's or FIFO's MAIN named by its declaration (MAIN_DISPLAY_NAME).
+    Returns True if any failure was reported, so the caller can decide
+    whether to fail the build -- results are still written for debugging
+    either way."""
+    timing_failures = getattr(multimain_timing_params, "sweep_timing_failures", None)
+    if not timing_failures:
+        return False
+    print(
+        "================== TIMING NOT MET ================================",
+        flush=True,
+    )
+    for main_func_name, goal_mhz, achieved_mhz, why in timing_failures:
+        main_func_name = MAIN_DISPLAY_NAME(main_func_name, parser_state)
+        achieved_str = (
+            f"{achieved_mhz:.2f} MHz" if achieved_mhz is not None else "unknown"
+        )
+        if why == "device_over_capacity":
+            print(
+                f"ERROR: DOES NOT FIT: {main_func_name} met its {goal_mhz:.2f} MHz "
+                f"goal ({achieved_str}) only in an over-capacity netlist, which "
+                "does not establish device timing",
+                flush=True,
+            )
+            continue
+        print(
+            f"ERROR: TIMING NOT MET: {main_func_name} achieved {achieved_str} "
+            f"vs {goal_mhz:.2f} MHz goal ({why})",
+            flush=True,
+        )
+    print(
+        "Results were written for debugging; skipping simulation/bitstream.",
+        flush=True,
+    )
+    return True
+
+
+def MAIN_PIPELINE_DEPTH(main_inst, parser_state, TimingParamsLookupTable):
+    """(subtrees, monolithic, regions, total_slices) for one main as built by
+    TimingParamsLookupTable. Shared by the printed depth summary and the
+    sweep_history.json final record so the two can never disagree. A main
+    with nothing cuttable returns no subtrees and zero slices."""
+    subtrees = AUTO_PIPELINE.COLLECT_CUT_SUBTREES(main_inst, parser_state)
+    if len(subtrees) == 0:
+        return subtrees, 0, {}, 0
+    monolithic, regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+        main_inst, subtrees, TimingParamsLookupTable, parser_state
+    )
+    return subtrees, monolithic, regions, total_stages
+
+
+# ─────────────────────────────────────────────
+# sweep_history.json
+# ─────────────────────────────────────────────
+# Per-main iteration records plus a "final" record describing the design
+# actually built. The iteration log alone cannot say what a build achieved:
+# an assumed-met final iteration (no path report named the main), a restored
+# best/met snapshot and a pin-and-confirm confirmation run are all not "the
+# last iteration".
+
+SWEEP_HISTORY_SCHEMA_VERSION = 4
+STOP_ON_OVER_CAPACITY = False
+SYNTHESIS_OBSERVATIONS = []
+CARRIED_LOCKS = {}
+# Module level, not on a plan or MultiMainTimingParams: the AUTO_PIPELINE
+# pin-and-confirm loop re-parses the design and builds fresh timing params
+# between passes, and a fallback sweep's iterations must not erase an earlier
+# pass's.
+# main func name -> {"goal_mhz": float | None, "iterations": [record, ...]}
+SWEEP_HISTORY = {}
+# main func name -> outcome of whichever run last decided that main
+SWEEP_OUTCOMES = {}
+# Numbers each deciding run (planned sweep, confirmation run, coarse sweep)
+SWEEP_HISTORY_RUN = 0
+
+
+def NEXT_SWEEP_HISTORY_RUN():
+    global SWEEP_HISTORY_RUN
+    SWEEP_HISTORY_RUN += 1
+    return SWEEP_HISTORY_RUN
+
+
+def RECORD_SWEEP_ITERATION(main_func_name, goal_mhz, record):
+    """Append one iteration record and return it with its "run" and "index"
+    (position in the main's iterations list -- unique even where the measured
+    fallback re-uses iteration numbers)."""
+    entry = SWEEP_HISTORY.setdefault(
+        main_func_name, {"goal_mhz": goal_mhz, "iterations": []}
+    )
+    entry["goal_mhz"] = goal_mhz
+    record = dict(record)
+    record.setdefault("run", SWEEP_HISTORY_RUN)
+    record["index"] = len(entry["iterations"])
+    entry["iterations"].append(record)
+    return record
+
+
+def RECORD_SWEEP_OUTCOME(main_func_name, goal_mhz, source, record=None, **fields):
+    """Set one main's outcome. source: planned_sweep / confirmation_run /
+    as_written / coarse_sweep / no_sweep. record: the iteration record the
+    built result came from (None when there is none), supplying run/iter/
+    iteration_index and the achieved MHz. Later runs overwrite earlier ones."""
+    outcome = {"source": source, "goal_mhz": goal_mhz, "run": SWEEP_HISTORY_RUN}
+    if record is not None:
+        outcome.update(
+            run=record.get("run"),
+            iter=record.get("iter"),
+            iteration_index=record.get("index"),
+            achieved_mhz=record.get("achieved_mhz"),
+            input_signature=record.get("input_signature"),
+            implementation_signature=record.get("implementation_signature"),
+            observation_origin=record.get("observation_origin"),
+        )
+    outcome.update(fields)
+    SWEEP_OUTCOMES[main_func_name] = outcome
+    return outcome
+
+
+def BUILD_FINAL_MAIN_RECORD(goal_mhz, outcome, failure, depth, fit_status=None):
+    """One main's sweep_history.json "final" record (pure).
+
+    outcome     its SWEEP_OUTCOMES entry, or None if no run recorded one
+    failure     its (name, goal_mhz, achieved_mhz, why) sweep_timing_failures
+                tuple, or None. That list gates the build's exit code, so it --
+                not the outcome -- decides a failed verdict.
+    depth       {"auto_pipelined", "slices_built", "pipeline_stages"} read off
+                the final table, or None
+    fit_status  the retained observation's utilization status, or None. An
+                over-capacity netlist's timing is never a pass: a main that
+                would otherwise be met is met=False (device_over_capacity).
+
+    A main that met its goal without any path report naming it never had an
+    MHz measured: achieved_mhz stays None and the goal is only a lower bound
+    (mhz_is_lower_bound / lower_bound_mhz), never the fmax."""
+    rest = dict(outcome or {})
+    source = rest.pop("source", None)
+    rest.pop("goal_mhz", None)
+    achieved_mhz = rest.pop("achieved_mhz", None)
+    failure_reason = None
+    if failure is not None:
+        met = None if failure[3] == "unknown_in_retained_snapshot" else False
+        met_basis = "unknown_in_retained_snapshot" if met is None else "timing_failure"
+        if failure[3] == "device_over_capacity":
+            met_basis = "device_over_capacity"
+        failure_reason = failure[3]
+        if failure[2] is not None:
+            achieved_mhz = round(failure[2], 3)
+    elif goal_mhz is None:
+        met = None
+        met_basis = "no_goal"
+    elif source is None or source in ("no_sweep", "comb"):
+        # "comb" builds the design as written with no added pipelining, so
+        # like --no_sweep they never verified the goal -- claiming "met"
+        # because nothing failed would read as a passing timing result.
+        met = None
+        met_basis = "unverified"
+    elif achieved_mhz is not None:
+        met = True
+        met_basis = "measured"
+    else:
+        met = True
+        met_basis = "no_failing_path_reported"
+    if met is True and fit_status == "over_capacity":
+        met = False
+        met_basis = failure_reason = "device_over_capacity"
+    lower_bound = met is True and achieved_mhz is None
+    final = {
+        "met": met,
+        "achieved_mhz": achieved_mhz,
+        "mhz_is_lower_bound": lower_bound,
+        "lower_bound_mhz": goal_mhz if lower_bound else None,
+        "met_basis": met_basis,
+        "source": source,
+        "run": rest.pop("run", None),
+        "iter": rest.pop("iter", None),
+        "iteration_index": rest.pop("iteration_index", None),
+        "failure_reason": failure_reason,
+    }
+    final.update(depth or {})
+    final.update(rest)
+    return final
+
+
+def WRITE_SWEEP_HISTORY(parser_state, multimain_timing_params, build_complete):
+    """Write <out_dir>/<top>/sweep_history.json (SWEEP_HISTORY_SCHEMA_VERSION).
+
+    Runs that decide mains write it provisionally (build_complete=False) so a
+    build that dies later still leaves its data; WRITE_SWEEP_RESULTS rewrites
+    it at 'Writing Results' (build_complete=True) against the final table and the
+    final sweep_timing_failures. Writes nothing when no run recorded anything
+    (--comb characterization builds). Returns the written document."""
+    if not SWEEP_HISTORY and not SWEEP_OUTCOMES and not SYNTHESIS_OBSERVATIONS:
+        return None
+    failures = {
+        failure[0]: failure
+        for failure in (
+            getattr(multimain_timing_params, "sweep_timing_failures", None) or []
+        )
+    }
+    tpl = multimain_timing_params.TimingParamsLookupTable
+    retained = (
+        RETAINED_OBSERVATION(parser_state, multimain_timing_params)
+        if SYNTHESIS_OBSERVATIONS
+        else None
+    )
+    # Only the built implementation's own observation says whether it fits; a
+    # newer log of another implementation says nothing about it.
+    fit_status = retained["utilization"]["status"] if retained else "unknown"
+    mains = {}
+    for main_inst in parser_state.main_mhz:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        main_func_name = main_logic.func_name
+        goal_mhz = SYN.GET_TARGET_MHZ(main_inst, parser_state)
+        recorded = (
+            main_func_name in SWEEP_HISTORY
+            or main_func_name in SWEEP_OUTCOMES
+            or main_func_name in failures
+        )
+        zero_delay = SYN.LOGIC_IS_ZERO_DELAY(
+            main_logic, parser_state, allow_none_delay=True
+        )
+        if not recorded and (goal_mhz is None or zero_delay):
+            continue
+        depth = None
+        if not zero_delay and main_inst in tpl:
+            subtrees, _mono, _regions, total_stages = MAIN_PIPELINE_DEPTH(
+                main_inst, parser_state, tpl
+            )
+            if subtrees:
+                depth = {
+                    "auto_pipelined": True,
+                    "slices_built": total_stages,
+                    "pipeline_stages": total_stages + 1,
+                }
+            else:
+                depth = {
+                    "auto_pipelined": False,
+                    "slices_built": None,
+                    "pipeline_stages": None,
+                }
+        mains[main_func_name] = {
+            "goal_mhz": goal_mhz,
+            "iterations": SWEEP_HISTORY.get(main_func_name, {}).get("iterations", []),
+            "final": BUILD_FINAL_MAIN_RECORD(
+                goal_mhz,
+                SWEEP_OUTCOMES.get(main_func_name),
+                failures.get(main_func_name),
+                depth,
+                fit_status,
+            ),
+        }
+    doc = {
+        "schema_version": SWEEP_HISTORY_SCHEMA_VERSION,
+        "build_complete": build_complete,
+        "stop_on_over_capacity": STOP_ON_OVER_CAPACITY,
+        "observations": SYNTHESIS_OBSERVATIONS,
+        "fit_status": fit_status,
+        "mains": mains,
+    }
+    if SYNTHESIS_OBSERVATIONS:
+        doc["synthesis_cost"] = {
+            "observations": len(SYNTHESIS_OBSERVATIONS),
+            "new_backend_launches": sum(
+                o["cache_hit"] is False for o in SYNTHESIS_OBSERVATIONS
+            ),
+            "cache_reads": sum(o["cache_hit"] is True for o in SYNTHESIS_OBSERVATIONS),
+            "unknown_cache_origin": sum(
+                o["cache_hit"] is None for o in SYNTHESIS_OBSERVATIONS
+            ),
+            "distinct_implementations": len(
+                {o["implementation_signature"] for o in SYNTHESIS_OBSERVATIONS}
+            ),
+            "estimated_registers_added_without_prior_failure": sum(
+                sum(o.get("register_growth_without_prior_failure", {}).values())
+                for o in SYNTHESIS_OBSERVATIONS
+            ),
+        }
+        doc["retained_observation"] = retained
+    auto_multi_cycle = getattr(
+        multimain_timing_params, "auto_multi_cycle_ncycles", None
+    )
+    if auto_multi_cycle:
+        doc["auto_multi_cycle_ncycles"] = dict(auto_multi_cycle)
+    import AUTO_PIPELINE
+
+    if AUTO_PIPELINE.LATENCY_PASS_RECORDS:
+        # Schema 4: the bottom-up values each pin-and-confirm pass read, built
+        # and where they were read (AUTO_PIPELINE.RECORD_LATENCY_PASS)
+        doc["latency_passes"] = AUTO_PIPELINE.LATENCY_PASS_RECORDS
+    if AUTO_PIPELINE.RAM_COLLECT(parser_state):
+        doc["auto_pipeline_rams"] = AUTO_PIPELINE.RAM_REPORT_PLANS(parser_state)
+        doc["auto_pipeline_ram_iterations"] = getattr(
+            multimain_timing_params, "auto_pipeline_ram_history", []
+        )
+    try:
+        out_dir = os.path.join(SYN.SYN_OUTPUT_DIRECTORY, SYN.TOP_LEVEL_MODULE)
+        os.makedirs(out_dir, exist_ok=True)
+        history_path = os.path.join(out_dir, "sweep_history.json")
+        with open(history_path, "w") as f:
+            json.dump(doc, f, indent=1)
+    except Exception as e:
+        print("[sweep] Could not write sweep history:", e)
+        return None
+    print(f"[sweep] History: {history_path}", flush=True)
+    return doc
+
+
+# ─────────────────────────────────────────────
+# Latency memory: starting latencies from past builds and hints files
+# ─────────────────────────────────────────────
+# Reuse independently matched pieces; every reused implementation is synthesized.
+# Hints are unconditional starts. Memory is resolved after the normal parse,
+# before synthesis. Independent pieces need one re-parse; dependencies may
+# require more, always with already matched served values.
+LATENCY_MEMORY_SCHEMA_VERSION = 2
+LATENCY_PROFILE_FILE = "latency_profile.json"
+LATENCY_MEMORY_FILE = "latency_memory.json"
+LATENCY_MEMORY_KINDS = ("AUTO_PIPELINE", "AUTO_MULTI_CYCLE")
+LATENCY_PIECE_KINDS = LATENCY_MEMORY_KINDS + ("lock", "main")
+# (digest, goal) variants kept per piece file, newest last
+LATENCY_MEMORY_MAX_ENTRIES = 16
+# Set by the pipelinec driver: False for --no_latency_memory or
+# PIPELINEC_INTERNAL_NO_LATENCY_MEMORY=1 (the test suite's default)
+LATENCY_MEMORY_ENABLED = True
+# (kind, key) -> (value, source) the final parse applied, for the profile
+LATENCY_SEEDS_USED = {}
+# (kind, key) -> the matched depth/count piece RESOLVE_LATENCY_MEMORY served
+LATENCY_MEMORY_SELECTED = {}
+# MAIN func name -> its matched implementation piece (TRY_LATENCY_MEMORY_REPLAY)
+LATENCY_MEMORY_MAIN_REPLAYS = {}
+# key -> count/depth required as a floor by a selected lower-goal piece
+LATENCY_MEMORY_MCP_FLOORS = {}
+LATENCY_MEMORY_AP_FLOORS = {}
+# (MAIN func, locked func, goal) -> depth of a lower-goal mini-sweep lock
+MINISWEEP_LOCK_HINTS = {}
+# (path, mtime, size) -> parsed pieces: one read per file per build
+_LATENCY_MEMORY_READ_CACHE = {}
+# Why MAIN replay was skipped, printed once (RAM plan search and AUTO_FSM
+# call the sweep once per candidate or schedule)
+_LATENCY_MEMORY_REPLAY_SKIPS = set()
+
+
+def LATENCY_MEMORY_STORE_PATH(tool, part, kind, key):
+    """Shared library pieces, independent of the build's output directory."""
+    if SYN.SYNTHESIS_STORE_DIR is None:
+        return None
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    # A tool with no part (pyrtl) shares one "none" directory, as AUTO_FSM's
+    # store does
+    return os.path.join(
+        SYN.SYNTHESIS_STORE_DIR,
+        "latency",
+        "v2",
+        tool,
+        SYN.PART_CACHE_DIR_NAME(part or "none"),
+        kind,
+        digest + ".json",
+    )
+
+
+def READ_LATENCY_TABLE(path):
+    """({(kind, key): entry}, metadata) from a latency_profile.json, a
+    latency_memory.json or a hand-written hints file
+    ({"AUTO_PIPELINE": {key: N}, "AUTO_MULTI_CYCLE": {key: N}}). Every entry
+    has an int "latency". Raises ValueError on anything malformed."""
+    with open(path) as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    meta = {k: doc.get(k) for k in ("part", "tool")}
+    rows = []
+    if "entries" in doc:  # a latency_profile.json
+        for entry in doc["entries"]:
+            rows.append((entry.get("kind"), entry.get("key"), dict(entry)))
+    else:
+        unknown = set(doc) - set(LATENCY_MEMORY_KINDS) - {
+            "schema_version",
+            "part",
+            "tool",
+            "out_dir",
+        }
+        if unknown:
+            raise ValueError(
+                f"{path}: unknown section(s) {sorted(unknown)}; expected "
+                f"{list(LATENCY_MEMORY_KINDS)}"
+            )
+        for kind in LATENCY_MEMORY_KINDS:
+            section = doc.get(kind) or {}
+            if not isinstance(section, dict):
+                raise ValueError(f"{path}: {kind} must map tag keys to latencies")
+            for key, value in section.items():
+                entry = dict(value) if isinstance(value, dict) else {"latency": value}
+                rows.append((kind, key, entry))
+    table = {}
+    for kind, key, entry in rows:
+        latency = entry.get("latency")
+        low = 1 if kind == "AUTO_MULTI_CYCLE" else 0
+        if kind not in LATENCY_MEMORY_KINDS or not isinstance(key, str):
+            raise ValueError(f"{path}: bad entry {kind!r} {key!r}")
+        if not isinstance(latency, int) or isinstance(latency, bool) or latency < low:
+            raise ValueError(
+                f"{path}: {kind} {key}: latency must be an int >= {low}, got {latency!r}"
+            )
+        table[(kind, key)] = entry
+    return table, meta
+
+
+def _seed_source_text(where, entry, meta):
+    parts = []
+    goal, achieved = entry.get("goal_mhz"), entry.get("achieved_mhz")
+    if achieved is not None and goal is not None:
+        parts.append(f"met {achieved:g} MHz at a {goal:g} MHz goal")
+    elif goal is not None:
+        parts.append(f"met a {goal:g} MHz goal")
+    target = "/".join(str(x) for x in (meta.get("part"), meta.get("tool")) if x)
+    if target:
+        parts.append(target)
+    return where + (": " + ", ".join(parts) if parts else "")
+
+
+def LOAD_LATENCY_SEEDS(out_dir, hints_files):
+    """Hints only for the first parse; memory needs resolved identities/goals.
+
+    Copied latency_profile.json files have exactly the same unconditional
+    starting-value meaning as hand-written hints and start_latency=.
+    """
+    seeds = {}
+    LATENCY_MEMORY_SELECTED.clear()
+    LATENCY_MEMORY_MAIN_REPLAYS.clear()
+    _LATENCY_MEMORY_REPLAY_SKIPS.clear()
+    LATENCY_MEMORY_MCP_FLOORS.clear()
+    LATENCY_MEMORY_AP_FLOORS.clear()
+    MINISWEEP_LOCK_HINTS.clear()
+    _LATENCY_MEMORY_READ_CACHE.clear()
+    LATENCY_SEEDS_USED.clear()
+    for path in hints_files or ():
+        try:
+            table, _meta = READ_LATENCY_TABLE(path)
+        except (OSError, ValueError) as e:
+            sys.exit(f"ERROR: --latency_hints {path}: {e}")
+        for pair, entry in table.items():
+            seeds[pair] = (entry["latency"], f"hints {os.path.basename(path)}")
+    return seeds
+
+
+def INSTALL_LATENCY_HINTS(src_file, hints_files):
+    """Before a build's first parse: a synthesizing build of a .py design starts
+    its AUTO_PIPELINE / AUTO_MULTI_CYCLE tags from the --latency_hints files
+    (LOAD_LATENCY_SEEDS). Matching memory pieces are selected later
+    (APPLY_LATENCY_MEMORY), once part, tool, goals and zero-clock hardware
+    digests are known. Returns the installed seeds ({} for any other build)."""
+    import pypeline
+
+    if src_file.endswith(".py") and pypeline.AUTO_PIPELINE_BUILD_MODE() == "sweep":
+        seeds = LOAD_LATENCY_SEEDS(SYN.SYN_OUTPUT_DIRECTORY, hints_files)
+        pypeline.SET_LATENCY_SEEDS(seeds)
+        return seeds
+    if hints_files:
+        print(
+            "NOTE: --latency_hints only applies to synthesizing builds of Pypeline "
+            "designs; ignored.",
+            flush=True,
+        )
+    return {}
+
+
+def PRINT_LATENCY_SEEDS(part=None, tool=None):
+    import pypeline
+
+    applied = pypeline.LATENCY_SEEDS_APPLIED()
+    LATENCY_SEEDS_USED.clear()
+    LATENCY_SEEDS_USED.update(applied)
+    for (kind, key), (value, source) in sorted(applied.items()):
+        print(f"[latency memory] {kind} {key}: starts at {value} ({source})", flush=True)
+    hints = [u for u in pypeline.LATENCY_SEEDS_UNUSED() if u[3].startswith("hints ")]
+    if hints:
+        print(f"NOTE: {len(hints)} latency hint(s) matched no AUTO_PIPELINE / "
+              "AUTO_MULTI_CYCLE in this build that takes a starting latency "
+              "(not in this configuration, renamed, removed or fixed): "
+              + ", ".join(f"{key} ({source})" for _kind, key, _value, source in hints),
+              flush=True)
+
+
+def LATENCY_SUBTREE_DIGESTS(parser_state):
+    """SHA-256 of (function, SHA-256 of zero-clock VHDL), per subtree.
+
+    Render zero-clock text independently of synthesized ancestor files. Inline
+    VHDL functions/expressions use their zero-clock declarations/connections.
+    No synthesis or delay estimate participates in this identity.
+    """
+    cached = getattr(parser_state, "_latency_subtree_digests", None)
+    if cached is not None:
+        return cached
+    table = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+    hashes = {}
+    for name in sorted(parser_state.FuncToInstances):
+        inst = sorted(parser_state.FuncToInstances[name])[0]
+        logic = parser_state.FuncLogicLookupTable[name]
+        if logic.is_vhdl_func:
+            text = VHDL.RENDER_TEXT(VHDL.GET_VHDL_FUNC_DECL(
+                inst, logic, parser_state, table[inst]), parser_state)
+        elif logic.is_vhdl_expr:
+            parent = LOGIC.GET_CONTAINER_INST(inst)
+            local = inst[len(parent + LOGIC.SUBMODULE_MARKER):]
+            text = VHDL.RENDER_TEXT(VHDL.GET_VHDL_EXPR_ENTITY_CONNECTION_TEXT(
+                logic, local, parent, parser_state.LogicInstLookupTable[parent],
+                table, parser_state), parser_state)
+        else:
+            text = VHDL.WRITE_LOGIC_ENTITY(inst, logic, SYN.SYN_OUTPUT_DIRECTORY,
+                                          parser_state, table, return_text=True)
+        hashes[name] = hashlib.sha256(text.encode()).hexdigest()
+    result = {}
+    for name in hashes:
+        values = [(child, hashes[child]) for child in SUBTREE_FUNCTIONS(name, parser_state)]
+        result[name] = hashlib.sha256(json.dumps(values).encode()).hexdigest()
+    parser_state._latency_subtree_digests = result
+    return result
+
+
+def _latency_piece_identities(parser_state):
+    digests = LATENCY_SUBTREE_DIGESTS(parser_state)
+    identities = {}
+    for key, main, constraint, callee in _auto_pipeline_tag_instances(parser_state):
+        pair = ("AUTO_PIPELINE", key)
+        item = identities.setdefault(pair, {"digest": digests[callee], "mains": set(),
+                                           "cap": constraint.max_latency if constraint else None})
+        if item["digest"] != digests[callee]:
+            item["digest"] = None  # ambiguous tag: never reuse
+        item["mains"].add(main)
+    for key, group in AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(parser_state).items():
+        if group.constraint.is_fixed():
+            continue
+        identities[("AUTO_MULTI_CYCLE", key)] = {
+            "digest": AUTO_MULTI_CYCLE.MCP_SHAPE(group, parser_state,
+                                                function_digest=lambda n: digests[n]),
+            "cap": group.constraint.upper_bound(),
+            "mains": {i.split(LOGIC.SUBMODULE_MARKER)[0] for i, _s, _e in group.paths}}
+    for main in parser_state.main_mhz:
+        name = parser_state.LogicInstLookupTable[main].func_name
+        identities[("main", name)] = {"digest": digests[name], "mains": {main}}
+    for item in identities.values():
+        goals = [SYN.GET_TARGET_MHZ(m, parser_state) for m in item["mains"]]
+        item["goal_mhz"] = min(goals) if goals and all(g is not None for g in goals) else None
+    return identities
+
+
+def _read_latency_pieces(path):
+    if path is None or not os.path.isfile(path):
+        return []
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return []
+    cache_key = (path, stat.st_mtime_ns, stat.st_size)
+    if cache_key in _LATENCY_MEMORY_READ_CACHE:
+        return _LATENCY_MEMORY_READ_CACHE[cache_key]
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+        if doc.get("schema_version") != LATENCY_MEMORY_SCHEMA_VERSION:
+            return []  # including v1: deliberately invalidated
+        entries = doc["pieces"]
+        if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+            raise ValueError("pieces must be a list of objects")
+        entries = [e for e in entries if e.get("kind") in LATENCY_PIECE_KINDS
+                   and all(isinstance(e.get(k), str) for k in ("key", "digest", "part", "tool"))
+                   and isinstance(e.get("goal_mhz"), (int, float)) and not isinstance(e["goal_mhz"], bool)
+                   and math.isfinite(e["goal_mhz"]) and e["goal_mhz"] > 0]
+        _LATENCY_MEMORY_READ_CACHE[cache_key] = entries
+        return entries
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"NOTE: ignoring unreadable latency memory {path}: {e}", flush=True)
+        return []
+
+
+def SELECT_LATENCY_PIECE(entries, kind, key, digest, goal, part, tool, excluded=()):
+    """Current goal first, else highest lower goal; never a higher goal."""
+    if digest is None or goal is None:
+        return None
+    matches = [e for e in entries
+               if e.get("kind") == kind and e.get("key") == key
+               and e.get("digest") == digest and e.get("part") == part
+               and e.get("tool") == tool
+               and (kind, key, digest, e.get("goal_mhz")) not in excluded
+               and isinstance(e.get("goal_mhz"), (int, float))
+               and not isinstance(e["goal_mhz"], bool)
+               and 0 < e["goal_mhz"] <= goal
+               and (kind != "main" or e["goal_mhz"] == goal)
+               and (kind not in LATENCY_MEMORY_KINDS or
+                    (isinstance(e.get("latency"), int) and not isinstance(e["latency"], bool)
+                     and e["latency"] >= (1 if kind == "AUTO_MULTI_CYCLE" else 0)))]
+    return max(matches, key=lambda e: e["goal_mhz"], default=None)
+
+
+def _select_latency_piece(parser_state, kind, key, digest, goal, excluded=()):
+    part, tool = parser_state.part, SYN.TOOL_NAME(SYN.SYN_TOOL)
+    out_path = os.path.join(SYN.SYN_OUTPUT_DIRECTORY, LATENCY_MEMORY_FILE)
+    candidates = []
+    for path, source in ((LATENCY_MEMORY_STORE_PATH(tool, part, kind, key), "store"),
+                         (out_path, "out_dir")):
+        selected = SELECT_LATENCY_PIECE(_read_latency_pieces(path), kind, key,
+                                       digest, goal, part, tool, excluded)
+        if selected:
+            candidates.append(dict(selected, source=source, path=path))
+    # At equal goals the output directory's own record wins.
+    return max(candidates, key=lambda e: (e["goal_mhz"], e["source"] == "out_dir"), default=None)
+
+
+def RESOLVE_LATENCY_MEMORY(parser_state, hints, reparse):
+    """Resolve strictly matched pieces, including dependent callee identities.
+
+    An AP depth may change a separately tagged MCP datapath's size. Recompute
+    identities after serving matched values, then select newly matching pieces.
+    Ordinary independent pieces need one re-parse; dependencies can need more.
+    A piece changing its own digest is blocked and removed before synthesis.
+    """
+    import pypeline
+
+    if not LATENCY_MEMORY_ENABLED:
+        return parser_state
+    blocked = set()
+    previous = {}
+    identities = _latency_piece_identities(parser_state)
+    limit = max(4, 2 * len(identities) + 2)
+    for attempt in range(limit):
+        identities = _latency_piece_identities(parser_state)
+        for pair, piece in previous.items():
+            identity = identities.get(pair)
+            if not identity or identity["digest"] != piece["digest"]:
+                blocked.add((*pair, piece["digest"], piece["goal_mhz"]))
+                print(f"[latency memory] Dropping {pair[0]} {pair[1]}: its digest changed after re-elaboration", flush=True)
+        selected = {}
+        seeds = dict(hints)
+        for (kind, key), item in sorted(identities.items()):
+            if kind not in LATENCY_MEMORY_KINDS:
+                continue
+            piece = _select_latency_piece(parser_state, kind, key, item["digest"],
+                                          item["goal_mhz"], blocked)
+            if piece and item.get("cap") is not None and piece["latency"] > item["cap"]:
+                print(f"NOTE: ignoring latency memory {kind} {key}: remembered count exceeds its cap", flush=True)
+                piece = None
+            if piece:
+                selected[(kind, key)] = piece
+                remembered = _seed_source_text(
+                    f"latency memory ({piece['source']})", piece, piece)
+                hint = hints.get((kind, key))
+                if (hint is not None and piece["goal_mhz"] < item["goal_mhz"]
+                        and hint[0] > piece["latency"]):
+                    # A lower-goal depth is a floor at this goal, not its
+                    # answer: a deeper explicit hint is the better start.
+                    seeds[(kind, key)] = (
+                        hint[0], f"{hint[1]}, above the floor {piece['latency']} "
+                                 f"from {remembered}")
+                else:
+                    seeds[(kind, key)] = (piece["latency"], remembered)
+        # A constructed tag need not have a .latency read. Its parser
+        # constraint still records what was served, avoiding redundant parses.
+        constraints = {("AUTO_PIPELINE", key): constraint
+                       for key, _main, constraint, _callee
+                       in _auto_pipeline_tag_instances(parser_state)}
+        constraints.update({("AUTO_MULTI_CYCLE", key): group.constraint
+                            for key, group in AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(parser_state).items()
+                            if not group.constraint.is_fixed()})
+        consumed_mc = AUTO_MULTI_CYCLE.ELABORATED_AUTO_MULTI_CYCLE_NCYCLES(parser_state)
+        changed = False
+        wanted_values = {}
+        for pair, constraint in constraints.items():
+            kind, key = pair
+            source_start = (constraint.start_latency if constraint else None)
+            source_start = source_start if source_start is not None else (1 if kind == "AUTO_MULTI_CYCLE" else 0)
+            wanted = seeds.get(pair, (source_start, None))[0]
+            cap = constraint.max_latency if constraint else None
+            if cap is not None:
+                wanted = min(wanted, cap)
+            wanted_values[pair] = wanted
+            actual = consumed_mc.get(key) if kind == "AUTO_MULTI_CYCLE" else (
+                constraint.seed if constraint and constraint.seed is not None else source_start)
+            changed |= actual != wanted
+        if not changed:
+            pypeline.SET_LATENCY_SEEDS(seeds)
+            for pair, constraint in constraints.items():
+                if constraint is not None:
+                    constraint.seed = wanted_values[pair] if pair in seeds else None
+                if pair in selected:
+                    pypeline._latency_seeds_applied[pair] = (wanted_values[pair], seeds[pair][1])
+                elif pair in pypeline._latency_seeds_applied:
+                    if pair in hints:
+                        pypeline._latency_seeds_applied[pair] = (wanted_values[pair], hints[pair][1])
+                    else:
+                        pypeline._latency_seeds_applied.pop(pair)
+            break
+        previous = selected
+        print("[latency memory] Re-elaborating with matched starting latencies"
+              + (" (dependent pieces)" if attempt else "") + "...", flush=True)
+        parser_state = reparse(seeds)
+    else:
+        print("NOTE: latency memory starting values did not settle; using hints/source starts", flush=True)
+        parser_state = reparse(hints)
+        identities = _latency_piece_identities(parser_state)
+        selected = {}
+    LATENCY_MEMORY_SELECTED.update(selected)
+    # Only a region's count is enforced (_ENFORCE_ONE_AUTO_PIPELINE_REGION), so
+    # only a region takes a depth floor: a seeded tag whose callee holds
+    # another AUTO_PIPELINE, or can't take registers, stays planned as if unseeded.
+    region_keys = {r.key for r in AUTO_PIPELINE.COLLECT_AUTO_PIPELINE_REGIONS(parser_state)}
+    for (kind, key), piece in selected.items():
+        if piece["goal_mhz"] < identities[(kind, key)]["goal_mhz"]:
+            if kind == "AUTO_MULTI_CYCLE":
+                LATENCY_MEMORY_MCP_FLOORS[key] = piece["latency"]
+            elif key in region_keys:
+                LATENCY_MEMORY_AP_FLOORS[key] = piece["latency"]
+    for (kind, key), item in identities.items():
+        if kind != "main":
+            continue
+        piece = _select_latency_piece(parser_state, kind, key, item["digest"], item["goal_mhz"])
+        if piece:
+            LATENCY_MEMORY_MAIN_REPLAYS[key] = piece
+    for piece in selected.values():
+        try:
+            os.utime(piece["path"], None)
+        except OSError:
+            pass
+    return parser_state
+
+
+def APPLY_LATENCY_MEMORY(parser_state, src_file, hints):
+    """Resolve the independent memory pieces of a synthesizing .py build, right
+    after its zero-clock VHDL is written: part/tool/goals and fresh zero-clock
+    digests are available, and no synthesis has run. Each re-parse keeps the
+    resolved part and tool and rewrites the zero-clock files. hints are the
+    INSTALL_LATENCY_HINTS seeds. Returns the (maybe re-parsed) parser_state;
+    other builds, and builds with no synthesis tool, return it unchanged."""
+    import pypeline
+    import PY_TO_LOGIC
+
+    if not (
+        src_file.endswith(".py")
+        and pypeline.AUTO_PIPELINE_BUILD_MODE() == "sweep"
+        and SYN.SYN_TOOL is not None
+    ):
+        return parser_state
+
+    def reparse(seeds):
+        pypeline.SET_LATENCY_SEEDS(seeds)
+        state = PY_TO_LOGIC.PARSE_FILE(src_file)
+        state.part = parser_state.part
+        state.syn_tool_name = parser_state.syn_tool_name
+        AUTO_PIPELINE.WRITE_0_ADDED_CLKS_INIT_FILES(state)
+        return state
+
+    parser_state = RESOLVE_LATENCY_MEMORY(parser_state, hints, reparse)
+    PRINT_LATENCY_SEEDS(parser_state.part, SYN.TOOL_NAME(SYN.SYN_TOOL))
+    return parser_state
+
+
+def NORMALIZE_CONCRETE_PIPELINE(snapshot):
+    """Validate cached parameters and restore JSON wire-type pairs to tuples."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        raise ValueError("empty or malformed concrete pipeline")
+    result = copy.deepcopy(snapshot)
+    for rel, record in result.items():
+        if not isinstance(rel, str) or not isinstance(record, dict) or not isinstance(record.get("func"), str):
+            raise ValueError("malformed concrete instance")
+        types = record["types"]
+        if not isinstance(types, list) or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in types):
+            raise ValueError("malformed concrete wire types")
+        slices = record["slices"]
+        if not isinstance(slices, list) or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(v) or not 0 <= v <= 1 for v in slices):
+            raise ValueError("malformed concrete slices")
+        bits = record["exact_bits"]
+        if bits is not None and (not isinstance(bits, list) or any(
+                not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in bits)):
+            raise ValueError("malformed exact-bit boundaries")
+        if any(not isinstance(record[k], bool) for k in ("input", "output", "fixed")):
+            raise ValueError("malformed concrete flags")
+        record["types"] = [tuple(pair) for pair in types]
+    return result
+
+
+def LOAD_LATENCY_MEMORY_LOCKS(parser_state):
+    if not LATENCY_MEMORY_ENABLED:
+        return
+    for main in parser_state.main_mhz:
+        name = parser_state.LogicInstLookupTable[main].func_name
+        goal = SYN.GET_TARGET_MHZ(main, parser_state)
+        for func in SUBTREE_FUNCTIONS(main, parser_state):
+            instances = sorted(i for i in parser_state.FuncToInstances[func]
+                               if i.startswith(main + LOGIC.SUBMODULE_MARKER))
+            if not instances:
+                continue
+            paths = [os.path.join(SYN.SYN_OUTPUT_DIRECTORY, LATENCY_MEMORY_FILE),
+                     LATENCY_MEMORY_STORE_PATH(SYN.TOOL_NAME(SYN.SYN_TOOL), parser_state.part,
+                                               "lock", name + "/" + func)]
+            if not any(e.get("kind") == "lock" and e.get("key") == name + "/" + func
+                       for path in paths for e in _read_latency_pieces(path)):
+                continue
+            fingerprint = MEASURED_LOCK_MODEL(func, instances[0], parser_state)
+            piece = _select_latency_piece(parser_state, "lock", name + "/" + func, fingerprint, goal)
+            if not piece:
+                continue
+            try:
+                data = piece["lock"]
+                lock = MiniSweepLock(data["slices"], data["input_registers"], data["output_registers"],
+                    data["boundary_strategy"], NORMALIZE_CONCRETE_PIPELINE(data["concrete"]),
+                    data["model_fingerprint"], data["winner_hash"])
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"NOTE: ignoring invalid latency lock {piece['key']}: {e}", flush=True)
+                continue
+            if piece["goal_mhz"] == goal:
+                CARRIED_LOCKS[(name, func, goal, fingerprint)] = lock
+                what = "concrete lock"
+            else:
+                MINISWEEP_LOCK_HINTS[(name, func, goal)] = len(lock.slices)
+                what = "mini-sweep hint"
+            print(f"[latency memory] Applying {what} for {func} in {name}: "
+                  f"depth {len(lock.slices)} ({piece['source']}, goal {piece['goal_mhz']:g} MHz)", flush=True)
+            try:
+                os.utime(piece["path"], None)
+            except OSError:
+                pass
+
+
+def TRY_LATENCY_MEMORY_REPLAY(parser_state, args):
+    """Conservative all-MAIN replay: no deliberately failing confirmation."""
+    if not LATENCY_MEMORY_ENABLED or not LATENCY_MEMORY_MAIN_REPLAYS:
+        return None
+    import AUTO_FSM
+
+    skip = None
+    if AUTO_PIPELINE.RAM_COLLECT(parser_state) or AUTO_FSM.DESIGN_HAS_AUTO_FSM(parser_state):
+        skip = "RAM plan search or AUTO_FSM re-parses around the sweep"
+    elif getattr(args, "coarse", False):
+        # --start/--stop bound the coarse search; a remembered implementation
+        # from another search could lie outside them
+        skip = "--coarse sweeps choose their own latency range"
+    if skip is not None:
+        if skip not in _LATENCY_MEMORY_REPLAY_SKIPS:
+            _LATENCY_MEMORY_REPLAY_SKIPS.add(skip)
+            print(f"NOTE: latency memory MAIN replay skipped: {skip}", flush=True)
+        return None
+    table = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+    snapshots = {}
+    for main in parser_state.main_mhz:
+        name = parser_state.LogicInstLookupTable[main].func_name
+        if name in parser_state.func_marked_wires:
+            # Wire MAINs cannot add latency and are excluded from sweep timing.
+            # Keep their fresh zero-clock table; there is no piece to load.
+            continue
+        piece = LATENCY_MEMORY_MAIN_REPLAYS.get(name)
+        try:
+            concrete = NORMALIZE_CONCRETE_PIPELINE(piece["concrete"]) if piece else None
+            compatible = AUTO_PIPELINE.CONCRETE_PIPELINE_COMPATIBLE(main, concrete, table, parser_state)
+        except (KeyError, TypeError, ValueError):
+            compatible = False
+        if not compatible:
+            print("NOTE: latency memory MAIN replay skipped: not every MAIN matches", flush=True)
+            return None
+        snapshots[main] = concrete
+    for main, concrete in snapshots.items():
+        AUTO_PIPELINE.RESTORE_CONCRETE_PIPELINE(main, concrete, table, parser_state)
+    # Zero-clock VHDL can stay identical when a tag's cap/fixed count changes.
+    # Validate the restored implementation before any confirmation synthesis.
+    problems = AUTO_PIPELINE.AUTO_PIPELINE_CONSTRAINTS_REALIZED_PROBLEMS(
+        parser_state, table, memory_floors=True)
+    if problems:
+        print("NOTE: latency memory MAIN replay skipped: remembered implementation "
+              "violates current AUTO_PIPELINE bounds\n" + "\n".join(problems), flush=True)
+        return None
+    params = AUTO_PIPELINE.MultiMainTimingParams()
+    for main in snapshots:
+        piece = LATENCY_MEMORY_MAIN_REPLAYS[parser_state.LogicInstLookupTable[main].func_name]
+        print(f"[latency memory] Replaying MAIN {main} ({piece['source']}, goal {piece['goal_mhz']:g} MHz)", flush=True)
+        try:
+            os.utime(piece["path"], None)
+        except OSError:
+            pass
+    params.TimingParamsLookupTable = table
+    params.confirmation_preserved_mains = snapshots
+    params, _met = DO_SEEDED_CONFIRM_OR_SWEEP(parser_state, params)
+    return params
+
+
+def _auto_pipeline_tag_instances(parser_state):
+    """(binding, main inst, constraint, callee func name) per AUTO_PIPELINE-
+    tagged instance, except fixed ones (latency=, @pipeline_latency callees),
+    whose latency is never a starting value. The binding is the tag's key, or
+    the key at the MAIN's goal when the key is used at several goals
+    (AUTO.AUTO_PIPELINE_BINDING): each goal remembers its own depth."""
+    import AUTO
+
+    marker = LOGIC.SUBMODULE_MARKER
+    fixed_funcs = getattr(parser_state, "func_fixed_latency", {}) or {}
+    for inst_name, logic in sorted(parser_state.LogicInstLookupTable.items()):
+        for local_sub, key in sorted(logic.sub_inst_to_auto_pipeline_key.items()):
+            if key is None:
+                continue
+            constraint = logic.sub_inst_to_auto_pipeline_latency.get(local_sub)
+            callee = logic.submodule_instances.get(local_sub)
+            if constraint is not None and constraint.is_fixed():
+                continue
+            if callee is None or callee in fixed_funcs:
+                continue
+            main = inst_name.split(marker)[0]
+            yield AUTO.AUTO_PIPELINE_BINDING(parser_state, key, main), main, constraint, callee
+
+
+def _latency_owners(parser_state):
+    """{(kind, key): (owning main func names, constraint, shape)} for every
+    non-fixed AUTO_PIPELINE / AUTO_MULTI_CYCLE the design elaborated. The shape
+    digests the hardware the latency is for: the AUTO_PIPELINE callee's
+    AUTO_MULTI_CYCLE.FUNCTION_SHAPE, or the AUTO_MULTI_CYCLE's MCP_SHAPE."""
+
+    def main_func(main_inst):
+        logic = parser_state.LogicInstLookupTable.get(main_inst)
+        return logic.func_name if logic is not None else main_inst
+
+    owners = {}
+    shapes = {}
+    for key, main_inst, constraint, callee in _auto_pipeline_tag_instances(parser_state):
+        entry = owners.setdefault(
+            ("AUTO_PIPELINE", key),
+            (set(), constraint, AUTO_MULTI_CYCLE.FUNCTION_SHAPE(callee, parser_state, shapes)),
+        )
+        entry[0].add(main_func(main_inst))
+    for key, group in AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(
+        parser_state
+    ).items():
+        if group.constraint.is_fixed():
+            continue
+        mains = {main_func(inst.split(LOGIC.SUBMODULE_MARKER)[0]) for inst, _s, _e in group.paths}
+        owners[("AUTO_MULTI_CYCLE", key)] = (
+            mains,
+            group.constraint,
+            AUTO_MULTI_CYCLE.MCP_SHAPE(group, parser_state),
+        )
+    return owners
+
+
+def BUILD_LATENCY_PROFILE(parser_state, multimain_timing_params, history, untimed=()):
+    """The latency_profile.json document (pure but for the harvest walks):
+    deterministic, sorted, without timestamps or absolute paths."""
+    import pypeline
+
+    tpl = multimain_timing_params.TimingParamsLookupTable
+    built = {}
+    latencies, _divergent = AUTO_PIPELINE.HARVEST_AUTO_PIPELINE_LATENCIES(
+        parser_state, tpl
+    )
+    for key, value in latencies.items():
+        built[("AUTO_PIPELINE", key)] = value
+    for key, value in AUTO_MULTI_CYCLE.HARVEST_AUTO_MULTI_CYCLE_NCYCLES(
+        parser_state, multimain_timing_params
+    ).items():
+        built[("AUTO_MULTI_CYCLE", key)] = value
+    finals = {
+        name: (main.get("goal_mhz"), main.get("final") or {})
+        for name, main in ((history or {}).get("mains") or {}).items()
+    }
+    named = {(kind, key): name for kind, name, key, _site in pypeline.USER_NAMED_AUTO_TAGS()}
+    entries = []
+    for (kind, key), (mains, constraint, shape) in sorted(_latency_owners(parser_state).items()):
+        if (kind, key) not in built:
+            continue
+        verdicts = [finals.get(m) for m in sorted(mains)]
+        verified = (
+            bool(verdicts)
+            and all(
+                v is not None
+                and v[1].get("met") is True
+                and v[1].get("met_basis") in ("measured", "no_failing_path_reported")
+                for v in verdicts
+            )
+            # A met MAIN says nothing about a region synthesis never timed
+            and not (kind == "AUTO_PIPELINE" and key in untimed)
+        )
+        goals = [v[0] for v in verdicts if v is not None and v[0] is not None]
+        achieved = [
+            v[1].get("achieved_mhz")
+            for v in verdicts
+            if v is not None and v[1].get("achieved_mhz") is not None
+        ]
+        seed = LATENCY_SEEDS_USED.get((kind, key))
+        entries.append(
+            {
+                "kind": kind,
+                "key": key,
+                "name": named.get((kind, key)),
+                "constraint": constraint.describe() if constraint is not None else "unconstrained",
+                "mains": sorted(mains),
+                "goal_mhz": max(goals) if goals else None,
+                "achieved_mhz": min(achieved) if achieved else None,
+                "latency": built[(kind, key)],
+                "verified": verified,
+                "seed": {"latency": seed[0], "source": seed[1]} if seed else None,
+                "shape": shape,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "part": parser_state.part,
+        "tool": SYN.TOOL_NAME(SYN.SYN_TOOL),
+        "mains": {
+            name: {
+                "goal_mhz": goal,
+                "achieved_mhz": final.get("achieved_mhz"),
+                "met": final.get("met"),
+            }
+            for name, (goal, final) in sorted(finals.items())
+        },
+        "entries": entries,
+    }
+
+
+def BUILD_LATENCY_PIECES(parser_state, params, history, profile, untimed=None):
+    """Record each piece only if all of its owning MAINs met timing, and none of
+    the AUTO_PIPELINE regions synthesis never timed ({key: MAIN instance},
+    WARN_UNTIMED_REGIONS), nor a MAIN or lock containing one."""
+    identities = _latency_piece_identities(parser_state)
+    finals = (history or {}).get("mains", {})
+    untimed = untimed or {}
+    untimed_mains = set(untimed.values())
+
+    def verified(mains, whole=False):
+        """whole: the piece captures whole MAINs (a MAIN implementation or lock)."""
+        if whole and set(mains) & untimed_mains:
+            return False
+        return bool(mains) and all(
+            finals.get(parser_state.LogicInstLookupTable[m].func_name, {}).get("final", {}).get("met") is True
+            and finals[parser_state.LogicInstLookupTable[m].func_name]["final"].get("met_basis")
+                in ("measured", "no_failing_path_reported") for m in mains)
+
+    part, tool = parser_state.part, SYN.TOOL_NAME(SYN.SYN_TOOL)
+    built = {(e["kind"], e["key"]): e for e in profile["entries"]}
+    pieces = []
+    for (kind, key), identity in sorted(identities.items()):
+        if kind == "AUTO_PIPELINE" and key in untimed:
+            continue
+        if not verified(identity["mains"], whole=kind == "main") or identity["goal_mhz"] is None:
+            continue
+        piece = dict(kind=kind, key=key, digest=identity["digest"],
+                     goal_mhz=identity["goal_mhz"], part=part, tool=tool)
+        if kind == "main":
+            main = next(iter(identity["mains"]))
+            piece["concrete"] = AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(
+                main, params.TimingParamsLookupTable, parser_state)
+        elif (kind, key) in built:
+            piece.update(latency=built[(kind, key)]["latency"],
+                         achieved_mhz=built[(kind, key)]["achieved_mhz"])
+        else:
+            continue
+        pieces.append(piece)
+    for (main_name, func, goal, fingerprint), lock in sorted(CARRIED_LOCKS.items()):
+        mains = {m for m in parser_state.main_mhz
+                 if parser_state.LogicInstLookupTable[m].func_name == main_name}
+        if not verified(mains, whole=True) or lock.concrete is None:
+            continue
+        if not any(SYN.GET_TARGET_MHZ(m, parser_state) == goal for m in mains):
+            continue
+        pieces.append(dict(kind="lock", key=main_name + "/" + func,
+            digest=fingerprint, goal_mhz=goal, part=part, tool=tool, lock=lock.to_dict()))
+    return pieces
+
+
+def MERGE_LATENCY_PIECES(previous, pieces):
+    """Retain old variants/failing pieces, bound entries per piece file."""
+    groups = {}
+    for piece in previous + pieces:
+        pair = (piece["kind"], piece["key"])
+        entries = groups.setdefault(pair, {})
+        identity = (piece["part"], piece["tool"], piece["digest"], piece["goal_mhz"])
+        entries.pop(identity, None)
+        entries[identity] = {k: v for k, v in piece.items() if k not in ("source", "path")}
+    return [e for pair in sorted(groups)
+            for e in list(groups[pair].values())[-LATENCY_MEMORY_MAX_ENTRIES:]]
+
+
+def RECORD_LATENCY_PROFILE(parser_state, multimain_timing_params, history, untimed=None):
+    """The profile format stays v1; memory v2 stores independently reusable pieces.
+    untimed: the regions WARN_UNTIMED_REGIONS found, recorded as unverified."""
+    try:
+        profile = BUILD_LATENCY_PROFILE(parser_state, multimain_timing_params, history, untimed or {})
+        out_dir = SYN.SYN_OUTPUT_DIRECTORY
+        SYN._write_json_atomic(os.path.join(out_dir, LATENCY_PROFILE_FILE), profile)
+        if not LATENCY_MEMORY_ENABLED:
+            print(f"Latency profile: {os.path.join(out_dir, LATENCY_PROFILE_FILE)} (latency memory off)", flush=True)
+            return profile
+        pieces = BUILD_LATENCY_PIECES(
+            parser_state, multimain_timing_params, history, profile, untimed
+        )
+        out_path = os.path.join(out_dir, LATENCY_MEMORY_FILE)
+        doc = {"schema_version": LATENCY_MEMORY_SCHEMA_VERSION,
+               "pieces": MERGE_LATENCY_PIECES(_read_latency_pieces(out_path), pieces)}
+        SYN._write_json_atomic(out_path, doc)
+        for piece in pieces:
+            path = LATENCY_MEMORY_STORE_PATH(piece["tool"], piece["part"], piece["kind"], piece["key"])
+            if path is None:
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            SYN._write_json_atomic(path, {"schema_version": LATENCY_MEMORY_SCHEMA_VERSION,
+                "pieces": MERGE_LATENCY_PIECES(_read_latency_pieces(path), [piece])})
+        places = "out_dir, store" if SYN.SYNTHESIS_STORE_DIR else "out_dir"
+        print(f"Latency memory: recorded {len(pieces)} pieces ({places})", flush=True)
+        return profile
+    except Exception as e:
+        print(f"WARNING: could not record the latency profile: {e}", flush=True)
+        return None
+
+
+def RETAINED_OBSERVATION(parser_state, multimain_timing_params):
+    """The newest SYNTHESIS_OBSERVATIONS entry of the implementation these
+    timing params build (same IMPLEMENTATION_SIGNATURE), or None."""
+    signature = IMPLEMENTATION_SIGNATURE(parser_state, multimain_timing_params)
+    return next(
+        (
+            o
+            for o in reversed(SYNTHESIS_OBSERVATIONS)
+            if o["implementation_signature"] == signature
+        ),
+        None,
+    )
+
+
+def ADD_OVER_CAPACITY_FAILURES(parser_state, multimain_timing_params):
+    """Without --stop_on_over_capacity the sweep only warns about an
+    over-capacity netlist and keeps going, but the build it ends on must still
+    fit to pass. When the retained observation is over capacity, each main
+    whose final record would otherwise say met gets a device_over_capacity
+    sweep_timing_failures entry, so the exit code agrees with final.met.
+    Returns the added entries."""
+    if not SYNTHESIS_OBSERVATIONS:
+        return []
+    retained = RETAINED_OBSERVATION(parser_state, multimain_timing_params)
+    if retained is None or retained["utilization"]["status"] != "over_capacity":
+        return []
+    failures = list(
+        getattr(multimain_timing_params, "sweep_timing_failures", None) or []
+    )
+    failing = {failure[0] for failure in failures}
+    added = []
+    for main_inst in sorted(parser_state.main_mhz):
+        main_func_name = parser_state.LogicInstLookupTable[main_inst].func_name
+        if main_func_name in failing:
+            continue
+        goal_mhz = SYN.GET_TARGET_MHZ(main_inst, parser_state)
+        outcome = SWEEP_OUTCOMES.get(main_func_name)
+        final = BUILD_FINAL_MAIN_RECORD(
+            goal_mhz, outcome, None, None, fit_status="over_capacity"
+        )
+        if final["met_basis"] == "device_over_capacity":
+            added.append(
+                (main_func_name, goal_mhz, final["achieved_mhz"], "device_over_capacity")
+            )
+    multimain_timing_params.sweep_timing_failures = failures + added
+    return added
+
+
+def WRITE_SWEEP_RESULTS(parser_state, multimain_timing_params, src_file):
+    """'Writing Results of Throughput Sweep', after a synthesizing build
+    (AUTO_PIPELINE.DO_PIPELINED_BUILD). Everything here is written before the
+    driver's TIMING NOT MET exit, so failing builds get it too: the depth
+    summary, over-capacity failures (an over-capacity final netlist fails the
+    build even when its timing met), the final sweep_history.json (the
+    machine-readable verdict for the design as built), the final files and the
+    syn @final hooks, and the latency profile (what this build built for each
+    AUTO_PIPELINE / AUTO_MULTI_CYCLE, and the verified results remembered for
+    the next one)."""
+    import pypeline
+    import PY_TO_LOGIC
+
+    # Starting latencies only start the build's own sweep: a --sim import
+    # after this uses the built values
+    pypeline.SET_LATENCY_SEEDS({})
+
+    print(
+        "================== Writing Results of Throughput Sweep ================================",
+        flush=True,
+    )
+    print(f"Throughput sweep done, elapsed time {SYN.ELAPSED_STR()}", flush=True)
+    PRINT_PIPELINE_DEPTH_SUMMARY(
+        parser_state, multimain_timing_params.TimingParamsLookupTable
+    )
+    ADD_OVER_CAPACITY_FAILURES(parser_state, multimain_timing_params)
+    untimed = WARN_UNTIMED_REGIONS(parser_state, multimain_timing_params)
+    sweep_history = WRITE_SWEEP_HISTORY(
+        parser_state, multimain_timing_params, build_complete=True
+    )
+    SYN.WRITE_FINAL_FILES(multimain_timing_params, parser_state)
+    PY_TO_LOGIC.RUN_SYN_FINAL_HOOKS()
+    if src_file.endswith(".py") and pypeline.AUTO_PIPELINE_BUILD_MODE() == "sweep":
+        RECORD_LATENCY_PROFILE(parser_state, multimain_timing_params, sweep_history, untimed)
+
+
+def RECORD_CONFIRMATION_RESULTS(
+    parser_state, multimain_timing_params, measured_mhz, met
+):
+    """Pin-and-confirm confirmation run (DO_SEEDED_CONFIRM_OR_SWEEP): one
+    iteration record per goal main, and on a pass its outcome. measured_mhz:
+    main inst -> MHz for mains a path report named; when every report passed,
+    unnamed goal mains are met with no MHz measured. A failed confirmation
+    records only its measurements -- the fallback sweep decides outcomes.
+    Call after sweep_timing_failures is set (the provisional write reads it)."""
+    NEXT_SWEEP_HISTORY_RUN()
+    tpl = multimain_timing_params.TimingParamsLookupTable
+    signature = IMPLEMENTATION_SIGNATURE(
+        parser_state, multimain_timing_params
+    )
+    observation = RETAINED_OBSERVATION(parser_state, multimain_timing_params) or {}
+    for main_inst in parser_state.main_mhz:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        main_func_name = main_logic.func_name
+        goal_mhz = SYN.GET_TARGET_MHZ(main_inst, parser_state)
+        if goal_mhz is None or SYN.LOGIC_IS_ZERO_DELAY(
+            main_logic, parser_state, allow_none_delay=True
+        ):
+            continue
+        curr_mhz = measured_mhz.get(main_inst)
+        if curr_mhz is None and not met:
+            continue
+        subtrees, _mono, _regions, total_stages = MAIN_PIPELINE_DEPTH(
+            main_inst, parser_state, tpl
+        )
+        record = RECORD_SWEEP_ITERATION(
+            main_func_name,
+            goal_mhz,
+            {
+                "iter": 1,
+                "implementation_signature": signature,
+                "input_signature": observation.get("input_signature"),
+                "observation_origin": "cache_hit"
+                if observation.get("cache_hit")
+                else "synthesis",
+                "main": main_func_name,
+                "goal_mhz": goal_mhz,
+                "achieved_mhz": None if curr_mhz is None else round(curr_mhz, 3),
+                "met": True if curr_mhz is None else curr_mhz >= goal_mhz,
+                "cuts": sum(len(tpl[d]._slices) for d in subtrees),
+                "pipeline_stages": total_stages + 1 if subtrees else None,
+                "action": (
+                    "confirm"
+                    if curr_mhz is not None
+                    else "confirm(no failing path reported)"
+                ),
+            },
+        )
+        if met:
+            prev = SWEEP_OUTCOMES.get(main_func_name) or {}
+            carried = {k: prev[k] for k in ("standalone_mhz",) if k in prev}
+            RECORD_SWEEP_OUTCOME(
+                main_func_name,
+                goal_mhz,
+                "confirmation_run",
+                record=record,
+                seeded_from=(
+                    {
+                        "source": prev.get("source"),
+                        "run": prev.get("run"),
+                        "iter": prev.get("iter"),
+                    }
+                    if prev
+                    else None
+                ),
+                **carried,
+            )
+    WRITE_SWEEP_HISTORY(parser_state, multimain_timing_params, build_complete=False)
+
+
+def PREDICTED_STAGE_NS(cuts, landscape):
+    # Worst combinational stage plus one launch/setup cost. The latter is zero
+    # for legacy backends or incomplete component evidence.
+    bounds = [-1] + list(cuts) + [landscape.total_units - 1]
+    worst = 0.0
+    for i in range(len(bounds) - 1):
+        w = 0.0
+        for u in range(bounds[i] + 1, bounds[i + 1] + 1):
+            w += landscape.weight[u]
+        worst = max(worst, w)
+    stage_ns = worst * landscape.units_to_ns
+    if worst > 0.0:
+        stage_ns += landscape.stage_overhead_ns
+    return stage_ns
+
+
+def APPLY_PIPELINE_PLACEMENTS(
+    placements,
+    parser_state,
+    TimingParamsLookupTable,
+    lock_targets=False,
+):
+    """Lower typed placements without recursively projecting global slices.
+
+    This is deliberately an internal compiler API: the planned sweep and the
+    opt-in QoR benchmark both use it, but it is not a source pragma or command
+    line interface.  The setters invalidate each modified TimingParams hash
+    and latency cache; the normal ancestor invalidation pass refreshes the
+    enclosing entity hashes after the full batch is applied.
+    """
+    target_insts = set()
+    seen = set()
+    bit_groups = {}
+    for placement in placements:
+        if not isinstance(placement, PipelinePlacement):
+            if isinstance(placement, BitPlacementRequest):
+                raise ValueError(
+                    f"Cannot lower provisional bit planning site "
+                    f"{placement.candidate_id}; materialize its ordinal/count "
+                    "against the complete selected leaf group first"
+                )
+            raise TypeError(type(placement))
+        if placement.candidate_id in seen:
+            continue
+        seen.add(placement.candidate_id)
+        if placement.inst_path not in TimingParamsLookupTable:
+            raise KeyError(
+                f"Pipeline placement instance does not exist: "
+                f"{placement.inst_path}"
+            )
+        timing_params = TimingParamsLookupTable[placement.inst_path]
+        logic = parser_state.LogicInstLookupTable[placement.inst_path]
+        AUTO_PIPELINE.CHECK_FIXED_LATENCY_BOUNDARY(placement.inst_path, parser_state)
+        AUTO_PIPELINE.CHECK_ADDED_LATENCY_CONTEXT(placement.inst_path, parser_state)
+        if timing_params.params_are_fixed:
+            raise ValueError(
+                f"Cannot add pipeline placement to locked instance "
+                f"{placement.inst_path}"
+            )
+        if not logic.CAN_HAVE_ADDED_LATENCY(parser_state):
+            raise ValueError(
+                f"Pipeline placement targets non-sliceable function "
+                f"{logic.func_name}: {placement.candidate_id}"
+            )
+        if placement.kind == PipelinePlacement.INSTANCE_INPUT:
+            if len(logic.inputs) == 0:
+                raise ValueError(
+                    f"Input-boundary placement targets function with no "
+                    f"inputs: {placement.candidate_id}"
+                )
+            timing_params.SET_HAS_IN_REGS(True)
+        elif placement.kind == PipelinePlacement.INSTANCE_OUTPUT:
+            if len(logic.outputs) == 0:
+                raise ValueError(
+                    f"Output-boundary placement targets function with no "
+                    f"outputs: {placement.candidate_id}"
+                )
+            timing_params.SET_HAS_OUT_REGS(True)
+        elif placement.kind == PipelinePlacement.BIT_INTERNAL:
+            if len(logic.submodule_instances) != 0:
+                raise ValueError(
+                    f"Bit-internal placement must target a raw HDL leaf: "
+                    f"{placement.candidate_id}"
+                )
+            if RAW_VHDL.GET_LEAF_SPLIT_KIND(logic) not in (
+                RAW_VHDL.SPLIT_KIND_BITS,
+                RAW_VHDL.SPLIT_KIND_MUX_BITS,
+            ):
+                raise ValueError(
+                    f"Bit-internal placement targets non-bit-splittable leaf "
+                    f"{logic.func_name}: {placement.candidate_id}"
+                )
+            bit_groups.setdefault(placement.inst_path, []).append(placement)
+        else:  # guarded by PipelinePlacement.__init__, defensive for mutation
+            raise ValueError(placement.kind)
+        target_insts.add(placement.inst_path)
+
+    for inst_path, group in bit_groups.items():
+        timing_params = TimingParamsLookupTable[inst_path]
+        logic = parser_state.LogicInstLookupTable[inst_path]
+        counts = {placement.bit_split_count for placement in group}
+        widths = {placement.bit_width for placement in group}
+        modes = {placement.bit_boundary_mode for placement in group}
+        if len(counts) != 1 or len(widths) != 1 or len(modes) != 1:
+            raise ValueError(
+                f"Physical bit placements for {inst_path} disagree on "
+                f"split count/width/mode: counts={counts}, widths={widths}, "
+                f"modes={modes}"
+            )
+        count = counts.pop()
+        width = widths.pop()
+        mode = modes.pop()
+        ordinals = {placement.bit_split_ordinal for placement in group}
+        if len(group) != count or ordinals != set(range(1, count + 1)):
+            raise ValueError(
+                f"Physical bit placement group for {inst_path} is incomplete: "
+                f"ordinals={sorted(ordinals)}, expected 1..{count}"
+            )
+        actual_width = RAW_VHDL.GET_LEAF_BIT_WIDTH(logic, parser_state)
+        if actual_width != width:
+            raise ValueError(
+                f"Physical bit placement width {width} disagrees with raw "
+                f"VHDL leaf width {actual_width} for {inst_path}"
+            )
+        if mode == "exact":
+            groups = {placement.bit_boundaries for placement in group}
+            if len(groups) != 1:
+                raise ValueError(
+                    f"Exact physical bit placements for {inst_path} disagree "
+                    f"on their boundary group: {groups}"
+                )
+            boundaries = list(groups.pop())
+        else:
+            boundaries = RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(width, count)
+        expected_slices = [boundary / float(width) for boundary in boundaries]
+        by_ordinal = {
+            placement.bit_split_ordinal: placement for placement in group
+        }
+        for ordinal, (boundary, local_slice) in enumerate(
+            zip(boundaries, expected_slices), start=1
+        ):
+            placement = by_ordinal[ordinal]
+            if (
+                placement.bit_boundary != boundary
+                or not math.isclose(
+                    placement.local_slice,
+                    local_slice,
+                    rel_tol=0.0,
+                    abs_tol=1e-15,
+                )
+            ):
+                raise ValueError(
+                    f"Physical bit placement {placement.candidate_id} does "
+                    f"not match RAW VHDL's {mode} allocation"
+                )
+        existing_boundaries = getattr(
+            timing_params, "_exact_bit_boundaries", None
+        )
+        if timing_params._slices not in ([], expected_slices) or (
+            existing_boundaries is not None
+            and list(existing_boundaries) != boundaries
+        ):
+            raise ValueError(
+                f"Physical bit placement group for {inst_path} conflicts "
+                f"with existing slices {timing_params._slices}; expected "
+                f"{expected_slices}"
+            )
+        if mode == "exact":
+            timing_params.SET_EXACT_BIT_BOUNDARIES(boundaries, width)
+        else:
+            timing_params.SET_SLICES(expected_slices)
+
+    if lock_targets:
+        # Lock after the whole batch so multiple internal cuts may legally
+        # target the same leaf.
+        for inst in target_insts:
+            TimingParamsLookupTable[inst].params_are_fixed = True
+    return TimingParamsLookupTable
+
+
+def PIPELINE_PLACEMENT_REALIZATION(
+    placement, parser_state, TimingParamsLookupTable
+):
+    """Machine-readable realization/status record for placement_trace.json."""
+    if isinstance(placement, BitPlacementRequest):
+        rv = placement.to_dict()
+        rv.update(
+            {
+                "realized": False,
+                "realization": "provisional_planning_site",
+            }
+        )
+        return rv
+    if not isinstance(placement, PipelinePlacement):
+        raise TypeError(type(placement))
+    timing_params = TimingParamsLookupTable.get(placement.inst_path)
+    rv = placement.to_dict()
+    if timing_params is None:
+        rv.update({"realized": False, "realization": "missing_instance"})
+        return rv
+    if placement.kind == PipelinePlacement.INSTANCE_INPUT:
+        realized = timing_params._has_input_regs
+        rv.update(
+            {
+                "realized": realized,
+                "boundary_register": "input" if realized else None,
+                "stage_assignment": {
+                    "scope": "instance_local",
+                    "starts_stage": 1 if realized else None,
+                },
+            }
+        )
+    elif placement.kind == PipelinePlacement.INSTANCE_OUTPUT:
+        realized = timing_params._has_output_regs
+        local_boundary = None
+        if realized:
+            local_boundary = timing_params.GET_TOTAL_LATENCY(
+                parser_state, TimingParamsLookupTable
+            )
+        rv.update(
+            {
+                "realized": realized,
+                "boundary_register": "output" if realized else None,
+                "stage_assignment": {
+                    "scope": "instance_local",
+                    "ends_stage": local_boundary,
+                },
+            }
+        )
+    else:
+        if placement.bit_boundary_mode == "exact":
+            expected_boundaries = list(placement.bit_boundaries)
+        else:
+            expected_boundaries = RAW_VHDL.GET_EQUAL_WIDTH_BIT_BOUNDARIES(
+                placement.bit_width, placement.bit_split_count
+            )
+        expected_slices = [
+            boundary / float(placement.bit_width)
+            for boundary in expected_boundaries
+        ]
+        exact_metadata = getattr(timing_params, "_exact_bit_boundaries", None)
+        realized = timing_params._slices == expected_slices and (
+            placement.bit_boundary_mode != "exact"
+            or exact_metadata == expected_boundaries
+        )
+        ends_stage = placement.bit_split_ordinal if realized else None
+        rv.update(
+            {
+                "realized": realized,
+                "realization": (
+                    f"{placement.bit_boundary_mode}_bit_boundary"
+                    if realized
+                    else "emitted_slice_group_mismatch"
+                ),
+                "emitted_slices": list(timing_params._slices),
+                "expected_slices": expected_slices,
+                "boundary_register": "leaf_internal" if realized else None,
+                "stage_assignment": {
+                    "scope": "leaf_local",
+                    "ends_stage": ends_stage,
+                },
+            }
+        )
+    return rv
+
+
+def CHECK_PIPELINE_PLACEMENTS_REALIZED(
+    placements, parser_state, TimingParamsLookupTable
+):
+    missing = []
+    for placement in placements:
+        record = PIPELINE_PLACEMENT_REALIZATION(
+            placement, parser_state, TimingParamsLookupTable
+        )
+        if not record["realized"]:
+            missing.append(placement.candidate_id)
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} planned pipeline placement(s) did not materialize: "
+            + ", ".join(missing[:5])
+        )
+    return len(placements)
+
+
+def DROP_NON_DEEPENING_PLACEMENTS(
+    subtree_root, cuts, placements, parser_state, TimingParamsLookupTable
+):
+    """After real lowering, drop any INSTANCE_INPUT/INSTANCE_OUTPUT placement
+    that materialized (its register really was set) but did not deepen the
+    subtree's realized pipeline latency.
+
+    Found for real on a packed MUX select bus: a candidate admitted only by
+    PLAN_CUTS' own ``_straddled`` near-edge slack sits on a parallel branch
+    whose sibling already bounds GET_PIPELINE_MAP's schedule (both must be
+    ready before their shared next stage), so registering it alone is real
+    hardware that adds nothing -- the same waste class ``_straddled``'s own
+    comment already describes for the divider ("silently inflates the cut
+    count without deepening the pipeline"), just not one geometry alone can
+    reliably catch (a tighter ``_straddled`` rule rejects far more
+    legitimate candidates elsewhere, e.g. most of a real chacha20 decrypt
+    path's own landscape -- see docs/SWEEP_DESIGN.md). Ground truth after real
+    lowering (GET_TOTAL_LATENCY, itself a real synchronous schedule via
+    GET_PIPELINE_MAP) is the only signal that can't be fooled this way.
+
+    BIT_INTERNAL placements are left alone -- they set a raw-HDL leaf's own
+    internal ``_slices`` list, not an IO-boundary register, and are not
+    implicated in this failure mode.
+
+    A subtree's own landscape can reach into a nested AUTO_PIPELINE-tagged
+    descendant (SUB_HAS_AUTO_PIPELINE_IN_HIER already lets BUILD_SLICE_
+    LANDSCAPE descend through one) -- found for real on stream_auto_pipeline_
+    test_top / div_inv's auto-pipelined soft_div_radix core. GET_SUBMODULE_
+    LATENCY deliberately reports such a region's own depth as 0 to ITS
+    container (the same convention SUMMARIZE_SUBTREE_PIPELINE's own
+    docstring documents, so balanced-latency reporting doesn't double count
+    an already-decoupled region), so subtree_root's own GET_TOTAL_LATENCY
+    alone would misread every one of that region's real registers as
+    "added no depth" and delete all of them -- each such region's own
+    GET_TOTAL_LATENCY is added back in below before comparing.
+
+    Cheap in the common case: the extra per-region-instance walk below only
+    ever runs once subtree_root's own monolithic latency alone already
+    looks short, and cache invalidation is bounded by this subtree's own
+    placement count times its hierarchy depth (no full LogicInstLookupTable
+    walk otherwise, unlike AUTO_PIPELINE.INVALIDATE_MODIFIED_INST_ANCESTOR_CACHES).
+    The per-candidate search loop only ever runs on a genuine mismatch.
+
+    Returns (cuts, placements), unchanged unless a mismatch is found and a
+    placement is provably redundant (removing it, alone, leaves the realized
+    latency exactly where it started).
+    """
+    if len(placements) == 0:
+        return cuts, placements
+    marker = LOGIC.SUBMODULE_MARKER
+
+    def _invalidate_ancestors(inst_path):
+        toks = inst_path.split(marker)
+        for i in range(1, len(toks) + 1):
+            ancestor_params = TimingParamsLookupTable.get(marker.join(toks[0:i]))
+            if ancestor_params is not None:
+                ancestor_params.INVALIDATE_CACHE()
+
+    def _toggle(placement, value):
+        timing_params = TimingParamsLookupTable[placement.inst_path]
+        if placement.kind == PipelinePlacement.INSTANCE_INPUT:
+            timing_params.SET_HAS_IN_REGS(value)
+        else:
+            timing_params.SET_HAS_OUT_REGS(value)
+        _invalidate_ancestors(placement.inst_path)
+
+    # SET_HAS_*_REGS above only invalidated each toggled leaf's own cache
+    # (see TimingParams.SET_HAS_OUT_REGS); every container between a leaf
+    # and subtree_root (e.g. an intermediate hierarchy instance) still
+    # caches its pre-this-iteration GET_PIPELINE_MAP result and must be
+    # invalidated too before either total below means anything.
+    root_timing_params = TimingParamsLookupTable[subtree_root]
+    for placement in placements:
+        _invalidate_ancestors(placement.inst_path)
+    monolithic = root_timing_params.GET_TOTAL_LATENCY(
+        parser_state, TimingParamsLookupTable
+    )
+    if monolithic >= len(cuts):
+        return cuts, placements
+
+    in_subtree_prefix = subtree_root + marker
+    region_insts = [
+        inst_name + marker + local_sub
+        for inst_name, logic in parser_state.LogicInstLookupTable.items()
+        if logic.sub_inst_to_auto_pipeline_latency
+        and (inst_name == subtree_root or inst_name.startswith(in_subtree_prefix))
+        for local_sub in logic.sub_inst_to_auto_pipeline_latency
+    ]
+
+    def _realized_total():
+        total = root_timing_params.GET_TOTAL_LATENCY(
+            parser_state, TimingParamsLookupTable
+        )
+        for region_inst in region_insts:
+            region_params = TimingParamsLookupTable.get(region_inst)
+            if region_params is not None:
+                total += region_params.GET_TOTAL_LATENCY(
+                    parser_state, TimingParamsLookupTable
+                )
+        return total
+
+    realized = _realized_total()
+    if realized >= len(cuts):
+        return cuts, placements
+
+    remaining = list(placements)
+
+    def _logical_cut_count(active):
+        return len({placement.axis_unit for placement in active})
+
+    # A synchronized physical frontier is one logical cut. Its members are
+    # mutually redundant when tested one at a time, so toggle the complete
+    # group atomically or this cleanup leaves one arbitrary branch registered.
+    # Bounded: every successful pass removes at least one placement group.
+    for _ in range(len(placements)):
+        if realized >= _logical_cut_count(remaining):
+            break
+        removal_groups = {}
+        for placement in remaining:
+            if placement.kind not in (
+                PipelinePlacement.INSTANCE_INPUT,
+                PipelinePlacement.INSTANCE_OUTPUT,
+            ):
+                continue
+            group_key = placement.placement_group_id
+            if group_key is None:
+                group_key = "single:" + placement.candidate_id
+            removal_groups.setdefault(group_key, []).append(placement)
+
+        dropped_this_pass = False
+        for group_key in sorted(removal_groups):
+            group = removal_groups[group_key]
+            for placement in group:
+                _toggle(placement, False)
+            trial_realized = _realized_total()
+            if trial_realized == realized:
+                member_ids = {placement.candidate_id for placement in group}
+                remaining = [
+                    placement
+                    for placement in remaining
+                    if placement.candidate_id not in member_ids
+                ]
+                dropped_this_pass = True
+                if realized >= _logical_cut_count(remaining):
+                    break
+            else:
+                for placement in group:
+                    _toggle(placement, True)
+        if not dropped_this_pass:
+            break
+    if len(remaining) == len(placements):
+        return cuts, placements
+    new_cuts = sorted(set(p.axis_unit for p in remaining))
+    return new_cuts, remaining
+
+
+def SUMMARIZE_PLACEMENT_GROUPS(final_selected, main_func):
+    """Summarize each synchronized placement group's planned/realized members
+    and raise if it did not materialize as one atomic frontier.
+
+    ``planned_axis_unit`` is only a *provisional* one-cut estimate stamped by
+    ``_PARALLEL_BIT_FRONTIER`` before a leaf's final request count is known --
+    ``MATERIALIZE_BIT_PLACEMENT_REQUESTS`` runs afterward and can move every
+    member of a bit frontier together to a different (but still common)
+    equal-width boundary once the leaf's real count of collected requests is
+    known (see ``_PARALLEL_BIT_FRONTIER``'s own docstring). A 16-bit leaf
+    predicted alone lowers at bit 8 (unit 299); the same leaf collecting a
+    second parallel request instead lowers both members to bit 5 (unit 277).
+    That move is the documented, safe case -- the real invariant a
+    synchronized group must satisfy is that every planned member realized
+    AND all realized members share one physical axis unit, not that the
+    realized unit matches the stale one-cut prediction.
+
+    ``planned_members`` (``bit_internal_request:...@<raster position>`` ids,
+    from the planning-time request) and ``realized_members``
+    (``bit_internal:...#<ordinal>/<count>@bit<n>/<width>`` ids, from the
+    materialized placement) use different id schemes for the same logical
+    member and are therefore only ever compared by length, never by set
+    equality.
+    """
+    placement_groups_by_id = {}
+    for record in final_selected:
+        group_id = record.get("placement_group_id")
+        if group_id is None:
+            continue
+        group = placement_groups_by_id.setdefault(
+            group_id,
+            {
+                "placement_group_id": group_id,
+                "kind": record["placement_group_kind"],
+                "planned_members": record["placement_group_members"],
+                "member_count": record["placement_group_member_count"],
+                "registered_bits": record[
+                    "placement_group_registered_bits"
+                ],
+                "planned_axis_unit": record["placement_group_axis_unit"],
+                "realized_members": [],
+                "realized_axis_units": [],
+            },
+        )
+        group["realized_members"].append(record["candidate_id"])
+        group["realized_axis_units"].append(record["axis_unit"])
+    placement_groups = []
+    for group_id in sorted(placement_groups_by_id):
+        group = placement_groups_by_id[group_id]
+        group["realized_members"].sort()
+        group["realized_axis_units"] = sorted(
+            set(group["realized_axis_units"])
+        )
+        complete = len(group["realized_members"]) == group["member_count"]
+        one_unit = len(group["realized_axis_units"]) == 1
+        group["realized"] = complete and one_unit
+        group["realized_axis_unit"] = (
+            group["realized_axis_units"][0] if one_unit else None
+        )
+        group["moved_from_planned"] = (
+            one_unit and group["realized_axis_unit"] != group["planned_axis_unit"]
+        )
+        if not complete:
+            raise RuntimeError(
+                f"Parallel placement group {group_id!r} for {main_func} lost "
+                f"member(s): expected {group['member_count']}, realized "
+                f"{len(group['realized_members'])} "
+                f"({group['realized_members']})"
+            )
+        if not one_unit:
+            raise RuntimeError(
+                f"Parallel placement group {group_id!r} for {main_func} "
+                f"split across physical units {group['realized_axis_units']} "
+                "instead of materializing as one frontier; members: "
+                f"{group['realized_members']}"
+            )
+        placement_groups.append(group)
+    return placement_groups
+
+
+def WRITE_PIPELINE_PLACEMENT_TRACE(
+    plans, parser_state, TimingParamsLookupTable, internal_config=None
+):
+    """Write the typed planner's candidate/selection/final-realization trace."""
+    out_dir = os.path.join(SYN.SYN_OUTPUT_DIRECTORY, SYN.TOP_LEVEL_MODULE)
+    os.makedirs(out_dir, exist_ok=True)
+    trace_path = os.path.join(out_dir, "placement_trace.json")
+    trace = {
+        "schema_version": 6,
+        "planner": "typed_physical_placement",
+        "internal_forced_mode": (
+            None if internal_config is None else internal_config.get("mode")
+        ),
+        "mains": {},
+    }
+    for plan in plans.values():
+        main_func = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+        _ff_text, final_estimated_ffs = SYN.GET_REGISTERS_ESTIMATE_TEXT_AND_FFS(
+            parser_state.LogicInstLookupTable[plan.main_inst],
+            plan.main_inst,
+            parser_state,
+            TimingParamsLookupTable,
+            {},
+        )
+        candidates = []
+        planning_sites = []
+        seen_candidates = set()
+        seen_planning_sites = set()
+        for subtree_root in plan.subtrees:
+            landscape = plan.landscapes.get(subtree_root)
+            if landscape is None:
+                continue
+            for placement in landscape.candidates:
+                record = placement.to_dict()
+                record["subtree"] = subtree_root
+                if isinstance(placement, BitPlacementRequest):
+                    if placement.candidate_id in seen_planning_sites:
+                        continue
+                    seen_planning_sites.add(placement.candidate_id)
+                    planning_sites.append(record)
+                else:
+                    if placement.candidate_id in seen_candidates:
+                        continue
+                    seen_candidates.add(placement.candidate_id)
+                    candidates.append(record)
+        candidates.sort(key=lambda p: (p["axis_position"], p["candidate_id"]))
+        planning_sites.sort(
+            key=lambda p: (
+                p["requested_axis_position"],
+                p["candidate_id"],
+            )
+        )
+
+        final_selected = []
+        selected_ids = set()
+        for subtree_root, placements in plan.placements.items():
+            for placement in placements:
+                if placement.candidate_id in selected_ids:
+                    continue
+                selected_ids.add(placement.candidate_id)
+                record = PIPELINE_PLACEMENT_REALIZATION(
+                    placement, parser_state, TimingParamsLookupTable
+                )
+                record["subtree"] = subtree_root
+                final_selected.append(record)
+        missing = [p["candidate_id"] for p in final_selected if not p["realized"]]
+        if missing:
+            raise RuntimeError(
+                f"Final placement trace disagrees with emitted TimingParams for "
+                f"{main_func}: {missing[:5]}"
+            )
+        final_selected.sort(
+            key=lambda p: (p["axis_position"], p["candidate_id"])
+        )
+        placement_groups = SUMMARIZE_PLACEMENT_GROUPS(final_selected, main_func)
+
+        # A mini-sweep fixes a helper's *interior*.  Its edge banks are a
+        # separate full-design choice and are retained here with the topology
+        # evidence that selected them.
+        locked_instances = []
+        for inst_path, lock in sorted(plan.locked.items()):
+            timing_params = TimingParamsLookupTable[inst_path]
+            logic = parser_state.LogicInstLookupTable[inst_path]
+            realized = (
+                timing_params.params_are_fixed
+                and timing_params._slices == list(lock.slices)
+                and timing_params._has_input_regs == lock.has_input_regs
+                and timing_params._has_output_regs == lock.has_output_regs
+            )
+            if not realized:
+                raise RuntimeError(
+                    f"Locked pipeline decision did not materialize for {inst_path}"
+                )
+            locked_instances.append(
+                {
+                    "instance_path": inst_path,
+                    "function": logic.func_name,
+                    "slices": list(lock.slices),
+                    "input_registers": lock.has_input_regs,
+                    "output_registers": lock.has_output_regs,
+                    "boundary_strategy": lock.boundary_strategy,
+                    "total_latency": timing_params.GET_TOTAL_LATENCY(
+                        parser_state, TimingParamsLookupTable
+                    ),
+                    "realized": realized,
+                    "lowering": "coarse_minisweep_lock",
+                }
+            )
+        trace["mains"][main_func] = {
+            "main_instance": plan.main_inst,
+            "target_mhz": plan.target_mhz,
+            "mode": plan.placement_mode,
+            "candidate_count": len(candidates),
+            "planning_site_count": len(planning_sites),
+            "final_estimated_total_ffs": final_estimated_ffs,
+            "candidates": candidates,
+            "planning_sites": planning_sites,
+            "iterations": plan.placement_iterations,
+            "same_depth_refinement": {
+                "chunked_mux_attempted": (
+                    plan.chunked_mux_refinement_attempted
+                ),
+                "default_chunked_banks": plan.default_chunked_banks,
+                "final_active_kind": plan.active_placement_refinement,
+                "attempted_physical_fingerprints": sorted(
+                    plan.attempted_placement_fingerprints
+                ),
+            },
+            "final_selected": final_selected,
+            "placement_groups": placement_groups,
+            "locked_instances": locked_instances,
+            "mini_sweep_boundary_diagnostics": plan.mini_sweep_boundary_diagnostics,
+        }
+    with open(trace_path, "w") as f:
+        json.dump(trace, f, indent=1, sort_keys=True)
+    print(f"[sweep] Placement trace: {trace_path}", flush=True)
+    return trace_path
+
+
+class MiniSweepLock:
+    """A proven helper interior plus independently selectable edge banks.
+
+    ``concrete`` holds the measured descendant parameters. ``slices`` is
+    descriptive coarse-search bookkeeping, not a recipe to replay.  Input/output banks are a
+    full-design scheduling decision: putting both on every serial instance
+    creates an avoidable empty output-to-input cycle.
+    """
+
+    def __init__(
+        self,
+        slices,
+        has_input_regs=False,
+        has_output_regs=False,
+        boundary_strategy="topology_output",
+        concrete=None, model_fingerprint=None, winner_hash=None,
+    ):
+        self.slices = list(slices)
+        self.concrete = copy.deepcopy(concrete)
+        self.model_fingerprint = model_fingerprint
+        self.winner_hash = winner_hash
+        self.model_mismatch_reported = False
+        self.has_input_regs = bool(has_input_regs)
+        self.has_output_regs = bool(has_output_regs)
+        self.boundary_strategy = boundary_strategy
+
+    def to_dict(self):
+        return {
+            "slices": list(self.slices),
+            "concrete": self.concrete,
+            "model_fingerprint": self.model_fingerprint,
+            "winner_hash": self.winner_hash,
+            "input_registers": self.has_input_regs,
+            "output_registers": self.has_output_regs,
+            "boundary_strategy": self.boundary_strategy,
+        }
+
+
+def CHECK_CUTS_VS_LATENCY(
+    subtree_root_inst, TimingParamsLookupTable, parser_state, n_cuts, landscape=None
+):
+    """Every planned cut must materialize as at least one slice in some raw
+    HDL leaf of the subtree - registers only physically exist as leaf
+    slices (or IO regs). Zero leaf slices means every cut was silently lost
+    descending the hierarchy (the old Finding #1 failure mode) - always fatal.
+
+    Beyond that, strictness depends on the subtree's landscape:
+    - Fully sliceable subtree (every delay unit legal - pure comb, a register
+      can go anywhere): no planned cut may be LOST, so fewer leaf slices
+      than cuts means the slicing machinery is broken and the build stops.
+      MORE leaf slices than cuts is normal even here: a cut is a stage
+      boundary line across the dataflow, and where it crosses parallel
+      branches each branch materializes its own leaf register.
+    - Subtree with unsliceable spans (atomic/locked segments): planned cuts
+      legitimately shift/merge around those spans on the way down, so a
+      shortfall is expected - one informational line only.
+
+    Note the subtree root's own rebuilt latency is NOT compared against the
+    cut count: auto-pipeline tagged submodules report latency 0 to their
+    containers by design, so a root whose cuts pass through tagged boundaries
+    can legitimately have total latency 0 while its interior is pipelined.
+    Latency may also legitimately exceed the cut count (misaligned child
+    cuts, IO regs on locked insts, factory internal auto-pipelines)."""
+    total_leaf_slices = 0
+    sliced_leaves = []
+    prefix = subtree_root_inst + LOGIC.SUBMODULE_MARKER
+    for inst in TimingParamsLookupTable:
+        if inst == subtree_root_inst or inst.startswith(prefix):
+            timing_params = TimingParamsLookupTable[inst]
+            if len(timing_params._slices) == 0:
+                continue
+            logic = parser_state.LogicInstLookupTable[inst]
+            if len(logic.submodule_instances) == 0:
+                total_leaf_slices += len(timing_params._slices)
+                sliced_leaves.append((inst, list(timing_params._slices)))
+    if total_leaf_slices == 0 and n_cuts > 0:
+        # Every cut vanished - the Finding #1 failure class (slicing descended
+        # into logic that silently dropped the slices). Never acceptable.
+        raise Exception(
+            f"Planned {n_cuts} cuts for {subtree_root_inst} but NO raw HDL "
+            f"leaf slices materialized: cuts were lost descending the "
+            f"hierarchy (sliceability model out of sync with SLICE_DOWN?)"
+        )
+    strict = landscape is not None and all(landscape.legal)
+    if strict and total_leaf_slices < n_cuts:
+        # Nothing in this subtree may shift or absorb a cut - a shortfall
+        # means a planned stage boundary was lost and slicing descent is
+        # broken. (More slices than cuts is fine: parallel branch fan-out.)
+        leaf_lines = []
+        for inst, slices in sliced_leaves[0:5]:
+            # Leaf name only - full instance paths are hundreds of chars
+            short = inst.split(LOGIC.SUBMODULE_MARKER)[-1]
+            leaf_lines.append(f"  .../{short}: {slices}")
+        if len(sliced_leaves) > 5:
+            leaf_lines.append(f"  ... and {len(sliced_leaves) - 5} more")
+        raise Exception(
+            f"Planned {n_cuts} cuts for fully sliceable subtree "
+            f"{subtree_root_inst} but only {total_leaf_slices} leaf slices "
+            f"materialized - the subtree is pure comb logic (a register can "
+            f"go anywhere) so no planned stage boundary may be lost. "
+            f"{len(sliced_leaves)} sliced leaves, first few:\n" + "\n".join(leaf_lines)
+        )
+    if not strict and total_leaf_slices < n_cuts:
+        # Expected drift: cuts shift/merge around the subtree's unsliceable
+        # spans on the way down. The refinement loop's timing feedback
+        # compensates - informational only.
+        print(
+            f"[sweep] note: planned {n_cuts} cuts for {subtree_root_inst}, "
+            f"{total_leaf_slices} leaf slices materialized "
+            f"(cuts shift/merge around unsliceable spans - expected)",
+            flush=True,
+        )
+    return total_leaf_slices
+
+
+class MainSweepPlan:
+    def __init__(self, main_inst, target_mhz):
+        self.main_inst = main_inst
+        self.target_mhz = target_mhz
+        self.target_period_ns = 1000.0 / target_mhz
+        self.subtrees = []  # list of subtree root inst names
+        self.landscapes = {}  # subtree root inst -> SliceLandscape
+        self.cuts = {}  # subtree root inst -> [int offsets]
+        self.placements = {}  # subtree root inst -> [PipelinePlacement]
+        self.fixed_placements = {}  # subtree root inst -> retained experiment seeds
+        self.placement_mode = "automatic"  # automatic / seed / replace
+        self.placement_iterations = []  # machine-readable trace snapshots
+        self.func_delay_scale = {}  # func name -> learned weight multiplier
+        self.global_scale = 1.0  # budget divisor when attribution fails
+        # inst -> MiniSweepLock.  An isolated mini-sweep proves the interior
+        # slices of a repeated helper, but does not prove that every instance
+        # needs both external register banks.  Keep those decisions separate
+        # so adjacent helpers can share one real boundary register.
+        self.locked = {}
+        # The other MAINs' plans at this clock goal. A lock or a region-group
+        # decision this plan makes holds for their instances too (SHARE_LOCK).
+        self.peers = []
+        self.mini_sweep_boundary_diagnostics = {}
+        self.hotspot_streak = {}  # func name -> consecutive attributions
+        self.minisweeps_used = 0
+        self.met_timing = False
+        self.stopped_reason = None
+        self.last_mhz = None
+        self.last_achieved_mhz = None  # most recent eval (met or not)
+        self.last_worst_path = None  # path_report behind last_achieved_mhz
+        self.same_mhz_count = 0
+        # Minimality's failing bound counts optional cuts under the current
+        # lock/boundary policy; fixed latency regions are not trimmable.
+        self.last_failing_total_cuts = None
+        self.prev_total_cuts = None
+        self.trim_pending = False  # probing fewer cuts after having met
+        self.zero_cut_probe = False  # omit optional cuts during a zero-cut trim
+        # A failed physical schedule may have a cheaper same-depth neighbor.
+        # Keep this separate from the delay-scale feedback so the neighbor is
+        # synthesized before the next denser landscape plan.
+        self.pending_placement_refinement = None
+        self.active_placement_refinement = None
+        self.chunked_mux_refinement_attempted = False
+        # Whether the most recently applied placement set included at least
+        # one packed-MUX output bank chunked by CHUNK_SELECTED_MUX_OUTPUT_
+        # BANKS (the default, same-depth lowering -- distinct from the (ii)
+        # terminal-split escalation tracked by chunked_mux_refinement_
+        # attempted above). Recomputed every iteration, not sticky.
+        self.default_chunked_banks = False
+        self.attempted_placement_fingerprints = set()
+        self.current_placement_fingerprint = None
+        # (func_name, reason) when the critical path was attributed to a
+        # func auto-pipelining cannot subdivide
+        self.unpipelinable_blame = None
+        # RESET_DISTRIBUTION_DESCRIPTION when a reset's fanout stopped the plan
+        self.reset_distribution_blame = None
+        self.history = []  # dicts for sweep_history.json
+        # Independent AUTO_PIPELINE regions under this main (see
+        # ENFORCE_AUTO_PIPELINE_REGIONS), including clock-driven plain tags.
+        self.regions = []
+        self.auto_pipeline_limit_blame = None
+        # Set when an AUTO_MULTI_CYCLE multi-cycle path that can't take more cycles
+        # (latency= / max_latency=) is the critical path
+        self.auto_multi_cycle_limit_blame = None
+        # history index where AT_PLATEAU's window starts: moved past records
+        # measured before a structural experiment (not the measured-delay
+        # fallback - a synthesized fmax is real either way)
+        self.plateau_window_start = 0
+        # soft-floor blame text for a "plateau" stop, None if there is none
+        self.plateau_blame = None
+
+    def predicted_floor(self):
+        # (floor_mhz, blame Segment) worst over subtrees, None if all sliceable
+        worst = None
+        blame = None
+        for landscape in self.landscapes.values():
+            if landscape is None:
+                continue
+            f = landscape.floor_mhz()
+            if f is not None and (worst is None or f < worst):
+                worst = f
+                blame = landscape.floor_blame
+        return worst, blame
+
+    def predicted_hard_floor(self):
+        # Hard floor only: pure comb spans no register can land in
+        worst = None
+        blame = None
+        for landscape in self.landscapes.values():
+            if landscape is None:
+                continue
+            f = landscape.hard_floor_mhz()
+            if f is not None and (worst is None or f < worst):
+                worst = f
+                blame = landscape.hard_floor_blame
+        return worst, blame
+
+
+def RANK_PATH_FUNC_CANDIDATES(path_report, plan, parser_state):
+    """Rank candidate funcs for critical-path attribution, best (deepest,
+    most specific) guess first. Post synthesis names below the MAIN are
+    mangled tool-dependently, so this is intentionally substring scoring,
+    never exact hierarchical matching.
+
+    Both endpoint names share their textual prefix down to the lowest
+    common ancestor of the two registers, so a candidate func name that is a
+    substring of *every available* endpoint name is a true ancestor of the
+    path - not just something that happens to appear near it. Ranking those
+    by the deepest (rightmost) match position, longest name breaking ties,
+    finds the lowest common ancestor without ever needing exact
+    hierarchical matching.
+
+    This replaces an earlier version that scored every candidate by summed
+    matched-substring length across start/end reg names and netlist
+    resources. Because every ancestor func's name is *itself* a substring
+    of a descendant register's fully-qualified name (each level just
+    prepends its own instance name), that scoring had no depth signal at
+    all - it always favored the single longest candidate name, which in
+    practice meant long auto-generated hash-suffixed interface-func wrapper
+    names beat short, specific, actually-on-the-critical-path names. Seen
+    for real on wireguard-fpga's decrypt path: the 58-char wrapper
+    ``if8040c842_decrypt_dataflow_core_077e07da383ed36e_inst18`` scored 14112
+    and won over the 29-char ``chacha20_chacha20_block_step`` (7056), even
+    though the reported critical path ran entirely between two registers
+    inside the latter - not merely nearby, but fully bounded within it.
+
+    Returns a list of func names, best first (may be empty)."""
+    endpoints = []
+    for s in [path_report.start_reg_name, path_report.end_reg_name]:
+        if s is not None:
+            endpoints.append(s.lower())
+    resource_strs = [r.lower() for r in path_report.netlist_resources]
+    name_strs = endpoints + resource_strs
+    if len(name_strs) == 0:
+        return []
+    # Candidate funcs = every func inside this plan's subtrees (from segments)
+    # EXCEPT the subtree roots and the main itself: the flattened netlist
+    # prefixes every register name with the top/main entity name, so the
+    # root would match everything and always win - a meaningless
+    # attribution. Only a proper interior func is a usable hotspot; when
+    # none matches the caller falls back to global rescaling.
+    excluded = set()
+    excluded.add(parser_state.LogicInstLookupTable[plan.main_inst].func_name)
+    for subtree_root in plan.subtrees:
+        excluded.add(parser_state.LogicInstLookupTable[subtree_root].func_name)
+    candidates = set()
+    for landscape in plan.landscapes.values():
+        if landscape is None:  # locked subtree root
+            continue
+        for seg in landscape.segments:
+            candidates |= seg.ancestor_funcs
+    # Independent AUTO_PIPELINE regions are locked, so their interiors appear
+    # in no subtree landscape: their own landscapes supply the candidates,
+    # and a region root is a meaningful attribution (the path is inside it).
+    region_root_funcs = set()
+    for region in getattr(plan, "regions", ()):
+        region_root_funcs.add(region.func_name)
+        candidates.add(region.func_name)
+        if region.landscape is not None:
+            for seg in region.landscape.segments:
+                candidates |= seg.ancestor_funcs
+    candidates -= excluded - region_root_funcs
+
+    def _ranked(keyed):
+        # keyed: func_name -> ascending-better sort key tuple. Name itself
+        # is always the last key element so a hash-seed-salted set
+        # iteration order never changes the result between two candidates
+        # that otherwise tie exactly.
+        return [
+            kv[0] for kv in sorted(keyed.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+
+    if len(endpoints) > 0:
+        # Tier A: substring of every available endpoint name (both, or the
+        # single one when the report only had one usable end) - a true
+        # common ancestor of the path.
+        both = {}
+        for func_name in candidates:
+            fl = func_name.lower()
+            positions = [e.rfind(fl) for e in endpoints]
+            if all(p >= 0 for p in positions):
+                both[func_name] = (min(positions), len(fl), fl)
+        if len(both) > 0:
+            return _ranked(both)
+        # Tier B: only reachable with two endpoints available and no
+        # candidate spanning both - fall back to whichever endpoint(s) a
+        # candidate does match.
+        one = {}
+        for func_name in candidates:
+            fl = func_name.lower()
+            positions = [e.rfind(fl) for e in endpoints if fl in e]
+            if len(positions) > 0:
+                one[func_name] = (max(positions), len(fl), fl)
+        if len(one) > 0:
+            return _ranked(one)
+        # Tiers A and B again for region roots, found by their instances'
+        # exact label paths (SYN.INSTANCE_LABEL_POSITION) when no name
+        # matched. An AUTO_PIPELINE call is labeled with the wrapped
+        # function's own name, and an imported function's func_name is
+        # module-prefixed, so a region root's name can be in no register name
+        # at all. Only after name matches, so a deeper function found by name
+        # still wins.
+        root_insts = {}
+        for region in getattr(plan, "regions", ()):
+            root_insts.setdefault(region.func_name, []).append(region.inst)
+        both, one = {}, {}
+        for func_name, insts in root_insts.items():
+            fl = func_name.lower()
+            positions = [
+                max(SYN.INSTANCE_LABEL_POSITION(e, inst, parser_state) for inst in insts)
+                for e in endpoints
+            ]
+            if all(p >= 0 for p in positions):
+                both[func_name] = (min(positions), len(fl), fl)
+            elif any(p >= 0 for p in positions):
+                one[func_name] = (max(positions), len(fl), fl)
+        if len(both) > 0:
+            return _ranked(both)
+        if len(one) > 0:
+            return _ranked(one)
+
+    # Tier C: no endpoint name usable at all (mangled beyond matching, or
+    # the tool reports netlist resources but no register endpoint names) -
+    # the pre-existing summed substring-length score, unchanged.
+    scores = {}
+    for func_name in candidates:
+        fl = func_name.lower()
+        s = 0
+        for st in name_strs:
+            if fl in st:
+                s += len(fl)
+        if s > 0:
+            scores[func_name] = (s, len(fl), fl)
+    return _ranked(scores)
+
+
+def _PATH_REPORT_STAGE_INFO(path_report):
+    # Entity-local pipeline stage numbers (REG_STAGEn_...) for logging only -
+    # stage indices are local to the entity the FF lives in, never global.
+    stages = []
+    for s in [path_report.start_reg_name, path_report.end_reg_name]:
+        if s is not None:
+            m = re.search(r"stage(\d+)", s.lower())
+            if m:
+                stages.append(m.group(1))
+    if len(stages) == 0:
+        return ""
+    return " local_stages=" + "->".join(stages)
+
+
+def ATTRIBUTE_PATH_TO_FUNC(path_report, plan, parser_state):
+    """Best-guess critical path attribution.
+    Returns (func_name or None, local_stage_info string for logging)."""
+    ranked = RANK_PATH_FUNC_CANDIDATES(path_report, plan, parser_state)
+    best = ranked[0] if len(ranked) > 0 else None
+    return best, _PATH_REPORT_STAGE_INFO(path_report)
+
+
+def OPAQUE_PATH_DELAY_REFINEMENTS(path_report, plan, parser_state):
+    """Zero-width text on this failing path, including omitted landscape spans.
+
+    A stalled plan may need a better width here. Unrelated opaque modules and
+    text outside this plan's geometry consumers remain at their zero estimate.
+    """
+    if SYN.HIER_SYN_MODE != "leaf":
+        return set()
+    if parser_state.path_delay_funcs is None:
+        raise RuntimeError("Initialize delay scope with ADD_PATH_DELAY_TO_LOOKUP before refinement")
+    candidates = set()
+    roots = list(plan.subtrees) + [r.inst for r in getattr(plan, "regions", ())]
+    for root in roots:
+        for func in SUBTREE_FUNCTIONS(root, parser_state):
+            logic = parser_state.FuncLogicLookupTable[func]
+            if (
+                logic.vhdl_module_text is not None
+                and logic.delay_is_estimated
+                and SYN.PATH_DELAY_IS_MEASURABLE(
+                    logic, parser_state, refine_opaque=True
+                )
+                and (
+                    ATTRIBUTION_BASIS(path_report, func) is not None
+                    or ATTRIBUTION_BASIS(
+                        path_report, VHDL.EMITTED_NAME(func, parser_state)
+                    )
+                    is not None
+                )
+            ):
+                candidates.add(func)
+    return candidates
+
+
+def WHY_HOTSPOT_NOT_PIPELINABLE(func_name, parser_state, plan=None):
+    """None if auto-pipelining can help this func; otherwise the reason it
+    cannot subdivide the path attributed to it. Mirrors the two-part check
+    the sweep uses before declaring a hotspot unpipelinable."""
+    if plan is not None:
+        targets, excluded = MINISWEEP_LOCK_TARGETS(func_name, plan, parser_state)
+        if excluded and not targets:
+            inst, blocker = next(iter(excluded.items()))
+            return AUTO_PIPELINE.DESCRIBE_ADDED_LATENCY_BLOCKER(
+                inst, blocker, parser_state
+            )[0]
+    h_logic = parser_state.FuncLogicLookupTable[func_name]
+    if not h_logic.CAN_HAVE_ADDED_LATENCY(parser_state):
+        return WHY_NOT_SLICEABLE(h_logic, parser_state)
+    if not AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+        func_name, parser_state
+    ):
+        return "no sliceable logic beneath it"
+    return None
+
+
+def RESOLVE_PIPELINABLE_HOTSPOT(path_report, plan, parser_state):
+    """Rank this path's candidate funcs and pick the deepest one that
+    auto-pipelining can actually help - an unsliceable common ancestor (e.g.
+    a wrapper with its own feedback_vars) must not mask a deeper-or-sibling
+    candidate on the same path that is fully sliceable, or a real hotspot
+    reads as unpipelinable and the sweep gives up early.
+
+    Returns (hotspot_func or None, unpipelinable_reason or None,
+    stage_info). unpipelinable_reason is only set when every ranked
+    candidate was checked and none can be auto-pipelined - the honest
+    "nothing here can help" case; hotspot_func is then the deepest (best
+    attributed) candidate, for logging/blame purposes."""
+    ranked = RANK_PATH_FUNC_CANDIDATES(path_report, plan, parser_state)
+    stage_info = _PATH_REPORT_STAGE_INFO(path_report)
+    if len(ranked) == 0:
+        return None, None, stage_info
+    hotspot_func = ranked[0]
+    reason = WHY_HOTSPOT_NOT_PIPELINABLE(hotspot_func, parser_state, plan)
+    if reason is None:
+        return hotspot_func, None, stage_info
+    for candidate in ranked[1:]:
+        if WHY_HOTSPOT_NOT_PIPELINABLE(candidate, parser_state, plan) is None:
+            return candidate, None, stage_info
+    return hotspot_func, reason, stage_info
+
+
+def _INSTS_CONFLICT(inst_a, inst_b):
+    m = LOGIC.SUBMODULE_MARKER
+    return (
+        inst_a == inst_b
+        or inst_a.startswith(inst_b + m)
+        or inst_b.startswith(inst_a + m)
+    )
+
+
+def _IO_REGISTER_BITS(logic, direction, parser_state):
+    """Return the bank width used by the existing VHDL I/O-register path."""
+    ports = logic.inputs if direction == "input" else logic.outputs
+    bits = 0
+    try:
+        for port in ports:
+            bits += VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(
+                logic.wire_to_c_type[port], parser_state
+            )
+    except Exception:
+        return None
+    return bits
+
+
+def _PARENT_INST_AND_LOCAL(inst_path):
+    marker = LOGIC.SUBMODULE_MARKER
+    if marker not in inst_path:
+        return None, None
+    return inst_path.rsplit(marker, 1)
+
+
+def _TRACE_TRANSPARENT_DRIVER(logic, wire):
+    """Follow only collapsed parent-scope aliases back to their source."""
+    seen = set()
+    while wire in logic.wire_driven_by and wire not in seen:
+        seen.add(wire)
+        wire = logic.wire_driven_by[wire]
+    return wire
+
+
+def _LOCKED_SOURCE_INSTANCE(parent_logic, parent_inst, wire, parser_state):
+    """Return the immediate child instance driving ``wire``, if any.
+
+    At this point aliases have been collapsed or followed.  Deliberately do
+    not walk through a submodule/operator: a register is shared only when two
+    locked helpers are connected by parent-scope wire plumbing with no logic
+    in between.
+    """
+    marker = LOGIC.SUBMODULE_MARKER
+    if marker not in wire:
+        return None
+    local_inst, port_expr = wire.split(marker, 1)
+    if local_inst not in parent_logic.submodule_instances:
+        return None
+    source_logic = parser_state.FuncLogicLookupTable[
+        parent_logic.submodule_instances[local_inst]
+    ]
+    if not any(
+        port_expr == port
+        or port_expr.startswith(port + ".")
+        or port_expr.startswith(port + "[")
+        for port in source_logic.outputs
+    ):
+        return None
+    return parent_inst + marker + local_inst
+
+
+def FIND_DIRECT_LOCKED_BOUNDARY_EDGES(plan, hotspot_func, parser_state):
+    """Find direct producer->consumer edges among one mini-swept helper set.
+
+    This intentionally uses elaborated connectivity rather than source order
+    or a function-name convention.  A serial chain, fanout, and fanin remain
+    distinguishable, while an intervening operation prevents false boundary
+    coalescing.
+    """
+    targets = {
+        inst
+        for inst in plan.locked
+        if parser_state.LogicInstLookupTable[inst].func_name == hotspot_func
+    }
+    edges = set()
+    for consumer in sorted(targets):
+        parent_inst, local_consumer = _PARENT_INST_AND_LOCAL(consumer)
+        if parent_inst is None:
+            continue
+        parent_logic = parser_state.LogicInstLookupTable.get(parent_inst)
+        if parent_logic is None:
+            continue
+        consumer_logic = parser_state.LogicInstLookupTable[consumer]
+        for input_port in consumer_logic.inputs:
+            try:
+                driver = LOGIC.GET_SUBMODULE_INPUT_PORT_DRIVING_WIRE(
+                    parent_logic, local_consumer, input_port
+                )
+            except KeyError:
+                continue
+            driver = _TRACE_TRANSPARENT_DRIVER(parent_logic, driver)
+            producer = _LOCKED_SOURCE_INSTANCE(
+                parent_logic, parent_inst, driver, parser_state
+            )
+            if producer in targets and producer != consumer:
+                edges.add((producer, consumer))
+    return sorted(edges)
+
+
+def _MIN_COST_BIPARTITE_BOUNDARY_COVER(
+    edges, output_cost, input_cost, prefer_output
+):
+    """Exact weighted vertex cover for direct helper connections.
+
+    Each graph edge can be covered by a producer output bank or consumer
+    input bank.  This is a bipartite minimum-cut problem; using the exact
+    solution avoids an order-dependent greedy policy on branching dataflow.
+    """
+    forced_outputs = {
+        producer
+        for producer, consumer in edges
+        if producer in output_cost and consumer not in input_cost
+    }
+    forced_inputs = {
+        consumer
+        for producer, consumer in edges
+        if producer not in output_cost and consumer in input_cost
+    }
+    remaining_edges = [
+        (producer, consumer)
+        for producer, consumer in edges
+        if producer not in forced_outputs and consumer not in forced_inputs
+    ]
+    left = sorted(
+        {producer for producer, _consumer in remaining_edges if producer in output_cost}
+    )
+    right = sorted(
+        {consumer for _producer, consumer in remaining_edges if consumer in input_cost}
+    )
+    usable_edges = [
+        (producer, consumer)
+        for producer, consumer in remaining_edges
+        if producer in output_cost and consumer in input_cost
+    ]
+    uncovered = [
+        (producer, consumer)
+        for producer, consumer in remaining_edges
+        if producer not in output_cost and consumer not in input_cost
+    ]
+    # A selected bank has a strictly positive integer capacity.  The scale
+    # makes width the primary objective, number of banks second, and the
+    # requested output/input orientation the deterministic final tie-break.
+    scale = 4 * (len(left) + len(right) + 1)
+
+    def capacity(bits, side):
+        bits = max(1, int(bits if bits is not None else 1_000_000))
+        side_penalty = 0 if (side == "output") == prefer_output else 1
+        return bits * scale + 1 + side_penalty
+
+    source = "__source__"
+    sink = "__sink__"
+    graph = {}
+
+    def add_edge(u, v, cap):
+        graph.setdefault(u, {})
+        graph.setdefault(v, {})
+        graph[u][v] = graph[u].get(v, 0) + cap
+        graph[v].setdefault(u, 0)
+
+    for producer in left:
+        add_edge(source, ("out", producer), capacity(output_cost[producer], "output"))
+    inf = sum(
+        capacity(output_cost[p], "output") for p in left
+    ) + sum(capacity(input_cost[c], "input") for c in right) + 1
+    for producer, consumer in usable_edges:
+        add_edge(("out", producer), ("in", consumer), inf)
+    for consumer in right:
+        add_edge(("in", consumer), sink, capacity(input_cost[consumer], "input"))
+
+    # Edmonds-Karp is adequate here: mini-sweep groups are deliberately
+    # bounded repeated helpers, and the implementation stays dependency-free.
+    while True:
+        parent = {source: None}
+        queue = [source]
+        for u in queue:
+            for v, cap in sorted(graph.get(u, {}).items(), key=lambda item: str(item[0])):
+                if cap > 0 and v not in parent:
+                    parent[v] = u
+                    queue.append(v)
+                    if v == sink:
+                        break
+            if sink in parent:
+                break
+        if sink not in parent:
+            break
+        flow = None
+        v = sink
+        while parent[v] is not None:
+            u = parent[v]
+            flow = graph[u][v] if flow is None else min(flow, graph[u][v])
+            v = u
+        v = sink
+        while parent[v] is not None:
+            u = parent[v]
+            graph[u][v] -= flow
+            graph[v][u] = graph[v].get(u, 0) + flow
+            v = u
+
+    reachable = {source}
+    queue = [source]
+    for u in queue:
+        for v, cap in graph.get(u, {}).items():
+            if cap > 0 and v not in reachable:
+                reachable.add(v)
+                queue.append(v)
+    selected_outputs = sorted(
+        forced_outputs | {
+            producer for producer in left if ("out", producer) not in reachable
+        }
+    )
+    selected_inputs = sorted(
+        forced_inputs | {
+            consumer for consumer in right if ("in", consumer) in reachable
+        }
+    )
+    return selected_outputs, selected_inputs, uncovered
+
+
+def SET_MINISWEEP_BOUNDARY_STRATEGY(plan, hotspot_func, strategy, parser_state):
+    """Choose boundary banks for one repeated mini-sweep helper group.
+
+    The compact policies cover only direct helper-to-helper edges.  This
+    leaves top-level endpoints unregistered by default and lets timing
+    feedback request the progressively broader one-sided/both-sided fallback
+    policies only when necessary.
+    """
+    valid = {
+        "topology_output",
+        "topology_input",
+        "all_output",
+        "all_input",
+        "both",
+    }
+    if strategy not in valid:
+        raise ValueError(f"Unknown mini-sweep boundary strategy: {strategy}")
+    target_insts = sorted(
+        inst
+        for inst in plan.locked
+        if parser_state.LogicInstLookupTable[inst].func_name == hotspot_func
+    )
+    if not target_insts:
+        return False
+    allow_io = hotspot_func not in parser_state.func_marked_no_add_io_regs
+    can_input = {
+        inst: allow_io
+        and len(parser_state.LogicInstLookupTable[inst].inputs) > 0
+        for inst in target_insts
+    }
+    can_output = {
+        inst: allow_io
+        and len(parser_state.LogicInstLookupTable[inst].outputs) > 0
+        for inst in target_insts
+    }
+    for inst in target_insts:
+        lock = plan.locked[inst]
+        lock.has_input_regs = False
+        lock.has_output_regs = False
+        lock.boundary_strategy = strategy
+
+    edges = FIND_DIRECT_LOCKED_BOUNDARY_EDGES(plan, hotspot_func, parser_state)
+    selected_outputs = []
+    selected_inputs = []
+    uncovered = []
+    if strategy == "both":
+        selected_outputs = [inst for inst in target_insts if can_output[inst]]
+        selected_inputs = [inst for inst in target_insts if can_input[inst]]
+    elif strategy == "all_output":
+        selected_outputs = [inst for inst in target_insts if can_output[inst]]
+    elif strategy == "all_input":
+        selected_inputs = [inst for inst in target_insts if can_input[inst]]
+    else:
+        output_cost = {
+            inst: _IO_REGISTER_BITS(
+                parser_state.LogicInstLookupTable[inst], "output", parser_state
+            )
+            for inst in target_insts
+            if can_output[inst]
+        }
+        input_cost = {
+            inst: _IO_REGISTER_BITS(
+                parser_state.LogicInstLookupTable[inst], "input", parser_state
+            )
+            for inst in target_insts
+            if can_input[inst]
+        }
+        selected_outputs, selected_inputs, uncovered = _MIN_COST_BIPARTITE_BOUNDARY_COVER(
+            edges,
+            output_cost,
+            input_cost,
+            prefer_output=(strategy == "topology_output"),
+        )
+    for inst in selected_outputs:
+        plan.locked[inst].has_output_regs = True
+    for inst in selected_inputs:
+        plan.locked[inst].has_input_regs = True
+    _, excluded = MINISWEEP_LOCK_TARGETS(hotspot_func, plan, parser_state)
+    diagnostics = {
+        "excluded_instances": {
+            inst: {
+                "blocker": blocker,
+                "reason": AUTO_PIPELINE.DESCRIBE_ADDED_LATENCY_BLOCKER(
+                    inst, blocker, parser_state
+                )[0],
+            }
+            for inst, blocker in excluded.items()
+        },
+        "strategy": strategy,
+        "direct_edges": [
+            {"producer": producer, "consumer": consumer}
+            for producer, consumer in edges
+        ],
+        "selected_outputs": selected_outputs,
+        "selected_inputs": selected_inputs,
+        "uncovered_edges": [
+            {"producer": producer, "consumer": consumer}
+            for producer, consumer in uncovered
+        ],
+    }
+    plan.mini_sweep_boundary_diagnostics[hotspot_func] = diagnostics
+    # A failing count before a new interior lock or boundary policy says
+    # nothing about the smaller residual cut count around that new hardware.
+    plan.last_failing_total_cuts = None
+    return True
+
+
+def TRY_NEXT_MINISWEEP_BOUNDARY_STRATEGY(plan, hotspot_func, parser_state):
+    """Advance one bounded full-design boundary-policy A/B candidate."""
+    target_locks = [
+        plan.locked[inst]
+        for inst in sorted(plan.locked)
+        if parser_state.LogicInstLookupTable[inst].func_name == hotspot_func
+    ]
+    if not target_locks:
+        return None
+    current = target_locks[0].boundary_strategy
+    order = [
+        "topology_output",
+        "topology_input",
+        "all_output",
+        "all_input",
+        "both",
+    ]
+    try:
+        next_index = order.index(current) + 1
+    except ValueError:
+        next_index = len(order)
+    if next_index >= len(order):
+        return None
+    next_strategy = order[next_index]
+    SET_MINISWEEP_BOUNDARY_STRATEGY(
+        plan, hotspot_func, next_strategy, parser_state
+    )
+    return next_strategy
+
+
+def MINISWEEP_LOCK_TARGETS(hotspot_func, plan, parser_state):
+    """Eligible instances in the blamed MAIN, plus in-MAIN context blockers."""
+    targets, excluded = [], {}
+    marker = LOGIC.SUBMODULE_MARKER
+    for inst in sorted(getattr(parser_state, "FuncToInstances", {}).get(hotspot_func, ())):
+        if inst != plan.main_inst and not inst.startswith(plan.main_inst + marker):
+            continue
+        blocker = AUTO_PIPELINE.ADDED_LATENCY_BLOCKER(inst, parser_state)
+        if blocker is None:
+            targets.append(inst)
+        else:
+            excluded[inst] = blocker
+    return targets, excluded
+
+
+def DESCRIBE_EXCLUDED_MINISWEEP_INSTANCES(excluded, parser_state):
+    if not excluded:
+        return ""
+    shown = 3
+    descriptions = [
+        AUTO_PIPELINE.DESCRIBE_ADDED_LATENCY_BLOCKER(inst, blocker, parser_state)[1]
+        for inst, blocker in list(excluded.items())[:shown]
+    ]
+    if len(excluded) > shown:
+        descriptions.append(f"... and {len(excluded) - shown} more")
+    return f"; left {len(excluded)} instance(s) combinational (" + "; ".join(descriptions) + ")"
+
+
+def REGION_LOCK_BLOCKER(region, plan, parser_state):
+    """Why a mini-sweep lock may not go on `region`'s root or inside it, or
+    None.
+
+    A fixed (latency=) or capped (max_latency=) region owns its register
+    count and resets its interior on a recount, which would drop the lock.
+    Every other member of the region's group is in this plan's MAIN or a
+    peer's: a group is one key at one clock goal
+    (AUTO.AUTO_PIPELINE_BINDING), and the lock goes into every member
+    (SHARE_LOCK), which must realize one .latency. A locked root realizes
+    its region from the lock (AUTO_PIPELINE._ENFORCE_ONE_AUTO_PIPELINE_REGION)."""
+    if region.constraint.upper_bound() is not None:
+        return "constrained AUTO_PIPELINE region"
+    return None
+
+
+def LOCK_BLOCKED_REASON(func, plan, targets, parser_state):
+    """Why `func` may not be locked in this plan, or None.
+
+    Shared by the mini-sweep and cross-pass lock carryover, so a carried lock
+    obeys exactly the rules that created it.
+    """
+    # Never mini-sweep a subtree root (or the main): "isolating" the whole
+    # subtree is just this sweep with even slices instead of planned cuts,
+    # and locking the root would freeze the entire plan. A subtree that is an
+    # AUTO_PIPELINE region (its caller cannot absorb latency) is planned by
+    # region enforcement instead, so its root follows the region rules below.
+    region_insts = {region.inst for region in getattr(plan, "regions", ())}
+    root_funcs = set(
+        parser_state.LogicInstLookupTable[d].func_name
+        for d in plan.subtrees
+        if d not in region_insts
+    )
+    root_funcs.add(parser_state.LogicInstLookupTable[plan.main_inst].func_name)
+    if func in root_funcs:
+        return "subtree root"
+    # Never lock around an AUTO_PIPELINE region, nor on or inside one whose
+    # register count a constraint owns (latency= / max_latency=: see
+    # ENFORCE_AUTO_PIPELINE_REGIONS). An uncapped region's count is only
+    # planned or a starting guess, so its root and interior take locks like
+    # an untagged call site's would.
+    for func_inst in targets:
+        for region in getattr(plan, "regions", ()):
+            if not _INSTS_CONFLICT(func_inst, region.inst):
+                continue
+            if region.inst.startswith(func_inst + LOGIC.SUBMODULE_MARKER):
+                return "contains an AUTO_PIPELINE region"
+            reason = REGION_LOCK_BLOCKER(region, plan, parser_state)
+            if reason is not None:
+                return reason
+    func_logic = parser_state.FuncLogicLookupTable[func]
+    if not func_logic.CAN_HAVE_ADDED_LATENCY(parser_state):
+        return "cannot have added latency"
+    if not AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+        func, parser_state
+    ):
+        return "no hierarchy allowing added latency"
+    return None
+
+
+def SUBTREE_FUNCTIONS(root, parser_state):
+    """Deterministic descendants-before-parent order, shared funcs once."""
+    result, seen = [], set()
+
+    def visit(name):
+        if name in seen:
+            return
+        seen.add(name)
+        logic = parser_state.FuncLogicLookupTable[name]
+        for child in sorted(set(logic.submodule_instances.values())):
+            visit(child)
+        result.append(name)
+
+    visit(root if root in parser_state.FuncLogicLookupTable else
+          parser_state.LogicInstLookupTable[root].func_name)
+    return result
+
+
+def SUBTREE_MODEL_FINGERPRINT(root, parser_state):
+    """Hash of the subtree's delay model: per-function delay, estimate flag,
+    wire types and delay components."""
+    values = []
+    for name in SUBTREE_FUNCTIONS(root, parser_state):
+        logic = parser_state.FuncLogicLookupTable[name]
+        values.append(
+            (
+                name,
+                getattr(logic, "delay", None),
+                getattr(logic, "delay_is_estimated", False),
+                sorted(getattr(logic, "wire_to_c_type", {}).items()),
+                getattr(logic, "delay_components", None),
+            )
+        )
+    return hashlib.sha256(
+        json.dumps(values, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def MEASURED_LOCK_MODEL(func, inst, parser_state):
+    """Measure the subtree (frontier rules apply), then fingerprint it.
+
+    Used before minimizing a hotspot and before matching a carried lock, so
+    both sides of a carryover key see the same measured model.
+    """
+    descendants = SUBTREE_FUNCTIONS(inst, parser_state)
+    if any(
+        getattr(parser_state.FuncLogicLookupTable[f], "delay_is_estimated", False)
+        for f in descendants
+    ):
+        SYN.MEASURE_DELAYS(descendants, parser_state)
+    return SUBTREE_MODEL_FINGERPRINT(inst, parser_state)
+
+
+def CARRIED_LOCK_KEY(plan, func, fingerprint, parser_state):
+    """Carried locks are kept per owning MAIN. A lock found at one goal is in
+    every same-goal MAIN's plan (SHARE_LOCK), so each stores its own copy."""
+    main_name = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+    return (main_name, func, plan.target_mhz, fingerprint)
+
+
+def LOAD_CARRIED_LOCKS(plan, parser_state, table, preserved_snapshot=None):
+    """Re-bind this MAIN's compatible concrete locks after re-elaboration."""
+    main_name = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+    funcs = sorted(
+        {k[1] for k in CARRIED_LOCKS if k[0] == main_name and k[2] == plan.target_mhz}
+    )
+    restored_strategies = {}
+    for func in funcs:
+        targets, _excluded = MINISWEEP_LOCK_TARGETS(func, plan, parser_state)
+        if not targets:
+            continue
+        reason = LOCK_BLOCKED_REASON(func, plan, targets, parser_state)
+        if reason is not None:
+            print(f"[sweep] Not reusing lock for {func} in {main_name}: {reason}", flush=True)
+            continue
+        fingerprint = MEASURED_LOCK_MODEL(func, targets[0], parser_state)
+        lock = CARRIED_LOCKS.get(CARRIED_LOCK_KEY(plan, func, fingerprint, parser_state))
+        if lock is None:
+            print(
+                f"[sweep] Not reusing lock for {func} in {main_name}: its measured delay model changed",
+                flush=True,
+            )
+            continue
+        loaded = []
+        for inst in targets:
+            if any(_INSTS_CONFLICT(inst, other) for other in plan.locked):
+                continue
+            if not AUTO_PIPELINE.CONCRETE_PIPELINE_COMPATIBLE(inst, lock.concrete, table, parser_state):
+                continue
+            if preserved_snapshot is not None and not AUTO_PIPELINE.CONCRETE_PIPELINE_CONTAINS(
+                preserved_snapshot, plan.main_inst, inst, lock.concrete
+            ):
+                continue  # the preserved implementation is not this lock
+            plan.locked[inst] = copy.deepcopy(lock)
+            loaded.append(inst)
+        if loaded:
+            restored_strategies[func] = lock.boundary_strategy
+            print(
+                f"[sweep] Reusing concrete lock for {func} on {len(loaded)} instance(s) in {main_name}",
+                flush=True,
+            )
+    # Boundary banks depend on this pass's topology, not the last instance
+    # that populated the carryover cache.
+    for func, strategy in sorted(restored_strategies.items()):
+        SET_MINISWEEP_BOUNDARY_STRATEGY(plan, func, strategy, parser_state)
+    return restored_strategies
+
+
+def STORE_CARRIED_LOCKS(plans, parser_state):
+    """Keep only the retained implementation's locks, keyed by owning MAIN."""
+    for plan in plans.values():
+        main_name = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+        for key in [k for k in CARRIED_LOCKS if k[0] == main_name and k[2] == plan.target_mhz]:
+            del CARRIED_LOCKS[key]
+        for inst, lock in sorted(plan.locked.items()):
+            if lock.concrete is None:
+                continue
+            func = parser_state.LogicInstLookupTable[inst].func_name
+            fingerprint = SUBTREE_MODEL_FINGERPRINT(inst, parser_state)
+            CARRIED_LOCKS[CARRIED_LOCK_KEY(plan, func, fingerprint, parser_state)] = (
+                copy.deepcopy(lock)
+            )
+
+
+def LINK_PEER_PLANS(plans):
+    """Give each plan its peers: the other MAINs' plans at its clock goal."""
+    for plan in plans.values():
+        plan.peers = sorted(
+            (
+                other
+                for other in plans.values()
+                if other is not plan and other.target_mhz == plan.target_mhz
+            ),
+            key=lambda other: other.main_inst,
+        )
+
+
+def SHARE_LOCK(plan, func, parser_state, only_unlocked=False):
+    """Apply this plan's lock on `func` to every eligible instance of `func`
+    in its peers, the MAINs at the same clock goal: an interior that meets the
+    goal in one instance meets it in all of them, and the instances of one
+    AUTO_PIPELINE group must realize one .latency. A peer keeps its own
+    boundary banks, chosen from its own topology, and replans with the lock.
+    `only_unlocked` (carried locks) leaves a peer that already locks `func`,
+    or replays a preserved implementation, as it is. Returns the peers that
+    took the lock."""
+    lock = next(
+        (
+            plan.locked[inst]
+            for inst in sorted(plan.locked)
+            if parser_state.LogicInstLookupTable[inst].func_name == func
+        ),
+        None,
+    )
+    if lock is None:
+        return []
+    took = []
+    for peer in plan.peers:
+        targets, _excluded = MINISWEEP_LOCK_TARGETS(func, peer, parser_state)
+        if not targets or (
+            only_unlocked
+            and (
+                any(inst in peer.locked for inst in targets)
+                or getattr(peer, "realized_snapshot", None) is not None
+            )
+        ):
+            continue
+        peer_name = parser_state.LogicInstLookupTable[peer.main_inst].func_name
+        reason = LOCK_BLOCKED_REASON(func, peer, targets, parser_state)
+        if reason is not None:
+            print(f"[sweep] Not applying the lock for {func} in {peer_name}: {reason}", flush=True)
+            continue
+        for inst in targets:
+            for locked_inst in list(peer.locked):
+                if _INSTS_CONFLICT(inst, locked_inst):
+                    del peer.locked[locked_inst]
+            peer.locked[inst] = copy.deepcopy(lock)
+        SET_MINISWEEP_BOUNDARY_STRATEGY(peer, func, lock.boundary_strategy, parser_state)
+        peer.needs_replan = True
+        print(
+            f"[sweep] Applying the lock for {func} to {len(targets)} instance(s) in "
+            f"{peer_name}, also at {plan.target_mhz:g} MHz",
+            flush=True,
+        )
+        took.append(peer)
+    return took
+
+
+def HOTSPOT_IS_LOCKED(hotspot_func, plan, parser_state):
+    targets, _ = MINISWEEP_LOCK_TARGETS(hotspot_func, plan, parser_state)
+    return bool(targets) and all(inst in plan.locked for inst in targets)
+
+
+def TRY_HOTSPOT_MINISWEEP(hotspot_func, plan, parser_state):
+    """Count one more consecutive attribution to hotspot_func (resetting other
+    funcs' streaks); once it repeats MINISWEEP_HOTSPOT_STREAK times and
+    mini-sweep budget remains, run the isolated mini-sweep. True if it
+    locked the hotspot.
+
+    A repeated, attributed helper is worth an early isolated probe:
+    RUN_HOTSPOT_MINISWEEP measures that helper before making a lock, so an
+    estimate elsewhere in the hierarchy is not a reason to keep densifying
+    past a compact repeated solution. False leaves the caller's ordinary
+    feedback (densify, region growth) to run."""
+    plan.hotspot_streak[hotspot_func] = plan.hotspot_streak.get(hotspot_func, 0) + 1
+    for f in list(plan.hotspot_streak.keys()):
+        if f != hotspot_func:
+            plan.hotspot_streak[f] = 0
+    if (
+        ((parser_state.LogicInstLookupTable[plan.main_inst].func_name, hotspot_func,
+          plan.target_mhz) not in MINISWEEP_LOCK_HINTS
+         and plan.hotspot_streak[hotspot_func] < MINISWEEP_HOTSPOT_STREAK)
+        or plan.minisweeps_used >= MAX_MINISWEEPS
+    ):
+        return False
+    plan.minisweeps_used += 1
+    if not RUN_HOTSPOT_MINISWEEP(hotspot_func, plan, parser_state):
+        return False
+    plan.hotspot_streak[hotspot_func] = 0
+    return True
+
+
+def RUN_HOTSPOT_MINISWEEP(hotspot_func, plan, parser_state):
+    """Isolated coarse sweep of one hotspot func.
+
+    A nonzero result locks interior slices on eligible instances in this MAIN. Boundary
+    registers are selected separately from the real parent dataflow: direct
+    serial helpers share one bank instead of every instance receiving the old
+    unconditional input-plus-output pair.
+    """
+    targets, excluded = MINISWEEP_LOCK_TARGETS(hotspot_func, plan, parser_state)
+    if not targets:
+        print(
+            f"[sweep] No eligible instances of {hotspot_func} in {plan.main_inst}"
+            + DESCRIBE_EXCLUDED_MINISWEEP_INSTANCES(excluded, parser_state),
+            flush=True,
+        )
+        return False
+    if HOTSPOT_IS_LOCKED(hotspot_func, plan, parser_state):
+        return False  # already locked, sweeping it again changes nothing
+    if LOCK_BLOCKED_REASON(hotspot_func, plan, targets, parser_state) is not None:
+        return False
+    inst = targets[0]
+    # The coarse sweep's initial guess divides this func's delay by the
+    # target period and only ever grows from there - an inflated estimated
+    # delay would over-pipeline the lock from the start. Measure for real
+    # (MEASURE_DELAYS skips stateful-subtree funcs; those keep the estimate
+    # for the guess and the coarse loop self-corrects from below).
+    # Keep MEASURE_DELAYS' state/frontier restrictions. Stabilize all
+    # geometry used by slicing, not just the helper's total delay.
+    MEASURED_LOCK_MODEL(hotspot_func, inst, parser_state)
+    print(
+        f"[sweep] Isolated coarse sweep of hotspot: {hotspot_func}"
+        f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} "
+        f"(goal {plan.target_mhz:.2f} MHz)",
+        flush=True,
+    )
+    inst_sweep_state = InstSweepState()
+    hint = MINISWEEP_LOCK_HINTS.get((
+        parser_state.LogicInstLookupTable[plan.main_inst].func_name,
+        hotspot_func, plan.target_mhz))
+    if hint is not None:
+        print(f"[latency memory] Starting mini-sweep of {hotspot_func} at remembered depth {hint}", flush=True)
+    (
+        inst_sweep_state,
+        working_slices,
+        winning_tpl,
+    ) = DO_COARSE_THROUGHPUT_SWEEP(
+        inst,
+        plan.target_mhz,
+        inst_sweep_state,
+        parser_state,
+        starting_guess_latency=hint,
+        do_incremental_guesses=True,
+        max_allowed_latency_mult=MAX_ALLOWED_LATENCY_MULT,
+        stop_at_n_worse_result=4,
+    )
+    if not inst_sweep_state.met_timing or working_slices is None:
+        print(
+            f"[sweep] Hotspot {hotspot_func}"
+            f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} could not meet "
+            "timing in isolation.",
+            flush=True,
+        )
+        return False
+    # The lock adds IO register banks around every instance.  If the helper
+    # already meets its isolated goal with zero internal cuts, those banks
+    # would add latency without subdividing the blamed combinational path.
+    # Leave it to normal boundary planning instead.  This is also important
+    # for repeated helpers such as Divider's step function, which may already
+    # be fast enough in isolation and must not acquire two gratuitous clocks
+    # per instance merely because a different path was blamed at top level.
+    if len(working_slices) == 0:
+        print(
+            f"[sweep] Hotspot {hotspot_func}"
+            f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} meets timing in "
+            "isolation without internal cuts; not locking IO-only latency.",
+            flush=True,
+        )
+        return False
+    # Prove (near-)minimality before locking: the coarse loop stops at the
+    # first PASSING latency, which may have overshot (its growth steps can
+    # jump). Bisect between the largest known-FAILING latency and the met
+    # one - reported slack is not usable for this (tools stop optimizing at
+    # slack ~0), only pass/fail data points are.
+    concrete = AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(inst, winning_tpl, parser_state)
+    winner_hash = winning_tpl[inst].GET_HASH_EXT(winning_tpl, parser_state)
+    met_latency = len(working_slices)
+    initial_guess = inst_sweep_state.initial_guess_latency
+    if met_latency > initial_guess:
+        lo = initial_guess  # initial guess ran and failed
+    else:
+        lo = 0  # met on the first try - nothing below is proven
+    hi = met_latency
+    probes = 0
+    while hi - lo > 1 and probes < MINISWEEP_TRIM_PROBES:
+        probes += 1
+        mid = (lo + hi) // 2
+        print(
+            f"[sweep] Hotspot minimality probe: {hotspot_func}"
+            f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} at {mid} clks "
+            f"(known failing: {lo}, met: {hi})",
+            flush=True,
+        )
+        known = getattr(inst_sweep_state, "coarse_results", {}).get(mid)
+        if known is not None:
+            print(f"[sweep] Reusing measured hotspot candidate at {mid} cuts", flush=True)
+            if known["met"]:
+                hi = len(known["slices"])  # same rule as a fresh probe below
+                working_slices = known["slices"]
+                concrete = known["concrete"]
+                winner_hash = known["hash"]
+            else:
+                lo = mid
+            continue
+        probe_state = InstSweepState()
+        (
+            probe_state,
+            probe_slices,
+            probe_tpl,
+        ) = DO_COARSE_THROUGHPUT_SWEEP(
+            inst,
+            plan.target_mhz,
+            probe_state,
+            parser_state,
+            starting_guess_latency=mid,
+            do_incremental_guesses=False,
+            stop_at_latency=mid,
+        )
+        if probe_state.met_timing and probe_slices is not None:
+            hi = len(probe_slices)
+            working_slices = probe_slices
+            concrete = AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(inst, probe_tpl, parser_state)
+            winner_hash = probe_tpl[inst].GET_HASH_EXT(probe_tpl, parser_state)
+        else:
+            lo = mid
+    # Replace any conflicting (nested/containing) older locks
+    for func_inst in targets:
+        for locked_inst in list(plan.locked.keys()):
+            if _INSTS_CONFLICT(func_inst, locked_inst):
+                del plan.locked[locked_inst]
+        plan.locked[func_inst] = MiniSweepLock(
+            working_slices,
+            boundary_strategy="topology_output",
+            concrete=concrete,
+            model_fingerprint=SUBTREE_MODEL_FINGERPRINT(inst, parser_state),
+            winner_hash=winner_hash,
+        )
+    SET_MINISWEEP_BOUNDARY_STRATEGY(
+        plan, hotspot_func, "topology_output", parser_state
+    )
+    boundary = plan.mini_sweep_boundary_diagnostics[hotspot_func]
+    print(
+        f"[sweep] Locked {hotspot_func}"
+        f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} at "
+        f"cuts={len(working_slices)} "
+        f"({len(boundary['selected_inputs'])} input + "
+        f"{len(boundary['selected_outputs'])} output boundary bank(s), "
+        f"{len(boundary['direct_edges'])} direct edge(s)) on "
+        f"{len(targets)} instance(s) in {plan.main_inst}"
+        + DESCRIBE_EXCLUDED_MINISWEEP_INSTANCES(excluded, parser_state),
+        flush=True,
+    )
+    return True
+
+
+def APPLY_LOCKS(plan, parser_state, TimingParamsLookupTable):
+    boundary_placements = []
+    for locked_inst in sorted(plan.locked.keys()):
+        AUTO_PIPELINE.CHECK_ADDED_LATENCY_CONTEXT(locked_inst, parser_state)
+        lock = plan.locked[locked_inst]
+        locked_logic = parser_state.LogicInstLookupTable[locked_inst]
+        if lock.concrete is not None:
+            TimingParamsLookupTable = AUTO_PIPELINE.RESTORE_CONCRETE_PIPELINE(
+                locked_inst, lock.concrete, TimingParamsLookupTable, parser_state
+            )
+            # A region root's isolated sweep fixed the root itself
+            # (REENFORCE_AUTO_PIPELINE_REGIONS), and the snapshot carries
+            # that flag. The locked instance is frozen below, once its
+            # boundary banks are in.
+            TimingParamsLookupTable[locked_inst].params_are_fixed = False
+            if (lock.model_fingerprint != SUBTREE_MODEL_FINGERPRINT(locked_inst, parser_state)
+                    and not lock.model_mismatch_reported):
+                print(f"[sweep] Delay model changed for locked {locked_logic.func_name}; "
+                      "replaying its measured concrete interior unchanged.", flush=True)
+                lock.model_mismatch_reported = True
+        else:
+            # Legacy in-memory fixtures/constrained placements; measured
+            # mini-sweeps always create concrete locks above.
+            TimingParamsLookupTable = (
+                AUTO_PIPELINE.ADD_SLICES_DOWN_HIERARCHY_TIMING_PARAMS_AND_WRITE_VHDL_PACKAGES(
+                    locked_inst,
+                    locked_logic,
+                    lock.slices,
+                    parser_state,
+                    TimingParamsLookupTable,
+                    write_files=False,
+                )
+            )
+        if type(TimingParamsLookupTable) is int:
+            raise Exception(f"Bad locked slices for {locked_inst}: {lock.slices}")
+        if lock.has_input_regs:
+            boundary_placements.append(
+                PipelinePlacement(
+                    PipelinePlacement.INSTANCE_INPUT,
+                    locked_inst,
+                    locked_logic.func_name,
+                    0,
+                    0.0,
+                    registered_bits=_IO_REGISTER_BITS(
+                        locked_logic, "input", parser_state
+                    ),
+                    source="minisweep_boundary_" + lock.boundary_strategy,
+                )
+            )
+        if lock.has_output_regs:
+            boundary_placements.append(
+                PipelinePlacement(
+                    PipelinePlacement.INSTANCE_OUTPUT,
+                    locked_inst,
+                    locked_logic.func_name,
+                    0,
+                    0.0,
+                    registered_bits=_IO_REGISTER_BITS(
+                        locked_logic, "output", parser_state
+                    ),
+                    source="minisweep_boundary_" + lock.boundary_strategy,
+                )
+            )
+    # The helper interiors have now been lowered but are not frozen until the
+    # independently selected I/O banks are present.  This reuses ordinary
+    # typed placement lowering rather than growing a second VHDL path.
+    TimingParamsLookupTable = APPLY_PIPELINE_PLACEMENTS(
+        boundary_placements, parser_state, TimingParamsLookupTable
+    )
+    for locked_inst in sorted(plan.locked.keys()):
+        timing_params = TimingParamsLookupTable[locked_inst]
+        timing_params.params_are_fixed = True
+    return TimingParamsLookupTable
+
+
+def GET_MAIN_INSTS_FOR_PATH_REPORT(path_report, parser_state, multimain_timing_params):
+    # Same resolution + degradation behavior as the old sweep: single main
+    # designs and tools without reg names (PYRTL) assume all mains
+    all_main_insts = list(parser_state.main_mhz.keys())
+    if len(all_main_insts) == 1:
+        return set(all_main_insts)
+    # A global instance's MAIN owns the paths shown to be inside it: those go
+    # to it alone. A path with one end in an instance MAIN stays with the
+    # other MAINs only, unless something inside the instance can take added
+    # latency (GLOBAL_INST_MAIN_CAN_TAKE_LATENCY): a FIFO or a stateful module
+    # cannot change the path, the user MAINs can.
+    inst_mains = set(GLOBAL_INST_MAINS(parser_state))
+    fixed_mains = {
+        m
+        for m in inst_mains
+        if not GLOBAL_INST_MAIN_CAN_TAKE_LATENCY(m, parser_state)
+    }
+    if path_report.start_reg_name is None or path_report.end_reg_name is None:
+        print(
+            "WARNING: No start/end reg name in timing report! "
+            "Assuming all clock domains had critical paths..."
+        )
+        return set(all_main_insts) - fixed_mains
+    # An async global FIFO's paths inside its clk_cross instance go to its
+    # side MAIN on the path's clock (both without a path group)
+    for decl in ASYNC_FIFO_DECLS(parser_state):
+        if SYN.PATH_ENDS_IN_INSTANCE(path_report, decl.crossing):
+            return ASYNC_FIFO_SIDES_FOR_PATH(decl, path_report, parser_state)
+    for main_inst in sorted(inst_mains):
+        if SYN.PATH_ENDS_IN_MAIN(
+            path_report,
+            main_inst,
+            parser_state,
+            multimain_timing_params.TimingParamsLookupTable,
+        ):
+            return {main_inst}
+    main_insts = SYN.GET_MAIN_INSTS_FROM_PATH_REPORT(
+        path_report, parser_state, multimain_timing_params.TimingParamsLookupTable
+    )
+    # sky130 STA may report only flattened Yosys cell names ($auto/$abc).
+    # Those are real endpoints without MAIN attribution, not evidence that
+    # the path is outside every MAIN. Keep its measured failure as feedback.
+    if not main_insts and SYN.SYN_TOOL is DEVICE_MODELS:
+        return set(all_main_insts) - fixed_mains
+    # One end inside an async FIFO's clk_cross instance, the other in no
+    # MAIN (nextpnr can name an end by a top-level net, global_to_module[..]):
+    # the FIFO's path, not one to drop
+    if not main_insts:
+        for decl in ASYNC_FIFO_DECLS(parser_state):
+            if SYN.NAME_IN_INSTANCE(
+                path_report.start_reg_name, decl.crossing
+            ) or SYN.NAME_IN_INSTANCE(path_report.end_reg_name, decl.crossing):
+                return ASYNC_FIFO_SIDES_FOR_PATH(decl, path_report, parser_state)
+    return main_insts - fixed_mains or main_insts
+
+
+def ASYNC_FIFO_DECLS(parser_state):
+    """The design's async global FIFOs: PY_TO_LOGIC.GlobalFifoDecls with a
+    clock crossing (decl.crossing, its clk_cross instance's label)."""
+    return [
+        decl
+        for decl in getattr(parser_state, "pypeline_global_insts", {}).values()
+        if decl.crossing is not None
+    ]
+
+
+def ASYNC_FIFO_SIDES_FOR_PATH(decl, path_report, parser_state):
+    """The side MAINs of the async FIFO `decl` a path inside it belongs to:
+    the one on the path's clock (its path group), or both without one."""
+    group = (getattr(path_report, "path_group", None) or "").lower()
+    sides = {
+        m
+        for m in decl.main_names
+        if ("clk_" + VHDL.CLK_EXT_STR(m, parser_state)).lower() == group
+    }
+    return sides or set(decl.main_names)
+
+
+def RESET_DISTRIBUTION_PATH(path_report, parser_state, params):
+    """(reset, source MAIN inst or None, reset MAIN inst) when a timing path
+    can only be a reset's distribution: it ends in a MAIN that resets with
+    `reset` (ParserState.main_resets), and it starts at that reset's pin
+    (source None, the pin's name outside every MAIN, or the input port a
+    tool reports as `start_port_name`) or in the one MAIN that
+    drives that reset Wire while no other global wire it drives reaches the
+    reset MAIN, directly or through any other MAIN (each taken as passing
+    every wire it reads to every wire it writes, as its logic may do in the
+    same cycle). A reset takes no pipeline registers (each register it resets
+    sees it in the same cycle), so the sweep reports such a path instead of
+    pipelining its MAINs. None for any other path, including one the source
+    MAIN's other wires could carry."""
+    main_resets = getattr(parser_state, "main_resets", None) or {}
+    start, end = path_report.start_reg_name, path_report.end_reg_name
+    if start is None:
+        # A tool that names no start register for a path from a top-level
+        # input reports the input port separately (DEVICE_MODELS)
+        start = getattr(path_report, "start_port_name", None)
+    if not main_resets or start is None or end is None:
+        return None
+    tpl = params.TimingParamsLookupTable
+
+    def main_of(name):
+        for main_inst in sorted(parser_state.main_mhz, key=len, reverse=True):
+            if SYN.NAME_IN_MAIN(name, main_inst, parser_state, tpl):
+                return main_inst
+        return None
+
+    def wires(main_inst, attr):
+        found = set()
+        for func, insts in parser_state.FuncToInstances.items():
+            if any(i.split(LOGIC.SUBMODULE_MARKER)[0] == main_inst for i in insts):
+                found.update(getattr(parser_state.FuncLogicLookupTable[func], attr))
+        return found
+
+    reset_main = main_of(end)
+    if reset_main not in main_resets:
+        return None
+    reset = main_resets[reset_main].source
+    start_main = main_of(start)
+    if reset in parser_state.input_wires:
+        pin = re.escape(reset.lower())
+        if start_main is None and re.match(pin + r"($|[^a-z0-9_]|_ibuf)", start.lower()):
+            return reset, None, reset_main
+        return None
+    drivers = wires(start_main, "write_only_global_wires") if start_main else set()
+    if start_main is None or start_main == reset_main or reset not in drivers:
+        return None
+    reads = {m: wires(m, "read_only_global_wires") for m in parser_state.main_mhz}
+    carried = frontier = drivers - {reset}
+    while frontier:
+        reached = set()
+        for main_inst in parser_state.main_mhz:
+            if main_inst not in (start_main, reset_main) and reads[main_inst] & frontier:
+                reached |= wires(main_inst, "write_only_global_wires")
+        frontier = reached - carried
+        carried = carried | frontier
+    if carried & (reads[reset_main] - {reset}):
+        return None
+    return reset, start_main, reset_main
+
+
+def RESET_PATH_STOPS_PLAN(plan, curr_mhz):
+    """Whether a failing RESET_DISTRIBUTION_PATH at curr_mhz stops `plan`:
+    unless an earlier iteration of the plan achieved more. Then the reset's
+    fanout grew with the registers added since that iteration, and that
+    iteration shows the reset is not the MAIN's limit, so the sweep's normal
+    feedback goes on (and it keeps its best result)."""
+    achieved = round(curr_mhz, 3)
+    return not any(
+        (record.get("achieved_mhz") or 0.0) > achieved for record in plan.history
+    )
+
+
+def RESET_DISTRIBUTION_DESCRIPTION(reset_path, parser_state):
+    """One line naming a RESET_DISTRIBUTION_PATH: the reset, where it comes
+    from and the MAIN it resets."""
+    reset, source, reset_main = reset_path
+    func = parser_state.LogicInstLookupTable[reset_main].func_name
+    origin = (
+        "its pin" if source is None
+        else f"{parser_state.LogicInstLookupTable[source].func_name}, which drives it"
+    )
+    return f"reset {reset} from {origin}, to the registers it resets in {func}"
+
+
+def PRINT_RESET_DISTRIBUTION(printed, reset_path, curr_mhz, target_mhz, parser_state):
+    """Say once per sweep and reset path why a failing path is not
+    pipelined: it is the reset's fanout (RESET_DISTRIBUTION_PATH)."""
+    if reset_path in printed:
+        return
+    printed.add(reset_path)
+    reset, source, reset_main = reset_path
+    fix = (
+        f"bring {reset} in through registers of a MAIN that drives a reset Wire"
+        if source is None
+        else "register it again in "
+        f"{parser_state.LogicInstLookupTable[source].func_name}, nearer its users"
+    )
+    print(
+        f"[sweep] WARNING: a failing {curr_mhz:.2f} MHz path ({target_mhz:.2f} MHz goal) "
+        f"is the distribution of {RESET_DISTRIBUTION_DESCRIPTION(reset_path, parser_state)}. "
+        f"Pipeline registers cannot be added to a reset: {fix}, or lower the clock "
+        "goal. Keeping best result.",
+        flush=True,
+    )
+
+
+def GLOBAL_INST_MAINS(parser_state):
+    """{MAIN name: PY_TO_LOGIC.GlobalInstDecl} of a design's global instances
+    and FIFOs (Inst[f], Fifo[T]): each MAIN holding a declaration's hardware
+    (decl.main_names: an async FIFO's two side MAINs, never its crossing)."""
+    return {
+        name: decl
+        for decl in getattr(parser_state, "pypeline_global_insts", {}).values()
+        for name in decl.main_names
+    }
+
+
+def GLOBAL_INST_MAIN_CAN_TAKE_LATENCY(main_inst, parser_state):
+    """True if something inside a global instance's MAIN, which itself takes
+    no added latency, can: an AUTO_PIPELINE call site whose instance
+    AUTO_PIPELINE.ADDED_LATENCY_BLOCKER clears, as in Inst[AUTO_PIPELINE(f)].
+    A FIFO or another stateful module has none."""
+    table = parser_state.LogicInstLookupTable
+    stack = [main_inst]
+    while stack:
+        inst = stack.pop()
+        logic = table.get(inst)
+        if logic is None:
+            continue
+        for leaf in logic.submodule_instances:
+            child = f"{inst}{LOGIC.SUBMODULE_MARKER}{leaf}"
+            if child not in table:
+                continue
+            if (
+                leaf in logic.sub_inst_to_auto_pipeline_latency
+                and AUTO_PIPELINE.ADDED_LATENCY_BLOCKER(child, parser_state) is None
+            ):
+                return True
+            stack.append(child)
+    return False
+
+
+def MAIN_DISPLAY_NAME(main_func_name, parser_state):
+    """How timing reports name a MAIN: a global instance's or FIFO's MAIN by
+    its declaration, `global FIFO rx [top.py:14]`; any other MAIN by its
+    function name."""
+    decl = GLOBAL_INST_MAINS(parser_state).get(main_func_name)
+    return main_func_name if decl is None else decl.describe()
+
+
+def PATH_MAIN_ROLES(path_report, parser_state, multimain_timing_params):
+    """Each MAIN's role on one timing path, read from hierarchical names.
+
+    GET_MAIN_INSTS_FOR_PATH_REPORT implicates every MAIN with a cell on the
+    path. A valid/ready handshake between two registers of one MAIN can pass
+    through other MAINs' stream wrappers and FSMs: those MAINs are on the path,
+    but their auto-pipelining cannot register it. Seen for real (WireGuard,
+    shared, 70 MHz): a testbench byte-source path crossed the shared ChaCha
+    wrapper and both dataflows' FSMs, then drove all three plans ahead of
+    their own paths -- ChaCha grew while its arithmetic already met.
+
+    Returns None without hierarchy evidence (one MAIN, or names no MAIN
+    entity prefixes, e.g. PyRTL or sky130 instance names); callers then treat
+    every implicated MAIN as owning the path. Otherwise {main inst: role},
+    role a dict:
+      relation  "endpoint" (owns the start or end register) or "through"
+      start/end whether it owns that endpoint
+      names     the path's names inside this MAIN
+      reach     some of those can hold added latency (ADDED_LATENCY_BLOCKER
+                is None for the owning instance), or could not be placed
+      blockers  [(func, reason)] of the instances blocking the others
+      crossing  "through" without reach while another MAIN with a goal owns
+                an endpoint: that owner reports the failure; this MAIN
+                cannot change the path and takes no feedback from it
+    """
+    if len(parser_state.main_mhz) <= 1:
+        return None
+    by_main = SYN.PATH_CELLS_BY_MAIN(
+        path_report, parser_state, multimain_timing_params.TimingParamsLookupTable
+    )
+    if not by_main:
+        return None
+    roles = {}
+    for main_inst, row in by_main.items():
+        reach = False
+        blockers = {}
+        for _name, owner in row["cells"]:
+            if owner is None:
+                reach = True
+                continue
+            blocker = AUTO_PIPELINE.ADDED_LATENCY_BLOCKER(owner, parser_state)
+            if blocker is None:
+                reach = True
+                continue
+            logic = parser_state.LogicInstLookupTable[blocker]
+            blockers.setdefault(logic.func_name, WHY_NOT_SLICEABLE(logic, parser_state))
+        roles[main_inst] = dict(
+            relation="endpoint" if row["start"] or row["end"] else "through",
+            start=row["start"] is not None,
+            end=row["end"] is not None,
+            names=[name for name, _owner in row["cells"]],
+            reach=reach,
+            blockers=sorted(blockers.items()),
+            crossing=False,
+        )
+    owned = any(
+        role["relation"] == "endpoint"
+        and SYN.GET_TARGET_MHZ(main_inst, parser_state) is not None
+        for main_inst, role in roles.items()
+    )
+    for role in roles.values():
+        role["crossing"] = owned and role["relation"] == "through" and not role["reach"]
+    return roles
+
+
+def PATH_OWNING_MAINS(path_report, parser_state, multimain_timing_params):
+    """GET_MAIN_INSTS_FOR_PATH_REPORT minus the MAINs the path only crosses
+    (PATH_MAIN_ROLES): the MAINs whose verdict and implementation the path
+    belongs to."""
+    mains = GET_MAIN_INSTS_FOR_PATH_REPORT(
+        path_report, parser_state, multimain_timing_params
+    )
+    if len(mains) <= 1:
+        return mains
+    roles = PATH_MAIN_ROLES(path_report, parser_state, multimain_timing_params)
+    if roles is None:
+        return mains
+    return {m for m in mains if not (m in roles and roles[m]["crossing"])}
+
+
+def _SERIALIZE_MAIN_ROLES(path_report, parser_state, params):
+    """{"main_roles": {MAIN func: role}} for an observation path record when
+    the path implicates several MAINs and names carry hierarchy, else {}."""
+    if (
+        len(parser_state.main_mhz) <= 1
+        or path_report.start_reg_name is None
+        or path_report.end_reg_name is None
+    ):
+        return {}
+    if len(GET_MAIN_INSTS_FOR_PATH_REPORT(path_report, parser_state, params)) <= 1:
+        return {}
+    roles = PATH_MAIN_ROLES(path_report, parser_state, params)
+    if roles is None:
+        return {}
+    return {
+        "main_roles": {
+            parser_state.LogicInstLookupTable[m].func_name: {
+                "relation": r["relation"],
+                "crossing": r["crossing"],
+                "reach": r["reach"],
+                "blocked_by": [f"{f}: {why}" for f, why in r["blockers"]],
+            }
+            for m, r in sorted(roles.items())
+        }
+    }
+
+
+def SCOPED_PATH_REPORT(path_report, main_inst, roles):
+    """path_report as seen from one MAIN, for attribution: endpoints and
+    netlist resources that belong to OTHER MAINs are dropped (names no MAIN
+    prefixes stay). Shared helpers have one func name in every MAIN, so an
+    unscoped substring match can blame this MAIN's plan for a cell of another
+    MAIN's instance (seen for real: the encrypt plan blamed
+    prep_auth_data_fsm from a cell in the decrypt instance). Without roles,
+    the report itself."""
+    if roles is None or main_inst not in roles:
+        return path_report
+    others = set()
+    for other_inst, role in roles.items():
+        if other_inst != main_inst:
+            others.update(role["names"])
+    scoped = copy.copy(path_report)
+    if path_report.start_reg_name in others:
+        scoped.start_reg_name = None
+    if path_report.end_reg_name in others:
+        scoped.end_reg_name = None
+    scoped.netlist_resources = {
+        name for name in (getattr(path_report, "netlist_resources", None) or ())
+        if name not in others
+    }
+    return scoped
+
+
+def DESCRIBE_CROSSING(path_report, roles, parser_state):
+    """One line naming the MAINs a path only crosses (role "crossing") and
+    what blocks registers in each, e.g.
+    'chacha20_pipeline_shared (pipeline_func: state_regs)'."""
+    parts = []
+    for main_inst, role in sorted(roles.items()):
+        if not role["crossing"]:
+            continue
+        name = parser_state.LogicInstLookupTable[main_inst].func_name
+        if role["blockers"]:
+            name += " (" + ", ".join(f"{f}: {why}" for f, why in role["blockers"]) + ")"
+        parts.append(name)
+    return ", ".join(parts)
+
+
+def RECORD_CROSSING(crossings, printed, main_inst, path_report, curr_mhz, roles, parser_state):
+    """Keep a failing path that main_inst only crosses (PATH_MAIN_ROLES) for
+    its iteration record, and say once per sweep why it does not re-pipeline
+    that MAIN. FEEDBACK_PATHS orders failing paths worst first, so the first
+    path per register-bank pair is the worst one."""
+    key = SYN.PATH_EVIDENCE_KEY(path_report)
+    row = crossings.setdefault(main_inst, {})
+    if key in row:
+        return
+    owners = sorted(
+        parser_state.LogicInstLookupTable[m].func_name
+        for m, r in roles.items()
+        if r["relation"] == "endpoint"
+    )
+    blockers = [f"{f}: {why}" for f, why in roles[main_inst]["blockers"]]
+    row[key] = {
+        "owner_mains": owners,
+        "achieved_mhz": round(curr_mhz, 3),
+        "start_reg_name": path_report.start_reg_name,
+        "end_reg_name": path_report.end_reg_name,
+        "blocked_by": blockers,
+    }
+    if (main_inst, key) in printed:
+        return
+    printed.add((main_inst, key))
+    name = parser_state.LogicInstLookupTable[main_inst].func_name
+    print(
+        f"[sweep] NOTE: a failing {curr_mhz:.2f} MHz path between registers of "
+        f"{', '.join(owners)} crosses {name}"
+        + (f" ({', '.join(blockers)})" if blockers else "")
+        + ", whose logic on it cannot hold added latency; it is reported under "
+        f"{', '.join(owners)} and does not re-pipeline {name}.",
+        flush=True,
+    )
+
+
+def ATTRIBUTION_BASIS(path_report, func_name, plan=None, parser_state=None):
+    """How an attribution of path_report to func_name is evidenced, so a
+    message can say what was measured and what was guessed:
+      "inside"   the name is in every available endpoint (the path's
+                 registers are inside func_name)
+      "endpoint" in one endpoint name only
+      "cells"    only in netlist cell/net names: the path passes through its
+                 logic
+    None when the name is in none of them (e.g. named from the instance
+    hierarchy instead, see PATH_MAIN_ROLES). Given the plan, an endpoint also
+    holds a region root of func_name whose instance's label path is in it
+    (RANK_PATH_FUNC_CANDIDATES)."""
+    if func_name is None:
+        return None
+    fl = func_name.lower()
+    endpoints = [
+        e.lower() for e in (path_report.start_reg_name, path_report.end_reg_name) if e
+    ]
+    root_insts = [
+        region.inst
+        for region in (getattr(plan, "regions", ()) if plan is not None else ())
+        if region.func_name == func_name
+    ]
+
+    def holds(e):
+        return fl in e or any(
+            SYN.INSTANCE_LABEL_POSITION(e, inst, parser_state) >= 0 for inst in root_insts
+        )
+
+    if endpoints and all(holds(e) for e in endpoints):
+        return "inside"
+    if any(holds(e) for e in endpoints):
+        return "endpoint"
+    if any(fl in r.lower() for r in (getattr(path_report, "netlist_resources", None) or ())):
+        return "cells"
+    return None
+
+
+def DESCRIBE_HOTSPOT_LOCATION(basis, func_desc):
+    """Where the critical path is, worded by what the attribution rests on
+    (ATTRIBUTION_BASIS, or "hierarchy" for an instance-hierarchy blocker)."""
+    if basis == "inside":
+        return f"the critical path runs inside {func_desc}"
+    if basis == "endpoint":
+        return f"the critical path starts or ends in {func_desc}"
+    if basis == "cells":
+        return (
+            f"the critical path passes through logic of {func_desc} "
+            "(matched by netlist cell names; no register of the path is inside it)"
+        )
+    if basis == "hierarchy":
+        return (
+            f"every cell of the critical path in this MAIN sits in {func_desc} "
+            "(by instance hierarchy)"
+        )
+    return f"the critical path was attributed to {func_desc}"
+
+
+# Two whole-design results whose worst achieved/target ratios differ by less
+# than this are the same result (the same 1%-of-target rule same_mhz_count
+# uses): another criterion decides between them.
+SNAPSHOT_TIE_TOLERANCE = 0.01
+
+
+def SNAPSHOT_BETTER(candidate, best, tolerance=SNAPSHOT_TIE_TOLERANCE):
+    """Is the candidate synthesized implementation a better result to keep than
+    the best so far? Each is (whole-design worst ratio, own-path worst ratio
+    capped at 1.0, total pipeline stages):
+      1. meeting every goal beats not; otherwise a whole-design ratio more
+         than `tolerance` higher wins;
+      2. within tolerance: meeting every plan's own paths beats not, then a
+         plan own-path ratio more than `tolerance` higher;
+      3. still tied: fewer pipeline stages (fewer registers, and fewer lanes in
+         latency-sized designs);
+      4. otherwise the earlier result stays.
+    Seen for real (WireGuard, shared, 70 MHz): every iteration failed on the
+    same testbench handshake path, 65.407 vs 65.389 MHz. The old
+    highest-ratio rule kept the iteration whose ChaCha own path still failed
+    and whose deeper Poly1305 body sized 7 multiplier lanes (960 DSPs, over
+    capacity) over one with every own path met and 5 lanes."""
+    if best is None:
+        return True
+    (c_all, c_own, c_stages), (b_all, b_own, b_stages) = candidate, best
+    if (c_all >= 1.0) != (b_all >= 1.0):
+        return c_all >= 1.0
+    if abs(c_all - b_all) > tolerance:
+        return c_all > b_all
+    if (c_own >= 1.0) != (b_own >= 1.0):
+        return c_own >= 1.0
+    if abs(c_own - b_own) > tolerance:
+        return c_own > b_own
+    return c_stages < b_stages
+
+
+def PRINT_FLOOR_REPORT(plan, parser_state):
+    for subtree_root in plan.subtrees:
+        landscape = plan.landscapes.get(subtree_root)
+        if landscape is None:
+            continue
+        root_logic = parser_state.LogicInstLookupTable[subtree_root]
+        total_ns = landscape.total_units * landscape.units_to_ns
+        floor = landscape.floor_mhz()
+        msg = (
+            f"[sweep] main={parser_state.LogicInstLookupTable[plan.main_inst].func_name} "
+            f"subtree={root_logic.func_name} comb delay ~{total_ns:.1f} ns, "
+            f"target {plan.target_period_ns:.1f} ns ({plan.target_mhz:.1f} MHz)"
+        )
+        if floor is None or floor >= plan.target_mhz:
+            msg += ", no estimated span limit below the goal"
+        else:
+            blame = landscape.floor_blame
+            is_hard = blame is not None and blame.hard
+            blame_str = ""
+            if blame is not None:
+                blame_str = f" due to {blame.inst_path.split(LOGIC.SUBMODULE_MARKER)[-1]} ({blame.reason}, {landscape.floor_ns:.1f} ns unsliceable)"
+            soft_str = "" if is_hard else " (soft)"
+            msg += f", estimated frequency ceiling{soft_str} ~{floor:.1f} MHz{blame_str}"
+            is_mux_bank = blame is not None and blame.reason == "mux_packed_bank"
+            if floor < plan.target_mhz:
+                if is_mux_bank:
+                    msg += (
+                        f"\n[sweep] Estimated select-fanout ceiling {floor:.1f} MHz "
+                        "assumes an unchunked packed MUX bank; chunked output "
+                        "banks may improve timing at the same cut count"
+                    )
+                elif is_hard:
+                    msg += (f"\n[sweep] Estimated unsliceable span exceeds the {plan.target_mhz:.1f} MHz stage budget "
+                            "under the current placement model; this estimate is not a timing verdict")
+                else:
+                    msg += (
+                        f"\n[sweep] WARNING: estimated soft ceiling {floor:.1f} MHz is below the {plan.target_mhz:.1f} MHz goal - "
+                        "stateful delay estimates require in-context measurement; boundary registers may cut IO paths"
+                    )
+        print(msg, flush=True)
+
+
+def RUN_AS_WRITTEN_CHECKS(goal_mains, parser_state):
+    """Optional standalone diagnostics for planless mains in full hierarchy mode.
+
+    Default sweeps use the required full-design reports for their verdicts.
+    This diagnostic never assigns the reported internal path to geometry.
+    """
+    results = {}  # main inst -> standalone MHz
+    if len(goal_mains) == 0:
+        return results
+    zero_clk_tpl = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+    my_thread_pool = ThreadPool(processes=SYN.GET_NUM_PROCESSES())
+    main_inst_to_async_result = {}
+    for main_inst, target_mhz in goal_mains:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        print(
+            f"Synthesizing function: {main_logic.func_name} (as-written timing check)",
+            flush=True,
+        )
+        main_inst_to_async_result[main_inst] = my_thread_pool.apply_async(
+            SYN.SYN_TOOL.SYN_AND_REPORT_TIMING,
+            (main_inst, main_logic, parser_state, zero_clk_tpl),
+        )
+    for main_inst, target_mhz in goal_mains:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        parsed_timing_report = main_inst_to_async_result[main_inst].get()
+        path_reports = list(parsed_timing_report.path_reports.values())
+        if len(path_reports) != 1 or path_reports[0].path_delay_ns is None:
+            print(
+                f"[sweep] WARNING: as-written check for {main_logic.func_name} "
+                "did not report a usable timing path",
+                flush=True,
+            )
+            continue
+        mhz = 1000.0 / path_reports[0].path_delay_ns
+        results[main_inst] = mhz
+        if mhz >= target_mhz:
+            verdict = "PASS"
+        else:
+            verdict = "FAIL: restructure the design or lower the clock goal"
+        print(
+            f"[sweep] {main_logic.func_name} synthesized as written "
+            f"(standalone check): {mhz:.2f} MHz vs {target_mhz:.2f} MHz goal "
+            f"- {verdict}",
+            flush=True,
+        )
+    return results
+
+
+# ─────────────────────────────────────────────
+# Plan accounting: cuts across a main's own subtrees and its constrained
+# AUTO_PIPELINE regions (enforced by AUTO_PIPELINE.ENFORCE_AUTO_PIPELINE_REGIONS)
+# ─────────────────────────────────────────────
+
+
+def PLAN_TOTAL_CUTS(plan):
+    return sum(len(cuts) for cuts in plan.cuts.values()) + AUTO_PIPELINE.PLAN_REGION_CUTS(plan)
+
+
+def PLAN_TRIMMABLE_CUTS(plan):
+    return sum(len(cuts) for cuts in plan.cuts.values()) + sum(
+        len(region.cuts) for region in plan.regions if not region.constraint.is_fixed()
+    )
+
+
+def PLAN_FINGERPRINT_PLACEMENTS(plan):
+    if not plan.regions:
+        return plan.placements
+    merged = dict(plan.placements)
+    for region in plan.regions:
+        merged["auto_pipeline_region:" + region.inst] = region.placements
+    return merged
+
+
+@SYN.PHASED("sweep planning")
+def DO_PLANNED_THROUGHPUT_SWEEP(parser_state, multimain_timing_params):
+    """Replaces the old middle-out sweep. One full-design synthesis per
+    iteration; landscape planning decides where registers go, timing report
+    attribution decides what to change when timing fails."""
+    NEXT_SWEEP_HISTORY_RUN()
+    # Build a plan per main that has a target and something cuttable
+    plans = {}
+    planless_goal_mains = []
+    for main_inst in parser_state.main_mhz:
+        target_mhz = SYN.GET_TARGET_MHZ(main_inst, parser_state)
+        if target_mhz is None:
+            continue
+        subtrees = AUTO_PIPELINE.COLLECT_CUT_SUBTREES(main_inst, parser_state)
+        if len(subtrees) == 0:
+            main_logic = parser_state.LogicInstLookupTable[main_inst]
+            # A zero-delay main (FUNC_WIRES rewiring, bit manipulation, clock
+            # crossing, ...) trivially meets any goal and has no timing path
+            # worth synthesizing - skip it silently (no as-written check, no
+            # "nothing auto-pipelining can help" note).
+            if SYN.LOGIC_IS_ZERO_DELAY(main_logic, parser_state, allow_none_delay=True):
+                continue
+            print(
+                f"[sweep] {main_logic.func_name} has a {target_mhz:.2f} MHz goal but "
+                "contains nothing auto-pipelining can help (no sliceable logic and "
+                "no AUTO_PIPELINE regions) - the goal is met only if the design "
+                "meets timing as written (checked below).",
+                flush=True,
+            )
+            planless_goal_mains.append((main_inst, target_mhz))
+            continue
+        plan = MainSweepPlan(main_inst, target_mhz)
+        plan.subtrees = subtrees
+        plans[main_inst] = plan
+    LINK_PEER_PLANS(plans)
+
+    # Full-design reports verify planless MAINs. Only explicit full-hierarchy
+    # characterization retains the additional informational standalone checks.
+    as_written_mhz = (
+        RUN_AS_WRITTEN_CHECKS(planless_goal_mains, parser_state)
+        if not NO_SWEEP and SYN.HIER_SYN_MODE == "full" else {}
+    )
+
+    # NOTE on budget calibration: cut counts are anchored to reality by the
+    # eligible combinational frontiers collected in the presynth wave.
+    # Surrounding stateful hierarchy and blocked-only helpers stay estimated;
+    # no new subtree-root geometry synthesis happens here.
+
+    # Independent AUTO_PIPELINE call sites belong to their owning MAIN's plan.
+    # Explicit constraints/seeds under goal-less MAINs still apply (no period).
+    planless_regions = []
+    for region in AUTO_PIPELINE.COLLECT_AUTO_PIPELINE_REGIONS(parser_state):
+        owner = next(
+            (
+                plan
+                for main_inst, plan in plans.items()
+                if region.inst.startswith(main_inst + LOGIC.SUBMODULE_MARKER)
+            ),
+            None,
+        )
+        if owner is None:
+            planless_regions.append(region)
+        else:
+            owner.regions.append(region)
+
+    # AUTO_MULTI_CYCLE multi-cycle paths start at their elaborated counts; a failing
+    # report whose critical path is one of them raises that count instead of
+    # adding pipelining (AUTO_MULTI_CYCLE_FEEDBACK)
+    auto_multi_cycle_groups = AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(parser_state)
+    AUTO_MULTI_CYCLE.SEED_COUNTS(parser_state, multimain_timing_params)
+    best_auto_multi_cycle = None
+    met_snapshot_auto_multi_cycle = None
+    # main inst -> AUTO_MULTI_CYCLE limit blame, for planless mains stopped by a cap
+    planless_auto_multi_cycle_blame = {}
+
+    best_tpl = None
+    best_score = None
+    best_key = None
+    # sweep_history.json provenance: main inst -> the record each synthesized
+    # iteration appended; snapshots keep a reference to their iteration's
+    # dict so a restored table reports the iteration it came from
+    iter_records = {}
+    best_iter_records = None
+    met_snapshot_iter_records = None
+    final_iter_records = None
+    fallback_attempted_funcs = set()  # Measurements already tried by this sweep.
+    iteration = 0
+    # main_inst -> (curr_mhz, met, target_mhz) for goal-having mains with no
+    # plan (nothing cuttable) - their failing reports must still fail the build
+    planless_results = {}
+    # Post-met stage trimming state (--pipeline_min_effort)
+    trim_iters_used = 0
+    met_snapshot_tpl = None
+    met_snapshot_cuts = None
+    met_snapshot_plan_cuts = None
+    met_snapshot_plan_placements = None
+    met_snapshot_plan_locks = None
+    met_snapshot_plan_boundary_diagnostics = None
+    best_plan_cuts = None
+    best_plan_placements = None
+    best_plan_locks = None
+    best_plan_boundary_diagnostics = None
+    best_plan_regions = None
+    met_snapshot_plan_regions = None
+    seen_implementations = {}
+    synthesis_attempts = 0
+    synthesis_budget = MAX_SWEEP_ITERS
+    repeated_decisions = 0
+    preserved_mains = getattr(multimain_timing_params, "confirmation_preserved_mains", None) or {}
+    # Consumed once: a later sweep on these params must not reuse stale snapshots.
+    multimain_timing_params.confirmation_preserved_mains = {}
+    for plan in plans.values():
+        plan.needs_replan = True
+        plan.realized_snapshot = preserved_mains.get(plan.main_inst)
+        if plan.realized_snapshot is not None:
+            plan.needs_replan = False
+        LOAD_CARRIED_LOCKS(
+            plan,
+            parser_state,
+            multimain_timing_params.TimingParamsLookupTable,
+            plan.realized_snapshot,
+        )
+    # A carried lock holds for every instance of its module at its goal: a
+    # peer with none of its own takes it.
+    for plan in sorted(plans.values(), key=lambda plan: plan.main_inst):
+        for func in sorted(
+            {parser_state.LogicInstLookupTable[inst].func_name for inst in plan.locked}
+        ):
+            SHARE_LOCK(plan, func, parser_state, only_unlocked=True)
+    internal_placement_config = LOAD_INTERNAL_PLACEMENT_CONFIG()
+    if internal_placement_config is not None:
+        print(
+            f"[sweep] INTERNAL TEST placement hook: "
+            f"{internal_placement_config['mode']} mode from "
+            f"{internal_placement_config['source_path']}",
+            flush=True,
+        )
+
+    # (main inst, path evidence key) crossing NOTEs already printed
+    printed_crossings = set()
+    # RESET_DISTRIBUTION_PATH results already reported
+    printed_reset_paths = set()
+    while True:
+        iteration += 1
+        # Did an AUTO_MULTI_CYCLE count change this iteration (needs another syn run)
+        auto_multi_cycle_changed = False
+        # Planless-main verdicts are per synthesis run: a later run (after an
+        # AUTO_MULTI_CYCLE change) supersedes earlier ones
+        planless_results = {}
+        planless_auto_multi_cycle_blame = {}
+        # main inst -> the MAINs its kept failing (as written) path crosses
+        planless_crossing = {}
+        # main inst -> RESET_DISTRIBUTION_DESCRIPTION of its kept failing path
+        planless_reset_distribution = {}
+        # Fresh zero-clock table, then locks, then planned cuts
+        tpl = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+        for plan in plans.values():
+            tpl = APPLY_LOCKS(plan, parser_state, tpl)
+        # Eligible clock-driven tags and explicit constrained/seeded regions
+        # are planned, lowered, verified and locked on their own before any
+        # containing landscape is built.
+        try:
+            for plan in plans.values():
+                if plan.regions and (plan.needs_replan or plan.trim_pending):
+                    tpl = AUTO_PIPELINE.ENFORCE_AUTO_PIPELINE_REGIONS(
+                        plan.regions,
+                        parser_state,
+                        tpl,
+                        func_delay_scale=plan.func_delay_scale,
+                        period_ns=plan.target_period_ns,
+                        global_scale=plan.global_scale,
+                        zero_cut_probe=plan.zero_cut_probe,
+                        unresolved=(
+                            not plan.met_timing
+                            and plan.stopped_reason is None
+                            and plan.prev_total_cuts is not None
+                            and all(
+                                landscape is None
+                                for landscape in plan.landscapes.values()
+                            )
+                        ),
+                        trim_pending=plan.trim_pending,
+                    )
+            if planless_regions:
+                tpl = AUTO_PIPELINE.ENFORCE_AUTO_PIPELINE_REGIONS(
+                    planless_regions, parser_state, tpl
+                )
+        except AUTO_PIPELINE.AutoPipelineLatencyInfeasible as err:
+            sys.exit(str(err))
+        for plan in plans.values():
+            # A plan that replays its realized snapshot (below) keeps the
+            # landscape its cuts were planned on: cut offsets are units of
+            # THAT landscape. Rebuilding it after a delay-model refresh (the
+            # measured fallback) would leave the replayed cuts pointing past
+            # the new, shorter axis. It is rebuilt when the plan replans.
+            replays_snapshot = (
+                plan.realized_snapshot is not None
+                and not plan.needs_replan
+                and not plan.trim_pending
+            )
+            # Build landscapes (locked subtree roots already carry their
+            # pipeline from the lock - planning/slicing them again is illegal)
+            for subtree_root in plan.subtrees:
+                if tpl[subtree_root].params_are_fixed:
+                    plan.landscapes[subtree_root] = None
+                    plan.cuts[subtree_root] = []
+                    plan.placements[subtree_root] = []
+                    continue
+                if replays_snapshot and plan.landscapes.get(subtree_root) is not None:
+                    continue
+                plan.landscapes[subtree_root] = BUILD_SLICE_LANDSCAPE(
+                    subtree_root, parser_state, tpl, plan.func_delay_scale
+                )
+        if internal_placement_config is not None:
+            RESOLVE_INTERNAL_PIPELINE_PLACEMENTS(
+                internal_placement_config, plans, parser_state
+            )
+        for plan in plans.values():
+            if plan.realized_snapshot is not None and not plan.needs_replan and not plan.trim_pending:
+                AUTO_PIPELINE.RESTORE_CONCRETE_PIPELINE(plan.main_inst, plan.realized_snapshot, tpl, parser_state)
+                continue
+            # Plan cuts. Replanning an unresolved plan to the identical cut
+            # list would waste a whole synthesis run (a small budget change
+            # can be eaten by cut quantization) - nudge the scale until the
+            # plan actually changes. Direction follows intent: more cuts when
+            # timing failed, fewer when probing down after having met (trim).
+            plan_unresolved = (
+                plan.needs_replan
+                and not plan.met_timing
+                and plan.stopped_reason is None
+                and plan.prev_total_cuts is not None
+            )
+            total_cuts = AUTO_PIPELINE.PLAN_REGION_CUTS(plan)
+            pending_refinement = plan.pending_placement_refinement
+            plan.pending_placement_refinement = None
+            plan.active_placement_refinement = None
+            if pending_refinement is not None:
+                # The refinement was derived from the just-measured physical
+                # schedule.  Try it byte-for-byte before the scale feedback
+                # below is allowed to select a denser landscape plan.
+                for subtree_root in plan.subtrees:
+                    cuts, placements = pending_refinement["subtrees"].get(
+                        subtree_root, ([], [])
+                    )
+                    plan.cuts[subtree_root] = list(cuts)
+                    plan.placements[subtree_root] = list(placements)
+                    total_cuts += len(cuts)
+                plan.active_placement_refinement = pending_refinement["kind"]
+                plan.chunked_mux_refinement_attempted = True
+            planning_attempts = (
+                range(8) if pending_refinement is None else ()
+            )
+            scale_before_attempts = plan.global_scale
+            for attempt in planning_attempts:
+                total_cuts = AUTO_PIPELINE.PLAN_REGION_CUTS(plan)
+                for subtree_root in plan.subtrees:
+                    landscape = plan.landscapes.get(subtree_root)
+                    if landscape is None:
+                        continue
+                    budget = (
+                        landscape.budget_units_for_period(plan.target_period_ns)
+                        / plan.global_scale
+                        if not plan.zero_cut_probe else math.inf
+                    )
+                    fixed = plan.fixed_placements.get(subtree_root, ())
+                    if plan.placement_mode == "replace":
+                        placements = MATERIALIZE_BIT_PLACEMENT_REQUESTS(
+                            list(fixed), landscape
+                        )
+                        cuts = sorted(set(p.axis_unit for p in placements))
+                    else:
+                        cuts, placements = PLAN_PIPELINE_PLACEMENTS(
+                            landscape, budget, fixed_placements=fixed
+                        )
+                    plan.cuts[subtree_root] = cuts
+                    plan.placements[subtree_root] = placements
+                    total_cuts += len(plan.cuts[subtree_root])
+                if not plan_unresolved or total_cuts != plan.prev_total_cuts:
+                    break
+                if plan.trim_pending:
+                    plan.global_scale /= 1.1  # probing down - even fewer
+                else:
+                    plan.global_scale *= 1.1  # failing - force more cuts
+            else:
+                # Every attempt left the cut count unchanged: the landscape
+                # is saturated, so the x1.1^8 nudge bought nothing. Keeping
+                # it compounded to x44,379 on a 64-cut ceiling; drop it.
+                plan.global_scale = scale_before_attempts
+            plan.prev_total_cuts = total_cuts
+            plan.default_chunked_banks = False
+            # Apply the cuts
+            for subtree_root in plan.subtrees:
+                landscape = plan.landscapes.get(subtree_root)
+                cuts = plan.cuts.get(subtree_root, [])
+                placements = plan.placements.get(subtree_root, [])
+                if landscape is None or len(placements) == 0:
+                    continue
+                if plan.placement_mode != "replace":
+                    # Ordinary lowering for a selected wide packed-MUX output
+                    # boundary now: same depth, same cut count, half the
+                    # select fanout. "replace" mode is the internal
+                    # forced-placement hook and must build exactly what was
+                    # supplied. See CHUNK_SELECTED_MUX_OUTPUT_BANKS.
+                    chunked = CHUNK_SELECTED_MUX_OUTPUT_BANKS(
+                        placements, landscape, parser_state
+                    )
+                    if chunked is not placements:
+                        placements = chunked
+                        plan.placements[subtree_root] = placements
+                        plan.default_chunked_banks = True
+                tpl = APPLY_PIPELINE_PLACEMENTS(
+                    placements,
+                    parser_state,
+                    tpl,
+                )
+                CHECK_PIPELINE_PLACEMENTS_REALIZED(
+                    placements, parser_state, tpl
+                )
+                if plan.placement_mode != "replace":
+                    # A candidate can materialize (a real register was set)
+                    # without deepening the schedule at all -- see
+                    # DROP_NON_DEEPENING_PLACEMENTS. "replace" mode is the
+                    # internal forced-placement hook and must build exactly
+                    # what was supplied, waste and all.
+                    cuts, placements = DROP_NON_DEEPENING_PLACEMENTS(
+                        subtree_root, cuts, placements, parser_state, tpl
+                    )
+                    plan.cuts[subtree_root] = cuts
+                    plan.placements[subtree_root] = placements
+            plan.current_placement_fingerprint = PIPELINE_PLACEMENT_FINGERPRINT(
+                PLAN_FINGERPRINT_PLACEMENTS(plan), plan.locked
+            )
+            if (
+                plan.regions
+                and plan.current_placement_fingerprint
+                in plan.attempted_placement_fingerprints
+                and not plan.met_timing
+                and plan.stopped_reason is None
+                and not plan.trim_pending
+                and pending_refinement is None
+                and any(r.at_cap() for r in plan.regions)
+            ):
+                # Identical hardware to an already-synthesized iteration, and
+                # a latency constraint is what keeps it from changing
+                AUTO_PIPELINE.STOP_AT_AUTO_PIPELINE_LATENCY_LIMIT(
+                    plan, parser_state, [r for r in plan.regions if r.at_cap()]
+                )
+            plan.attempted_placement_fingerprints.add(
+                plan.current_placement_fingerprint
+            )
+            plan.placement_iterations.append(
+                {
+                    "iteration": iteration,
+                    "mode": plan.placement_mode,
+                    "refinement": plan.active_placement_refinement,
+                    "placement_fingerprint": plan.current_placement_fingerprint,
+                    **(
+                        {
+                            "auto_pipeline_regions": [
+                                r.to_dict() for r in plan.regions
+                            ]
+                        }
+                        if plan.regions
+                        else {}
+                    ),
+                    "mini_sweep_locks": {
+                        inst: lock.to_dict() for inst, lock in sorted(plan.locked.items())
+                    },
+                    "subtrees": {
+                        subtree_root: {
+                            "cuts": list(plan.cuts.get(subtree_root, ())),
+                            "placements": [
+                                p.to_dict()
+                                for p in plan.placements.get(subtree_root, ())
+                            ],
+                        }
+                        for subtree_root in plan.subtrees
+                    },
+                }
+            )
+        if (
+            plans
+            and all(
+                p.met_timing or p.stopped_reason is not None for p in plans.values()
+            )
+            and any(
+                p.stopped_reason == "auto_pipeline_latency_limit"
+                for p in plans.values()
+            )
+            and best_tpl is not None
+        ):
+            # Nothing left to try: don't re-synthesize an identical schedule
+            break
+        if iteration == 1:
+            for plan in plans.values():
+                PRINT_FLOOR_REPORT(plan, parser_state)
+
+        multimain_timing_params.TimingParamsLookupTable = tpl
+
+        # Instances above the modified (sliced/locked) ones still carry stale
+        # zero clock hash/latency caches - refresh them and rewrite their
+        # entities since the names of their instantiated children changed
+        ancestor_insts = AUTO_PIPELINE.INVALIDATE_MODIFIED_INST_ANCESTOR_CACHES(tpl, parser_state)
+
+        # Write output files and run the one full-design synthesis
+        print("Updating output files...", flush=True)
+        AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES(tpl, parser_state, ancestor_insts)
+        SYN.WRITE_REGISTERS_ESTIMATE_FILE(parser_state, multimain_timing_params)
+        SYN.WRITE_AREA_ESTIMATE_FILE(parser_state, multimain_timing_params)
+
+        if NO_SWEEP:
+            # First planned guess only -- no sweep synthesis iterations.
+            # Timing is NOT verified; raise the @MAIN mhz target for more
+            # pipeline stages.
+            print(
+                "--no_sweep: writing the first planned guess without "
+                "verifying it against real synthesis. Timing is NOT "
+                "confirmed -- raise the @MAIN mhz target for more pipeline "
+                "stages.",
+                flush=True,
+            )
+            for plan in plans.values():
+                main_func_name = parser_state.LogicInstLookupTable[
+                    plan.main_inst
+                ].func_name
+                _mono, _regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+                    plan.main_inst, plan.subtrees, tpl, parser_state
+                )
+                # Nothing measures a --no_sweep plan, so report what the plan
+                # itself predicts. Taken from the REALIZED cuts (post
+                # MATERIALIZE_BIT_PLACEMENT_REQUESTS, which can relocate a
+                # bit-internal cut to the leaf's equal-width bit boundary),
+                # not from the planner's raster request. Without this, a plan
+                # that cannot reach the goal looks identical to one that can:
+                # every target from 167 to 250 MHz used to print the same
+                # "cuts=33" line while predicting a 7.1 ns stage.
+                predicted_ns = 0.0
+                for subtree_root in plan.subtrees:
+                    landscape = plan.landscapes.get(subtree_root)
+                    if landscape is None:
+                        continue
+                    predicted_ns = max(
+                        predicted_ns,
+                        PREDICTED_STAGE_NS(
+                            plan.cuts.get(subtree_root, []), landscape
+                        ),
+                    )
+                predicted_str = ""
+                if predicted_ns > 0.0:
+                    predicted_mhz = 1000.0 / predicted_ns
+                    predicted_str = (
+                        f", predicted worst stage {predicted_ns:.2f}ns "
+                        f"(~{predicted_mhz:.1f} MHz vs "
+                        f"{plan.target_mhz:.1f} MHz goal)"
+                    )
+                print(
+                    f"[sweep] {main_func_name}: --no_sweep guess, "
+                    f"{total_stages} slice(s) built "
+                    f"({total_stages + 1} pipeline stages), "
+                    f"cuts={PLAN_TOTAL_CUTS(plan)}"
+                    f"{predicted_str} (UNVERIFIED)",
+                    flush=True,
+                )
+                RECORD_SWEEP_OUTCOME(
+                    main_func_name,
+                    plan.target_mhz,
+                    "no_sweep",
+                    cuts=PLAN_TOTAL_CUTS(plan),
+                    predicted_mhz=(
+                        round(1000.0 / predicted_ns, 3) if predicted_ns > 0.0 else None
+                    ),
+                )
+                if predicted_ns > 0.0 and 1000.0 / predicted_ns < plan.target_mhz:
+                    print(
+                        f"[sweep] WARNING: {main_func_name}'s --no_sweep plan "
+                        f"is predicted at ~{1000.0 / predicted_ns:.1f} MHz, "
+                        f"below its {plan.target_mhz:.1f} MHz goal - the "
+                        "delay model cannot place enough registers to reach "
+                        "the goal (see the floor report above).",
+                        flush=True,
+                    )
+            WRITE_PIPELINE_PLACEMENT_TRACE(
+                plans,
+                parser_state,
+                tpl,
+                internal_config=internal_placement_config,
+            )
+            multimain_timing_params.sweep_timing_failures = []
+            for main_inst, target_mhz in planless_goal_mains:
+                RECORD_SWEEP_OUTCOME(
+                    parser_state.LogicInstLookupTable[main_inst].func_name,
+                    target_mhz,
+                    "no_sweep",
+                )
+            WRITE_SWEEP_HISTORY(
+                parser_state, multimain_timing_params, build_complete=False
+            )
+            return multimain_timing_params
+
+        # What's about to be synthesized, printed BEFORE the long wait below
+        # (previously this only appeared after synthesis finished, alongside
+        # the achieved MHz - leaving "how many slices/stages did it even try"
+        # unknown for the whole duration of a long syn run).
+        for plan in plans.values():
+            main_logic = parser_state.LogicInstLookupTable[plan.main_inst]
+            main_func_name = main_logic.func_name
+            if SYN.LOGIC_IS_ZERO_DELAY(main_logic, parser_state, allow_none_delay=True):
+                continue
+            _mono, _regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+                plan.main_inst, plan.subtrees, tpl, parser_state
+            )
+            print(
+                f"[sweep] {main_func_name}: about to synthesize, "
+                f"cuts={PLAN_TOTAL_CUTS(plan)}, "
+                f"{total_stages} slice(s) "
+                f"({total_stages + 1} pipeline stages)",
+                flush=True,
+            )
+
+        implementation = IMPLEMENTATION_SIGNATURE(parser_state, multimain_timing_params)
+        if implementation in seen_implementations:
+            # Re-run the feedback ladder on existing evidence; do not spend a
+            # synthesis on a quantized-away densification or boundary change.
+            timing_report = seen_implementations[implementation]
+            repeated_decisions += 1
+            print(f"[sweep] No realized HDL/constraint change: reusing observation for decision {iteration}", flush=True)
+            if repeated_decisions > 8:
+                for p in plans.values():
+                    if not p.met_timing:
+                        p.stopped_reason = "no_realized_change"
+                break
+        else:
+            repeated_decisions = 0
+            synthesis_attempts += 1
+            print(f"Running syn w timing params... (sweep iteration {synthesis_attempts}, decision {iteration})", flush=True)
+            print(f"Elapsed time: {SYN.ELAPSED_STR()}...", flush=True)
+            timing_report = SYN.RUN_MULTIMAIN_SYN(parser_state, multimain_timing_params)
+            seen_implementations[implementation] = timing_report
+            RECORD_SYNTHESIS_OBSERVATION(parser_state, multimain_timing_params, timing_report, synthesis_attempts)
+        for plan in plans.values():
+            plan.realized_snapshot = AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(plan.main_inst, tpl, parser_state)
+            plan.needs_replan = False
+        # Feedback mutates locks/boundary policies for the NEXT implementation.
+        # A best/met snapshot must retain only the policies actually built.
+        built_plan_locks = {m:copy.deepcopy(p.locked) for m,p in plans.items()}
+        built_plan_boundary_diagnostics = {m:copy.deepcopy(p.mini_sweep_boundary_diagnostics) for m,p in plans.items()}
+        built_plan_regions = AUTO_PIPELINE.SNAPSHOT_AUTO_PIPELINE_REGIONS(plans)
+        if len(timing_report.path_reports) == 0:
+            print(timing_report.orig_text)
+            EXPLAIN_NO_PATHS(timing_report)
+            sys.exit(-1)
+        SYN.PRINT_MEASURED_AREA_IF_AVAILABLE(
+            timing_report,
+            SYN.ESTIMATE_DESIGN_AREA(parser_state, multimain_timing_params)["total_area"],
+        )
+
+        if all(path.path_delay_ns > 0
+               and 1000.0 / path.path_delay_ns >= (SYN.GET_TARGET_MHZ(m, parser_state) or 0)
+               for path in SYN.TIMING_REPORT_PATHS(timing_report)
+               for m in GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, multimain_timing_params)):
+            observed_before = len(SYNTHESIS_OBSERVATIONS)
+            timing_report = CONFIRM_PROVISIONAL_MCP_SEEDS(
+                timing_report, parser_state, multimain_timing_params, seen_implementations
+            )
+            # A confirm-down trial is a real backend run: it counts.
+            synthesis_attempts += len(SYNTHESIS_OBSERVATIONS) - observed_before
+            implementation = IMPLEMENTATION_SIGNATURE(parser_state, multimain_timing_params)
+            seen_implementations[implementation] = timing_report
+
+        # The AUTO_MULTI_CYCLE counts this run was synthesized with (feedback below
+        # may raise them for the next run; snapshots must record these)
+        synthesized_auto_multi_cycle = dict(multimain_timing_params.auto_multi_cycle_ncycles)
+
+        # Evaluate each reported clock group
+        iter_records = {}
+        made_change = False
+        overall_score = None
+        evaluated_plans = set()  # main insts implicated in some path report
+        any_report_failed = False
+        handled_plans = set()
+        # Plans with a failing multi-cycle path this iteration: a later passing
+        # (optional) path must not mark them met or overwrite their record.
+        mcp_failed_plans = set()
+        # Plans whose next implementation is a new, model-independent candidate
+        # (fresh concrete lock, boundary policy, same-depth refinement): their
+        # repeated MHz is not stagnation yet - that candidate is observed first.
+        new_candidate_plans = set()
+        # main inst -> (hotspot func, action) a peer at the same goal already
+        # decided for it this iteration (a shared lock or region-group change):
+        # it takes no second decision for that hotspot.
+        decided_by_peer = {}
+        opaque_refinements = set()  # Text evidenced on failing geometry paths only.
+        # main inst -> {path evidence key: failing path this MAIN only crosses}
+        crossings = {}
+        # plan main inst -> worst achieved/target ratio of its own paths
+        plan_own_scores = {}
+        for path_report in FEEDBACK_PATHS(timing_report, parser_state, multimain_timing_params):
+            reported_clock_group = path_report.path_group
+            curr_mhz = 1000.0 / path_report.path_delay_ns
+            main_insts = GET_MAIN_INSTS_FOR_PATH_REPORT(
+                path_report, parser_state, multimain_timing_params
+            )
+            roles = (
+                PATH_MAIN_ROLES(path_report, parser_state, multimain_timing_params)
+                if len(main_insts) > 1
+                else None
+            )
+            reset_path = RESET_DISTRIBUTION_PATH(
+                path_report, parser_state, multimain_timing_params
+            )
+            if len(main_insts) == 0:
+                print(
+                    "Path group:",
+                    reported_clock_group,
+                    "is likely only limited by built in FIFO implementations...",
+                )
+                continue
+            auto_multi_cycle_group = AUTO_MULTI_CYCLE.AUTO_MULTI_CYCLE_GROUP_FOR_PATH_REPORT(
+                path_report, auto_multi_cycle_groups, parser_state, multimain_timing_params
+            )
+            auto_multi_cycle_feedback = None  # computed once per report, if failing
+            for main_inst in main_insts:
+                main_logic = parser_state.LogicInstLookupTable[main_inst]
+                target_mhz = SYN.GET_TARGET_MHZ(main_inst, parser_state)
+                if target_mhz is None:
+                    continue
+                met = curr_mhz >= target_mhz
+                if not met:
+                    any_report_failed = True
+                score = curr_mhz / target_mhz
+                if overall_score is None or score < overall_score:
+                    overall_score = score
+                if main_inst in plans:
+                    evaluated_plans.add(main_inst)
+                role = roles.get(main_inst) if roles else None
+                if role is not None and role["crossing"]:
+                    # Only crossed (see PATH_MAIN_ROLES): the endpoint owner
+                    # reports this path. Record it; never re-pipeline from it.
+                    if not met:
+                        RECORD_CROSSING(
+                            crossings, printed_crossings, main_inst, path_report,
+                            curr_mhz, roles, parser_state,
+                        )
+                    continue
+                if main_inst in plans:
+                    plan_own_scores[main_inst] = min(
+                        plan_own_scores.get(main_inst, score), score
+                    )
+                if reset_path is not None and not met and (
+                    main_inst not in plans
+                    or RESET_PATH_STOPS_PLAN(plans[main_inst], curr_mhz)
+                ):
+                    # A reset's fanout (RESET_DISTRIBUTION_PATH): no plan can
+                    # register it. Report it, stop this MAIN's plan.
+                    PRINT_RESET_DISTRIBUTION(
+                        printed_reset_paths, reset_path, curr_mhz, target_mhz,
+                        parser_state,
+                    )
+                    blame = RESET_DISTRIBUTION_DESCRIPTION(reset_path, parser_state)
+                    fields = {
+                        "iter": iteration,
+                        "main": main_logic.func_name,
+                        "goal_mhz": target_mhz,
+                        "achieved_mhz": round(curr_mhz, 3),
+                        "met": False,
+                        "reset_distribution": blame,
+                    }
+                    if main_inst not in plans:
+                        if _KEEP_WORST_PLANLESS(
+                            planless_results, main_inst, curr_mhz, met, target_mhz
+                        ):
+                            planless_crossing.pop(main_inst, None)
+                            planless_reset_distribution[main_inst] = blame
+                            iter_records[main_inst] = RECORD_SWEEP_ITERATION(
+                                main_logic.func_name, target_mhz,
+                                {**fields, "action": "as_written"},
+                            )
+                        continue
+                    if main_inst in handled_plans:
+                        continue
+                    handled_plans.add(main_inst)
+                    plan = plans[main_inst]
+                    plan.needs_replan = False
+                    plan.met_timing = False
+                    plan.last_achieved_mhz = curr_mhz
+                    plan.last_worst_path = path_report
+                    plan.stopped_reason = "reset_distribution"
+                    plan.reset_distribution_blame = blame
+                    record = RECORD_SWEEP_ITERATION(
+                        main_logic.func_name,
+                        target_mhz,
+                        {
+                            **fields,
+                            "cuts": PLAN_TOTAL_CUTS(plan),
+                            "action": "stop(reset distribution)",
+                        },
+                    )
+                    plan.history.append(record)
+                    iter_records[main_inst] = record
+                    continue
+                if auto_multi_cycle_group is not None and not met:
+                    # The critical path is an AUTO_MULTI_CYCLE multi-cycle path: more
+                    # cycles (not more pipelining) is the remedy, and this is
+                    # no evidence about the plan's cut count either way
+                    if auto_multi_cycle_feedback is None:
+                        auto_multi_cycle_feedback = AUTO_MULTI_CYCLE.AUTO_MULTI_CYCLE_FEEDBACK(
+                            auto_multi_cycle_group,
+                            path_report,
+                            target_mhz,
+                            multimain_timing_params,
+                        )
+                        if auto_multi_cycle_feedback[1]:
+                            made_change = True
+                            auto_multi_cycle_changed = True
+                    action, changed, blame = auto_multi_cycle_feedback
+                    if main_inst not in plans:
+                        if not _KEEP_WORST_PLANLESS(
+                            planless_results, main_inst, curr_mhz, met, target_mhz
+                        ):
+                            continue
+                        if blame is not None:
+                            planless_auto_multi_cycle_blame[main_inst] = blame
+                        print(
+                            f"[sweep] iter={iteration} main={main_logic.func_name} "
+                            f"goal={target_mhz:.2f}MHz got={curr_mhz:.2f}MHz "
+                            f"({path_report.path_delay_ns:.2f}ns) action={action}",
+                            flush=True,
+                        )
+                        iter_records[main_inst] = RECORD_SWEEP_ITERATION(
+                            main_logic.func_name,
+                            target_mhz,
+                            {
+                                "iter": iteration,
+                                "main": main_logic.func_name,
+                                "goal_mhz": target_mhz,
+                                "achieved_mhz": round(curr_mhz, 3),
+                                "met": met,
+                                "bottleneck": auto_multi_cycle_group.label(),
+                                "action": action,
+                                "auto_multi_cycle_ncycles": synthesized_auto_multi_cycle,
+                            },
+                        )
+                        continue
+                    plan = plans[main_inst]
+                    mcp_failed_plans.add(main_inst)
+                    plan.last_achieved_mhz = curr_mhz
+                    plan.trim_pending = False
+                    plan.zero_cut_probe = False
+                    plan.met_timing = False
+                    if changed:
+                        plan.stopped_reason = None
+                        plan.same_mhz_count = 0
+                        plan.last_mhz = None
+                        plan.plateau_window_start = len(plan.history) + 1
+                    else:
+                        plan.stopped_reason = "auto_multi_cycle_latency_limit"
+                        plan.auto_multi_cycle_limit_blame = blame
+                        plan.last_mhz = curr_mhz
+                    print(
+                        f"[sweep] iter={iteration} main={main_logic.func_name} "
+                        f"goal={target_mhz:.2f}MHz got={curr_mhz:.2f}MHz "
+                        f"({path_report.path_delay_ns:.2f}ns) "
+                        f"cuts={PLAN_TOTAL_CUTS(plan)} action={action}",
+                        flush=True,
+                    )
+                    record = RECORD_SWEEP_ITERATION(
+                        main_logic.func_name,
+                        target_mhz,
+                        {
+                            "iter": iteration,
+                            "main": main_logic.func_name,
+                            "goal_mhz": target_mhz,
+                            "achieved_mhz": round(curr_mhz, 3),
+                            "met": False,
+                            "cuts": PLAN_TOTAL_CUTS(plan),
+                            "bottleneck": auto_multi_cycle_group.label(),
+                            "action": action,
+                            "auto_multi_cycle_ncycles": synthesized_auto_multi_cycle,
+                        },
+                    )
+                    plan.history.append(record)
+                    iter_records[main_inst] = record
+                    continue
+                if main_inst not in plans:
+                    # Nothing cuttable for this main
+                    if not _KEEP_WORST_PLANLESS(
+                        planless_results, main_inst, curr_mhz, met, target_mhz
+                    ):
+                        continue
+                    crossed = DESCRIBE_CROSSING(path_report, roles, parser_state) if roles else ""
+                    planless_crossing.pop(main_inst, None)
+                    planless_reset_distribution.pop(main_inst, None)
+                    if crossed and not met:
+                        planless_crossing[main_inst] = crossed
+                    iter_records[main_inst] = RECORD_SWEEP_ITERATION(
+                        main_logic.func_name,
+                        target_mhz,
+                        {
+                            "iter": iteration,
+                            "main": main_logic.func_name,
+                            "goal_mhz": target_mhz,
+                            "achieved_mhz": round(curr_mhz, 3),
+                            "met": met,
+                            "action": "as_written",
+                            **({"crosses": crossed} if crossed and not met else {}),
+                        },
+                    )
+                    if not met:
+                        crossed_str = (
+                            f" The path crosses {crossed}, which auto-pipelining "
+                            "cannot register either."
+                            if crossed
+                            else ""
+                        )
+                        print(
+                            f"[sweep] WARNING: "
+                            f"{MAIN_DISPLAY_NAME(main_logic.func_name, parser_state)} "
+                            f"fails timing "
+                            f"({curr_mhz:.2f} MHz vs {target_mhz:.2f} MHz goal) and auto-pipelining "
+                            "cannot help it (no sliceable logic and no AUTO_PIPELINE regions in this main) - "
+                            f"restructure the design or lower the clock goal.{crossed_str}"
+                        )
+                        print("START: ", path_report.start_reg_name, "=>")
+                        print(" ~", path_report.path_delay_ns, "ns of logic+routing ~")
+                        print("END: =>", path_report.end_reg_name, flush=True)
+                    continue
+                if main_inst in handled_plans:
+                    continue
+                if met and main_inst in mcp_failed_plans:
+                    continue  # its failing multi-cycle path decides this iteration
+                handled_plans.add(main_inst)
+                plan = plans[main_inst]
+                plan.needs_replan = not met
+                plan.last_achieved_mhz = curr_mhz
+                plan.last_worst_path = path_report
+                plan.trim_pending = False
+                plan.zero_cut_probe = False
+                total_cuts = PLAN_TOTAL_CUTS(plan)
+                latency = tpl[main_inst].GET_TOTAL_LATENCY(parser_state, tpl)
+                deepest = GET_SUBTREE_PIPELINE_STAGES(plan, tpl, parser_state)
+                predicted_ns = 0.0
+                for subtree_root, cuts in plan.cuts.items():
+                    landscape = plan.landscapes.get(subtree_root)
+                    if landscape is not None:
+                        predicted_ns = max(
+                            predicted_ns, PREDICTED_STAGE_NS(cuts, landscape)
+                        )
+                # A region-only plan's stages are all in its regions
+                for region in plan.regions:
+                    predicted_ns = max(predicted_ns, region.predicted_ns)
+                # Attribution sees only this MAIN's names (SCOPED_PATH_REPORT)
+                scoped_path = SCOPED_PATH_REPORT(path_report, main_inst, roles)
+                path_opaque_refinements = (
+                    OPAQUE_PATH_DELAY_REFINEMENTS(scoped_path, plan, parser_state)
+                    if not met else set()
+                )
+                opaque_refinements.update(path_opaque_refinements)
+                hotspot_func = None
+                hotspot_basis = None
+                stage_info = ""
+                action = "met" if met else "?"
+                if met:
+                    plan.met_timing = True
+                    plan.stopped_reason = None
+                else:
+                    plan.met_timing = False
+                    # Record largest known-failing cut count (for minimality
+                    # bisection after timing is met)
+                    failing_cuts = PLAN_TRIMMABLE_CUTS(plan)
+                    if (
+                        plan.last_failing_total_cuts is None
+                        or failing_cuts > plan.last_failing_total_cuts
+                    ):
+                        plan.last_failing_total_cuts = failing_cuts
+                    # Same result twice in a row? (relative tolerance: 1% of
+                    # the target - e.g. 62.92 vs 62.99 MHz IS the same result)
+                    if (
+                        plan.last_mhz is not None
+                        and abs(curr_mhz - plan.last_mhz) < 0.01 * target_mhz
+                    ):
+                        plan.same_mhz_count += 1
+                    else:
+                        plan.same_mhz_count = 0
+                    # At a predicted floor?
+                    # Hard floors (pure comb spans) stop immediately; soft
+                    # floors (stateful module delays incl. cuttable IO paths)
+                    # only stop once the achieved fmax has actually stagnated
+                    # there - they are pessimistic estimates, not ceilings.
+                    hard_floor, hard_blame = plan.predicted_hard_floor()
+                    soft_floor, soft_blame = plan.predicted_floor()
+                    # A soft floor built from ESTIMATED spans is not evidence
+                    # enough to give up: measure the real delays first (the
+                    # ladder's escalation - fallback, minisweep - broke
+                    # identical plateaus before). Only stop at a soft floor
+                    # once no estimates are in play.
+                    any_estimates_in_play = bool(
+                        path_opaque_refinements - fallback_attempted_funcs
+                    ) or any(
+                        l.delay_is_estimated
+                        and f not in fallback_attempted_funcs
+                        and SYN.PATH_DELAY_IS_MEASURABLE(l, parser_state)
+                        for f, l in parser_state.FuncLogicLookupTable.items()
+                    )
+                    delays_measured = (
+                        not any_estimates_in_play
+                        # "prim" mode: estimates are always in play and
+                        # never measured for real -- treat as if the
+                        # fallback already ran so the sweep can still
+                        # reach its floor stop instead of densifying
+                        # forever.
+                        or SYN.HIER_SYN_MODE == "prim"
+                    )
+                    at_hard_floor = AT_EVIDENCED_HARD_FLOOR(
+                        plan, curr_mhz, target_mhz, scoped_path, parser_state,
+                        delays_measured,
+                    )
+                    at_soft_floor = (
+                        AT_PREDICTED_FLOOR(curr_mhz, soft_floor, target_mhz)
+                        and plan.same_mhz_count >= 1
+                        and delays_measured
+                    )
+                    # Flat measured results while cuts grew, whatever the
+                    # prediction says (see AT_PLATEAU). The window may
+                    # span the measured fallback, but the current plan must
+                    # itself be a fresh one planned with measured delays: a
+                    # placement refinement is a same-depth probe carried
+                    # over from the previous plan, not a test of more
+                    # registers (seen for real under PyRTL: stopping on the
+                    # post-fallback refinement's 15.11 MHz missed the next
+                    # denser plan's 15.82 MHz).
+                    plateau_window = plan.history[plan.plateau_window_start :]
+                    at_plateau = (
+                        delays_measured
+                        and plan.active_placement_refinement is None
+                        and AT_PLATEAU(
+                            plateau_window, curr_mhz, total_cuts, target_mhz
+                        )
+                    )
+                    if at_hard_floor or at_soft_floor:
+                        floor = hard_floor if at_hard_floor else soft_floor
+                        floor_blame = hard_blame if at_hard_floor else soft_blame
+                        blame_str = ""
+                        if floor_blame is not None:
+                            blame_str = f" due to {floor_blame.inst_path.split(LOGIC.SUBMODULE_MARKER)[-1]} ({floor_blame.reason})"
+                        kind_str = "predicted" if at_hard_floor else "empirical (soft)"
+                        print(
+                            f"[sweep] WARNING: {main_logic.func_name} at {kind_str} frequency ceiling "
+                            f"(~{floor:.1f} MHz{blame_str}); cannot improve by adding registers. Keeping best result.",
+                            flush=True,
+                        )
+                        plan.stopped_reason = (
+                            "predicted_floor" if at_hard_floor else "empirical_floor"
+                        )
+                        action = "stop_at_floor"
+                    elif at_plateau:
+                        first = plateau_window[-(PLATEAU_STREAK - 1)]
+                        plan.plateau_blame = None
+                        if (
+                            soft_floor is not None
+                            and soft_floor < target_mhz
+                            and soft_blame is not None
+                        ):
+                            blamed = soft_blame.inst_path.split(
+                                LOGIC.SUBMODULE_MARKER
+                            )[-1]
+                            plan.plateau_blame = (
+                                f"likely limited by {blamed} ({soft_blame.reason}, "
+                                f"estimated soft ceiling ~{soft_floor:.1f} MHz)"
+                            )
+                        blame_str = (
+                            f" {plan.plateau_blame[0].upper()}{plan.plateau_blame[1:]}."
+                            if plan.plateau_blame
+                            else ""
+                        )
+                        print(
+                            f"[sweep] WARNING: {main_logic.func_name} fmax plateaued at "
+                            f"~{curr_mhz:.2f} MHz over {PLATEAU_STREAK} iterations while "
+                            f"cuts grew {first['cuts']}->{total_cuts}; adding registers "
+                            f"is not helping.{blame_str} Keeping best result.",
+                            flush=True,
+                        )
+                        plan.stopped_reason = "plateau"
+                        action = "stop(plateau)"
+                    else:
+                        (
+                            hotspot_func,
+                            unpipelinable_reason,
+                            stage_info,
+                        ) = RESOLVE_PIPELINABLE_HOTSPOT(
+                            scoped_path, plan, parser_state
+                        )
+                        if (
+                            hotspot_func is None
+                            and role is not None
+                            and not role["reach"]
+                            and role["blockers"]
+                        ):
+                            # Nothing in this plan's landscapes matched, and
+                            # every cell of the path in this MAIN sits in an
+                            # instance that cannot hold added latency: name it
+                            # instead of blindly rescaling the whole plan.
+                            hotspot_func, unpipelinable_reason = role["blockers"][0]
+                            hotspot_basis = "hierarchy"
+                        else:
+                            hotspot_basis = ATTRIBUTION_BASIS(
+                                scoped_path, hotspot_func, plan, parser_state
+                            )
+                        if (
+                            hotspot_func is not None
+                            and unpipelinable_reason is not None
+                        ):
+                            # The critical path is somewhere register insertion
+                            # cannot reach. Boundary registers placed around the
+                            # func can still cut its IO paths, so rescale once -
+                            # but if fmax then stagnates, tell the user plainly
+                            # that the tool cannot help this path.
+                            plan.unpipelinable_blame = (
+                                hotspot_func,
+                                unpipelinable_reason,
+                            )
+                            if plan.same_mhz_count >= 1:
+                                where = DESCRIBE_HOTSPOT_LOCATION(
+                                    hotspot_basis,
+                                    f"function {hotspot_func}"
+                                    f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)}",
+                                )
+                                print(
+                                    f"[sweep] WARNING: {main_logic.func_name} cannot meet {target_mhz:.2f} MHz: "
+                                    f"{where}, which cannot be "
+                                    f"auto-pipelined ({unpipelinable_reason}). Adding pipeline registers cannot "
+                                    f"subdivide this path - restructure {hotspot_func} or lower the clock goal. "
+                                    "Keeping best result.",
+                                    flush=True,
+                                )
+                                print("START: ", path_report.start_reg_name, "=>")
+                                print("END: =>", path_report.end_reg_name, flush=True)
+                                plan.stopped_reason = "unpipelinable_hotspot"
+                                action = f"stop(unpipelinable {hotspot_func})"
+                            else:
+                                where = DESCRIBE_HOTSPOT_LOCATION(
+                                    hotspot_basis,
+                                    f"{hotspot_func}"
+                                    f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)}",
+                                )
+                                print(
+                                    f"[sweep] NOTE: {main_logic.func_name}: {where}, "
+                                    f"which cannot be auto-pipelined internally ({unpipelinable_reason}); "
+                                    "registers at its boundaries may still help - replanning.",
+                                    flush=True,
+                                )
+                                step = min(
+                                    max(
+                                        (target_mhz / curr_mhz) * 1.05,
+                                        GLOBAL_SCALE_MIN_STEP,
+                                    ),
+                                    GLOBAL_SCALE_MAX_STEP,
+                                )
+                                plan.global_scale *= step
+                                action = f"replan(global x{plan.global_scale:.2f}, {hotspot_func} unpipelinable)"
+                                made_change = True
+                        elif (
+                            hotspot_func is not None
+                            and decided_by_peer.get(main_inst, (None,))[0] == hotspot_func
+                        ):
+                            # The next synthesis tries what a peer decided
+                            # for every instance of this hotspot.
+                            action = decided_by_peer[main_inst][1]
+                            made_change = True
+                        elif hotspot_func is not None and HOTSPOT_IS_LOCKED(
+                            hotspot_func, plan, parser_state
+                        ):
+                            # Its interior is fixed, but the full design has
+                            # not necessarily proved the cheapest side for
+                            # each boundary bank.  Try compact output/input
+                            # covers and single-sided endpoint variants before
+                            # giving up or restoring the historical both-I/O
+                            # shape.
+                            internal_failure = PATH_INSIDE_LOCK(
+                                path_report, plan, parser_state, tpl, hotspot_func
+                            )
+                            next_boundary_strategy = None if internal_failure else TRY_NEXT_MINISWEEP_BOUNDARY_STRATEGY(
+                                plan, hotspot_func, parser_state)
+                            if internal_failure:
+                                plan.same_mhz_count = max(1, plan.same_mhz_count)
+                                print("[sweep] Both failing endpoints are inside the concrete lock; boundary registers cannot split this path.", flush=True)
+                            if next_boundary_strategy is not None:
+                                print(
+                                    f"[sweep] Locked {hotspot_func}"
+                                    f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} remains on "
+                                    f"the critical path; trying "
+                                    f"{next_boundary_strategy} boundary policy.",
+                                    flush=True,
+                                )
+                                plan.same_mhz_count = 0
+                                plan.last_mhz = None
+                                plan.plateau_window_start = (
+                                    len(plan.history) + 1
+                                )
+                                action = (
+                                    f"refine(minisweep boundary "
+                                    f"{next_boundary_strategy})"
+                                )
+                                new_candidate_plans.add(main_inst)
+                                made_change = True
+                            elif plan.same_mhz_count >= 1:
+                                print(
+                                    f"[sweep] WARNING: {main_logic.func_name} limited by "
+                                    f"already-locked {hotspot_func}"
+                                    f"{LOGIC.FUNC_SRC_LOC_STR(parser_state, hotspot_func)} "
+                                    "(concrete isolated implementation applied); "
+                                    "this search has no further applicable refinement. Keeping best result."
+                                    + DESCRIBE_EXCLUDED_MINISWEEP_INSTANCES(
+                                        MINISWEEP_LOCK_TARGETS(hotspot_func, plan, parser_state)[1],
+                                        parser_state,
+                                    ),
+                                    flush=True,
+                                )
+                                plan.stopped_reason = "locked_hotspot_limit"
+                                action = f"stop(locked {hotspot_func})"
+                            else:
+                                step = min(
+                                    max(
+                                        (target_mhz / curr_mhz) * 1.05,
+                                        GLOBAL_SCALE_MIN_STEP,
+                                    ),
+                                    GLOBAL_SCALE_MAX_STEP,
+                                )
+                                plan.global_scale *= step
+                                action = f"replan(global x{plan.global_scale:.2f}, hotspot {hotspot_func} locked)"
+                                made_change = True
+                        elif (
+                            hotspot_func is not None
+                            and AUTO_PIPELINE.REGION_FOR_HOTSPOT(hotspot_func, plan, parser_state)
+                            is not None
+                        ):
+                            region = AUTO_PIPELINE.REGION_FOR_HOTSPOT(
+                                hotspot_func, plan, parser_state
+                            )
+                            # A repeated hotspot in an uncapped region, its
+                            # root or a helper inside it, takes the same
+                            # measured mini-sweep an untagged call site's
+                            # would; a region-wide count change only spreads
+                            # cuts over the delay model's geometry (see
+                            # REGION_LOCK_BLOCKER).
+                            if (
+                                REGION_LOCK_BLOCKER(
+                                    region, plan, parser_state
+                                )
+                                is None
+                                and TRY_HOTSPOT_MINISWEEP(
+                                    hotspot_func, plan, parser_state
+                                )
+                            ):
+                                AUTO_PIPELINE.RESET_REGION_CALIBRATION_AFTER_LOCK(
+                                    plan, region
+                                )
+                                new_candidate_plans.add(main_inst)
+                                action = f"minisweep({hotspot_func})"
+                                made_change = True
+                                for peer in SHARE_LOCK(plan, hotspot_func, parser_state):
+                                    new_candidate_plans.add(peer.main_inst)
+                                    decided_by_peer[peer.main_inst] = (
+                                        hotspot_func,
+                                        f"{action} from {main_logic.func_name}",
+                                    )
+                            else:
+                                action, region_changed = AUTO_PIPELINE.AUTO_PIPELINE_REGION_FEEDBACK(
+                                    plan,
+                                    region,
+                                    hotspot_func,
+                                    target_mhz,
+                                    curr_mhz,
+                                    parser_state,
+                                )
+                                if region_changed:
+                                    made_change = True
+                                    for peer in plan.peers:
+                                        if any(r.group == region.group for r in peer.regions):
+                                            decided_by_peer[peer.main_inst] = (
+                                                hotspot_func,
+                                                f"{action} from {main_logic.func_name}",
+                                            )
+                        elif hotspot_func is not None:
+                            if TRY_HOTSPOT_MINISWEEP(hotspot_func, plan, parser_state):
+                                new_candidate_plans.add(main_inst)
+                                action = f"minisweep({hotspot_func})"
+                                made_change = True
+                                for peer in SHARE_LOCK(plan, hotspot_func, parser_state):
+                                    new_candidate_plans.add(peer.main_inst)
+                                    decided_by_peer[peer.main_inst] = (
+                                        hotspot_func,
+                                        f"{action} from {main_logic.func_name}",
+                                    )
+                            else:
+                                # Not yet repeated, or the isolated probe
+                                # couldn't fix it: densify
+                                step = min(
+                                    max(
+                                        (target_mhz / curr_mhz) * 1.05,
+                                        FUNC_SCALE_MIN_STEP,
+                                    ),
+                                    FUNC_SCALE_MAX_STEP,
+                                )
+                                plan.func_delay_scale[hotspot_func] = (
+                                    plan.func_delay_scale.get(hotspot_func, 1.0) * step
+                                )
+                                action = f"densify({hotspot_func} x{plan.func_delay_scale[hotspot_func]:.2f})"
+                                made_change = True
+                        elif (
+                            plan.regions
+                            and all(r.at_cap() for r in plan.regions)
+                            and all(
+                                landscape is None
+                                for landscape in plan.landscapes.values()
+                            )
+                        ):
+                            # Every register this main can take is inside a
+                            # constrained region already at its limit
+                            AUTO_PIPELINE.STOP_AT_AUTO_PIPELINE_LATENCY_LIMIT(
+                                plan, parser_state, plan.regions
+                            )
+                            action = "stop(auto-pipeline latency limit)"
+                        else:
+                            # No attribution (PYRTL etc.): scale global budget
+                            step = min(
+                                max(
+                                    (target_mhz / curr_mhz) * 1.05,
+                                    GLOBAL_SCALE_MIN_STEP,
+                                ),
+                                GLOBAL_SCALE_MAX_STEP,
+                            )
+                            plan.global_scale *= step
+                            action = f"replan(global x{plan.global_scale:.2f})"
+                            made_change = True
+                    if (
+                        not met
+                        and plan.placement_mode == "automatic"
+                        and plan.active_placement_refinement is None
+                        and not plan.chunked_mux_refinement_attempted
+                    ):
+                        # Before spending another full synthesis on more
+                        # stages, try the bounded physical neighbor which
+                        # replaces selected packed-MUX output banks with a
+                        # midpoint bit boundary.  The terminal MUX is included
+                        # so a formerly unregistered tail does not retain the
+                        # same high-fanout select path.  Delay-scale feedback
+                        # computed above is retained for use only if this
+                        # neighbor also fails.
+                        refined_subtrees = {}
+                        changed = False
+                        for subtree_root in plan.subtrees:
+                            landscape = plan.landscapes.get(subtree_root)
+                            current = list(
+                                plan.placements.get(subtree_root, ())
+                            )
+                            refinement = None
+                            if landscape is not None:
+                                refinement = BUILD_CHUNKED_MUX_REFINEMENT(
+                                    current, landscape, parser_state
+                                )
+                            if refinement is None:
+                                refined_subtrees[subtree_root] = (
+                                    list(plan.cuts.get(subtree_root, ())),
+                                    current,
+                                )
+                            else:
+                                refined_subtrees[subtree_root] = refinement
+                                changed = True
+                        if changed:
+                            candidate_fingerprint = (
+                                PIPELINE_PLACEMENT_FINGERPRINT(
+                                    {
+                                        subtree_root: placements
+                                        for subtree_root, (
+                                            _cuts,
+                                            placements,
+                                        ) in refined_subtrees.items()
+                                    },
+                                    plan.locked,
+                                )
+                            )
+                            if (
+                                candidate_fingerprint
+                                not in plan.attempted_placement_fingerprints
+                            ):
+                                plan.pending_placement_refinement = {
+                                    "kind": "chunked_mux",
+                                    "fingerprint": candidate_fingerprint,
+                                    "subtrees": refined_subtrees,
+                                }
+                                plan.stopped_reason = None
+                                action = (
+                                    "refine(chunked MUX boundaries)"
+                                )
+                                new_candidate_plans.add(main_inst)
+                                made_change = True
+                    if not met and plan.placement_mode == "replace":
+                        # Controlled frozen-placement A/B: synthesize exactly
+                        # the supplied hardware once and report its result.
+                        # Any densify scale computed by the generic failure
+                        # branch above is deliberately ignored.
+                        plan.stopped_reason = "internal_forced_placement_result"
+                        action = "stop(internal forced placement result)"
+                    plan.last_mhz = curr_mhz
+                bottleneck_str = (
+                    f" bottleneck={hotspot_func}{stage_info}" if hotspot_func else ""
+                )
+                # deepest = SLICES (see GET_SUBTREE_PIPELINE_STAGES);
+                # pipeline_stages is comb regions separated by those slices,
+                # i.e. slices + 1 (0 slices = 1 stage, 1 slice = 2
+                # stages, ...) - conflating the two here previously made
+                # e.g. "cuts=30 main_latency=30 pipeline_stages=30" look like
+                # 30 cuts bought 0 extra stages.
+                pipeline_stages = deepest + 1
+                # Not every SYN_TOOL's PathReport carries this (VIVADO's
+                # does not); a fanout overload is not fixed by more stages,
+                # which is exactly why the mux select-fanout cliff's 130 MHz
+                # plan measured worse than its 104 MHz one with no other
+                # visible cause in the rest of this line.
+                max_cap_violations = getattr(
+                    path_report, "n_max_capacitance_violations", None
+                )
+                max_cap_str = (
+                    f" max_cap_violations={max_cap_violations}"
+                    if max_cap_violations
+                    else ""
+                )
+                print(
+                    f"[sweep] iter={iteration} main={main_logic.func_name} "
+                    f"goal={target_mhz:.2f}MHz got={curr_mhz:.2f}MHz ({path_report.path_delay_ns:.2f}ns) "
+                    f"cuts={total_cuts} main_latency={latency} pipeline_stages={pipeline_stages} "
+                    f"predicted_stage={predicted_ns:.2f}ns"
+                    f"{bottleneck_str}{max_cap_str} action={action}",
+                    flush=True,
+                )
+                record = RECORD_SWEEP_ITERATION(
+                    main_logic.func_name,
+                    target_mhz,
+                    {
+                        "iter": iteration,
+                        "main": main_logic.func_name,
+                        "goal_mhz": target_mhz,
+                        "achieved_mhz": round(curr_mhz, 3),
+                        "met": met,
+                        "cuts": total_cuts,
+                        "main_latency": latency,
+                        "pipeline_stages": pipeline_stages,
+                        "predicted_stage_ns": round(predicted_ns, 3),
+                        "bottleneck": hotspot_func,
+                        **(
+                            {"bottleneck_basis": hotspot_basis}
+                            if hotspot_basis is not None
+                            else {}
+                        ),
+                        "max_cap_violations": max_cap_violations,
+                        "action": action,
+                        **(
+                            {
+                                "auto_pipeline_regions": [
+                                    r.to_dict() for r in plan.regions
+                                ]
+                            }
+                            if plan.regions
+                            else {}
+                        ),
+                        **(
+                            {"auto_multi_cycle_ncycles": synthesized_auto_multi_cycle}
+                            if synthesized_auto_multi_cycle
+                            else {}
+                        ),
+                    },
+                )
+                plan.history.append(record)
+                iter_records[main_inst] = record
+
+        for main_inst, record in iter_records.items():
+            if crossings.get(main_inst):
+                record["crossing_paths"] = list(crossings[main_inst].values())
+        for record in iter_records.values():
+            record.update(decision=iteration, synthesis_observations=synthesis_attempts,
+                          implementation_signature=implementation,
+                          input_signature=getattr(timing_report, "input_signature", None),
+                          observation_origin="reused_observation" if repeated_decisions else
+                              "cache" if getattr(timing_report, "cache_hit", False) else "synthesis")
+        # Track best result so far: largest worst-case achieved/target ratio,
+        # ties (within SNAPSHOT_TIE_TOLERANCE) going to met own paths, then
+        # fewer stages -- see SNAPSHOT_BETTER
+        candidate_key = None
+        if overall_score is not None:
+            candidate_key = (
+                overall_score,
+                min([1.0] + [min(v, 1.0) for v in plan_own_scores.values()]),
+                sum(
+                    GET_SUBTREE_PIPELINE_STAGES(p, tpl, parser_state)
+                    for p in plans.values()
+                ),
+            )
+        if candidate_key is not None and SNAPSHOT_BETTER(candidate_key, best_key):
+            best_key = candidate_key
+            best_score = overall_score
+            best_tpl = AUTO_PIPELINE.COPY_TIMING_PARAMS_LOOKUP(tpl)
+            best_auto_multi_cycle = dict(synthesized_auto_multi_cycle)
+            best_iter_records = iter_records
+            best_plan_regions = copy.deepcopy(built_plan_regions)
+            best_plan_cuts = {mi: copy.deepcopy(p.cuts) for mi, p in plans.items()}
+            best_plan_placements = {
+                mi: copy.deepcopy(p.placements) for mi, p in plans.items()
+            }
+            best_plan_locks = copy.deepcopy(built_plan_locks)
+            best_plan_boundary_diagnostics = copy.deepcopy(built_plan_boundary_diagnostics)
+
+        # Plans never implicated in a failing path report have no timing
+        # signal to react to - when every reported path meets its goal they
+        # are done too (the per clock group report only shows the worst path,
+        # which can live in a different main of the same clock group)
+        # Their history record carries no MHz (none was measured): without
+        # it the history of a sweep ending this way stopped one iteration
+        # early, its last entry a superseded mid-sweep result.
+        if not any_report_failed:
+            for main_inst, plan in plans.items():
+                if main_inst in evaluated_plans or plan.stopped_reason is not None:
+                    continue
+                main_func_name = parser_state.LogicInstLookupTable[main_inst].func_name
+                if not plan.met_timing:
+                    print(
+                        f"[sweep] {main_func_name}: "
+                        "no failing timing path reported for this main; assuming met.",
+                        flush=True,
+                    )
+                    plan.met_timing = True
+                record = RECORD_SWEEP_ITERATION(
+                    main_func_name,
+                    plan.target_mhz,
+                    {
+                        "iter": iteration,
+                        "main": main_func_name,
+                        "goal_mhz": plan.target_mhz,
+                        "achieved_mhz": None,
+                        "met": True,
+                        "cuts": PLAN_TOTAL_CUTS(plan),
+                        "main_latency": tpl[main_inst].GET_TOTAL_LATENCY(
+                            parser_state, tpl
+                        ),
+                        "pipeline_stages": GET_SUBTREE_PIPELINE_STAGES(
+                            plan, tpl, parser_state
+                        )
+                        + 1,
+                        "action": "met(no failing path reported)",
+                        **(
+                            {
+                                "auto_pipeline_regions": [
+                                    r.to_dict() for r in plan.regions
+                                ]
+                            }
+                            if plan.regions
+                            else {}
+                        ),
+                        **(
+                            {"auto_multi_cycle_ncycles": synthesized_auto_multi_cycle}
+                            if synthesized_auto_multi_cycle
+                            else {}
+                        ),
+                    },
+                )
+                plan.history.append(record)
+                iter_records[main_inst] = record
+            for main_inst, target_mhz in planless_goal_mains:
+                if main_inst in planless_results:
+                    continue
+                main_func_name = parser_state.LogicInstLookupTable[main_inst].func_name
+                iter_records[main_inst] = RECORD_SWEEP_ITERATION(
+                    main_func_name,
+                    target_mhz,
+                    {
+                        "iter": iteration,
+                        "main": main_func_name,
+                        "goal_mhz": target_mhz,
+                        "achieved_mhz": None,
+                        "met": True,
+                        "action": "as_written(no failing path reported)",
+                    },
+                )
+
+        # Termination
+        all_done = (
+            all(p.met_timing or p.stopped_reason is not None or not p.needs_replan for p in plans.values())
+            and len(plans) > 0
+        )
+        if len(plans) == 0 and not auto_multi_cycle_changed:
+            # Nothing was cuttable: one syn run characterized the design
+            # (plus one per AUTO_MULTI_CYCLE count change)
+            break
+        if all_done and not auto_multi_cycle_changed:
+            all_met = all(p.met_timing for p in plans.values())
+            if all_met:
+                # Timing met - but with how many registers? Meeting timing by
+                # over-pipelining is worse than a few more iterations. Slack
+                # is NOT the signal (tools stop optimizing at slack ~0, so a
+                # met design reports near-zero slack no matter how many
+                # excess registers it carries). Instead use cut-count
+                # history: bisect between the last known FAILING cut count
+                # and the met count, or probe below a met count whose
+                # minimality was never proven by a failing data point.
+                total_cuts_now = sum(
+                    PLAN_TOTAL_CUTS(p) for p in plans.values()
+                )
+                if met_snapshot_cuts is None or total_cuts_now < met_snapshot_cuts:
+                    met_snapshot_cuts = total_cuts_now
+                    met_snapshot_tpl = AUTO_PIPELINE.COPY_TIMING_PARAMS_LOOKUP(tpl)
+                    met_snapshot_auto_multi_cycle = dict(synthesized_auto_multi_cycle)
+                    met_snapshot_iter_records = iter_records
+                    met_snapshot_plan_regions = copy.deepcopy(built_plan_regions)
+                    met_snapshot_plan_cuts = {
+                        mi: copy.deepcopy(p.cuts) for mi, p in plans.items()
+                    }
+                    met_snapshot_plan_placements = {
+                        mi: copy.deepcopy(p.placements) for mi, p in plans.items()
+                    }
+                    met_snapshot_plan_locks = copy.deepcopy(built_plan_locks)
+                    met_snapshot_plan_boundary_diagnostics = copy.deepcopy(built_plan_boundary_diagnostics)
+                trim_candidates = []
+                for p in plans.values():
+                    if (
+                        p.stopped_reason is not None
+                        or p.placement_mode == "replace"
+                    ):
+                        continue
+                    met_cuts = PLAN_TRIMMABLE_CUTS(p)
+                    if met_cuts == 0:
+                        continue
+                    if p.last_failing_total_cuts is None:
+                        # Never seen failing - minimality unproven, probe down
+                        desired = met_cuts - max(1, met_cuts // 8)
+                    elif met_cuts > p.last_failing_total_cuts + 1:
+                        # Bisect the gap toward the fewest passing count
+                        desired = (met_cuts + p.last_failing_total_cuts) // 2
+                    else:
+                        continue  # minimal within one cut - proven
+                    if desired < 0 or desired >= met_cuts:
+                        continue
+                    # A worst-stage measurement and a cut count do not bound
+                    # timing after trimming: stages can be uneven, and the
+                    # reported path may be in an unchanged subtree. Let the
+                    # bounded trim probe measure the smaller implementation.
+                    trim_candidates.append((p, met_cuts, desired))
+                if (
+                    trim_iters_used < PIPELINE_MIN_EFFORT
+                    and len(trim_candidates) > 0
+                ):
+                    trim_iters_used += 1
+                    for p, met_cuts, desired in trim_candidates:
+                        # cuts scale ~linearly with global_scale
+                        p.zero_cut_probe = desired == 0
+                        if not p.zero_cut_probe:
+                            p.global_scale *= desired / float(met_cuts)
+                        p.met_timing = False  # must re-prove at fewer cuts
+                        p.trim_pending = True
+                        print(
+                            f"[sweep] Trimming stages: {parser_state.LogicInstLookupTable[p.main_inst].func_name} "
+                            f"met at {met_cuts} cuts (known failing: {p.last_failing_total_cuts}), "
+                            f"retrying at ~{desired} cuts (trim {trim_iters_used}/{PIPELINE_MIN_EFFORT})",
+                            flush=True,
+                        )
+                    continue
+                print("Met timing...", flush=True)
+            break
+        # Restore a failed trim only after testing any fresh concrete lock or
+        # refinement discovered by its feedback. Otherwise a compact measured
+        # helper can be discarded without ever reaching whole-design synthesis.
+        if (
+            met_snapshot_tpl is not None
+            and trim_iters_used > 0
+            and not auto_multi_cycle_changed
+            and not new_candidate_plans
+        ):
+            print(
+                f"[sweep] Trim attempt failed timing; restoring met result with {met_snapshot_cuts} cuts...",
+                flush=True,
+            )
+            tpl = met_snapshot_tpl
+            final_iter_records = met_snapshot_iter_records
+            multimain_timing_params.TimingParamsLookupTable = tpl
+            multimain_timing_params.auto_multi_cycle_ncycles = dict(met_snapshot_auto_multi_cycle)
+            AUTO_PIPELINE.RESTORE_AUTO_PIPELINE_REGIONS(plans, met_snapshot_plan_regions)
+            for mi, p in plans.items():
+                if mi in met_snapshot_plan_cuts:
+                    p.cuts = met_snapshot_plan_cuts[mi]
+                if mi in met_snapshot_plan_placements:
+                    p.placements = met_snapshot_plan_placements[mi]
+                if mi in met_snapshot_plan_locks:
+                    p.locked = met_snapshot_plan_locks[mi]
+                if mi in met_snapshot_plan_boundary_diagnostics:
+                    p.mini_sweep_boundary_diagnostics = (
+                        met_snapshot_plan_boundary_diagnostics[mi]
+                    )
+            ancestor_insts = AUTO_PIPELINE.INVALIDATE_MODIFIED_INST_ANCESTOR_CACHES(
+                tpl, parser_state
+            )
+            AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES(tpl, parser_state, ancestor_insts)
+            for p in plans.values():
+                if p.stopped_reason is None:
+                    p.met_timing = True
+            print("Met timing...", flush=True)
+            break
+        # Fmax stuck at the same value while cuts keep growing means the
+        # landscape geometry is wrong (cuts not landing on the real critical
+        # path) - if estimates are in play they are the prime suspect
+        # A plan with a new model-independent candidate is not stagnant until
+        # that candidate has been synthesized: measuring every estimate first
+        # (the fallback below) cannot change a concrete lock or refinement.
+        fmax_stagnant = any(
+            p.same_mhz_count >= 1
+            and not p.met_timing
+            and p.stopped_reason is None
+            and m not in new_candidate_plans
+            for m, p in plans.items()
+        )
+        if synthesis_attempts >= synthesis_budget or not made_change or fmax_stagnant:
+            # Automatic fallback: measure eligible estimates (and opaque text
+            # on failing paths) not yet tried by this sweep, then keep
+            # sweeping - an estimate must never be the reason the sweep fails
+            if SYN.HIER_SYN_MODE == "leaf":
+                estimated_funcs = {
+                    f
+                    for f, l in parser_state.FuncLogicLookupTable.items()
+                    if l.delay_is_estimated and SYN.PATH_DELAY_IS_MEASURABLE(l, parser_state)
+                }
+                estimated_funcs.update(opaque_refinements)
+                estimated_funcs.difference_update(fallback_attempted_funcs)
+                if len(estimated_funcs) > 0:
+                    print(
+                        "[sweep] Measuring eligible pipeline geometry: replacing "
+                        f"{len(estimated_funcs)} estimated delays with measured results...",
+                        flush=True,
+                    )
+                    changed = SYN.MEASURE_DELAYS(
+                        sorted(estimated_funcs), parser_state,
+                        refine_opaque=bool(opaque_refinements),
+                    )
+                    fallback_attempted_funcs.update(estimated_funcs)
+                    # Fresh signal: the delay model changed, stagnation
+                    # bookkeeping no longer applies. plateau_window_start is
+                    # deliberately kept: already-synthesized fmax results
+                    # are real regardless of the model that planned them.
+                    if changed:
+                        for p in plans.values():
+                            p.same_mhz_count = 0
+                            p.last_mhz = None
+                        # An actual model change warrants another plan.
+                        synthesis_budget = max(synthesis_budget, synthesis_attempts + 2)
+                        continue
+            if not (synthesis_attempts >= synthesis_budget or not made_change):
+                # Only stagnation brought us here and no untried measurement
+                # remains - keep iterating within the normal budget
+                continue
+            for plan in plans.values():
+                if not plan.met_timing and plan.stopped_reason is None:
+                    plan.stopped_reason = (
+                        "iteration_limit" if made_change else "no_legal_adjustment"
+                    )
+                    culprit_str = ""
+                    if plan.unpipelinable_blame is not None:
+                        blamed_func, blame_reason = plan.unpipelinable_blame
+                        culprit_str = (
+                            f" Critical path was attributed to {blamed_func}, which cannot be "
+                            f"auto-pipelined ({blame_reason}) - restructure it or lower the clock goal."
+                        )
+                    print(
+                        f"[sweep] WARNING: {parser_state.LogicInstLookupTable[plan.main_inst].func_name} "
+                        f"stopped without meeting timing ({plan.stopped_reason}). Keeping best result.{culprit_str}",
+                        flush=True,
+                    )
+            break
+
+    # Use the best seen params if the last iteration wasn't the best
+    if best_tpl is not None and not all(p.met_timing for p in plans.values()):
+        multimain_timing_params.TimingParamsLookupTable = best_tpl
+        multimain_timing_params.auto_multi_cycle_ncycles = dict(best_auto_multi_cycle)
+        final_iter_records = best_iter_records
+        AUTO_PIPELINE.RESTORE_AUTO_PIPELINE_REGIONS(plans, best_plan_regions)
+        if best_plan_cuts is not None:
+            for mi, p in plans.items():
+                if mi in best_plan_cuts:
+                    p.cuts = best_plan_cuts[mi]
+                if mi in best_plan_placements:
+                    p.placements = best_plan_placements[mi]
+                if mi in best_plan_locks:
+                    p.locked = best_plan_locks[mi]
+                if mi in best_plan_boundary_diagnostics:
+                    p.mini_sweep_boundary_diagnostics = (
+                        best_plan_boundary_diagnostics[mi]
+                    )
+        best_ancestors = AUTO_PIPELINE.INVALIDATE_MODIFIED_INST_ANCESTOR_CACHES(
+            best_tpl, parser_state
+        )
+        AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES(best_tpl, parser_state, best_ancestors)
+        if BEST_SNAPSHOT_MET_ALL_GOALS(best_score):
+            for p in plans.values():
+                p.met_timing = True
+                p.stopped_reason = None
+
+    # A retained snapshot can expose fewer MAINs than earlier observations.
+    # Only that snapshot's measurement/bound may decide a final MAIN verdict.
+    if final_iter_records is None:
+        final_iter_records = iter_records
+    for plan in plans.values():
+        record = final_iter_records.get(plan.main_inst)
+        plan.met_timing = bool(record and record.get("met"))
+        if record is None:
+            plan.stopped_reason = "unknown_in_retained_snapshot"
+
+    # Retain only locks from the implementation actually kept, not abandoned probes.
+    STORE_CARRIED_LOCKS(plans, parser_state)
+    # Final summary + history dump
+    for plan in plans.values():
+        main_func_name = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+        outcome = (
+            "met timing" if plan.met_timing else f"stopped ({plan.stopped_reason})"
+        )
+        _mono, _regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+            plan.main_inst,
+            plan.subtrees,
+            multimain_timing_params.TimingParamsLookupTable,
+            parser_state,
+        )
+        print(
+            f"[sweep] {main_func_name}: {outcome}, {total_stages} slice(s) built "
+            f"({total_stages + 1} pipeline stages), "
+            f"cuts={PLAN_TOTAL_CUTS(plan)}, "
+            f"locked={len(plan.locked)} inst(s), iterations={iteration}",
+            flush=True,
+        )
+        for region in plan.regions:
+            print(
+                f"[sweep] AUTO_PIPELINE {region.label()} "
+                f"({region.constraint.describe()}): {region.realized} clk(s) "
+                f"built at {region.inst}",
+                flush=True,
+            )
+    for key, group in sorted(auto_multi_cycle_groups.items()):
+        print(
+            f"[sweep] AUTO_MULTI_CYCLE {group.label()} ({group.constraint.describe()}): "
+            f"{multimain_timing_params.auto_multi_cycle_ncycles.get(key)} cycle(s) "
+            f"constrained on {len(group.paths)} multi-cycle path(s)",
+            flush=True,
+        )
+    AUTO_PIPELINE.CHECK_AUTO_PIPELINE_CONSTRAINTS_REALIZED(
+        parser_state, multimain_timing_params.TimingParamsLookupTable
+    )
+    WRITE_PIPELINE_PLACEMENT_TRACE(
+        plans,
+        parser_state,
+        multimain_timing_params.TimingParamsLookupTable,
+        internal_config=internal_placement_config,
+    )
+
+    # Record unmet timing goals so the build can FAIL (non zero exit) instead
+    # of silently writing results and running simulation on a design that
+    # does not meet its clocks (pipelinec gates on this after writing files)
+    timing_failures = []
+    for plan in plans.values():
+        if plan.met_timing:
+            continue
+        main_func_name = parser_state.LogicInstLookupTable[plan.main_inst].func_name
+        retained_record = (final_iter_records or iter_records).get(plan.main_inst, {})
+        achieved = retained_record.get("achieved_mhz")
+        why = plan.stopped_reason or "unknown"
+        if plan.plateau_blame is not None and plan.stopped_reason == "plateau":
+            why += f": {plan.plateau_blame}"
+        if plan.auto_pipeline_limit_blame is not None:
+            why += f": {plan.auto_pipeline_limit_blame}"
+        if plan.auto_multi_cycle_limit_blame is not None and plan.stopped_reason == (
+            "auto_multi_cycle_latency_limit"
+        ):
+            why += f": {plan.auto_multi_cycle_limit_blame}"
+        if plan.unpipelinable_blame is not None:
+            blamed_func, blame_reason = plan.unpipelinable_blame
+            why += f": {blamed_func}, {blame_reason}"
+        if plan.stopped_reason == "reset_distribution":
+            why += f": {plan.reset_distribution_blame}"
+        timing_failures.append((main_func_name, plan.target_mhz, achieved, why))
+    # Mains with a goal but no plan (nothing cuttable) whose last timing
+    # report failed also count
+    for main_inst, (pl_curr, pl_met, pl_target) in planless_results.items():
+        if not pl_met:
+            timing_failures.append(
+                (
+                    parser_state.LogicInstLookupTable[main_inst].func_name,
+                    pl_target,
+                    pl_curr,
+                    (
+                        f"auto_multi_cycle_latency_limit: {planless_auto_multi_cycle_blame[main_inst]}"
+                        if main_inst in planless_auto_multi_cycle_blame
+                        else f"reset_distribution: {planless_reset_distribution[main_inst]}"
+                        if main_inst in planless_reset_distribution
+                        else "nothing_auto_pipelinable"
+                        + (
+                            f": path crosses {planless_crossing[main_inst]}"
+                            if main_inst in planless_crossing
+                            else ""
+                        )
+                    ),
+                )
+            )
+    multimain_timing_params.sweep_timing_failures = timing_failures
+
+    # Outcomes come from the iteration whose table was actually kept: a
+    # restored best/met snapshot is not the last iteration
+    if final_iter_records is None:
+        final_iter_records = iter_records
+    for plan in plans.values():
+        record = final_iter_records.get(plan.main_inst)
+        RECORD_SWEEP_OUTCOME(
+            parser_state.LogicInstLookupTable[plan.main_inst].func_name,
+            plan.target_mhz,
+            "planned_sweep",
+            record=record,
+            **(
+                {"crossing_paths": record["crossing_paths"]}
+                if record and record.get("crossing_paths")
+                else {}
+            ),
+            stopped_reason=plan.stopped_reason,
+            cuts=PLAN_TOTAL_CUTS(plan),
+            locked_instances=len(plan.locked),
+            **(
+                {"auto_pipeline_regions": [r.to_dict() for r in plan.regions]}
+                if plan.regions
+                else {}
+            ),
+        )
+    # Planless verdicts are per synthesis run, like planless_results
+    for main_inst, target_mhz in planless_goal_mains:
+        standalone_mhz = as_written_mhz.get(main_inst)
+        RECORD_SWEEP_OUTCOME(
+            parser_state.LogicInstLookupTable[main_inst].func_name,
+            target_mhz,
+            "as_written",
+            record=iter_records.get(main_inst),
+            standalone_mhz=(
+                None if standalone_mhz is None else round(standalone_mhz, 3)
+            ),
+        )
+    WRITE_SWEEP_HISTORY(parser_state, multimain_timing_params, build_complete=False)
+
+    return multimain_timing_params
+
+
+# ─────────────────────────────────────────────
+# Sweep drivers: the throughput sweep entry point, the coarse sweep, and the
+# seeded confirm-or-sweep used by the .latency pin-and-confirm loop
+# ─────────────────────────────────────────────
+
+# Sweep state for a single pipeline inst of logic
+# (a main inst or an isolated hotspot func inst - used by the coarse sweep)
+class InstSweepState:
+    def __init__(self):
+        self.met_timing = False
+        self.coarse_results = {}
+        self.timing_report = None  # Current timing report with multiple paths
+        self.mhz_to_latency = {}  # BEST dict[mhz] = latency
+        self.latency_to_mhz = {}  # BEST dict[latency] = mhz
+        self.last_mhz = None
+        self.last_latency = None
+
+        # Coarse grain sweep
+        self.coarse_latency = None
+        self.initial_guess_latency = None
+        self.last_non_passing_latency = None
+        self.last_latency_increase = None
+        self.worse_or_same_tries_count = 0
+
+
+def REPORT_CONFIRMATION_RESULTS(timing_report, parser_state, multimain_timing_params):
+    """One worst-path verdict per MAIN; per-MCP detail stays in path evidence.
+
+    Optional MCP paths are cycle-normalized observations, not extra final
+    frequencies for the MAIN. Aggregate before printing or recording failure.
+    """
+    measured_mhz = {}
+    for path in FEEDBACK_PATHS(timing_report, parser_state, multimain_timing_params):
+        mhz = 1000.0 / path.path_delay_ns
+        for main in PATH_OWNING_MAINS(path, parser_state, multimain_timing_params):
+            if SYN.GET_TARGET_MHZ(main, parser_state) is not None:
+                measured_mhz[main] = min(mhz, measured_mhz.get(main, mhz))
+    failures = []
+    for main, mhz in sorted(measured_mhz.items()):
+        goal = SYN.GET_TARGET_MHZ(main, parser_state)
+        name = parser_state.LogicInstLookupTable[main].func_name
+        verdict = "PASS" if mhz >= goal else "FAIL"
+        print(f"{verdict} {name}: {mhz:.2f} MHz vs {goal:.2f} MHz goal; "
+              "worst reported path (confirmation run)", flush=True)
+        if mhz < goal:
+            failures.append((name, goal, mhz, "confirmation run"))
+    return not failures, measured_mhz, failures
+
+
+def DO_SEEDED_CONFIRM_OR_SWEEP(parser_state, multimain_timing_params):
+    """Pin-and-confirm pass 2: with pipelining seeded from the previous
+    pass's sweep result (SEED_TIMING_PARAMS_FROM_PREVIOUS), run ONE
+    full-design synthesis and check timing instead of a fresh sweep.
+
+    Returns (multimain_timing_params, met). met=True is the expected cheap
+    path: the pinned stage counts still meet timing, so the .latency values
+    the design's Python consumed equal the stage counts actually built.
+    met=None means isolated MCP seeding changed a consumed count, so no
+    synthesis ran and the driver re-elaborates with the seeded counts. On
+    timing failure, falls back to the full planned sweep -- which replans
+    from a fresh zero-clock table each iteration (informed by the disk-cached
+    measured path delays), so the seeded table can't corrupt it."""
+    SYN.PART_SET_TOOL(parser_state.part)
+    # Mirror the planned sweep's per-iteration write sequence for the seeded params
+    VHDL.WRITE_CLK_CROSS_ENTITIES(parser_state, multimain_timing_params)
+    ancestor_insts = AUTO_PIPELINE.INVALIDATE_MODIFIED_INST_ANCESTOR_CACHES(
+        multimain_timing_params.TimingParamsLookupTable, parser_state
+    )
+    AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES(
+        multimain_timing_params.TimingParamsLookupTable, parser_state, ancestor_insts
+    )
+    VHDL.WRITE_MULTIMAIN_TOP(parser_state, multimain_timing_params)
+    SYN.WRITE_BLACK_BOX_FILES(parser_state, multimain_timing_params, False)
+    SYN.WRITE_REGISTERS_ESTIMATE_FILE(parser_state, multimain_timing_params)
+    SYN.WRITE_AREA_ESTIMATE_FILE(parser_state, multimain_timing_params)
+
+    if NO_SWEEP:
+        # --no_sweep: skip the confirmation synthesis. The convergence loop's
+        # real job (making the .latency ints the Python consumed equal the
+        # stage counts actually built) is decided by HARVEST_AUTO_PIPELINE_LATENCIES,
+        # not by this timing verdict, so it still works.
+        print(
+            "--no_sweep: skipping AUTO_PIPELINE confirmation synthesis. "
+            "Timing is NOT confirmed.",
+            flush=True,
+        )
+        multimain_timing_params.sweep_timing_failures = []
+        return multimain_timing_params, True
+
+    # What's about to be synthesized, printed BEFORE the long wait below --
+    # mirrors SWEEP.py's own "about to synthesize" print, but reads directly
+    # off the seeded TimingParamsLookupTable (the pinned state actually
+    # about to be built) rather than a fresh plan.
+    TimingParamsLookupTable = multimain_timing_params.TimingParamsLookupTable
+    for main_inst in parser_state.main_mhz:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        if SYN.LOGIC_IS_ZERO_DELAY(main_logic, parser_state, allow_none_delay=True):
+            continue
+        subtrees = AUTO_PIPELINE.COLLECT_CUT_SUBTREES(main_inst, parser_state)
+        if len(subtrees) == 0:
+            continue
+        _monolithic, _regions, total_stages = SUMMARIZE_SUBTREE_PIPELINE(
+            main_inst, subtrees, TimingParamsLookupTable, parser_state
+        )
+        cuts = sum(len(TimingParamsLookupTable[d]._slices) for d in subtrees)
+        print(
+            f"[sweep] {main_logic.func_name}: about to synthesize (pinned "
+            f"from previous pass), cuts={cuts}, {total_stages} pipeline "
+            f"register stage(s) ({total_stages + 1} pipeline stages)",
+            flush=True,
+        )
+
+    seeded = AUTO_MULTI_CYCLE.SEED_COUNTS(parser_state, multimain_timing_params) or {}
+    consumed = AUTO_MULTI_CYCLE.ELABORATED_AUTO_MULTI_CYCLE_NCYCLES(parser_state) if seeded else {}
+    stale = {k: (consumed[k], n) for k, n in sorted(seeded.items()) if k in consumed and consumed[k] != n}
+    if stale:
+        # The handshake compares against the .latency this elaboration
+        # consumed, so the driver must re-elaborate with the seeded counts
+        # whatever a synthesis now reports. Confirm that hardware instead.
+        print(
+            "[sweep] Isolated AUTO_MULTI_CYCLE seeds changed counts this elaboration consumed ("
+            + ", ".join(f"{k}: {a}->{b}" for k, (a, b) in stale.items())
+            + "); re-elaborating before confirmation synthesis.",
+            flush=True,
+        )
+        multimain_timing_params.sweep_timing_failures = []
+        return multimain_timing_params, None
+    groups = AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(parser_state)
+    confirmation_iteration = 0
+    while True:
+        confirmation_iteration += 1
+        print("Running confirmation synthesis with pipelining pinned from the previous pass...", flush=True)
+        timing_report = SYN.RUN_MULTIMAIN_SYN(parser_state, multimain_timing_params)
+        RECORD_SYNTHESIS_OBSERVATION(parser_state, multimain_timing_params, timing_report,
+                                     f"confirmation-{confirmation_iteration}")
+        failed_non_mcp = set()
+        changed = False
+        for path in FEEDBACK_PATHS(timing_report, parser_state, multimain_timing_params):
+            # A MAIN the path only crosses keeps its implementation; the
+            # endpoint owner carries the failure (PATH_MAIN_ROLES)
+            mains = PATH_OWNING_MAINS(path, parser_state, multimain_timing_params)
+            goals = [SYN.GET_TARGET_MHZ(m, parser_state) for m in mains]
+            goals = [g for g in goals if g is not None]
+            if not goals or 1000.0 / path.path_delay_ns >= max(goals):
+                continue
+            group = AUTO_MULTI_CYCLE.AUTO_MULTI_CYCLE_GROUP_FOR_PATH_REPORT(
+                path, groups, parser_state, multimain_timing_params)
+            if group is None:
+                failed_non_mcp.update(mains)
+            else:
+                _, raised, _ = AUTO_MULTI_CYCLE.AUTO_MULTI_CYCLE_FEEDBACK(
+                    group, path, max(goals), multimain_timing_params)
+                changed |= raised
+        if changed and not failed_non_mcp:
+            if confirmation_iteration > MAX_CONFIRMATION_MCP_REPAIRS:
+                print(
+                    f"[sweep] MCP-only confirmation still failing after {MAX_CONFIRMATION_MCP_REPAIRS} "
+                    "count repairs; stopping this bounded repair (timing not met).",
+                    flush=True,
+                )
+                break
+            print("[sweep] MCP-only confirmation failure: preserving all pipelines and re-confirming adjusted constraints.", flush=True)
+            continue
+        break
+    if len(timing_report.path_reports) == 0:
+        print(timing_report.orig_text)
+        EXPLAIN_NO_PATHS(timing_report)
+        sys.exit(-1)
+    SYN.PRINT_MEASURED_AREA_IF_AVAILABLE(
+        timing_report,
+        SYN.ESTIMATE_DESIGN_AREA(parser_state, multimain_timing_params)["total_area"],
+    )
+    if all(
+        SYN.GET_TARGET_MHZ(m, parser_state) is None
+        or 1000.0 / path.path_delay_ns >= SYN.GET_TARGET_MHZ(m, parser_state)
+        for path in FEEDBACK_PATHS(timing_report, parser_state, multimain_timing_params)
+        for m in GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, multimain_timing_params)
+    ):
+        timing_report = CONFIRM_PROVISIONAL_MCP_SEEDS(timing_report, parser_state, multimain_timing_params)
+    met, measured_mhz, confirmation_failures = REPORT_CONFIRMATION_RESULTS(
+        timing_report, parser_state, multimain_timing_params
+    )
+    # Feed the driver's TIMING NOT MET exit gate: the confirmation's verdict
+    # is the pass-2 result when it holds; when it fails, the fallback sweep
+    # below sets its own sweep_timing_failures, which governs instead.
+    multimain_timing_params.sweep_timing_failures = confirmation_failures
+    # A passing confirmation runs no sweep, so without this the history would
+    # still describe the previous pass's sweep
+    RECORD_CONFIRMATION_RESULTS(
+        parser_state, multimain_timing_params, measured_mhz, met
+    )
+    if met:
+        return multimain_timing_params, True
+    if not failed_non_mcp:
+        return multimain_timing_params, False
+    if not any(AUTO_PIPELINE.COLLECT_CUT_SUBTREES(m, parser_state) for m in failed_non_mcp):
+        # Only MAINs with nothing auto-pipelining can change failed: a
+        # fallback sweep could not change their paths either
+        print(
+            "AUTO_PIPELINE confirmation failed only in MAINs auto-pipelining cannot "
+            "change; keeping the confirmed implementation (timing not met).",
+            flush=True,
+        )
+        return multimain_timing_params, False
+    # Preserve every unaffected MAIN's realized implementation through fallback.
+    multimain_timing_params.confirmation_preserved_mains = {
+        m: AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(m, TimingParamsLookupTable, parser_state)
+        for m in parser_state.main_mhz if m not in failed_non_mcp
+    }
+    print("AUTO_PIPELINE confirmation failed: replanning implicated pipelined MAINs; preserving unaffected implementations.", flush=True)
+    return DO_PLANNED_THROUGHPUT_SWEEP(
+        parser_state, multimain_timing_params
+    ), False
+
+
+def DO_THROUGHPUT_SWEEP(
+    parser_state,
+    coarse_only=False,
+    starting_guess_latency=None,
+    do_incremental_guesses=True,
+    comb_only=False,
+    stop_at_latency=None,
+):
+    # Make sure syn tool is set
+    SYN.PART_SET_TOOL(parser_state.part)
+
+    for main_func in parser_state.main_mhz:
+        main_logic = parser_state.FuncLogicLookupTable[main_func]
+        if main_logic.delay is not None and main_logic.delay > 0:
+            mhz = SYN.GET_TARGET_MHZ(main_func, parser_state, allow_no_syn_tool=True)
+            print("Function:", main_func, "Target MHz:", mhz, flush=True)
+
+    # Populate timing lookup table as all 0 clk
+    print("Starting with no added pipelining...", flush=True)
+    ZeroAddedClocksTimingParamsLookupTable = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(
+        parser_state
+    )
+    multimain_timing_params = AUTO_PIPELINE.MultiMainTimingParams()
+    multimain_timing_params.TimingParamsLookupTable = (
+        ZeroAddedClocksTimingParamsLookupTable
+    )
+
+    # Write clock cross entities
+    VHDL.WRITE_CLK_CROSS_ENTITIES(parser_state, multimain_timing_params)
+
+    # Write multi-main top
+    VHDL.WRITE_MULTIMAIN_TOP(parser_state, multimain_timing_params)
+
+    # Re-write black box modules that are no longer in final state starting throughput sweep
+    SYN.WRITE_BLACK_BOX_FILES(parser_state, multimain_timing_params, False)
+
+    # Can only do comb. logic with yosys json for now
+    if OPEN_TOOLS.YOSYS_JSON_ONLY:
+        print(
+            "Running Yosys on top level without added pipelining. logic. TODO: Complete feedback for pipeline params..."
+        )
+        comb_only = True
+        SYN.SYN_TOOL = OPEN_TOOLS
+
+    # If comb. logic only
+    if comb_only:
+        # Fixed AUTO_PIPELINE latency= call sites keep their registers even here
+        fixed_timing_params = AUTO_PIPELINE.BUILD_FIXED_AUTO_PIPELINE_TIMING_PARAMS(parser_state)
+        if fixed_timing_params is not None:
+            multimain_timing_params = fixed_timing_params
+            VHDL.WRITE_MULTIMAIN_TOP(parser_state, multimain_timing_params)
+        print("Running synthesis on top level without added pipelining...", flush=True)
+        for main_func in parser_state.main_mhz:
+            main_func_timing_params = multimain_timing_params.TimingParamsLookupTable[
+                main_func
+            ]
+            main_func_latency = main_func_timing_params.GET_TOTAL_LATENCY(
+                parser_state, multimain_timing_params.TimingParamsLookupTable
+            )
+            if main_func_latency > 0:
+                print(
+                    main_func,
+                    ":",
+                    main_func_latency,
+                    "clocks latency total...",
+                    len(main_func_timing_params._slices),
+                    "slices...",
+                    flush=True,
+                )
+        # Comb logic only AND coarse?
+        if coarse_only:
+            print("Using --coarse and --comb doesnt make sense? TODO fix?")
+            sys.exit(-1)
+        else:
+            # Regular multi main top comb logic
+            timing_report = SYN.RUN_MULTIMAIN_SYN(parser_state, multimain_timing_params)
+
+        RECORD_SYNTHESIS_OBSERVATION(parser_state, multimain_timing_params, timing_report, "comb")
+        # Print a little timing info to characterize comb logic
+        clk_to_mhz, constraints_filepath = SYN.GET_CLK_TO_MHZ_AND_CONSTRAINTS_PATH(
+            parser_state
+        )
+        for reported_clock_group, path_report in timing_report.path_reports.items():
+            passfail = ""
+            mhz = 1000.0 / path_report.path_delay_ns
+            if reported_clock_group in clk_to_mhz:
+                target_mhz = clk_to_mhz[reported_clock_group]
+                if target_mhz is not None:
+                    if mhz >= target_mhz:
+                        passfail = "PASS "
+                    else:
+                        passfail = "FAIL "
+            print(
+                f"{passfail}Clock {reported_clock_group} FMAX: {mhz:.3f} MHz ({path_report.path_delay_ns:.3f} ns)",
+                flush=True,
+            )
+        SYN.PRINT_MEASURED_AREA_IF_AVAILABLE(
+            timing_report,
+            SYN.ESTIMATE_DESIGN_AREA(parser_state, multimain_timing_params)["total_area"],
+        )
+
+        # sweep_history.json gets a record for every top level synthesis run,
+        # and a --comb build is one: the design as written, no added
+        # pipelining. Without this the unpipelined point -- the one every
+        # sweep starts from, and the only measurement of what the logic costs
+        # before any cuts -- was reported to the console and then thrown away.
+        NEXT_SWEEP_HISTORY_RUN()
+        for main_func in parser_state.main_mhz:
+            main_clk = "clk_" + VHDL.CLK_EXT_STR(main_func, parser_state)
+            path_report = timing_report.path_reports.get(main_clk)
+            if path_report is None and len(timing_report.path_reports) == 1:
+                # Single clock: whatever the tool called it is this main's.
+                (path_report,) = timing_report.path_reports.values()
+            curr_mhz = (
+                1000.0 / path_report.path_delay_ns
+                if path_report is not None and path_report.path_delay_ns
+                else None
+            )
+            goal_mhz = SYN.GET_TARGET_MHZ(
+                main_func, parser_state, allow_no_syn_tool=True
+            )
+            main_latency = multimain_timing_params.TimingParamsLookupTable[
+                main_func
+            ].GET_TOTAL_LATENCY(
+                parser_state, multimain_timing_params.TimingParamsLookupTable
+            )
+            record = RECORD_SWEEP_ITERATION(
+                main_func,
+                goal_mhz,
+                {
+                    "iter": 0,
+                    "main": main_func,
+                    "goal_mhz": goal_mhz,
+                    "achieved_mhz": None if curr_mhz is None else round(curr_mhz, 3),
+                    "met": (
+                        None
+                        if (curr_mhz is None or goal_mhz is None)
+                        else curr_mhz >= goal_mhz
+                    ),
+                    "cuts": 0,
+                    "main_latency": main_latency,
+                    # Stage count, not added clocks: +1 like every other
+                    # pipeline_stages in this file (see "deepest + 1").
+                    "pipeline_stages": main_latency + 1,
+                    "action": "comb",
+                },
+            )
+            RECORD_SWEEP_OUTCOME(main_func, goal_mhz, "comb", record=record)
+        WRITE_SWEEP_HISTORY(
+            parser_state, multimain_timing_params, build_complete=True
+        )
+
+        return multimain_timing_params
+
+    # Switch to coase if single main with no target mhz
+    # -- but only if the coarse sweep could add latency somewhere under it. A
+    # stateful main (Reg/Feedback, no AUTO_PIPELINE below) cannot take added
+    # latency: coarse slicing into it is the "for no reason" sanity failure.
+    # Such a design has nothing to pipeline; the planned sweep skips goal-less
+    # mains and characterizes the design as written with one synthesis run.
+    if len(parser_state.main_mhz) == 1:
+        main_func = list(parser_state.main_mhz.keys())[0]
+        target_mhz = SYN.GET_TARGET_MHZ(main_func, parser_state)
+        if target_mhz is None:
+            if AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+                parser_state.FuncLogicLookupTable[main_func].func_name, parser_state
+            ):
+                print(
+                    "Switching to coarse sweep since only main function has no specified frequency..."
+                )
+                coarse_only = True
+            elif not coarse_only:
+                print(
+                    f"Main function {main_func} has no specified frequency and "
+                    "nothing auto-pipelining can add latency to (ex. stateful, "
+                    "no AUTO_PIPELINE regions) - no coarse sweep, characterizing "
+                    "the design as written...",
+                    flush=True,
+                )
+
+    # if coarse only
+    if coarse_only:
+        print("Doing coarse sweep only...", flush=True)
+        for region in AUTO_PIPELINE.COLLECT_AUTO_PIPELINE_REGIONS(parser_state):
+            if region.constraint.start() is not None:
+                print(
+                    f"NOTE: AUTO_PIPELINE {region.label()} "
+                    f"start {region.constraint.start()} only sets "
+                    "its bootstrap .latency under a coarse sweep; coarse slicing "
+                    "starts from the main's own latency guess.",
+                    flush=True,
+                )
+        if len(parser_state.main_mhz) == 1:
+            main_func = list(parser_state.main_mhz.keys())[0]
+            if not AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+                parser_state.FuncLogicLookupTable[main_func].func_name, parser_state
+            ):
+                # Explicit --coarse (the automatic switch above never picks
+                # an ineligible main): say why instead of failing deep in
+                # slicing with "Trying to slice into ... for no reason"
+                raise Exception(
+                    f"No main functions are elligible for pipelining: --coarse "
+                    f"main function {main_func} has nothing auto-pipelining can "
+                    "add latency to (ex. stateful, no AUTO_PIPELINE regions). "
+                    "Drop --coarse to characterize the design as written."
+                )
+        elif len(parser_state.main_mhz) > 1:
+            # Try to guess at main func, find funcs with delay and can be sliced
+            possible_mains = []
+            for main_func in parser_state.main_mhz:
+                main_logic = parser_state.FuncLogicLookupTable[main_func]
+                if (
+                    main_logic.delay != 0
+                    and AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+                        main_logic.func_name, parser_state
+                    )
+                ):
+                    possible_mains.append(main_func)
+            if len(possible_mains) == 1:
+                main_func = possible_mains[0]
+                print("Assuming coarse sweep is for main function:", main_func)
+            elif len(possible_mains) == 0:
+                raise Exception("No main functions are elligible for pipelining.")
+            else:
+                raise Exception(
+                    f"Cannot do use a single coarse sweep with multiple pipelined main functions. Possible main functions: {possible_mains}"
+                )
+                sys.exit(-1)
+        target_mhz = SYN.GET_TARGET_MHZ(main_func, parser_state)
+        if target_mhz is None:
+            print("Main function:", main_func, "does not have a set target frequency.")
+            target_mhz = SYN.INF_MHZ
+            if starting_guess_latency is None:
+                if NO_SWEEP:
+                    # The incremental-from-zero strategy needs sweep
+                    # iterations to grow the latency; --no_sweep takes the
+                    # first guess as-is, which here would be zero added
+                    # pipelining. Nothing to grow from - say so plainly
+                    # instead of silently emitting an unpipelined design.
+                    print(
+                        "WARNING: --no_sweep with a coarse sweep of a main "
+                        "with no target frequency has no first guess to make "
+                        "(the coarse strategy grows incrementally from zero "
+                        "added latency, which needs sweep iterations). "
+                        "Emitting ZERO added pipelining. Set a @MAIN mhz "
+                        "target, or pass --start N for N clocks of latency.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "Starting a coarse sweep incrementally from zero added latency logic.",
+                        flush=True,
+                    )
+                starting_guess_latency = 0
+                do_incremental_guesses = False
+        max_allowed_latency_mult = None
+        stop_at_n_worse_result = None
+        inst_sweep_state = InstSweepState()
+        (
+            inst_sweep_state,
+            working_slices,
+            multimain_timing_params.TimingParamsLookupTable,
+        ) = DO_COARSE_THROUGHPUT_SWEEP(
+            main_func,
+            target_mhz,
+            inst_sweep_state,
+            parser_state,
+            starting_guess_latency,
+            do_incremental_guesses,
+            max_allowed_latency_mult,
+            stop_at_n_worse_result,
+            stop_at_latency,
+        )
+
+        # Do update of top vhdl (not final though)
+        is_final_top = False
+        VHDL.WRITE_MULTIMAIN_TOP(parser_state, multimain_timing_params, is_final_top)
+        AUTO_PIPELINE.CHECK_AUTO_PIPELINE_CONSTRAINTS_REALIZED(
+            parser_state, multimain_timing_params.TimingParamsLookupTable
+        )
+
+        # Record unmet timing so the build fails with non zero exit (a coarse
+        # sweep with no user target uses INF_MHZ = characterization, no gate).
+        # --no_sweep never measured anything, so there is nothing to fail.
+        if (
+            not NO_SWEEP
+            and target_mhz != SYN.INF_MHZ
+            and not inst_sweep_state.met_timing
+        ):
+            achieved = inst_sweep_state.last_mhz
+            if len(inst_sweep_state.mhz_to_latency) > 0:
+                achieved = max(inst_sweep_state.mhz_to_latency.keys())
+            multimain_timing_params.sweep_timing_failures = [
+                (main_func, target_mhz, achieved, "coarse_sweep_not_met")
+            ]
+
+        NEXT_SWEEP_HISTORY_RUN()
+        coarse_mhz = None
+        if not NO_SWEEP:
+            coarse_mhz = inst_sweep_state.last_mhz
+            if not inst_sweep_state.met_timing and inst_sweep_state.mhz_to_latency:
+                coarse_mhz = max(inst_sweep_state.mhz_to_latency.keys())
+        RECORD_SWEEP_OUTCOME(
+            parser_state.LogicInstLookupTable[main_func].func_name,
+            None if target_mhz == SYN.INF_MHZ else target_mhz,
+            "no_sweep" if NO_SWEEP else "coarse_sweep",
+            achieved_mhz=None if coarse_mhz is None else round(coarse_mhz, 3),
+        )
+
+        return multimain_timing_params
+
+    # Planned sweep: static slice landscape analysis + one full design syn per
+    # iteration with critical path attribution (see docs/SWEEP_DESIGN.md)
+    print("Starting planned throughput sweep...", flush=True)
+    return DO_PLANNED_THROUGHPUT_SWEEP(parser_state, multimain_timing_params)
+
+
+def CHECK_INST_TIMING_REPORT_AND_ADJUST(
+    inst_name,
+    logic,
+    inst_sweep_state,
+    parser_state,
+    TimingParamsLookupTable,
+    target_mhz,
+    working_slices,
+    do_incremental_guesses,
+    max_allowed_latency_mult,
+    stop_at_n_worse_result,
+    stop_at_latency,
+):
+    # Did it meet timing? Make adjusments as checking
+    made_adj = False
+    has_paths = len(inst_sweep_state.timing_report.path_reports) > 0
+    inst_sweep_state.met_timing = has_paths
+    for reported_clock_group in inst_sweep_state.timing_report.path_reports:
+        path_report = inst_sweep_state.timing_report.path_reports[reported_clock_group]
+        curr_mhz = 1000.0 / path_report.path_delay_ns
+        # Oh boy old log files can still be used if target freq changes right?
+        # Do a little hackery to get actual target freq right now, not from log
+        # Could be a clock crossing too right?
+
+        # Met timing?
+        func_logic = parser_state.LogicInstLookupTable[inst_name]
+        timing_params = TimingParamsLookupTable[inst_name]
+        latency = timing_params.GET_TOTAL_LATENCY(parser_state, TimingParamsLookupTable)
+        met_timing = curr_mhz >= target_mhz
+        if not met_timing:
+            inst_sweep_state.met_timing = False
+
+        # Print, log, maybe give up
+        # NOTE: cuts (requested slices) and latency (rebuilt pipeline depth) are
+        # intentionally reported as separate numbers - they need not match.
+        print(
+            "{} Clock Goal: {:.2f} (MHz) Current: {:.2f} (MHz)({:.2f} ns) latency={} clks cuts={} slices".format(
+                func_logic.func_name,
+                target_mhz,
+                curr_mhz,
+                path_report.path_delay_ns,
+                latency,
+                len(timing_params._slices),
+            ),
+            flush=True,
+        )
+        best_mhz_so_far = 0.0
+        if len(inst_sweep_state.mhz_to_latency) > 0:
+            best_mhz_so_far = max(inst_sweep_state.mhz_to_latency.keys())
+        better_mhz = curr_mhz >= best_mhz_so_far
+        if better_mhz:
+            # Log result
+            inst_sweep_state.mhz_to_latency[curr_mhz] = latency
+            inst_sweep_state.latency_to_mhz[latency] = curr_mhz
+            # Log return val best result fmax
+            best_guess_slices = AUTO_PIPELINE.GET_BEST_GUESS_IDEAL_SLICES(
+                inst_sweep_state.coarse_latency
+            )
+            working_slices = best_guess_slices
+            # Reset count of bad tries
+            inst_sweep_state.worse_or_same_tries_count = 0
+        else:
+            # Same or worse timing result
+            inst_sweep_state.worse_or_same_tries_count += 1
+            print(
+                f"Same or worse timing result... (best={best_mhz_so_far})",
+                flush=True,
+            )
+            if stop_at_n_worse_result is not None:
+                if inst_sweep_state.worse_or_same_tries_count >= stop_at_n_worse_result:
+                    print(
+                        logic.func_name,
+                        "giving up after",
+                        inst_sweep_state.worse_or_same_tries_count,
+                        "bad tries...",
+                    )
+                    continue
+
+        # Intentionally stopping?
+        if (
+            stop_at_latency is not None
+            and inst_sweep_state.coarse_latency >= stop_at_latency
+        ):
+            print("Stopping at", stop_at_latency, "clocks latency added...")
+            continue
+
+        # Make adjustment if can be sliced
+        if not met_timing and AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+            func_logic.func_name, parser_state
+        ):
+            # DO incremental guesses based on time report results
+            if do_incremental_guesses:
+                max_path_delay = path_report.path_delay_ns
+                # Given current latency for pipeline and stage delay what new total comb logic delay does this imply?
+                total_delay = max_path_delay * (inst_sweep_state.coarse_latency + 1)
+                # How many slices for that delay to meet timing
+                fake_one_clk_mhz = 1000.0 / total_delay
+                mult = target_mhz / fake_one_clk_mhz
+                if mult > 1.0:
+                    # Divide up into that many clocks
+                    clks = int(mult) - 1
+                    print("Timing report suggests", clks, "clocks...")
+                    # Reached max check again before setting main_inst_to_coarse_latency
+                    if max_allowed_latency_mult is not None:
+                        if inst_sweep_state.initial_guess_latency == 0:
+                            limit = max_allowed_latency_mult
+                        else:
+                            limit = (
+                                inst_sweep_state.initial_guess_latency
+                                * max_allowed_latency_mult
+                            )
+                        if clks >= limit:
+                            print(
+                                logic.func_name,
+                                "reached maximum allowed latency, no more adjustments...",
+                                "multiplier =",
+                                max_allowed_latency_mult,
+                            )
+                            continue
+
+                    # If very close to goal suggestion might be same clocks (or less?), still increment
+                    if clks <= inst_sweep_state.coarse_latency:
+                        clks = inst_sweep_state.coarse_latency + 1
+                    # Calc diff in latency change
+                    clk_inc = clks - inst_sweep_state.coarse_latency
+                    # Should be getting smaller
+                    if (
+                        inst_sweep_state.last_latency_increase is not None
+                        and clk_inc >= inst_sweep_state.last_latency_increase
+                    ):
+                        # Clip to last inc size - 1, minus one to always be narrowing down
+                        # Extra div by 2 helps?
+                        clk_inc = int(inst_sweep_state.last_latency_increase / 2)  # - 1
+                        if clk_inc <= 0:
+                            clk_inc = 1
+                        clks = inst_sweep_state.coarse_latency + clk_inc
+                        print("Clipped for decreasing jump size to", clks, "clocks...")
+
+                    # Record
+                    inst_sweep_state.last_non_passing_latency = (
+                        inst_sweep_state.coarse_latency
+                    )
+                    inst_sweep_state.coarse_latency = clks
+                    inst_sweep_state.last_latency_increase = clk_inc
+                    made_adj = True
+            else:
+                # No guess, dumb increment by 1
+                # Record, save non passing latency
+                inst_sweep_state.last_non_passing_latency = (
+                    inst_sweep_state.coarse_latency
+                )
+                inst_sweep_state.coarse_latency += 1
+                inst_sweep_state.last_latency_increase = 1
+                made_adj = True
+
+    return made_adj, working_slices
+
+
+def DO_COARSE_THROUGHPUT_SWEEP(
+    inst_name,
+    target_mhz,
+    inst_sweep_state,
+    parser_state,
+    starting_guess_latency=None,
+    do_incremental_guesses=True,
+    max_allowed_latency_mult=None,
+    stop_at_n_worse_result=None,
+    stop_at_latency=None,
+):
+    working_slices = None
+    logic = parser_state.LogicInstLookupTable[inst_name]
+    AUTO_PIPELINE.SET_INITIAL_COARSE_LATENCY_GUESS(
+        inst_name, target_mhz, inst_sweep_state, parser_state, starting_guess_latency
+    )
+
+    # Do loop of:
+    #   Reset top to 0 clk
+    #   Slice each main evenly based on latency
+    #   Syn multimain top
+    #   Course adjust func latency
+    # until mhz goals met
+    while True:
+        candidate_cuts = inst_sweep_state.coarse_latency
+        TimingParamsLookupTable = AUTO_PIPELINE.BUILD_AND_WRITE_COARSE_SLICED_TIMING_PARAMS(
+            inst_name, logic, inst_sweep_state, parser_state
+        )
+
+        if NO_SWEEP:
+            # First planned guess only -- no sweep synthesis iterations.
+            print(
+                "--no_sweep: writing the first coarse guess for",
+                logic.func_name,
+                "without verifying it against real synthesis. Timing is NOT "
+                "confirmed -- raise the @MAIN mhz target for more pipeline "
+                "stages.",
+                flush=True,
+            )
+            return inst_sweep_state, working_slices, TimingParamsLookupTable
+
+        SYN.RUN_INST_SYN_AND_UPDATE_CACHE(
+            inst_name, logic, inst_sweep_state, parser_state, TimingParamsLookupTable
+        )
+
+        made_adj, working_slices = CHECK_INST_TIMING_REPORT_AND_ADJUST(
+            inst_name,
+            logic,
+            inst_sweep_state,
+            parser_state,
+            TimingParamsLookupTable,
+            target_mhz,
+            working_slices,
+            do_incremental_guesses,
+            max_allowed_latency_mult,
+            stop_at_n_worse_result,
+            stop_at_latency,
+        )
+
+        inst_sweep_state.coarse_results[candidate_cuts] = {
+            "met": inst_sweep_state.met_timing,
+            "slices": list(TimingParamsLookupTable[inst_name]._slices),
+            "concrete": AUTO_PIPELINE.CAPTURE_CONCRETE_PIPELINE(inst_name, TimingParamsLookupTable, parser_state),
+            "hash": TimingParamsLookupTable[inst_name].GET_HASH_EXT(TimingParamsLookupTable, parser_state),
+        }
+
+        # Intentionally stopping?
+        if (
+            stop_at_latency is not None
+            and inst_sweep_state.coarse_latency >= stop_at_latency
+        ):
+            return inst_sweep_state, working_slices, TimingParamsLookupTable
+        # Passed timing?
+        if inst_sweep_state.met_timing:
+            return inst_sweep_state, working_slices, TimingParamsLookupTable
+        # Stuck?
+        if not made_adj:
+            print(
+                "Unable to make further adjustments. Failed coarse grain attempt meet timing for this module."
+            )
+            return inst_sweep_state, working_slices, TimingParamsLookupTable
+
+
+def FEEDBACK_PATHS(report, parser_state, params):
+    """Independent MCP groups plus worst pipelining path per MAIN.
+
+    Dedup bits first. Failing evidence precedes passing evidence so a second
+    optional report can never erase a failure in the same implementation.
+    """
+    groups = AUTO_MULTI_CYCLE.COLLECT_AUTO_MULTI_CYCLE_GROUPS(parser_state)
+    mcp, ordinary = {}, []
+    for row in SYN.DISTINCT_PATHS(SYN.TIMING_REPORT_PATHS(report)):
+        path = row["path"]
+        if not path.path_delay_ns > 0:
+            continue  # not setup-timing evidence
+        group = AUTO_MULTI_CYCLE.AUTO_MULTI_CYCLE_GROUP_FOR_PATH_REPORT(
+            path, groups, parser_state, params
+        )
+        if group is None:
+            ordinary.append(path)
+        elif group.key not in mcp or path.path_delay_ns > mcp[group.key].path_delay_ns:
+            mcp[group.key] = path
+
+    def failing(path):
+        goals = [
+            SYN.GET_TARGET_MHZ(m, parser_state)
+            for m in GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, params)
+        ]
+        return any(g is not None and 1000.0 / path.path_delay_ns < g for g in goals)
+
+    return sorted(
+        list(mcp.values()) + ordinary,
+        key=lambda p: (not failing(p), -p.path_delay_ns),
+    )
+
+
+def _KEEP_WORST_PLANLESS(results, main_inst, curr_mhz, met, target_mhz):
+    """A later, passing optional path never replaces a MAIN's failing verdict."""
+    old = results.get(main_inst)
+    if old is not None and old[0] / old[2] <= curr_mhz / target_mhz:
+        return False
+    results[main_inst] = (curr_mhz, met, target_mhz)
+    return True
+
+
+def PATH_INSIDE_LOCK(path, plan, parser_state, tpl, hotspot_func=None):
+    """Require two endpoints strictly within the same locked physical instance
+    (of `hotspot_func` when given)."""
+    if not path.start_reg_name or not path.end_reg_name:
+        return False
+    root = plan.main_inst
+    marker = LOGIC.SUBMODULE_MARKER
+    entity = VHDL.GET_ENTITY_NAME(
+        root, parser_state.LogicInstLookupTable[root], tpl, parser_state
+    )
+    for inst in plan.locked:
+        if (
+            hotspot_func is not None
+            and parser_state.LogicInstLookupTable[inst].func_name != hotspot_func
+        ):
+            continue
+        local = inst[len(root) :]
+        if local.startswith(marker):
+            local = local[len(marker) :]  # a prefix, not a character set
+        names = [
+            VHDL.WIRE_TO_VHDL_NAME(n, parser_state)
+            for n in local.split(LOGIC.SUBMODULE_MARKER)
+            if n
+        ]
+        prefix = "/".join([entity] + names) + "/"
+        if all(
+            prefix in endpoint for endpoint in (path.start_reg_name, path.end_reg_name)
+        ):
+            # Input/output banks of the locked root are boundary evidence.
+            tails = [
+                e.split(prefix, 1)[1] for e in (path.start_reg_name, path.end_reg_name)
+            ]
+            if all("/" in tail or "raw_hdl_pipeline" in tail for tail in tails):
+                return True
+    return False
+
+
+def EXPLAIN_NO_PATHS(report):
+    """A report without timing paths: say whether the netlist was over capacity."""
+    utilization = getattr(report, "utilization", None) or {}
+    if utilization.get("status") == "over_capacity":
+        print(
+            "[sweep] DOES NOT FIT: the tool reported no timing paths for an over-capacity "
+            "netlist; resource overflow: "
+            + ", ".join(
+                f"{r['resource']} {r['used']}/{r['available']}"
+                for r in utilization.get("overutilization", [])
+            ),
+            flush=True,
+        )
+    else:
+        print("Using a bad syn log file?")
+
+
+def IMPLEMENTATION_SIGNATURE(parser_state, params):
+    """Decision signature: each MAIN's entity hash, its clock and the MCP counts.
+    The backend's input-byte/recipe signature is recorded separately."""
+    values = []
+    for root in sorted(parser_state.main_mhz):
+        values.append(
+            (
+                root,
+                params.TimingParamsLookupTable[root].GET_HASH_EXT(
+                    params.TimingParamsLookupTable, parser_state
+                ),
+            )
+        )
+    values.append(
+        (
+            "clocks",
+            [
+                (m, SYN.GET_TARGET_MHZ(m, parser_state))
+                for m in sorted(parser_state.main_mhz)
+            ],
+        )
+    )
+    values.append(
+        ("mcp", sorted(getattr(params, "auto_multi_cycle_ncycles", {}).items()))
+    )
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def RECORD_SYNTHESIS_OBSERVATION(parser_state, params, report, iteration):
+    utilization = getattr(
+        report, "utilization", dict(status="unknown", resources={}, overutilization=[])
+    )
+    tpl = params.TimingParamsLookupTable
+    latencies = {
+        "MAIN:" + m: tpl[m].GET_TOTAL_LATENCY(parser_state, tpl)
+        for m in sorted(parser_state.main_mhz)
+    }
+    # Keyed by owning MAIN and canonical key, which survive re-elaboration;
+    # physical instance paths (renamed by latency-sized wrappers) are kept
+    # separately as evidence. Replicas of one key share one depth, else the
+    # harvest fails, so a list here only records that divergence.
+    regions = {}
+    for inst, logic in sorted(parser_state.LogicInstLookupTable.items()):
+        for local, key in sorted(
+            getattr(logic, "sub_inst_to_auto_pipeline_key", {}).items()
+        ):
+            child = inst + LOGIC.SUBMODULE_MARKER + local
+            if key is not None and child in tpl:
+                owner = child.split(LOGIC.SUBMODULE_MARKER, 1)[0]
+                regions.setdefault("AUTO_PIPELINE:" + owner + ":" + key, {})[child] = tpl[
+                    child
+                ].GET_TOTAL_LATENCY(parser_state, tpl)
+    for name, rows in regions.items():
+        depths = sorted(set(rows.values()))
+        latencies[name] = depths[0] if len(depths) == 1 else depths
+    previous = next(
+        (
+            o
+            for o in reversed(SYNTHESIS_OBSERVATIONS)
+            if o["utilization"]["status"] == "within_reported_limits"
+        ),
+        None,
+    )
+    delta = {
+        m: dict(previous=previous["latencies"].get(m), current=v)
+        for m, v in latencies.items()
+        if previous and previous["latencies"].get(m) != v
+    }
+    observation = dict(
+        run=SWEEP_HISTORY_RUN,
+        iteration=iteration,
+        auto_pipeline_pass=getattr(AUTO_PIPELINE, "CURRENT_LATENCY_PASS", 1),
+        log_path=getattr(report, "log_path", None),
+        cache_hit=getattr(report, "cache_hit", None),
+        input_signature=getattr(report, "input_signature", None),
+        elapsed_seconds=getattr(report, "elapsed_seconds", None),
+        optional_report_ms=getattr(report, "optional_report_ms", None),
+        implementation_signature=IMPLEMENTATION_SIGNATURE(
+            parser_state, params
+        ),
+        utilization=utilization,
+        latencies=latencies,
+        auto_pipeline_instances={name: sorted(rows) for name, rows in regions.items()},
+        latency_changes_since_fit=delta,
+        auto_multi_cycle_ncycles=dict(
+            getattr(params, "auto_multi_cycle_ncycles", {}) or {}
+        ),
+        coverage=getattr(report, "coverage", {}),
+        paths=[
+            dict(
+                **SYN.SERIALIZE_PATH_REPORT(row["path"]),
+                member_count=row["member_count"],
+                query_scopes=row["query_scopes"],
+                **_SERIALIZE_MAIN_ROLES(row["path"], parser_state, params),
+            )
+            for row in SYN.DISTINCT_PATHS(SYN.TIMING_REPORT_PATHS(report))
+        ],
+    )
+    observation["estimated_main_ffs"] = dict(getattr(params, "sweep_main_ffs", {}))
+    failing = [
+        path
+        for path in SYN.TIMING_REPORT_PATHS(report)
+        if path.path_delay_ns > 0
+        and any(
+            SYN.GET_TARGET_MHZ(m, parser_state) is not None
+            and 1000.0 / path.path_delay_ns < SYN.GET_TARGET_MHZ(m, parser_state)
+            for m in GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, params)
+        )
+    ]
+    owning = {path_id: PATH_OWNING_MAINS(path, parser_state, params) for path_id, path in enumerate(failing)}
+    observation["mains_with_reported_failure"] = sorted(
+        {
+            m
+            for path_id, path in enumerate(failing)
+            for m in owning[path_id]
+            if SYN.GET_TARGET_MHZ(m, parser_state) is not None
+            and 1000.0 / path.path_delay_ns < SYN.GET_TARGET_MHZ(m, parser_state)
+        }
+    )
+    # MAINs a failing path only crosses (PATH_MAIN_ROLES): on the path, but
+    # not its owner and unable to register it
+    crossed = sorted(
+        {
+            m
+            for path_id, path in enumerate(failing)
+            for m in GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, params)
+            if m not in owning[path_id]
+        }
+    )
+    if crossed:
+        observation["mains_crossed_by_failure"] = crossed
+    last = SYNTHESIS_OBSERVATIONS[-1] if SYNTHESIS_OBSERVATIONS else None
+    observation["register_growth_without_prior_failure"] = {}
+    if last and last["auto_pipeline_pass"] == observation["auto_pipeline_pass"]:
+        observation["register_growth_without_prior_failure"] = {
+            m: max(0, value - last["estimated_main_ffs"][m])
+            for m, value in observation["estimated_main_ffs"].items()
+            if m in last.get("estimated_main_ffs", {})
+            and m not in last.get("mains_with_reported_failure", [])
+        }
+    SYNTHESIS_OBSERVATIONS.append(observation)
+    if utilization["status"] != "over_capacity":
+        return observation
+    first = (
+        sum(
+            o["utilization"]["status"] == "over_capacity"
+            for o in SYNTHESIS_OBSERVATIONS
+        )
+        == 1
+    )
+    if first or STOP_ON_OVER_CAPACITY:
+        print(
+            f"\n[sweep] DOES NOT FIT: pass {observation['auto_pipeline_pass']}, iteration {iteration}",
+            flush=True,
+        )
+        for item in utilization["overutilization"]:
+            print(
+                f"  {item['resource']}: requested {item['used']}, available {item['available']}",
+                flush=True,
+            )
+        for resource, item in utilization["resources"].items():
+            if item["used"] > item["available"]:
+                print(
+                    f"  {resource}: used {item['used']}, available {item['available']}",
+                    flush=True,
+                )
+        print(
+            f"  Latency changes since last netlist within reported capacity: {delta or 'none recorded'}",
+            flush=True,
+        )
+        print(
+            "  Over-capacity synthesis timing does not establish achievable device timing.",
+            flush=True,
+        )
+    if STOP_ON_OVER_CAPACITY:
+        params.sweep_timing_failures = [
+            (
+                parser_state.LogicInstLookupTable[m].func_name,
+                SYN.GET_TARGET_MHZ(m, parser_state),
+                None,
+                "device_over_capacity",
+            )
+            for m in parser_state.main_mhz
+        ]
+        for m in parser_state.main_mhz:
+            RECORD_SWEEP_OUTCOME(
+                parser_state.LogicInstLookupTable[m].func_name,
+                SYN.GET_TARGET_MHZ(m, parser_state),
+                "over_capacity",
+            )
+        WRITE_SWEEP_HISTORY(parser_state, params, build_complete=False)
+        raise SystemExit(
+            "DOES NOT FIT: stopped before timing feedback (--stop_on_over_capacity). Artifacts preserved."
+        )
+    return observation
+
+
+def CONFIRM_PROVISIONAL_MCP_SEEDS(report, parser_state, params, seen_implementations=None):
+    """One batched downward trial of provisional MCP seeds.
+
+    With `seen_implementations` (the sweep's), an already-observed signature
+    is reused instead of synthesized; a backend run is recorded (and so counted
+    through SYNTHESIS_OBSERVATIONS by the caller).
+    """
+    proposals = AUTO_MULTI_CYCLE.PROPOSE_CONFIRM_DOWN(report, parser_state, params)
+    if not proposals:
+        return report
+    original = dict(params.auto_multi_cycle_ncycles)
+    params.auto_multi_cycle_ncycles.update(proposals)
+    print(
+        f"[sweep] Confirming provisional MCP seeds down once: {proposals}", flush=True
+    )
+    signature = None
+    if seen_implementations is not None:
+        signature = IMPLEMENTATION_SIGNATURE(parser_state, params)
+    if signature is not None and signature in seen_implementations:
+        print("[sweep] MCP confirm-down candidate already observed; reusing it.", flush=True)
+        trial = seen_implementations[signature]
+    else:
+        trial = SYN.RUN_MULTIMAIN_SYN(parser_state, params)
+        RECORD_SYNTHESIS_OBSERVATION(parser_state, params, trial, "mcp-confirm-down")
+        if signature is not None:
+            seen_implementations[signature] = trial
+    for path in SYN.TIMING_REPORT_PATHS(trial):
+        mains = GET_MAIN_INSTS_FOR_PATH_REPORT(path, parser_state, params)
+        goals = [SYN.GET_TARGET_MHZ(m, parser_state) for m in mains]
+        if any(g is not None and 1000.0 / path.path_delay_ns < g for g in goals):
+            params.auto_multi_cycle_ncycles = original
+            print(
+                "[sweep] MCP confirm-down failed; restoring the previous passing counts and observation.",
+                flush=True,
+            )
+            return report
+    print(
+        "[sweep] MCP confirm-down passed; counts are now grow-only for this datapath shape.",
+        flush=True,
+    )
+    return trial

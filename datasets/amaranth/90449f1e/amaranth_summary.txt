@@ -1,0 +1,4 @@
+Amaranth SCORE snapshot (amaranth-lang/amaranth)
+Commit: 90449f1e
+Dataset: /home/yongfu/proj/score/datasets/amaranth/90449f1e
+Snapshot files: 1

@@ -1,0 +1,4345 @@
+#!/usr/bin/env python3
+"""The synthesis API: what the compiler asks a synthesis tool to do, and what
+it expects back.
+
+See docs/SYN_DESIGN.md. This module owns:
+
+- tool selection (`PART_SET_TOOL` -> the `SYN_TOOL` backend module) and the
+  backend contract (`SYN_AND_REPORT_TIMING*`, the file-list/TCL and clock
+  constraint helpers every backend calls);
+- the kinds of runs: per-function delay measurement (`MEASURE_DELAYS`,
+  `ADD_PATH_DELAY_TO_LOOKUP`), one instance (`RUN_INST_SYN_AND_UPDATE_CACHE`),
+  the full multi-MAIN design, and the final bitstream;
+- the reports it expects: parsed timing paths (`SET_MEASURED_DELAY_FROM_REPORT`,
+  `GET_MAIN_INSTS_FROM_PATH_REPORT`, `PATH_CELLS_BY_MAIN`), measured area, and pre-synthesis area /
+  register estimates;
+- the on-disk path-delay and area caches, output directories, final files.
+- synthesis run reuse: a backend's log is reused only for identical inputs
+  (`SYNTHESIS_INPUT_MANIFEST`, `REUSE_SYNTHESIS_LOG`, `RECORD_SYNTHESIS_LOG`),
+  and the optional `--syn_cache` store shared by output directories
+  (`SYNTHESIS_STORE_*`).
+
+Using these runs to reach a timing goal is SWEEP.py; how pipelines are
+represented is AUTO_PIPELINE.py; multi-cycle path constraints are
+AUTO_MULTI_CYCLE.py.
+"""
+
+import contextlib
+import datetime
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+from multiprocessing.pool import ThreadPool
+from timeit import default_timer as timer
+
+import CC_TOOLS
+import DEVICE_MODELS
+import DIAMOND
+import EFINITY
+import GOWIN
+import LOGIC
+import OPEN_TOOLS
+import PYRTL
+import QUARTUS
+import RAW_VHDL
+import VHDL
+import VIVADO
+import pypeline
+from utilities import EXE_ABS_DIR, REPO_ABS_DIR
+
+START_TIME = timer()
+# When the design finished parsing/elaborating (set by the driver), and every
+# whole-design synthesis run as (seconds, cache_hit): for ELAPSED_SUMMARY_STR.
+PARSE_DONE_TIME = None
+MULTIMAIN_SYN_RUNS = []
+# Exclusive wall seconds per named build phase (PHASE), for ELAPSED_SUMMARY_STR.
+PHASE_SECONDS = {}
+# Open PHASE blocks, innermost last: [name, start time, seconds in nested phases].
+_PHASE_STACK = []
+
+
+@contextlib.contextmanager
+def PHASE(name):
+    """Charge the wall time spent in this block to a named build phase. A
+    nested phase's time goes to the nested phase only, so the phases add up
+    to the time inside the outermost ones."""
+    entry = [name, timer(), 0.0]
+    _PHASE_STACK.append(entry)
+    try:
+        yield
+    finally:
+        _PHASE_STACK.pop()
+        elapsed = timer() - entry[1]
+        PHASE_SECONDS[name] = PHASE_SECONDS.get(name, 0.0) + elapsed - entry[2]
+        if _PHASE_STACK:
+            _PHASE_STACK[-1][2] += elapsed
+
+
+def PHASED(name):
+    """Decorator: run the whole function as PHASE(name)."""
+
+    def decorate(func):
+        import functools
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with PHASE(name):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def DURATION_STR(seconds):
+    """H:MM:SS, whole seconds, for build progress prints."""
+    return str(datetime.timedelta(seconds=round(seconds)))
+
+
+def ELAPSED_STR():
+    """Wall time since the compiler started, as DURATION_STR."""
+    return DURATION_STR(timer() - START_TIME)
+
+
+@PHASED("whole-design synthesis")
+def RUN_MULTIMAIN_SYN(parser_state, multimain_timing_params):
+    """SYN_TOOL.SYN_AND_REPORT_TIMING_MULTIMAIN, then one line saying how long
+    that whole-design run took and the build's elapsed time."""
+    started = timer()
+    report = SYN_TOOL.SYN_AND_REPORT_TIMING_MULTIMAIN(
+        parser_state, multimain_timing_params
+    )
+    seconds = timer() - started
+    cache_hit = getattr(report, "cache_hit", None) is True
+    MULTIMAIN_SYN_RUNS.append((seconds, cache_hit))
+    print(
+        f"Whole-design synthesis took {DURATION_STR(seconds)}"
+        f"{' (reused cached log)' if cache_hit else ''}, elapsed time {ELAPSED_STR()}",
+        flush=True,
+    )
+    return report
+
+
+def ELAPSED_SUMMARY_STR():
+    """The end of a build: total wall time, then how much of it was
+    parsing/elaboration and whole-design synthesis (the remainder is
+    per-function characterization, HDL writing, simulation, ...). A second
+    line splits the time inside named build phases (PHASE)."""
+    parts = []
+    if PARSE_DONE_TIME is not None:
+        parts.append(f"parse/elaborate {DURATION_STR(PARSE_DONE_TIME - START_TIME)}")
+    if MULTIMAIN_SYN_RUNS:
+        cached = sum(hit for _seconds, hit in MULTIMAIN_SYN_RUNS)
+        runs = len(MULTIMAIN_SYN_RUNS)
+        parts.append(
+            f"whole-design synthesis {DURATION_STR(sum(s for s, _hit in MULTIMAIN_SYN_RUNS))}"
+            f" over {runs} run{'s' if runs != 1 else ''}"
+            + (f" ({cached} cached)" if cached else "")
+        )
+    detail = f" ({', '.join(parts)})" if parts else ""
+    phases = ""
+    if PHASE_SECONDS:
+        phases = "\nTime by build phase: " + ", ".join(
+            f"{name} {DURATION_STR(seconds)}"
+            for name, seconds in sorted(PHASE_SECONDS.items(), key=lambda item: -item[1])
+        )
+    return f"Total elapsed time: {ELAPSED_STR()}{detail}{phases}"
+
+
+OUTPUT_DIR_NAME = "pipelinec_output"
+SYN_OUTPUT_DIRECTORY = None  # Auto created with pid and filename or from user
+TOP_LEVEL_MODULE = None  # Holds the name of the top level module
+SYN_TOOL = None  # Attempts to figure out from part number
+# Tri-state override for the mux path-delay cache key (see
+# GET_CACHED_LOGIC_FILE_KEY): None = automatic per SYN_TOOL, True/False force
+# width-keyed or collapsed for every tool. Set by --mux_delay_by_width /
+# --no_mux_delay_by_width.
+MUX_DELAY_KEY_BY_WIDTH = None
+# How many synthesis runs may be in flight at once. None = read
+# config/num_processes.cfg; set by pipelinec's -j/--jobs. Each in-flight run is
+# a whole vendor tool process, so this is really a memory knob: Efinity's
+# efx_pnr peaks near 3.7GB building a Titanium routing graph, and four of those
+# at once will exhaust a 16GB machine (the OOM killer then takes whatever has
+# the worst oom_score, not necessarily the build).
+NUM_PROCESSES = None
+_NUM_PROCESSES_CFG = None
+CONVERT_FINAL_TOP_VERILOG = False  # Flag for final top level converison to verilog
+WRITE_AXIS_XO_FILE = False
+PIN_CONSTRAINTS_FILE = None  # Pin constraints file to use
+
+# Welcome to the land of magic numbers
+#   "But I think its much worse than you feared" Modest Mouse - I'm Still Here
+
+DELAY_UNIT_MULT = 10.0  # Timing is reported in nanoseconds. Multiplier to convert that time into integer units (nanosecs, tenths, hundreds of nanosecs)
+INF_MHZ = 1000  # Impossible timing goal
+# Pre-pipelining path delay collection mode:
+#  "leaf" = measure primitives and combinational pipeline frontiers; estimate
+#           surrounding hierarchy from its primitive dependencies.
+#  "full" = old behavior, synthesize every level of hierarchy individually
+#           including MAINs (--full_hier_syn cmd line flag).
+#  "prim" = required true leaves only for geometry; estimate
+#           inspectable hierarchy, without hierarchical fallback
+#           (--no_hier_syn). Independent MCP/FSM consumers remain enabled.
+HIER_SYN_MODE = "leaf"
+# Before estimating a delay or an area, use an earlier run's synthesis of the
+# same exact inputs when the output directory or the --syn_cache store holds
+# one (STORED_MEASUREMENT). In every HIER_SYN_MODE. False
+# (--no_stored_measurements): estimate as if no earlier run existed.
+USE_STORED_MEASUREMENTS = True
+# Experimental planner geometry: use a timing backend's measured
+# combinational component as the relative leaf weight, then normalize it at
+# the measured frontier before placement. This stays internal and defaults
+# off until controlled A/B evidence promotes it; the synthesis/STA budget
+# continues to use Logic.delay regardless.
+USE_COMBINATIONAL_PLANNER_WEIGHTS = os.environ.get(
+    "PIPELINEC_INTERNAL_COMBINATIONAL_PLANNER_WEIGHTS", "0"
+).lower() in ("1", "true", "yes", "on")
+COMBINATIONAL_PLANNER_MODEL_VERSION = 1
+
+
+def GET_PLANNER_DELAY_CACHE_SUFFIX():
+    if not USE_COMBINATIONAL_PLANNER_WEIGHTS:
+        return ""
+    return f"__comb_planner_v{COMBINATIONAL_PLANNER_MODEL_VERSION}"
+
+
+def GET_PLANNER_DELAY(logic):
+    """Relative planner weight in the same integer units as ``logic.delay``.
+
+    The experimental value is the measured combinational component. Callers
+    must normalize a frontier's relative weights back to its existing
+    measured total before placement; this helper intentionally does not alter
+    the global slice-count/timing budget.
+    """
+
+    if (
+        USE_COMBINATIONAL_PLANNER_WEIGHTS
+        and getattr(logic, "planner_delay", None) is not None
+    ):
+        return logic.planner_delay
+    return logic.delay
+
+
+def GET_NUM_PROCESSES():
+    """Parallel synthesis runs allowed. -j/--jobs wins, else
+    config/num_processes.cfg, else 4."""
+    global _NUM_PROCESSES_CFG
+    if NUM_PROCESSES is not None:
+        return max(1, int(NUM_PROCESSES))
+    if _NUM_PROCESSES_CFG is None:
+        try:
+            with open(
+                EXE_ABS_DIR() + "/../config/num_processes.cfg", "r"
+            ) as f:
+                _NUM_PROCESSES_CFG = max(1, int(f.readline()))
+        except (OSError, ValueError):
+            _NUM_PROCESSES_CFG = 4
+    return _NUM_PROCESSES_CFG
+
+
+# Every selectable synthesis backend, by the name used on the command line
+# (--syn_tool) and in source (SYN_TOOL("...")). These names are also what a
+# build log's "Running: .../<name>_....log" lines say, and what the test
+# suite's per-tool categories are named after (common.SYN_TOOLS).
+TOOL_MODULES = {
+    "vivado": VIVADO,
+    "quartus": QUARTUS,
+    "diamond": DIAMOND,
+    "gowin": GOWIN,
+    "efinity": EFINITY,
+    "open_tools": OPEN_TOOLS,
+    "cc_tools": CC_TOOLS,
+    "pyrtl": PYRTL,
+    "device_models": DEVICE_MODELS,
+}
+TOOL_NAMES = tuple(TOOL_MODULES.keys())
+
+
+def TOOL_NAME(tool):
+    """The --syn_tool spelling of a backend module, or None."""
+    for name, module in TOOL_MODULES.items():
+        if module is tool:
+            return name
+    return None
+
+
+def GET_TOOL_MODULE(tool_name):
+    """Backend module for a --syn_tool/SYN_TOOL() name. Raises on a typo."""
+    try:
+        return TOOL_MODULES[tool_name]
+    except KeyError:
+        raise Exception(
+            f"Unknown synthesis tool '{tool_name}'! Expected one of: "
+            + ", ".join(TOOL_NAMES)
+        )
+
+
+def PART_TO_TOOL(part_str):
+    """The backend a part string selects, or None if nothing matches.
+
+    Pure: no install checks, no writes to the SYN_TOOL global. A part of None
+    means "no part given" and selects PYRTL, the part-less estimator.
+    """
+    if part_str is None:
+        return PYRTL
+    if part_str.lower().startswith("xc"):
+        return VIVADO
+    elif (
+        part_str.lower().startswith("ep")
+        or part_str.lower().startswith("10c")
+        or part_str.lower().startswith("5c")
+    ):
+        return QUARTUS
+    elif part_str.lower().startswith("lfe5u") or part_str.lower().startswith("ice"):
+        # Diamond fails to create proj for UMG5G part?
+        if "um5g" in part_str.lower():
+            return OPEN_TOOLS
+        # Default to open tools for non ice40 (nextpnr not support ooc mode yet)
+        elif "ice40" not in part_str.lower():
+            return OPEN_TOOLS
+        else:
+            # ice40 is the one part family two backends can serve: Diamond when
+            # it is installed, open tools otherwise. PART_TO_TOOL reports the
+            # install-dependent preference; TOOL_MATCHES_PART treats both as
+            # consistent so an explicit --syn_tool never depends on which
+            # machine it runs on.
+            if os.path.exists(DIAMOND.DIAMOND_PATH):
+                return DIAMOND
+            return OPEN_TOOLS
+    elif part_str.upper().startswith("T8") or part_str.upper().startswith("TI"):
+        return EFINITY
+    elif part_str.upper().startswith("GW"):
+        return GOWIN
+    elif part_str.upper().startswith("CCGM"):
+        return CC_TOOLS
+    elif part_str.lower().startswith("sky130"):
+        return DEVICE_MODELS
+    return None
+
+
+def _PART_IS_ICE40(part_str):
+    return part_str is not None and "ice40" in part_str.lower()
+
+
+def TOOL_MATCHES_PART(tool, part_str):
+    """Is an explicitly named tool consistent with an explicitly given part?
+
+    Exact match, except families with more than one supported backend:
+    ice40 may use DIAMOND or OPEN_TOOLS, and Xilinx 7-series may use VIVADO
+    or the open Yosys/nextpnr-xilinx flow in OPEN_TOOLS. PART_TO_TOOL keeps
+    the historical/default choice; an explicit --syn_tool may select the
+    alternate backend without making the part/tool pair contradictory.
+    """
+    if tool is PART_TO_TOOL(part_str):
+        return True
+    if _PART_IS_ICE40(part_str) and tool in (DIAMOND, OPEN_TOOLS):
+        return True
+    if OPEN_TOOLS.IS_XC7_PART(part_str) and tool in (VIVADO, OPEN_TOOLS):
+        return True
+    return False
+
+
+def CHECK_TOOL_INSTALLED(tool, part_str=None, allow_fail=False):
+    """Report/verify that a selected backend is actually installed.
+
+    Returns True when usable. With allow_fail the caller gets False instead of
+    an exception, which is how pipelinec falls back to --comb --no_synth.
+    """
+    if tool is None:
+        return False
+
+    def _found(label, path):
+        print(label + ":", path, flush=True)
+        return True
+
+    def _missing(msg):
+        if not allow_fail:
+            raise Exception(msg)
+        return False
+
+    if tool is VIVADO:
+        if os.path.exists(VIVADO.VIVADO_PATH):
+            return _found("Vivado", VIVADO.VIVADO_PATH)
+        return _missing("Vivado install not found!")
+    elif tool is QUARTUS:
+        if os.path.exists(QUARTUS.QUARTUS_PATH):
+            return _found("Quartus", QUARTUS.QUARTUS_PATH)
+        return _missing("Quartus install not found!")
+    elif tool is DIAMOND:
+        if os.path.exists(DIAMOND.DIAMOND_PATH):
+            return _found("Diamond", DIAMOND.DIAMOND_PATH)
+        return _missing("Diamond install not found!")
+    elif tool is EFINITY:
+        if os.path.exists(EFINITY.EFINITY_PATH):
+            return _found("Efinity", EFINITY.EFINITY_PATH)
+        return _missing("Efinity install not found!")
+    elif tool is GOWIN:
+        if os.path.exists(GOWIN.GOWIN_PATH):
+            return _found("Gowin", GOWIN.GOWIN_PATH)
+        return _missing("Gowin install not found!")
+    elif tool is CC_TOOLS:
+        # TODO dont base on cc-toolchain directory?
+        if os.path.exists(CC_TOOLS.CC_TOOLS_PATH):
+            return _found("CologneChip Tools", CC_TOOLS.CC_TOOLS_PATH)
+        return _missing("CologneChip toolchain install not found!")
+    elif tool is OPEN_TOOLS:
+        if OPEN_TOOLS.IS_XC7_PART(part_str):
+            missing = []
+            if OPEN_TOOLS.YOSYS_BIN_PATH is None:
+                missing.append("yosys")
+            if OPEN_TOOLS.GHDL_PREFIX is None:
+                missing.append("ghdl")
+            nextpnr = OPEN_TOOLS.GET_XC7_TOOL_PATH(OPEN_TOOLS.XC7_NEXTPNR_EXE)
+            if nextpnr is None:
+                missing.append("nextpnr-xilinx")
+            chipdb = OPEN_TOOLS.GET_XC7_CHIPDB_PATH(part_str)
+            if chipdb is None:
+                missing.append(
+                    "nextpnr-xilinx chipdb " + OPEN_TOOLS.XC7_CHIPDB_NAME(part_str)
+                )
+            if missing:
+                return _missing(
+                    "OpenXC7 install incomplete for "
+                    + part_str
+                    + ": missing "
+                    + ", ".join(missing)
+                    + ". Put the OpenXC7 tools on PATH and set OPENXC7_CHIPDB, "
+                    "or use OPENXC7 for a self-contained tool root."
+                )
+            return _found("Open tools (OpenXC7)", nextpnr)
+        if OPEN_TOOLS.YOSYS_BIN_PATH is not None:
+            return _found("Open tools (yosys)", OPEN_TOOLS.YOSYS_BIN_PATH)
+        return _missing("Open tools (yosys/nextpnr/ghdl) install not found!")
+    elif tool is PYRTL:
+        if PYRTL.IS_INSTALLED():
+            return True
+        return _missing(
+            "PyRTL not installed -- need the pyrtl and pyparsing python modules!"
+        )
+    elif tool is DEVICE_MODELS:
+        if DEVICE_MODELS.IS_INSTALLED():
+            return _found(
+                "DEVICE_MODELS (sky130 liberty STA)", DEVICE_MODELS.SELECTED_LIBRARY
+            )
+        return _missing(
+            "sky130 liberty STA not available -- need yosys+ghdl "
+            "(OPEN_TOOLS) and a volare sky130 PDK install "
+            "(see DEVICE_MODELS.LIBERTY_RAW_LIB_PATH / "
+            "PIPELINEC_SKY130_LIB_PATH)!"
+        )
+    return _missing(f"Do not know how to check install of {tool.__name__}!")
+
+
+def _RECONCILE(axis, cli_value, cli_flag, src_value, src_call):
+    """One value from two sources that must not disagree."""
+    if cli_value is not None and src_value is not None and cli_value != src_value:
+        raise Exception(
+            f"Conflicting {axis}: {cli_flag} says '{cli_value}' but the source's "
+            f"{src_call} says '{src_value}'. Set only one, or set both the same."
+        )
+    return cli_value if cli_value is not None else src_value
+
+
+def RESOLVE_PART_AND_TOOL(
+    cli_part=None, cli_tool=None, src_part=None, src_tool=None, allow_fail=False
+):
+    """Settle the part and the synthesis tool from all four possible sources.
+
+    Part comes from --part or PART(...), tool from --syn_tool or SYN_TOOL(...).
+    Same-axis disagreements are errors, and so is naming a tool that the part
+    does not select -- the two are one decision spelled two ways, never an
+    override. Naming a tool with no part falls back to that tool's
+    DEFAULT_PART.
+
+    Returns (part_str, tool_module); tool_module is None when nothing is
+    installed and allow_fail is set. Sets the SYN_TOOL global.
+    """
+    global SYN_TOOL
+    part = _RECONCILE("FPGA part", cli_part, "--part", src_part, 'PART("...")')
+    tool_name = _RECONCILE(
+        "synthesis tool", cli_tool, "--syn_tool", src_tool, 'SYN_TOOL("...")'
+    )
+
+    if tool_name is not None:
+        tool = GET_TOOL_MODULE(tool_name)
+        if part is None:
+            # Tool named on its own: it supplies the part it is normally used with.
+            part = tool.DEFAULT_PART
+            if part is not None:
+                print(
+                    f"Using {tool_name} default part:", part, flush=True
+                )
+        elif not TOOL_MATCHES_PART(tool, part):
+            implied = PART_TO_TOOL(part)
+            implied_name = TOOL_NAME(implied) if implied else "no known tool"
+            raise Exception(
+                f"Part '{part}' selects {implied_name}, but the synthesis tool "
+                f"was set to '{tool_name}'. A part and a tool cannot contradict: "
+                f"either drop the tool and let the part choose it, or pass a part "
+                f"{tool_name} supports (ex. --part {tool.DEFAULT_PART})."
+            )
+    else:
+        tool = PART_TO_TOOL(part)
+        if tool is None:
+            if not allow_fail:
+                print("No known synthesis tool for FPGA part:", part, flush=True)
+                sys.exit(-1)
+            return part, None
+
+    if part is None and tool is not PYRTL:
+        # Only PYRTL models something that isn't a part.
+        if not allow_fail:
+            raise Exception(
+                f"{TOOL_NAME(tool)} needs an FPGA part -- set --part or PART(...)."
+            )
+        return part, None
+
+    if not CHECK_TOOL_INSTALLED(tool, part, allow_fail=allow_fail):
+        return part, None
+
+    SYN_TOOL = tool
+    print("Using", SYN_TOOL.__name__, "synthesizing for part:", part)
+    return part, tool
+
+
+def TARGET_HAS_REGISTER_POWER_UP_VALUES(part, tool_name):
+    """Whether a build's declared target gives registers power-up values.
+    False for an ASIC: the part selects DEVICE_MODELS (sky130...) or the tool
+    is device_models or pyrtl. None when neither part nor tool is declared
+    (the PyRTL timing fallback of PART_SET_TOOL is no declaration). True for
+    an FPGA. Reads names only: a declared target counts where its tool is not
+    installed."""
+    if tool_name is not None and TOOL_MODULES.get(tool_name) in (DEVICE_MODELS, PYRTL):
+        return False
+    if part is not None:
+        return PART_TO_TOOL(part) is not DEVICE_MODELS
+    if tool_name is None:
+        return None
+    return True
+
+
+def RESOLVE_BUILD_TARGET(
+    parser_state, src_file, cli_part, cli_tool, check_bitstream_tools
+):
+    """Settle a build's target right after the first parse, before any file is
+    written (AUTO_PIPELINE.WRITE_0_ADDED_CLKS_INIT_FILES is the first step to
+    consume the tool). On an ASIC target (TARGET_HAS_REGISTER_POWER_UP_VALUES)
+    a .py design's explicitly initialized registers must reset
+    (PY_TO_LOGIC.CHECK_ASIC_REGISTER_INITS).
+
+    Part and tool come from all four sources (--part / PART(...), --syn_tool /
+    SYN_TOOL(...)) now that the design's own values are known: errors on any
+    contradiction, fills in a tool's default part when only a tool was named.
+    The SYN_TOOL the driver set from --syn_tool / --part alone before parsing
+    does not get the final say. A .py design's RAMs are then planned for that
+    target. A requested XC7 bitstream (check_bitstream_tools, --pins with
+    open_tools) needs Project X-Ray conversion tools in addition to the
+    synthesis/P&R payload CHECK_TOOL_INSTALLED verified: diagnosed here, before
+    time goes into a throughput sweep. Returns the (maybe re-parsed)
+    parser_state.
+    """
+    global SYN_TOOL
+    SYN_TOOL = None
+    parser_state.part, resolved_tool = RESOLVE_PART_AND_TOOL(
+        cli_part=cli_part,
+        cli_tool=cli_tool,
+        src_part=parser_state.part,
+        src_tool=parser_state.syn_tool_name,
+        allow_fail=True,
+    )
+    if src_file.endswith(".py"):
+        import AUTO_PIPELINE
+        import PY_TO_LOGIC
+
+        tool_name = cli_tool if cli_tool is not None else parser_state.syn_tool_name
+        if TARGET_HAS_REGISTER_POWER_UP_VALUES(parser_state.part, tool_name) is False:
+            # An ASIC keeps an initial value only through a reset
+            PY_TO_LOGIC.CHECK_ASIC_REGISTER_INITS(
+                parser_state, parser_state.part or tool_name
+            )
+        parser_state = AUTO_PIPELINE.RAM_PREPARE_TARGET(parser_state, src_file)
+    if (
+        check_bitstream_tools
+        and resolved_tool is OPEN_TOOLS
+        and OPEN_TOOLS.IS_XC7_PART(parser_state.part)
+        and PIN_CONSTRAINTS_FILE
+    ):
+        OPEN_TOOLS.GET_XC7_BITSTREAM_TOOLS_AND_DB(parser_state.part)
+    return parser_state
+
+
+def PART_SET_TOOL(part_str, allow_fail=False):
+    """Set the SYN_TOOL global from a part string, if not already set.
+
+    Thin back-compat wrapper over PART_TO_TOOL + CHECK_TOOL_INSTALLED, kept
+    for the many call sites that only have a part in hand. A SYN_TOOL already
+    chosen (by --syn_tool/SYN_TOOL(), via RESOLVE_PART_AND_TOOL) always wins.
+    """
+    global SYN_TOOL
+    if SYN_TOOL is not None:
+        return
+    if part_str is None:
+        if PYRTL.IS_INSTALLED():
+            SYN_TOOL = PYRTL
+            print("Defaulting to pyrtl based timing estimates...")
+        else:
+            if allow_fail:
+                return
+            print(
+                "Need to set FPGA part somewhere in the code to continue with synthesis tool support!"
+            )
+            print('Ex. #pragma PART "LFE5U-85F-6BG381C"')
+            sys.exit(0)
+    else:
+        tool = PART_TO_TOOL(part_str)
+        if tool is None:
+            if not allow_fail:
+                print("No known synthesis tool for FPGA part:", part_str, flush=True)
+                sys.exit(-1)
+            return
+        if not CHECK_TOOL_INSTALLED(tool, part_str, allow_fail=allow_fail):
+            return
+        SYN_TOOL = tool
+
+    if SYN_TOOL is not None:
+        print("Using", SYN_TOOL.__name__, "synthesizing for part:", part_str)
+
+
+def TOOL_DOES_PNR():
+    # Does tool do full PNR or just syn?
+    if SYN_TOOL is VIVADO:
+        return VIVADO.DO_PNR == "all"
+    elif SYN_TOOL is GOWIN:
+        return GOWIN.DO_PNR == "all"
+    # Uses PNR
+    elif (
+        (SYN_TOOL is QUARTUS)
+        or (SYN_TOOL is OPEN_TOOLS)
+        or (SYN_TOOL is EFINITY)
+        or (SYN_TOOL is CC_TOOLS)
+    ):
+        return True
+    # Uses synthesis estimates
+    elif (SYN_TOOL is DIAMOND) or (SYN_TOOL is PYRTL) or (SYN_TOOL is DEVICE_MODELS):
+        return False
+    else:
+        raise Exception("Need to know if tool flow does PnR!")
+
+
+def GET_CLK_TO_MHZ_AND_CONSTRAINTS_PATH(
+    parser_state, inst_name=None, allow_no_syn_tool=False
+):
+    ext = None
+    if SYN_TOOL is VIVADO:
+        ext = ".xdc"
+    elif SYN_TOOL is QUARTUS:
+        ext = ".sdc"
+    elif SYN_TOOL is DIAMOND and DIAMOND.DIAMOND_TOOL == "lse":
+        ext = ".ldc"
+    elif SYN_TOOL is DIAMOND and DIAMOND.DIAMOND_TOOL == "synplify":
+        ext = ".sdc"
+    elif SYN_TOOL is OPEN_TOOLS:
+        ext = ".py"
+    elif SYN_TOOL is EFINITY:
+        ext = ".sdc"
+    elif SYN_TOOL is GOWIN:
+        ext = ".sdc"
+    elif SYN_TOOL is PYRTL:
+        ext = ".sdc"
+    elif SYN_TOOL is DEVICE_MODELS:
+        ext = ".sdc"
+    elif SYN_TOOL is CC_TOOLS:
+        ext = ".ccf"  # Only for temp clock pins, no timing contraints?
+    else:
+        if not allow_no_syn_tool:
+            # Sufjan Stevens - Video Game
+            raise Exception(
+                f"Add constraints file ext for syn tool {SYN_TOOL.__name__}"
+            )
+        ext = ""
+
+    clock_name_to_mhz = {}
+    if inst_name:
+        # Default instances get max fmax
+        clock_name_to_mhz["clk"] = INF_MHZ
+        """
+    # Unless happens to be main with fixed freq
+    if inst_name in parser_state.main_mhz:
+      clock_mhz = GET_TARGET_MHZ(inst_name, parser_state, allow_no_syn_tool)
+      clock_name_to_mhz["clk"] = clock_mhz
+    """
+        out_filename = "clock" + ext
+        Logic = parser_state.LogicInstLookupTable[inst_name]
+        output_dir = GET_OUTPUT_DIRECTORY(Logic)
+        out_filepath = output_dir + "/" + out_filename
+    else:
+        out_filename = "clocks" + ext
+        out_filepath = SYN_OUTPUT_DIRECTORY + "/" + out_filename
+        for main_func in parser_state.main_mhz:
+            clock_mhz = GET_TARGET_MHZ(main_func, parser_state, allow_no_syn_tool)
+            clk_ext_str = VHDL.CLK_EXT_STR(main_func, parser_state)
+            clk_name = "clk_" + clk_ext_str
+            clock_name_to_mhz[clk_name] = clock_mhz
+
+    return clock_name_to_mhz, out_filepath
+
+
+def GET_ALL_USER_CLOCKS(parser_state):
+    all_user_clks = set()
+    for clk_wire, mhz in parser_state.clk_mhz.items():
+        clk_group = None
+        if clk_wire in parser_state.clk_group:
+            clk_group = parser_state.clk_group[clk_wire]
+        clk_name = "clk_" + VHDL.CLK_MHZ_GROUP_TEXT(mhz, clk_group)
+        all_user_clks.add(clk_name)
+    return all_user_clks
+
+
+# return path
+def WRITE_CLK_CONSTRAINTS_FILE(multimain_timing_params, parser_state, inst_name=None):
+    # Use specified mhz is multimain top
+    import AUTO_MULTI_CYCLE
+
+    clock_name_to_mhz, out_filepath = GET_CLK_TO_MHZ_AND_CONSTRAINTS_PATH(
+        parser_state, inst_name
+    )
+    f = open(out_filepath, "w")
+
+    if SYN_TOOL is OPEN_TOOLS:
+        # All clock assumed async in nextpnr constraints
+        for clock_name in clock_name_to_mhz:
+            clock_mhz = clock_name_to_mhz[clock_name]
+            if clock_mhz is None:
+                print(
+                    f"WARNING: No frequency associated with clock {clock_name}. Missing MAIN_MHZ pragma? Setting to maximum rate = {INF_MHZ}MHz so timing report can be generated..."
+                )
+                clock_mhz = INF_MHZ
+            f.write('ctx.addClock("' + clock_name + '", ' + str(clock_mhz) + ")\n")
+    elif SYN_TOOL is CC_TOOLS:
+        f.write("#TODO")
+    else:
+        # Collect all user generated clocks
+        all_user_clks = GET_ALL_USER_CLOCKS(parser_state)
+
+        # Standard sdc like constraints
+        for clock_name in clock_name_to_mhz:
+            clock_mhz = clock_name_to_mhz[clock_name]
+            if clock_mhz is None:
+                print(
+                    f"WARNING: No frequency associated with clock {clock_name}. Missing MAIN_MHZ pragma? Setting to maximum rate = {INF_MHZ}MHz so timing report can be generated..."
+                )
+                clock_mhz = INF_MHZ
+            ns = 1000.0 / clock_mhz
+            # Quartus has some maximum acceptable clock period < 8333333 ns
+            if SYN_TOOL is QUARTUS:
+                MAX_NS = 80000
+                if ns > MAX_NS:
+                    print("Clipping clock", clock_name, "period to", MAX_NS, "ns...")
+                    ns = MAX_NS
+            # Default cmd is get_ports unless need internal user clk net name
+            get_thing_cmd = "get_ports"
+            if clock_name in all_user_clks:
+                get_thing_cmd = "get_nets"
+            f.write(
+                f"create_clock -add -name {clock_name} -period {ns} -waveform {{0 {ns/2.0}}} [{get_thing_cmd} {{{clock_name}}}]\n"
+            )
+
+        # All clock assumed async? Doesnt matter for internal syn
+        # Rely on generated/board provided constraints for real hardware
+        if len(clock_name_to_mhz) > 1:
+            if SYN_TOOL is VIVADO:
+                f.write(
+                    "set_clock_groups -name async_clks_group -asynchronous -group [get_clocks *] -group [get_clocks *]\n"
+                )
+            elif SYN_TOOL is QUARTUS:
+                # Ignored set_clock_groups at clocks.sdc(3): The clock clk_100p0 was found in more than one -group argument.
+                # Uh do the hard way?
+                clk_sets = set()
+                for clock_name1 in clock_name_to_mhz:
+                    for clock_name2 in clock_name_to_mhz:
+                        if clock_name1 != clock_name2:
+                            clk_set = frozenset([clock_name1, clock_name2])
+                            if clk_set not in clk_sets:
+                                f.write(
+                                    "set_clock_groups -asynchronous -group [get_clocks "
+                                    + clock_name1
+                                    + "] -group [get_clocks "
+                                    + clock_name2
+                                    + "]"
+                                )
+                                clk_sets.add(clk_set)
+            elif SYN_TOOL is DIAMOND:
+                # f.write("set_clock_groups -name async_clks_group -asynchronous -group [get_clocks *] -group [get_clocks *]")
+                # ^ is wrong, makes 200mhx system clock?
+                pass  # rely on clock cross path detection error in timing report
+            else:
+                raise Exception(
+                    f"How does tool {SYN_TOOL.__name__} deal with async clocks?"
+                )
+
+    # Multi cycle path constraints:
+    # TODO should mcps be in separate file? - how will user consume like vhdl_files.txt or read_vhdl.tcl?
+    # Loop over funcs, records instances of those with MCP constraints
+    insts = []
+    for func_logic in parser_state.FuncLogicLookupTable.values():
+        if len(func_logic.mcp_tuples) > 0:
+            func_insts = parser_state.FuncToInstances[func_logic.func_name]
+            for func_inst in func_insts:
+                if (
+                    (inst_name is None)
+                    or (inst_name == func_inst)
+                    or func_inst.startswith(inst_name + LOGIC.SUBMODULE_MARKER)
+                ):
+                    insts.append(func_inst)
+    for inst in insts:
+        # Top level has different name if individual module with inst_name or multi main top
+        if inst_name is None:
+            main_func = LOGIC.RECURSIVE_FIND_MAIN_FUNC_FROM_INST(
+                inst, parser_state
+            )
+            main_logic = parser_state.LogicInstLookupTable[main_func]
+            top_path = VHDL.GET_ENTITY_NAME(
+                main_func,
+                main_logic,
+                multimain_timing_params.TimingParamsLookupTable,
+                parser_state,
+            )
+            top_inst = main_func
+        else:
+            func_logic = parser_state.LogicInstLookupTable[inst_name]
+            top_path = VHDL.GET_ENTITY_NAME(
+                inst_name,
+                func_logic,
+                multimain_timing_params.TimingParamsLookupTable,
+                parser_state,
+            )
+            top_inst = inst_name
+        constraints = AUTO_MULTI_CYCLE.GET_MCP_PATH_CONSTRAINTS(
+            inst, top_inst, top_path, multimain_timing_params, parser_state
+        )
+        for constraint in constraints:
+            f.write(constraint + "\n")
+
+    f.close()
+    return out_filepath
+
+
+def DEL_ALL_CACHES():
+    # Clear all caches after parsing is done
+    global _FUNC_SUBTREE_HAS_STATE_cache
+    import AUTO_PIPELINE
+
+    import AUTO_FSM
+
+    _FUNC_SUBTREE_HAS_STATE_cache = {}
+    AUTO_PIPELINE.DEL_PIPELINE_CACHES()
+    AUTO_FSM.DEL_AUTO_FSM_SUBTREE_CACHE()
+
+
+    # _GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP_cache    = {}
+
+
+# Target mhz is internal name for whatever mhz we are using in this run
+# Real pnr MAIN_MHZ or syn only MAIN_SYN_MHZ
+def GET_TARGET_MHZ(main_func, parser_state, allow_no_syn_tool=False):
+    if SYN_TOOL is None:
+        if not allow_no_syn_tool:
+            raise Exception("Need syn tool!")
+        # Default to main mhz
+        return parser_state.main_mhz[main_func]
+
+    # Does tool do full PNR or just syn?
+    if TOOL_DOES_PNR():
+        # Uses PNR MAIN_MHZ
+        return parser_state.main_mhz[main_func]
+    else:
+        # Uses synthesis estimates
+        return parser_state.main_syn_mhz[main_func]
+
+
+def WRITE_BLACK_BOX_FILES(parser_state, multimain_timing_params, is_final_top):
+    for func_name in parser_state.func_marked_blackbox:
+        if func_name in parser_state.FuncToInstances:
+            blackbox_func_logic = parser_state.FuncLogicLookupTable[func_name]
+            for inst_name in parser_state.FuncToInstances[func_name]:
+                bb_out_dir = GET_OUTPUT_DIRECTORY(blackbox_func_logic)
+                VHDL.WRITE_LOGIC_ENTITY(
+                    inst_name,
+                    blackbox_func_logic,
+                    bb_out_dir,
+                    parser_state,
+                    multimain_timing_params.TimingParamsLookupTable,
+                    is_final_top,
+                )
+
+
+def CHECK_VHDL_FILES_CONSISTENCY(vhdl_files_texts):
+    """Assert the final VHDL file list is referentially consistent: every
+    `entity work.X` instantiated inside a listed file is defined by some file
+    in the list. VHDL identifiers are case-insensitive, so compare casefolded.
+    Raises with the offending (file, unit) pairs -- this is how stale/mixed
+    entity references (an old file under a still-matching name whose child
+    entities have since been renamed) surface as a build error rather than a
+    downstream GHDL/Vivado analysis failure."""
+    file_paths = vhdl_files_texts.split()
+    defined_units = set()
+    file_to_refs = {}
+    entity_def_re = re.compile(r"^\s*entity\s+(\w+)\s+is", re.IGNORECASE | re.MULTILINE)
+    entity_ref_re = re.compile(r"entity\s+work\.(\w+)", re.IGNORECASE)
+    for file_path in file_paths:
+        try:
+            with open(file_path, "r") as vhd_f:
+                text = vhd_f.read()
+        except OSError:
+            raise Exception(f"vhdl_files.txt references a missing file: {file_path}")
+        for m in entity_def_re.finditer(text):
+            defined_units.add(m.group(1).casefold())
+        refs = {m.group(1).casefold() for m in entity_ref_re.finditer(text)}
+        if refs:
+            file_to_refs[file_path] = refs
+    missing = []
+    for file_path, refs in file_to_refs.items():
+        for ref in sorted(refs - defined_units):
+            missing.append((file_path, ref))
+    if missing:
+        for file_path, ref in missing:
+            print(
+                f"VHDL file list inconsistency: {file_path} instantiates "
+                f"'entity work.{ref}' but no listed file defines it"
+            )
+        raise Exception(
+            "Final VHDL file list is not self-consistent (stale/mixed entity "
+            "references above) -- refusing to hand it to simulation/synthesis."
+        )
+
+
+def WRITE_FINAL_FILES(multimain_timing_params, parser_state):
+    import AUTO_PIPELINE
+
+    import AUTO_COMB_OPT
+
+    AUTO_COMB_OPT.DUMP_GENERATED_SOURCE(parser_state, SYN_OUTPUT_DIRECTORY)
+    if multimain_timing_params is None:
+        ZeroAddedClocksTimingParamsLookupTable = (
+            AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+        )
+        multimain_timing_params = AUTO_PIPELINE.MultiMainTimingParams()
+        multimain_timing_params.TimingParamsLookupTable = (
+            ZeroAddedClocksTimingParamsLookupTable
+        )
+
+    # The final files/list must be computed 100% against the CURRENT
+    # parser_state: invalidate every cached hash/latency string in the final
+    # table first (subsumes the previous ancestors-only invalidation --
+    # ancestor treatment alone still folded children's stale cached strings,
+    # and any cache carried across an AUTO_PIPELINE pass-2 re-elaboration may
+    # embed since-renamed child func names). One full lazy recompute at end
+    # of build.
+    for final_timing_params in multimain_timing_params.TimingParamsLookupTable.values():
+        final_timing_params.INVALIDATE_CACHE()
+
+    is_final_top = True
+    VHDL.WRITE_MULTIMAIN_TOP(parser_state, multimain_timing_params, is_final_top)
+
+    # Ensure every entity the final file list will reference exists on disk
+    # under its freshly-computed (content-aware) name: pass ALL insts as
+    # eligible; already-written entities are skipped by name dedup +
+    # skip-if-exists inside (sound now that entity hashes cover descendant
+    # func names, so same filename => same rendered content).
+    AUTO_PIPELINE.WRITE_ALL_NON_ZERO_CLK_VHDL_FILES(
+        multimain_timing_params.TimingParamsLookupTable,
+        parser_state,
+        set(multimain_timing_params.TimingParamsLookupTable.keys()),
+    )
+
+    # Black boxes are different in final files
+    WRITE_BLACK_BOX_FILES(parser_state, multimain_timing_params, is_final_top)
+
+    # Do generic dump of vhdl files
+    # Which vhdl files?
+    vhdl_files_texts, top_entity_name = GET_VHDL_FILES_TCL_TEXT_AND_TOP(
+        multimain_timing_params, parser_state, inst_name=None, is_final_top=is_final_top
+    )
+    out_filename = "vhdl_files.txt"
+    out_filepath = SYN_OUTPUT_DIRECTORY + "/" + out_filename
+    out_text = vhdl_files_texts
+    f = open(out_filepath, "w")
+    f.write(out_text)
+    f.close()
+
+    # Referential consistency: every entity instantiated inside a listed file
+    # must be defined by a file in the list. Catches any stale/mixed entity
+    # references (e.g. a file written by an earlier elaboration pass whose
+    # children have since been renamed) at build time with a clear message,
+    # instead of failing later inside GHDL/Vivado analysis.
+    CHECK_VHDL_FILES_CONSISTENCY(vhdl_files_texts)
+
+    # TODO better GUI / tcl scripts support for other tools
+    # ^ incorporate into GET_VHDL_FILES_TCL_TEXT_AND_TOP instead of hacky below?
+    if SYN_TOOL is VIVADO:
+        # Write read_vhdl.tcl
+        tcl = VIVADO.GET_SYN_IMP_AND_REPORT_TIMING_TCL(
+            multimain_timing_params,
+            parser_state,
+            inst_name=None,
+            is_final_top=is_final_top,
+        )
+        rv_lines = []
+        for line in tcl.split("\n"):
+            # Hacky AF Built To Spill - Kicked It In The Sun
+            if (
+                line.startswith("read_vhdl")
+                or line.startswith("add_files")
+                or line.startswith("set_property")
+            ):
+                line = line.replace(SYN_OUTPUT_DIRECTORY, "$thisDir")
+                line = line.replace(VIVADO.VIVADO_DIR, "$vivadoDir")
+                line = line.replace("{", "[subst {").replace("}", "}]")
+                rv_lines.append(line)
+        rv = ""
+        rv += f"set vivadoDir {VIVADO.VIVADO_DIR}\n"
+        rv += "set thisFile [ dict get [ info frame 0 ] file ] \n"
+        rv += "set thisDir [file dirname $thisFile] \n"
+        for line in rv_lines:
+            rv += line + "\n"
+
+        # Write file
+        out_filename = "read_vhdl.tcl"
+        out_filepath = SYN_OUTPUT_DIRECTORY + "/" + out_filename
+        out_text = rv
+    elif SYN_TOOL is QUARTUS:
+        # Make a .qip file in the output dir
+        # Pull set vhdl file assignment lines from file (gets ieee stuff too)
+        # I dont think its too hacky right? lolz Baby When I Close My Eyes  -Sweet Spirit
+        constraints_filepath = ""  # fine for this
+        tcl = QUARTUS.GET_SH_TCL(
+            top_entity_name, vhdl_files_texts, constraints_filepath, parser_state
+        )
+        rv_lines = []
+        for line in tcl.split("\n"):
+            if "-name VHDL_FILE" in line:
+                # Ok getting hack hack
+                if SYN_OUTPUT_DIRECTORY in line:
+                    line = (
+                        line.replace(
+                            SYN_OUTPUT_DIRECTORY + "/",
+                            '[file join $::quartus(qip_path) "',
+                        )
+                        + '"]'
+                    )
+                rv_lines.append(line)
+        rv = ""
+        for line in rv_lines:
+            rv += line + "\n"
+
+        # Write file
+        out_filename = "pipelinec_top.qip"
+        out_filepath = SYN_OUTPUT_DIRECTORY + "/" + out_filename
+        out_text = rv
+
+    print("Output VHDL files:", out_filepath)
+    f = open(out_filepath, "w")
+    f.write(out_text)
+    f.close()
+
+    # Optional Vivado .xo file, only needs IO info to be ready, not final read_vhdl.tcl yet
+    if WRITE_AXIS_XO_FILE:
+        VIVADO.WRITE_AXIS_XO(parser_state)
+
+    # Tack on a conversion to verilog if requested
+    if CONVERT_FINAL_TOP_VERILOG:
+        OPEN_TOOLS.RENDER_FINAL_TOP_VERILOG(multimain_timing_params, parser_state)
+
+
+# Wow this is hack AF
+def JSON_DIGEST(value):
+    """SHA256 of value's canonical JSON."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+# Path evidence, independent of backend: the base one-worst-path-per-clock
+# report plus any optional extra paths (Vivado's per-MAIN, per-MCP-pair and
+# failing-endpoint queries, see docs/SYN_DESIGN.md#3-the-backend-contract).
+
+
+def TIMING_REPORT_PATHS(report):
+    """Base one-per-clock reports remain sufficient; optional paths add evidence."""
+    return list(report.path_reports.values()) + list(getattr(report, "extra_paths", ()))
+
+
+def PATH_REGISTER_BANK(name):
+    """Collapse payload indices, retaining hierarchy, fields and physical stages."""
+    if name is None:
+        return None
+    # raw_hdl_pipeline's following numeric index is a stage, not a data lane.
+    name = re.sub(r"(\[raw_hdl_pipeline\])\[(-?\d+)\]", r"\1[stage=\2]", name)
+    return re.sub(r"\[-?\d+(?::-?\d+)?\]", "[*]", name)
+
+
+def PATH_EVIDENCE_KEY(path):
+    return (
+        getattr(path, "path_group", None),
+        PATH_REGISTER_BANK(path.start_reg_name),
+        PATH_REGISTER_BANK(path.end_reg_name),
+    )
+
+
+def DISTINCT_PATHS(paths):
+    """One row per (clock, start bank, end bank), worst path first."""
+
+    def rank(path):
+        slack = getattr(path, "slack_ns", None)
+        return slack if slack is not None else -getattr(path, "path_delay_ns", 0)
+
+    grouped = {}
+    for path in paths:
+        key = PATH_EVIDENCE_KEY(path)
+        row = grouped.setdefault(key, dict(path=path, members=set(), scopes=set()))
+        # The same bit reported globally, per MAIN and per MCP counts once.
+        row["members"].add(
+            (
+                path.start_reg_name,
+                path.end_reg_name,
+                getattr(path, "start_pin_name", None),
+                getattr(path, "end_pin_name", None),
+            )
+        )
+        row["scopes"].add(getattr(path, "scope", "clock_worst"))
+        if rank(path) < rank(row["path"]):
+            row["path"] = path
+    return [
+        dict(
+            path=row["path"],
+            member_count=len(row["members"]),
+            query_scopes=sorted(row["scopes"]),
+        )
+        for row in sorted(
+            grouped.values(),
+            key=lambda x: (rank(x["path"]), str(PATH_EVIDENCE_KEY(x["path"]))),
+        )
+    ]
+
+
+def SERIALIZE_PATH_REPORT(path):
+    fields = (
+        "scope",
+        "path_group",
+        "start_reg_name",
+        "end_reg_name",
+        "start_pin_name",
+        "end_pin_name",
+        "source_ns_per_clock",
+        "requirement_ns",
+        "slack_ns",
+        "path_delay_ns",
+        "data_path_ns",
+        "logic_levels",
+        "path_elements",
+    )
+    result = {k: getattr(path, k, None) for k in fields}
+    result["netlist_resources"] = sorted(getattr(path, "netlist_resources", ()) or ())
+    return result
+
+
+_PATH_TRIE_INST = "\0inst"
+
+
+def _VHDL_INSTANCE_TRIE(parser_state):
+    """main inst -> nested {lowercase VHDL instance label: node} trie of every
+    instance below it, each node naming its instance under _PATH_TRIE_INST.
+    Labels are the ones VHDL emission gives submodule instances
+    (WIRE_TO_VHDL_NAME of the local name), which Vivado keeps as hierarchy
+    in post-synthesis cell names. Cached per instance table."""
+    table = parser_state.LogicInstLookupTable
+    key = (id(table), len(table))
+    cached = getattr(parser_state, "_vhdl_instance_trie", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    marker = LOGIC.SUBMODULE_MARKER
+    tries = {}
+    for inst in table:
+        parts = inst.split(marker)
+        node = tries.setdefault(parts[0], {})
+        for local in parts[1:]:
+            node = node.setdefault(
+                VHDL.WIRE_TO_VHDL_NAME(local, parser_state).lower(), {}
+            )
+        node[_PATH_TRIE_INST] = inst
+    parser_state._vhdl_instance_trie = (key, tries)
+    return tries
+
+
+def INSTANCE_LABEL_POSITION(name, inst, parser_state):
+    """Where instance `inst`'s own VHDL label starts in a timing report's cell
+    name (lower case), or -1. The labels VHDL emission gives the instances from
+    inst's MAIN down to it (WIRE_TO_VHDL_NAME of each local name, as
+    _VHDL_INSTANCE_TRIE keys them) must appear as consecutive hierarchy levels:
+    separated by "/" (Vivado) or by a flattening tool's "." before an escaped
+    identifier (sky130 STA: `$flatten\\main.\\label.\\label.$auto...`). The last
+    occurrence wins, like a substring match's rfind."""
+    if name is None:
+        return -1
+    labels = [
+        VHDL.WIRE_TO_VHDL_NAME(local, parser_state).lower()
+        for local in inst.split(LOGIC.SUBMODULE_MARKER)[1:]
+    ]
+    if not labels:
+        return -1
+    pattern = (
+        r"(?:^|/|\\)"
+        + "".join(re.escape(label) + r"(?:/|\.\\)" for label in labels[:-1])
+        + "("
+        + re.escape(labels[-1])
+        + r")(?=[/.]|$)"
+    )
+    position = -1
+    for match in re.finditer(pattern, name.lower()):
+        position = match.start(1)
+    return position
+
+
+def PATH_CELLS_BY_MAIN(path_report, parser_state, TimingParamsLookupTable):
+    """Which MAIN, and which instance inside it, each name on a timing path
+    belongs to.
+
+    Returns {main inst: {"start": owner or None, "end": owner or None,
+    "cells": [(name, owner inst or None)]}} for the names that start with a
+    MAIN's entity name plus "/" (Vivado's hierarchical cell/net/pin names).
+    The owner is the deepest instance whose label path prefixes the name;
+    None when the name continues into hierarchy that was not recognized
+    (more than a cell plus a pin below the last matched instance), so the
+    caller cannot claim to know where it is. Names in other tools' formats
+    match no MAIN and are left out: an empty result means "no hierarchy
+    evidence", never "nothing on this path"."""
+    names = []
+    for name in [path_report.start_reg_name, path_report.end_reg_name] + sorted(
+        getattr(path_report, "netlist_resources", None) or ()
+    ):
+        if name is not None and name not in names:
+            names.append(name)
+    if not names:
+        return {}
+    prefixes = {}
+    for main_inst in parser_state.main_mhz:
+        entity = VHDL.GET_ENTITY_NAME(
+            main_inst,
+            parser_state.LogicInstLookupTable[main_inst],
+            TimingParamsLookupTable,
+            parser_state,
+        )
+        prefixes[entity.lower() + "/"] = main_inst
+    tries = _VHDL_INSTANCE_TRIE(parser_state)
+    by_main = {}
+    for name in names:
+        lower = name.lower()
+        main_inst = next((m for p, m in prefixes.items() if lower.startswith(p)), None)
+        if main_inst is None:
+            continue
+        node = tries.get(main_inst, {})
+        owner = main_inst
+        rest = lower.split("/")[1:]
+        consumed = 0
+        for label in rest:
+            child = node.get(label)
+            if child is None:
+                break
+            node = child
+            consumed += 1
+            owner = child.get(_PATH_TRIE_INST, owner)
+        if len(rest) - consumed > 2:
+            owner = None
+        row = by_main.setdefault(main_inst, {"start": None, "end": None, "cells": []})
+        if name == path_report.start_reg_name:
+            row["start"] = owner or main_inst
+        if name == path_report.end_reg_name:
+            row["end"] = owner or main_inst
+        row["cells"].append((name, owner))
+    return by_main
+
+
+def PATH_ENDS_IN_MAIN(path_report, main_inst, parser_state, TimingParamsLookupTable):
+    """True if a path's start and end registers are both inside main_inst's
+    entity: named under its instance, as GET_MAIN_INSTS_FROM_PATH_REPORT
+    matches them, in any case (OPEN_TOOLS reports lower case) and also when
+    a flattening tool prefixes the hierarchy (sky130 STA:
+    `$flatten\\rx_fifo_0clk_d60bc461.\\fifo_hardware_...`)."""
+    if path_report.start_reg_name is None or path_report.end_reg_name is None:
+        return False
+    return NAME_IN_MAIN(
+        path_report.start_reg_name, main_inst, parser_state, TimingParamsLookupTable
+    ) and NAME_IN_MAIN(
+        path_report.end_reg_name, main_inst, parser_state, TimingParamsLookupTable
+    )
+
+
+def NAME_IN_MAIN(name, main_inst, parser_state, TimingParamsLookupTable):
+    """True if a timing report's cell name is inside main_inst's entity
+    (PATH_ENDS_IN_MAIN's test for one end)."""
+    if name is None:
+        return False
+    entity = VHDL.GET_ENTITY_NAME(
+        main_inst,
+        parser_state.LogicInstLookupTable[main_inst],
+        TimingParamsLookupTable,
+        parser_state,
+    ).lower()
+    return _PATH_HIERARCHY(name).startswith(entity)
+
+
+def _PATH_HIERARCHY(name):
+    """A timing report's cell name, lower case, without a flattening tool's
+    `$flatten\\` prefix: what PATH_ENDS_IN_MAIN and PATH_ENDS_IN_INSTANCE
+    compare names against."""
+    name = name.lower()
+    if name.startswith("$flatten"):
+        name = name[len("$flatten") :]
+    return name.lstrip("\\")
+
+
+def PATH_ENDS_IN_INSTANCE(path_report, label):
+    """True if a path's start and end registers are both inside the
+    top-level instance `label` (a clk_cross entity's instance, labeled with
+    its crossing's name): each name is the label followed by a hierarchy
+    separator, in any case and through a flattening prefix, as
+    PATH_ENDS_IN_MAIN reads them. A longer name that only starts with the
+    label (the MAIN rx_FIFO_wr beside the crossing rx_FIFO) is not inside it."""
+    if path_report.start_reg_name is None or path_report.end_reg_name is None:
+        return False
+    return NAME_IN_INSTANCE(path_report.start_reg_name, label) and NAME_IN_INSTANCE(
+        path_report.end_reg_name, label
+    )
+
+
+def NAME_IN_INSTANCE(name, label):
+    """True if a timing report's cell name is inside the top-level instance
+    `label` (PATH_ENDS_IN_INSTANCE's test for one end)."""
+    if name is None:
+        return False
+    name = _PATH_HIERARCHY(name)
+    label = label.lower()
+    return (
+        name.startswith(label)
+        and len(name) > len(label)
+        and not (name[len(label)].isalnum() or name[len(label)] == "_")
+    )
+
+
+def GET_MAIN_INSTS_FROM_PATH_REPORT(path_report, parser_state, TimingParamsLookupTable):
+    main_insts = set()
+    if path_report.start_reg_name is None:
+        return main_insts
+    if path_report.end_reg_name is None:
+        return main_insts
+    all_main_insts = list(reversed(sorted(list(parser_state.main_mhz.keys()), key=len)))
+    # Try to go off of just start and end registers being in single top level main
+    start_reg_main = None
+    end_reg_main = None
+    for main_inst in all_main_insts:
+        main_logic = parser_state.LogicInstLookupTable[main_inst]
+        main_vhdl_entity_name = VHDL.GET_ENTITY_NAME(
+            main_inst,
+            main_logic,
+            TimingParamsLookupTable,
+            parser_state,
+        )
+        # OPEN_TOOLs reports in lower case
+        if path_report.start_reg_name.lower().startswith(main_vhdl_entity_name.lower()):
+            start_reg_main = main_inst
+        if path_report.end_reg_name.lower().startswith(main_vhdl_entity_name.lower()):
+            end_reg_main = main_inst
+        if start_reg_main == end_reg_main and start_reg_main is not None:
+            main_insts.add(start_reg_main)
+
+    # If nothing was found try hacky netlist resource check?
+    # if len(main_insts) == 0:
+    # Include start and end regs in search
+    all_netlist_resources = set(path_report.netlist_resources)
+    all_netlist_resources.add(path_report.start_reg_name)
+    all_netlist_resources.add(path_report.end_reg_name)
+    for netlist_resource in all_netlist_resources:
+        # toks = netlist_resource.split("/")
+        # if toks[0] in parser_state.main_mhz:
+        #  main_inst_funcs.add(toks[0])
+        # If in the top level - no '/'? then look for main funcs like a dummy
+        # if "/" not in netlist_resource:
+        # Main funcs sorted by len for best match
+        match_main = None
+        # print("netlist_resource",netlist_resource)
+        for main_inst in all_main_insts:
+            main_logic = parser_state.LogicInstLookupTable[main_inst]
+            main_vhdl_entity_name = VHDL.GET_ENTITY_NAME(
+                main_inst,
+                main_logic,
+                TimingParamsLookupTable,
+                parser_state,
+            )
+            # print(main_vhdl_entity_name,"?")
+            # OPEN_TOOLs reports in lower case
+            if netlist_resource.lower().startswith(main_vhdl_entity_name.lower()):
+                match_main = main_inst
+                break
+        if match_main:
+            main_insts.add(match_main)
+
+    # If nothing was found try hacky clock cross check?
+    # if len(main_insts) == 0:
+    # print("No mains form path reportS?")
+    start_inst = path_report.start_reg_name.split("/")[0]
+    end_inst = path_report.end_reg_name.split("/")[0]
+    # print(start_inst,end_inst)
+    if (start_inst in parser_state.clk_cross_var_info) and (
+        end_inst in parser_state.clk_cross_var_info
+    ):
+        start_info = parser_state.clk_cross_var_info[start_inst]
+        end_info = parser_state.clk_cross_var_info[end_inst]
+        # Start read and end write must be same main
+        start_write_mains, start_read_mains = start_info.write_read_main_funcs
+        end_write_mains, end_read_mains = end_info.write_read_main_funcs
+        # print(start_read_main,end_write_main)
+        in_both_mains = start_read_mains & end_write_mains
+        if len(in_both_mains) > 0:
+            main_insts |= in_both_mains
+
+    return main_insts
+
+
+def GET_REGISTERS_ESTIMATE_TEXT_AND_FFS(
+    logic, inst_name, parser_state, TimingParamsLookupTable, ff_est_cache
+):
+    import AUTO_PIPELINE
+
+    timing_params = TimingParamsLookupTable[inst_name]
+    hash_ext = timing_params.GET_HASH_EXT(TimingParamsLookupTable, parser_state)
+
+    cache_key = (logic.func_name, hash_ext)
+    if cache_key in ff_est_cache:
+        cache_text, cache_ffs = ff_est_cache[cache_key]
+        return cache_text, cache_ffs
+
+    total_ffs = 0
+    text = f"Function: {LOGIC.LEAF_NAME(inst_name)} ({logic.func_name})\n"
+
+    input_ffs = 0
+    inputs_text = ""
+    for input_port in logic.inputs:
+        input_type = logic.wire_to_c_type[input_port]
+        inputs_text += input_type + " " + input_port + ","
+        input_bits = VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(input_type, parser_state)
+        input_ffs += input_bits
+    inputs_text += "\n"
+    if timing_params._has_input_regs:
+        text += f"  {input_ffs} Input FFs: " + inputs_text
+        total_ffs += input_ffs
+
+    output_ffs = 0
+    outputs_text = ""
+    for output_port in logic.outputs:
+        output_type = logic.wire_to_c_type[output_port]
+        outputs_text += output_type + " " + output_port + ","
+        output_bits = VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(output_type, parser_state)
+        output_ffs += output_bits
+    outputs_text += "\n"
+    if timing_params._has_output_regs:
+        text += f"  {output_ffs} Output FFs: " + outputs_text
+        total_ffs += output_ffs
+
+    if len(logic.state_regs) > 0:
+        state_reg_ffs = 0
+        state_regs_text = ""
+        for state_reg_name in logic.state_regs:
+            var_info = logic.state_regs[state_reg_name]
+            state_reg_type = var_info.type_name
+            state_regs_text += state_reg_type + " " + state_reg_name + ","
+            state_reg_bits = VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(
+                state_reg_type, parser_state
+            )
+            state_reg_ffs += state_reg_bits
+        state_regs_text += "\n"
+        text += f"  {state_reg_ffs} State Register FFs: " + state_regs_text
+        total_ffs += state_reg_ffs
+
+    latency = timing_params.GET_TOTAL_LATENCY(parser_state, TimingParamsLookupTable)
+    if latency > 0:
+        if LOGIC.LOGIC_IS_RAW_HDL(logic, parser_state) or FUNC_IS_PRIMITIVE(
+            logic.func_name, parser_state
+        ):
+            # Raw vhdl estimate func of N bits input -> M bits output as using
+            # (N+M)/2 bits per pipeline stage
+            avg_regs = int((input_ffs + output_ffs) / 2)
+            # raw_hdl_ffs = avg_regs * (latency)
+            # text += f"  {avg_regs} average width * {latency} pipeline register stages = ~ {raw_hdl_ffs} FFs\n"
+            raw_hdl_ffs = avg_regs
+            text += f"  ~ {avg_regs} average bit width = ~ {raw_hdl_ffs} FFs\n"
+            total_ffs += raw_hdl_ffs
+        else:
+            # use range size from PiplineHDLParams to get regs for each wire
+            # do per stage - how many regs from wires in each stage
+            pipeline_map = AUTO_PIPELINE.GET_PIPELINE_MAP(
+                inst_name, logic, parser_state, TimingParamsLookupTable
+            )
+            pipeline_hdl_params = AUTO_PIPELINE.PiplineHDLParams(
+                inst_name, logic, parser_state, TimingParamsLookupTable, pipeline_map
+            )
+            pipeline_ffs = 0
+            pipeline_text = ""
+            for stage in range(0, latency):  # Last stage never has regs, dont print
+                stage_ffs = 0
+                stage_wires_text = ""
+                for wire in pipeline_hdl_params.wires_to_decl:
+                    (
+                        wire_start_stage,
+                        wire_end_stage,
+                    ) = pipeline_hdl_params.wire_to_reg_stage_start_end[wire]
+                    if wire_start_stage is None or wire_end_stage is None:
+                        continue
+                    if stage in range(wire_start_stage, wire_end_stage + 1):
+                        wire_type = logic.wire_to_c_type[wire]
+                        wire_ffs = VHDL.C_TYPE_STR_TO_VHDL_SLV_LEN_NUM(
+                            wire_type, parser_state
+                        )
+                        stage_ffs += wire_ffs
+                        stage_wires_text += f"{wire_type}({wire_ffs} bits) {wire}, "
+                stage_text = (
+                    "    "
+                    + f"{stage_ffs} FFs for stage {stage}: "
+                    + stage_wires_text
+                    + "\n"
+                )
+                pipeline_text += stage_text
+                pipeline_ffs += stage_ffs
+            text += f"  {pipeline_ffs} FFs for {latency+1} auto-pipeline stages:\n"
+            text += pipeline_text
+            total_ffs += pipeline_ffs
+
+    sub_mod_reg_ffs = 0
+    sub_mod_regs_text = ""
+    for sub_inst in logic.submodule_instances:
+        sub_func_name = logic.submodule_instances[sub_inst]
+        sub_logic = parser_state.FuncLogicLookupTable[sub_func_name]
+        sub_full_inst = inst_name + LOGIC.SUBMODULE_MARKER + sub_inst
+        sub_inst_text, sub_inst_ffs = GET_REGISTERS_ESTIMATE_TEXT_AND_FFS(
+            sub_logic,
+            sub_full_inst,
+            parser_state,
+            TimingParamsLookupTable,
+            ff_est_cache,
+        )
+        sub_inst_text = sub_inst_text.strip("\n")
+        if sub_inst_ffs > 0:
+            for sub_inst_text_line in sub_inst_text.split("\n"):
+                sub_mod_regs_text += "    " + sub_inst_text_line + "\n"
+            # sub_mod_regs_text = sub_mod_regs_text.strip("\n")
+        sub_mod_reg_ffs += sub_inst_ffs
+    # sub_mod_regs_text += "\n"
+    if sub_mod_reg_ffs > 0:
+        text += f"  {sub_mod_reg_ffs} total submodule FFs: \n"
+        text += sub_mod_regs_text
+        total_ffs += sub_mod_reg_ffs
+
+    text = f"{total_ffs} FFs " + text
+
+    ff_est_cache[cache_key] = (text, total_ffs)
+    return text, total_ffs
+
+
+def WRITE_REGISTERS_ESTIMATE_FILE(
+    parser_state, multimain_timing_params_or_TimingParamsLookupTable, inst_name=None
+):
+    if inst_name is None:
+        # Multi main
+        multimain_timing_params = multimain_timing_params_or_TimingParamsLookupTable
+        TimingParamsLookupTable = multimain_timing_params.TimingParamsLookupTable
+        hash_ext = multimain_timing_params.GET_HASH_EXT(parser_state)
+        output_dir = SYN_OUTPUT_DIRECTORY + "/" + TOP_LEVEL_MODULE
+        output_file = output_dir + "/" + TOP_LEVEL_MODULE + hash_ext + "_registers.log"
+    else:
+        # Specific inst
+        TimingParamsLookupTable = multimain_timing_params_or_TimingParamsLookupTable
+        logic = parser_state.LogicInstLookupTable[inst_name]
+        # Prim pipelines dont have reg estimates
+        if FUNC_IS_PRIMITIVE(logic.func_name, parser_state):
+            return
+        output_dir = GET_OUTPUT_DIRECTORY(logic)
+        timing_params = TimingParamsLookupTable[inst_name]
+        hash_ext = timing_params.GET_HASH_EXT(TimingParamsLookupTable, parser_state)
+        latency = timing_params.GET_TOTAL_LATENCY(parser_state, TimingParamsLookupTable)
+        output_file = (
+            output_dir
+            + "/"
+            + f"{logic.func_name}_{latency}CLK"
+            + hash_ext
+            + "_registers.log"
+        )
+
+    # Start cache of info for recursive process
+    ff_est_cache = {}
+
+    # For each main func write text
+    text = ""
+    main_ffs = {}
+    for main_func in parser_state.main_mhz:
+        main_logic = parser_state.LogicInstLookupTable[main_func]
+        main_func_text, main_func_ffs = GET_REGISTERS_ESTIMATE_TEXT_AND_FFS(
+            main_logic, main_func, parser_state, TimingParamsLookupTable, ff_est_cache
+        )
+        main_ffs[main_func] = main_func_ffs
+        text += main_func_text
+        text += "\n"
+
+    if inst_name is None:
+        multimain_timing_params.sweep_main_ffs = main_ffs
+
+    print(f"Estimated register usage: {output_file}")
+    f = open(output_file, "w")
+    f.write(text)
+    f.close()
+
+
+def GET_ESTIMATED_COMBINATIONAL_AREA(logic, parser_state, area_memo=None):
+    """Sum of cached leaf areas (SYN.GET_CACHED_LEAF_AREA) across logic's
+    full instance hierarchy, one term per call site -- the combinational
+    counterpart to GET_REGISTERS_ESTIMATE_TEXT_AND_FFS's sequential walk.
+    Every non-shared call site becomes its own hardware instance, so a leaf
+    used N times contributes N times its area, exactly like the FF walk
+    counts every instance's own registers. A function a synthesis run
+    measured -- this build's, or an earlier run of its exact inputs -- counts
+    that measured area instead of its leaves' sum, and an uncached leaf its own
+    measured area (MEASURED_AREA).
+
+    Returns (area, unit, missing_leaf_func_names). A leaf with no cached
+    area contributes 0.0 and its func_name to the missing set rather than
+    triggering synthesis here -- see ADD_PATH_DELAY_TO_LOOKUP's forced
+    remeasure clause for where cache/area actually gets filled in. The
+    exception is a leaf LOGIC_IS_ZERO_DELAY already excludes from synthesis
+    entirely (bit-manip/concat/const-ref wiring, black boxes, ...): it
+    correctly has no cache/area entry because nothing ever measured it, so
+    it contributes 0.0 without being counted as missing.
+
+    Genuinely combinational as of AREA_MODEL_VERSION 2: GET_CACHED_LEAF_AREA
+    reads combinational_cell_area, not total_cell_area, so a leaf's own
+    dont_touch STA harness registers (VHDL.WRITE_LOGIC_TOP) are excluded. A
+    v1 cache mixed them in, which is why ESTIMATE_DESIGN_AREA used to
+    double-count sequential area between this term and its own FF term.
+    """
+    area_memo = {} if area_memo is None else area_memo
+    hit = area_memo.get(logic.func_name)
+    if hit is not None:
+        return hit
+    unit = DEVICE_MODELS.AREA_UNIT if SYN_TOOL is DEVICE_MODELS else None
+    area_memo[logic.func_name] = (0.0, unit, frozenset())  # cycle guard
+    if not logic.submodule_instances:
+        if LOGIC_IS_ZERO_DELAY(logic, parser_state, allow_none_delay=True):
+            result = (0.0, unit, frozenset())
+        else:
+            cached = GET_CACHED_LEAF_AREA(logic, parser_state)
+            if cached is None:
+                cached = MEASURED_AREA(logic, parser_state)
+            if cached is None:
+                result = (0.0, unit, frozenset({logic.func_name}))
+            else:
+                value, cached_unit = cached
+                result = (value, cached_unit, frozenset())
+    elif (measured := MEASURED_AREA(logic, parser_state)) is not None:
+        result = (measured[0], measured[1], frozenset())
+    else:
+        total = 0.0
+        missing = set()
+        for sub_func_name in logic.submodule_instances.values():
+            sub_logic = parser_state.FuncLogicLookupTable[sub_func_name]
+            sub_area, sub_unit, sub_missing = GET_ESTIMATED_COMBINATIONAL_AREA(
+                sub_logic, parser_state, area_memo
+            )
+            total += sub_area
+            missing |= sub_missing
+            unit = sub_unit or unit
+        result = (total, unit, frozenset(missing))
+    area_memo[logic.func_name] = result
+    return result
+
+
+def ESTIMATE_DESIGN_AREA(
+    parser_state, multimain_timing_params_or_TimingParamsLookupTable, inst_name=None
+):
+    """Whole-design area estimate: cached leaf areas summed across the
+    instance hierarchy (combinational) plus PipelineC's own already-computed
+    FF count times one flip-flop's real cell area (sequential). Pure
+    computation, no synthesis triggered -- see GET_ESTIMATED_COMBINATIONAL_AREA.
+    Same dual multimain/single-inst calling convention as
+    GET_REGISTERS_ESTIMATE_TEXT_AND_FFS/WRITE_REGISTERS_ESTIMATE_FILE.
+    """
+    if inst_name is None:
+        multimain_timing_params = multimain_timing_params_or_TimingParamsLookupTable
+        TimingParamsLookupTable = multimain_timing_params.TimingParamsLookupTable
+        mains = [
+            (parser_state.LogicInstLookupTable[main_func], main_func)
+            for main_func in parser_state.main_mhz
+        ]
+    else:
+        TimingParamsLookupTable = multimain_timing_params_or_TimingParamsLookupTable
+        mains = [(parser_state.LogicInstLookupTable[inst_name], inst_name)]
+
+    unit = None
+    dff_area = 0.0
+    if SYN_TOOL is DEVICE_MODELS:
+        dff_area, unit = DEVICE_MODELS.GET_SEQUENTIAL_CELL_AREA()
+
+    area_memo = {}
+    ff_est_cache = {}
+    combinational_area = 0.0
+    total_ffs = 0
+    missing_leaf_funcs = set()
+    for logic, full_inst_name in mains:
+        comb_area, comb_unit, missing = GET_ESTIMATED_COMBINATIONAL_AREA(
+            logic, parser_state, area_memo
+        )
+        combinational_area += comb_area
+        missing_leaf_funcs |= missing
+        unit = comb_unit or unit
+        _text, main_ffs = GET_REGISTERS_ESTIMATE_TEXT_AND_FFS(
+            logic, full_inst_name, parser_state, TimingParamsLookupTable, ff_est_cache
+        )
+        total_ffs += main_ffs
+
+    sequential_area = total_ffs * dff_area
+    return {
+        "total_area": combinational_area + sequential_area,
+        "combinational_area": combinational_area,
+        "sequential_area": sequential_area,
+        "n_ffs": total_ffs,
+        "area_unit": unit,
+        "missing_leaf_area_funcs": sorted(missing_leaf_funcs),
+    }
+
+
+def WRITE_AREA_ESTIMATE_FILE(
+    parser_state, multimain_timing_params_or_TimingParamsLookupTable, inst_name=None
+):
+    """Print + JSON sidecar for ESTIMATE_DESIGN_AREA, written beside the
+    matching _registers.log (see WRITE_REGISTERS_ESTIMATE_FILE, same output
+    path convention with _area.json in place of _registers.log). No-op for
+    any SYN_TOOL other than DEVICE_MODELS -- area is a sky130-only estimate
+    today, and every non-DEVICE_MODELS tool's leaf area cache is empty by
+    construction (SYN.GET_AREA_CACHE_DIR returns None for them).
+    """
+    if SYN_TOOL is not DEVICE_MODELS:
+        return
+    if inst_name is None:
+        multimain_timing_params = multimain_timing_params_or_TimingParamsLookupTable
+        hash_ext = multimain_timing_params.GET_HASH_EXT(parser_state)
+        output_dir = SYN_OUTPUT_DIRECTORY + "/" + TOP_LEVEL_MODULE
+        output_file = output_dir + "/" + TOP_LEVEL_MODULE + hash_ext + "_area.json"
+    else:
+        TimingParamsLookupTable = multimain_timing_params_or_TimingParamsLookupTable
+        logic = parser_state.LogicInstLookupTable[inst_name]
+        if FUNC_IS_PRIMITIVE(logic.func_name, parser_state):
+            return
+        output_dir = GET_OUTPUT_DIRECTORY(logic)
+        timing_params = TimingParamsLookupTable[inst_name]
+        hash_ext = timing_params.GET_HASH_EXT(TimingParamsLookupTable, parser_state)
+        latency = timing_params.GET_TOTAL_LATENCY(parser_state, TimingParamsLookupTable)
+        output_file = (
+            output_dir
+            + "/"
+            + f"{logic.func_name}_{latency}CLK"
+            + hash_ext
+            + "_area.json"
+        )
+
+    result = ESTIMATE_DESIGN_AREA(
+        parser_state, multimain_timing_params_or_TimingParamsLookupTable, inst_name
+    )
+    unit = result["area_unit"] or DEVICE_MODELS.AREA_UNIT
+    missing_note = (
+        f", {len(result['missing_leaf_area_funcs'])} leaf area(s) not yet cached"
+        if result["missing_leaf_area_funcs"]
+        else ""
+    )
+    print(
+        f"Estimated area: {result['total_area']:.1f} {unit} "
+        f"(comb {result['combinational_area']:.1f} + regs {result['sequential_area']:.1f}, "
+        f"{result['n_ffs']} FFs){missing_note} [estimate, pre-PnR]"
+    )
+    with open(output_file, "w") as f:
+        json.dump(dict(result, schema_version=1), f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def PRINT_MEASURED_AREA_IF_AVAILABLE(timing_report, estimated_total_area=None):
+    """After a real whole-design confirmation synthesis (only DEVICE_MODELS
+    ever populates this -- see DEVICE_MODELS._run_synth_and_sta, which
+    measures area as a free byproduct of the same mapped netlist it already
+    STAs), print the exact measured area once. One number for the whole
+    design regardless of how many clock groups were reported, since they all
+    come from the same single mapped netlist.
+    """
+    for path_report in timing_report.path_reports.values():
+        area = getattr(path_report, "total_cell_area", None)
+        unit = getattr(path_report, "area_unit", None)
+        if area is None or unit is None:
+            return
+        delta_note = ""
+        if estimated_total_area:
+            delta_pct = (estimated_total_area - area) / area * 100.0
+            delta_note = f" (estimate {delta_pct:+.2f}%)"
+        print(f"Measured area: {area:.1f} {unit}{delta_note}", flush=True)
+        return
+
+
+def GENERATE_FINAL_BITSTREAM(parser_state, multimain_timing_params):
+    print("================== Generating Bitstream ==================", flush=True)
+    generate_bitstream = getattr(SYN_TOOL, "GENERATE_BITSTREAM", None)
+    if generate_bitstream is not None:
+        return generate_bitstream(parser_state, multimain_timing_params)
+    # Backends without an explicit bitstream hook keep the historical path.
+    return SYN_TOOL.SYN_AND_REPORT_TIMING(
+        None,
+        None,
+        parser_state,
+        multimain_timing_params.TimingParamsLookupTable,
+        is_final_top=True,
+    )
+
+
+# Not because it is easy, but because we thought it would be easy
+
+# Do I like Joe Walsh?
+
+
+def RUN_INST_SYN_AND_UPDATE_CACHE(
+    inst_name, logic, inst_sweep_state, parser_state, TimingParamsLookupTable
+):
+    import AUTO_PIPELINE
+
+    # Run syn on multi main top
+    timing_params = TimingParamsLookupTable[inst_name]
+    latency = timing_params.GET_TOTAL_LATENCY(parser_state, TimingParamsLookupTable)
+    print(
+        "Synthesizing",
+        logic.func_name,
+        ":",
+        latency,
+        "clocks total latency...",
+        len(timing_params._slices),
+        "slices...",
+        flush=True,
+    )
+    print(f"Elapsed time: {ELAPSED_STR()}...", flush=True)
+    inst_sweep_state.timing_report = SYN_TOOL.SYN_AND_REPORT_TIMING(
+        inst_name, logic, parser_state, TimingParamsLookupTable
+    )
+
+    # Write pipeline delay cache
+    AUTO_PIPELINE.UPDATE_PIPELINE_MIN_PERIOD_CACHE(
+        inst_sweep_state.timing_report,
+        TimingParamsLookupTable,
+        parser_state,
+        inst_name,
+    )
+
+
+def GET_OUTPUT_DIRECTORY(Logic):
+    if Logic.is_c_built_in or Logic.ast_meta is None:
+        output_directory = (
+            SYN_OUTPUT_DIRECTORY + "/" + "built_in" + "/" + Logic.func_name
+        )
+    elif LOGIC.IS_BIT_MANIP(Logic):
+        output_directory = (
+            SYN_OUTPUT_DIRECTORY
+            + "/"
+            + LOGIC.BIT_MANIP_HEADER_FILE
+            + "/"
+            + Logic.func_name
+        )
+    elif LOGIC.IS_MEM(Logic):
+        output_directory = (
+            SYN_OUTPUT_DIRECTORY + "/" + LOGIC.MEM_HEADER_FILE + "/" + Logic.func_name
+        )
+    elif LOGIC.IS_BIT_MATH(Logic):
+        output_directory = (
+            SYN_OUTPUT_DIRECTORY
+            + "/"
+            + LOGIC.BIT_MATH_HEADER_FILE
+            + "/"
+            + Logic.func_name
+        )
+    else:
+        # Use source file if not built in?
+        # print("Logic.func_name", Logic.func_name)
+        src_file = Logic.ast_meta.src_file
+        # # hacky catch files from same dir as script?
+        # ex src file = /media/1TB/Dropbox/PipelineC/git/PipelineC/src/../axis.h
+        repo_dir = REPO_ABS_DIR()
+        if src_file.startswith(repo_dir + "/"):
+            # hacky
+            src_file = src_file.replace(repo_dir + "/src/../", "")
+            src_file = src_file.replace(repo_dir + "/", "")
+            output_directory = (
+                SYN_OUTPUT_DIRECTORY + "/" + src_file + "/" + Logic.func_name
+            )
+        # hacky catch generated files from output dir already?
+        elif src_file.startswith(SYN_OUTPUT_DIRECTORY + "/"):
+            output_directory = os.path.dirname(src_file)
+        else:
+            # Otherwise normal
+            # output_directory = SYN_OUTPUT_DIRECTORY + "/" + src_file + "/" + Logic.func_name
+            # print("output_directory",output_directory,repo_dir)
+            # Func uniquely identifies logic so just use that?
+            output_directory = SYN_OUTPUT_DIRECTORY + "/" + Logic.func_name
+
+    if output_directory.endswith("/" + Logic.func_name):
+        output_directory = output_directory[
+            : -len(Logic.func_name)
+        ] + VHDL.EMITTED_NAME(Logic.func_name, Logic)
+    return output_directory
+
+
+def LOGIC_IS_ZERO_DELAY(logic, parser_state, allow_none_delay=False):
+    if logic.func_name in parser_state.func_marked_wires:
+        return True
+    # Black boxes have no known delay to the tool
+    elif logic.func_name in parser_state.func_marked_blackbox:
+        return True
+    elif LOGIC.IS_BIT_MANIP(logic):
+        return True
+    elif logic.is_clock_crossing:
+        return True  # For now? How to handle paths through clock cross logic?
+    elif logic.func_name.startswith(LOGIC.CONST_REF_RD_FUNC_NAME_PREFIX):
+        return True
+    elif logic.func_name.startswith(
+        LOGIC.CONST_PREFIX + LOGIC.BIN_OP_SL_NAME
+    ) or logic.func_name.startswith(
+        LOGIC.CONST_PREFIX + LOGIC.BIN_OP_SR_NAME
+    ):
+        return True
+    elif logic.vhdl_module_text is not None:
+        return False  # No idea what user has in there
+    elif logic.is_vhdl_func or logic.is_vhdl_expr:
+        return True
+    elif (
+        logic.func_name in getattr(parser_state, "func_fixed_latency", {})
+        and not logic.is_c_built_in
+        and not logic.submodule_instances
+    ):
+        # A user pipeline consisting only of wire assignments and registers
+        # has no combinational operators to time. In particular PYRTL's
+        # zero-FF-overhead timing model cannot divide by this zero path delay.
+        return True
+    elif (
+        not logic.is_c_built_in
+        and not logic.submodule_instances
+        and not logic.state_regs
+    ):
+        # Every operator is a submodule, so a stateless user function with
+        # none is only wiring. Timing it would just measure the backend's
+        # floor, which the planner then tries to cut. (Exception: a C
+        # float-format conversion is inline VHDL logic, issue #376.)
+        return True
+    elif logic.is_c_built_in and LOGIC.IS_SIM_CTRL_FUNC_NAME(logic.func_name):
+        # printf/sim_print, sim_assert, and sim_finish submodules are all void,
+        # simulation-console-facing builtins with no real output to measure a delay
+        # to -- without this, sim_assert_.../sim_finish_... fall through to the
+        # `else` branch below and get fed to real synthesis for pre-pipelining path
+        # delay measurement, which produces an all-zero utilization report (nothing
+        # to synthesize) that VIVADO.py's ParsedTimingReport then rejects as a "Bad
+        # synthesis log?" instead of the zero-delay short-circuit sim_print already got.
+        return True
+    elif (SYN_TOOL is GOWIN) and logic.func_name.startswith(
+        f"{LOGIC.UNARY_OP_LOGIC_NAME_PREFIX}_{LOGIC.UNARY_OP_NOT_NAME}_"
+    ):
+        # for some reason, GowinSynthesis (GOWIN EDA version 1.9.9.01)
+        # fails to generate timing reports for this particular setup, so we skip it
+        return True
+    else:
+        # Maybe all submodules are zero delay?
+        if len(logic.submodule_instances) > 0:
+            for submodule_inst in logic.submodule_instances:
+                submodule_func_name = logic.submodule_instances[submodule_inst]
+                submodule_logic = parser_state.FuncLogicLookupTable[submodule_func_name]
+                if submodule_logic.delay is None:
+                    # A delay walk may not have visited this child yet, but it can
+                    # still be intrinsically zero-delay (for example CONST_REF_RD).
+                    if LOGIC_IS_ZERO_DELAY(
+                        submodule_logic, parser_state, allow_none_delay=True
+                    ):
+                        continue
+                    if allow_none_delay:
+                        return False
+                    else:
+                        raise Exception("Wtf none to check delay?")
+                if submodule_logic.delay > 0 or submodule_logic.delay_is_estimated:
+                    # Zero estimated width (e.g. opaque text) is not proof of
+                    # zero delay. Keep its ancestors estimated so fallback can
+                    # propagate a later measurement through zero-only wrappers.
+                    return False
+            return True
+
+    return False
+
+
+def IS_USER_CODE(logic, parser_state):
+    # Check logic.is_built_in
+    # or autogenerated code
+
+    user_code = not logic.is_c_built_in and not LOGIC.IS_AUTO_GENERATED(logic)
+
+    # GAH NEED TO CHECK input and output TYPES
+    # AND ALL INNNER WIRES TOO!
+    all_types = []
+    for input_port in logic.inputs:
+        all_types.append(logic.wire_to_c_type[input_port])
+    for wire in logic.wires:
+        all_types.append(logic.wire_to_c_type[wire])
+    for output_port in logic.outputs:
+        all_types.append(logic.wire_to_c_type[output_port])
+    all_types = list(set(all_types))
+
+    # Becomes user code if using struct or array of structs
+    # For now???? fuck me
+    for c_type in all_types:
+        is_user = LOGIC.C_TYPE_IS_USER_TYPE(c_type, parser_state)
+        if is_user:
+            user_code = True
+            break
+    # print "?? USER? logic.func_name:",logic.func_name, user_code
+
+    return user_code
+
+
+def GET_CACHE_ROOT_DIR():
+    """Root of the committed measurement cache tree: cache/delay, cache/area.
+
+    One env override for the whole tree -- the subtrees are siblings under it
+    (see GET_PATH_DELAY_CACHE_DIR / GET_AREA_CACHE_DIR), never independently
+    relocatable, so a build can never read delay from one tree and area from
+    another.
+    """
+    return os.environ.get(
+        "PYPELINEC_CACHE_DIR", EXE_ABS_DIR() + "/../cache/"
+    )
+
+
+# Windows forbids these in a path component. `:` is the live case: Gowin parts
+# are spelled PART:DEVICE_VERSION (GOWIN.py splits on it) and a committed
+# cache/delay/gowin/<part> dir named that way broke every Windows checkout
+# (PR #298). `/` would silently nest directories (a Gowin tool grade like C8/I7).
+_UNSAFE_PATH_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+
+
+def PART_CACHE_DIR_NAME(part):
+    """The part as one filesystem-safe path component (cache dirs only).
+
+    The part string itself keeps its spelling everywhere else -- tools parse
+    it (GOWIN.py splits PART:DEVICE_VERSION on the colon) -- only the directory
+    it is cached under is sanitized.
+    """
+    return _UNSAFE_PATH_CHARS_RE.sub("_", part)
+
+
+def GET_PATH_DELAY_CACHE_DIR(parser_state, dir_name="delay"):
+    cache_dir = os.path.join(GET_CACHE_ROOT_DIR(), dir_name)
+    PATH_DELAY_CACHE_DIR = os.path.join(cache_dir, str(SYN_TOOL.__name__).lower())
+    if SYN_TOOL is PYRTL:
+        PATH_DELAY_CACHE_DIR += (
+            "_" + str(PYRTL.TECH_IN_NM) + "nm" + "_" + str(PYRTL.FF_OVERHEAD) + "ff"
+        )
+    if SYN_TOOL is DEVICE_MODELS:
+        PATH_DELAY_CACHE_DIR += (
+            "_" + DEVICE_MODELS.SELECTED_LIBRARY
+            + "_" + DEVICE_MODELS.SELECTED_CORNER
+            + "_v" + str(DEVICE_MODELS.MODEL_VERSION)
+            + DEVICE_MODELS.GET_SYNTHESIS_RECIPE_CACHE_SUFFIX()
+        )
+    PATH_DELAY_CACHE_DIR += GET_PLANNER_DELAY_CACHE_SUFFIX()
+    # `part` disambiguates cache entries when the same SYN_TOOL/library/
+    # corner combo could still map to different physical parts (ex. PyRTL's
+    # tech node doesn't imply an FPGA part number). For DEVICE_MODELS the
+    # part carries no information the library+corner above doesn't already
+    # encode -- the part string is only ever a *selector* that routes to this
+    # tool (PART_SET_TOOL matches any "sky130"-prefixed string), and the
+    # library/corner actually used comes from SELECTED_LIBRARY/SELECTED_CORNER
+    # regardless of how it was spelled. Appending it too would fragment one
+    # logical cache across a directory per spelling: PART("sky130") and
+    # PART("sky130_fd_sc_hvl") select the identical tool+library+corner but
+    # would look in ".../sky130/syn" and ".../syn" respectively, so a
+    # committed cache populated under one spelling silently misses under the
+    # other (real bug: PART("sky130") re-synthesized every already-cached
+    # leaf).
+    part_already_encoded = SYN_TOOL is DEVICE_MODELS
+    if parser_state.part is not None and not part_already_encoded:
+        PATH_DELAY_CACHE_DIR += "/" + PART_CACHE_DIR_NAME(parser_state.part)
+    if TOOL_DOES_PNR():
+        PATH_DELAY_CACHE_DIR += "/pnr"
+    else:
+        PATH_DELAY_CACHE_DIR += "/syn"
+    return PATH_DELAY_CACHE_DIR
+
+
+def GET_AREA_CACHE_DIR(parser_state, dir_name="area"):
+    """Leaf area cache directory, mirroring GET_PATH_DELAY_CACHE_DIR above.
+
+    Returns None for any SYN_TOOL that has no area source -- only
+    DEVICE_MODELS measures area today, unlike the delay cache which every
+    tool populates. Callers must check for None.
+
+    Keyed by DEVICE_MODELS.AREA_MODEL_VERSION, deliberately NOT
+    DEVICE_MODELS.MODEL_VERSION: leaf area depends only on which cells the
+    synthesis recipe maps to (a flat histogram sum, see
+    DEVICE_MODELS.MEASURE_NETLIST_AREA), not on run_sta()'s own STA physics.
+    A future STA-only MODEL_VERSION bump must not discard an
+    otherwise-still-valid committed cache/area, and vice versa.
+    """
+    if SYN_TOOL is not DEVICE_MODELS:
+        return None
+    cache_dir = os.path.join(GET_CACHE_ROOT_DIR(), dir_name)
+    AREA_CACHE_DIR = os.path.join(cache_dir, str(SYN_TOOL.__name__).lower())
+    AREA_CACHE_DIR += (
+        "_" + DEVICE_MODELS.SELECTED_LIBRARY
+        + "_" + DEVICE_MODELS.SELECTED_CORNER
+        + "_a" + str(DEVICE_MODELS.AREA_MODEL_VERSION)
+        + DEVICE_MODELS.GET_SYNTHESIS_RECIPE_CACHE_SUFFIX()
+    )
+    AREA_CACHE_DIR += "/syn"
+    return AREA_CACHE_DIR
+
+
+def LOGIC_IS_BUILT_IN_MUX(logic):
+    return logic.is_c_built_in and logic.func_name.startswith(
+        LOGIC.MUX_LOGIC_NAME
+    )
+
+
+def LOGIC_PATH_DELAY_IS_CACHEABLE(logic, parser_state):
+    """Measured built-in MUXes are reusable even when their packed data
+    type is user-defined.  Other user-code entities retain the existing
+    no-disk-cache policy.
+
+    Pypeline's operator library (include/pypeline/operators/: the soft
+    operators, AUTO_FSM's operand muxes) counts as user code here.
+    cache/delay is keyed by name, which an edited library would not
+    change. Their synthesis runs are reused by exact inputs instead
+    (REUSE_SYNTHESIS_LOG; --syn_cache across output directories)."""
+    return LOGIC_IS_BUILT_IN_MUX(logic) or not IS_USER_CODE(logic, parser_state)
+
+
+def CLAIM_MUX_PATH_DELAY_SYNTH_OWNER(
+    logic, parser_state, cache_key_to_owner
+):
+    """Claim one cold synthesis owner for a canonical packed-MUX key.
+
+    Returns ``(None, None)`` for non-MUX logic.  Equivalent typed MUXes get
+    the first claimant's function name so ADD_PATH_DELAY_TO_LOOKUP can share
+    its AsyncResult without launching a duplicate synthesis.
+    """
+    if not LOGIC_IS_BUILT_IN_MUX(logic):
+        return None, None
+    cache_key = GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+    owner = cache_key_to_owner.setdefault(cache_key, logic.func_name)
+    return cache_key, owner
+
+
+def _mux_cache_key_is_width_collapsed():
+    """True when a MUX's cache key collapses every width onto the bare "mux"
+    string. True for PYRTL (measured: 1.640ns at every width 1..64, with the
+    cache deleted -- not a caching artifact) and every tool that predates
+    MUX_DELAY_KEY_BY_WIDTH, false for DEVICE_MODELS -- a real per-cell model
+    is not necessarily flat, since a wider mux's select really does drive
+    more sinks inside its own entity. --mux_delay_by_width/
+    --no_mux_delay_by_width force either, for any tool, for A/B measurement.
+    """
+    by_width = MUX_DELAY_KEY_BY_WIDTH
+    if by_width is None:
+        by_width = SYN_TOOL is DEVICE_MODELS
+    return not by_width
+
+
+def GET_MUX_CACHE_KEY(width):
+    """The cache key one width's 2:1 mux bank is stored under -- the same
+    string GET_CACHED_LOGIC_FILE_KEY resolves a MUX Logic object to, from
+    just the width, for a caller pricing a mux bank with no Logic object in
+    hand. AUTO_FSM's operand multiplexers are that caller: ESTIMATE_SCHEDULE_
+    AREA prices one from (ctype, fold count) during scheduling, before any
+    MUX entity is ever built. Reconstructing this convention independently
+    (rather than calling through to it) is exactly how a caller would go
+    silently wrong under --no_mux_delay_by_width, where every width collapses
+    onto the bare "mux" key."""
+    if _mux_cache_key_is_width_collapsed():
+        return "mux"
+    return f"{LOGIC.MUX_LOGIC_NAME}_uint{width}_t"
+
+
+def GET_CACHED_LOGIC_FILE_KEY(logic, parser_state):
+    # Default sanity
+    key = logic.func_name
+
+    if LOGIC_IS_BUILT_IN_MUX(logic):
+        if _mux_cache_key_is_width_collapsed():
+            key = "mux"
+        else:
+            # A 2:1 MUX over any N-bit packed type is physically the same
+            # bank as MUX_uintN_t. Canonicalizing signed, float, enum, array,
+            # and struct names lets every representation share the existing
+            # integer cache.
+            width = RAW_VHDL.GET_MUX_DATA_WIDTH(logic, parser_state)
+            key = GET_MUX_CACHE_KEY(width)
+    else:
+        # MEM has var name - weird yo
+        if LOGIC.IS_MEM(logic):
+            key = LOGIC.GET_MEM_NAME(logic)
+
+        func_name_includes_types = LOGIC.FUNC_NAME_INCLUDES_TYPES(logic)
+        if not func_name_includes_types:
+            for input_port in logic.inputs:
+                c_type = logic.wire_to_c_type[input_port]
+                key += "_" + c_type
+    # Hard safety cap: this key becomes a filename with a suffix appended
+    # (".delay", ".timing.json"), so an unbounded number of input ports (each
+    # contributing its own, possibly already-near-cap, c_type name above)
+    # must never be allowed to exceed the filesystem's 255-byte filename
+    # limit. 235 leaves generous headroom under 255 for the longest suffix.
+    key = pypeline.collapse_overflow_name(key, logic.func_name, 235)
+    return key
+
+
+def GET_CACHED_PATH_DELAY_FILE_PATH(logic, parser_state):
+    key = GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+    file_path = GET_PATH_DELAY_CACHE_DIR(parser_state) + "/" + key + ".delay"
+    return file_path
+
+
+def GET_CACHED_PATH_DELAY_COMPONENTS_FILE_PATH(logic, parser_state):
+    key = GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+    return GET_PATH_DELAY_CACHE_DIR(parser_state) + "/" + key + ".timing.json"
+
+
+class _ReadScopes(threading.local):
+    """Per thread: a scope belongs to the thread that opened it, and synthesis
+    runs in thread pools."""
+
+    def __init__(self):
+        # This thread's active RECORDED_READS dicts, outermost first: each
+        # (kind, key) -> the value read
+        self.stack = []
+
+
+# The RECORDED_READS scopes active now, per thread
+_READ_SCOPES = _ReadScopes()
+
+
+def _read_scopes():
+    return _READ_SCOPES.stack
+# The persistent-cache file kinds SYN records (_record_cache_file_read) and
+# checks (CACHE_FILES_UNCHANGED)
+CACHE_FILE_KINDS = ("delay", "components", "area")
+
+
+@contextlib.contextmanager
+def RECORDED_READS():
+    """Record the reads made inside the block in the dict this yields:
+    (kind, key) -> the value read. SYN records each persistent-cache file it
+    reads (CACHE_FILE_KINDS: key the path, value CACHE_FILE_SIGNATURE, None
+    for no file); another module records its own kinds (RECORD_READ) and
+    checks them itself. Scopes nest and a read goes to every active one. A
+    memo of a value derived from reads keeps them and replays them on a hit
+    (REPLAY_READS), so each scope holds every read its result rests on,
+    whatever ran before it. AUTO_FSM keeps a search's reads with its result
+    and reuses it only while they all read the same; its forked workers send
+    their reads back into the scopes active when they forked
+    (AUTO_FSM._map_forked)."""
+    reads = {}
+    stack = _read_scopes()
+    stack.append(reads)
+    try:
+        yield reads
+    finally:
+        assert stack[-1] is reads, "RECORDED_READS scopes must nest"
+        stack.pop()
+
+
+def ACTIVE_READ_SCOPES():
+    """This thread's active RECORDED_READS dicts, outermost first."""
+    return list(_read_scopes())
+
+
+def RECORD_READ(kind, key, value):
+    """Record one read in every active RECORDED_READS scope."""
+    for scope in _read_scopes():
+        scope[(kind, key)] = value
+
+
+def REPLAY_READS(reads):
+    """Add reads recorded earlier (a RECORDED_READS dict) to every active scope."""
+    for scope in _read_scopes():
+        scope.update(reads)
+
+
+def CACHE_FILE_SIGNATURE(kind, path):
+    """What the persistent-cache file at `path` holds now, in the form
+    RECORDED_READS records a read of it: the delay ns of a "delay" file, the
+    sha256 of a "components" file, the (value, unit) of an "area" file; None
+    when there is no usable file. Records nothing."""
+    if kind == "delay":
+        return READ_CACHED_PATH_DELAY_FILE(path)
+    if kind == "components":
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+    if kind == "area":
+        return _read_area_file(path)
+    raise ValueError(f"not a persistent-cache file kind: {kind!r}")
+
+
+def CACHE_FILES_UNCHANGED(reads):
+    """Whether every persistent-cache file read among `reads` (a
+    RECORDED_READS dict) would read the same now: a changed, removed or newly
+    created file is a difference. Other kinds are their recorder's to check."""
+    return all(
+        CACHE_FILE_SIGNATURE(kind, path) == value
+        for (kind, path), value in reads.items()
+        if kind in CACHE_FILE_KINDS
+    )
+
+
+def _record_cache_file_read(kind, path, value):
+    if _read_scopes():
+        RECORD_READ(kind, path, value)
+
+
+def READ_CACHED_PATH_DELAY_FILE(file_path):
+    """The delay ns a .delay cache file holds, or None when there is none."""
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            return float(f.readlines()[0])
+    return None
+
+
+def GET_CACHED_PATH_DELAY(logic, parser_state):
+    if not logic.is_c_built_in and LOGIC.FUNC_IS_OP_OVERLOAD(logic.func_name):
+        return None
+
+    # Look in cache dir
+    file_path = GET_CACHED_PATH_DELAY_FILE_PATH(logic, parser_state)
+    delay_ns = READ_CACHED_PATH_DELAY_FILE(file_path)
+    _record_cache_file_read("delay", file_path, delay_ns)
+    return delay_ns
+
+
+# Estimate built-in primitive delays from this tool/part's measured widths
+# before synthesizing a new width (--no_primitive_delay_model turns it off).
+USE_PRIMITIVE_DELAY_MODEL = True
+# How each modeled primitive's delay grows: with width, with log2(width), or
+# not at all. Multiplies, compares through soft operators and composites are
+# never modeled.
+PRIMITIVE_DELAY_MODEL_SHAPES = {
+    "PLUS": "width",
+    "MINUS": "width",
+    "EQ": "log2",
+    "NEQ": "log2",
+    "AND": "constant",
+    "OR": "constant",
+    "XOR": "constant",
+    "NOT": "constant",
+}
+# Distinct measured widths a family needs before its fit is used.
+PRIMITIVE_DELAY_MODEL_MIN_WIDTHS = 3
+_PRIMITIVE_NAME = re.compile(
+    r"(?:BIN_OP_([A-Z]+)_(u?int)(\d+)_t_(u?int)(\d+)_t|UNARY_OP_([A-Z]+)_(u?int)(\d+)_t)$"
+)
+
+
+def PRIMITIVE_DELAY_SHAPE(func_name):
+    """(op, signed, width) of a built-in integer primitive the delay model
+    covers, read from its entity name, else None."""
+    match = _PRIMITIVE_NAME.match(func_name)
+    if match is None:
+        return None
+    if match.group(1):
+        op, kinds = match.group(1), (match.group(2), match.group(4))
+        widths = (int(match.group(3)), int(match.group(5)))
+    else:
+        op, kinds, widths = match.group(6), (match.group(7),), (int(match.group(8)),)
+    if op not in PRIMITIVE_DELAY_MODEL_SHAPES:
+        return None
+    return op, any(kind == "int" for kind in kinds), max(widths)
+
+
+class PrimitiveDelayModel:
+    """Least-squares fits of measured primitive delays against width, per
+    (op, signed) family, from one tool/part delay cache directory. A family
+    predicts only inside its measured width range, from at least
+    PRIMITIVE_DELAY_MODEL_MIN_WIDTHS widths. Its error bound is the largest
+    leave-one-out error, so a caller can tell a decision the estimate cannot
+    change from one it might."""
+
+    def __init__(self, cache_dir):
+        points = {}
+        try:
+            names = sorted(os.listdir(cache_dir))
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".delay"):
+                continue
+            shape = PRIMITIVE_DELAY_SHAPE(name[: -len(".delay")])
+            if shape is None:
+                continue
+            try:
+                with open(os.path.join(cache_dir, name)) as f:
+                    delay_ns = float(f.readline())
+            except (OSError, ValueError):
+                continue
+            op, signed, width = shape
+            # Keep the slowest of operand-width variants at one width.
+            family = points.setdefault((op, signed), {})
+            family[width] = max(delay_ns, family.get(width, delay_ns))
+        self.fits = {}  # (op, signed) -> (intercept, slope, low, high, error_ns)
+        for (op, signed), by_width in points.items():
+            if len(by_width) < PRIMITIVE_DELAY_MODEL_MIN_WIDTHS:
+                continue
+            xs = [self._x(op, w) for w in sorted(by_width)]
+            ys = [by_width[w] for w in sorted(by_width)]
+            intercept, slope = self._fit(op, xs, ys)
+            error = 0.0
+            for i in range(len(xs)):
+                a, b = self._fit(op, xs[:i] + xs[i + 1 :], ys[:i] + ys[i + 1 :])
+                error = max(error, abs(a + b * xs[i] - ys[i]))
+            self.fits[(op, signed)] = (intercept, slope, min(by_width), max(by_width), error)
+
+    @staticmethod
+    def _x(op, width):
+        shape = PRIMITIVE_DELAY_MODEL_SHAPES[op]
+        return 0.0 if shape == "constant" else math.log2(width) if shape == "log2" else float(width)
+
+    @staticmethod
+    def _fit(op, xs, ys):
+        mean_x, mean_y = sum(xs) / len(xs), sum(ys) / len(ys)
+        spread = sum((x - mean_x) ** 2 for x in xs)
+        if PRIMITIVE_DELAY_MODEL_SHAPES[op] == "constant" or spread == 0.0:
+            return mean_y, 0.0
+        slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / spread
+        return mean_y - slope * mean_x, slope
+
+    def estimate(self, func_name):
+        """(delay ns, error bound ns) inside a fitted family's measured width
+        range, else None."""
+        shape = PRIMITIVE_DELAY_SHAPE(func_name)
+        if shape is None:
+            return None
+        op, signed, width = shape
+        fit = self.fits.get((op, signed))
+        if fit is None:
+            return None
+        intercept, slope, low, high, error = fit
+        if not low <= width <= high:
+            return None
+        return intercept + slope * self._x(op, width), error
+
+
+def GET_CACHED_PATH_DELAY_COMPONENTS(logic, parser_state, expected_delay_ns=None):
+    """Read an optional V1 leaf timing-component cache sidecar.
+
+    Old ``.delay`` caches intentionally have no sidecar and cleanly return
+    None. When the experimental combinational planner model is selected its
+    cache identity is distinct, so such a miss triggers one real measurement
+    rather than silently mixing total-delay and combinational geometries.
+    """
+
+    if not logic.is_c_built_in and LOGIC.FUNC_IS_OP_OVERLOAD(logic.func_name):
+        return None
+    path = GET_CACHED_PATH_DELAY_COMPONENTS_FILE_PATH(logic, parser_state)
+    if _read_scopes():
+        RECORD_READ("components", path, CACHE_FILE_SIGNATURE("components", path))
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            value = json.load(f)
+        if value.get("schema_version") != 1:
+            return None
+        component_names = (
+            "launch_clock_to_q_ns",
+            "combinational_delay_ns",
+            "setup_ns",
+        )
+        components = {
+            name: float(value[name])
+            for name in component_names
+        }
+        cached_total = float(value["path_delay_ns"])
+        if expected_delay_ns is not None and not math.isclose(
+            cached_total,
+            expected_delay_ns,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            return None
+        components["path_delay_ns"] = cached_total
+        return components
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def _PATH_REPORT_DELAY_COMPONENTS(path_report):
+    names = (
+        "launch_clock_to_q_ns",
+        "combinational_delay_ns",
+        "setup_ns",
+    )
+    values = [getattr(path_report, name, None) for name in names]
+    if any(value is None for value in values):
+        return None
+    components = {name: float(value) for name, value in zip(names, values)}
+    components["path_delay_ns"] = float(path_report.path_delay_ns)
+    component_sum = sum(components[name] for name in names)
+    # DEVICE_MODELS text logs are rounded to 6 decimal places. Reject a
+    # genuinely inconsistent decomposition but tolerate that serialization.
+    if not math.isclose(
+        component_sum,
+        components["path_delay_ns"],
+        rel_tol=1e-6,
+        abs_tol=5e-6,
+    ):
+        return None
+    return components
+
+
+def _SET_LOGIC_DELAY_COMPONENTS(logic, components):
+    logic.delay_components = dict(components) if components is not None else None
+    logic.planner_delay = None
+    if components is None:
+        return
+    combinational_ns = components["combinational_delay_ns"]
+    planner_delay = int(combinational_ns * DELAY_UNIT_MULT)
+    if combinational_ns > 0.0 and planner_delay == 0:
+        planner_delay = 1
+    logic.planner_delay = planner_delay
+
+
+def _WRITE_CACHED_PATH_DELAY_COMPONENTS(logic, parser_state, components):
+    if components is None:
+        return
+    path = GET_CACHED_PATH_DELAY_COMPONENTS_FILE_PATH(logic, parser_state)
+    value = dict(components)
+    value["schema_version"] = 1
+    value["planner_weight"] = "combinational_delay_ns"
+    with open(path, "w") as f:
+        json.dump(value, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def GET_CACHED_LEAF_AREA_FILE_PATH(logic, parser_state):
+    """Same relative path as this leaf's .delay file (shared cache key), in
+    the separately-versioned cache/area tree. None when the active
+    SYN_TOOL has no area source (GET_AREA_CACHE_DIR)."""
+    cache_dir = GET_AREA_CACHE_DIR(parser_state)
+    if cache_dir is None:
+        return None
+    key = GET_CACHED_LOGIC_FILE_KEY(logic, parser_state)
+    return GET_CACHED_LEAF_AREA_FILE_PATH_BY_KEY(key, parser_state)
+
+
+def GET_CACHED_LEAF_AREA_FILE_PATH_BY_KEY(key, parser_state):
+    """Same cache path GET_CACHED_LEAF_AREA_FILE_PATH builds from a Logic
+    object, from an already-known cache key directly -- for a shape priced
+    with no Logic in hand. AUTO_FSM's operand multiplexers are the case this
+    exists for: ESTIMATE_SCHEDULE_AREA prices one from (ctype, fold count)
+    alone during scheduling, before any MUX entity is ever built, but its
+    cache key (GET_MUX_CACHE_KEY(width), the same canonicalization
+    GET_CACHED_LOGIC_FILE_KEY uses for a real MUX Logic) is knowable without
+    one. None when the active SYN_TOOL has no area source
+    (GET_AREA_CACHE_DIR)."""
+    cache_dir = GET_AREA_CACHE_DIR(parser_state)
+    if cache_dir is None:
+        return None
+    return cache_dir + "/" + key + ".area"
+
+
+def _READ_CACHED_AREA_FILE(file_path):
+    """(value, unit) parsed from one .area file, or None on a missing or
+    malformed file, or a unit that disagrees with the active model's own
+    unit (DEVICE_MODELS.AREA_UNIT) -- the whole point of writing the unit
+    into the file is to make that mismatch loud instead of silently mixed.
+    Recorded in the active RECORDED_READS scopes."""
+    area = _read_area_file(file_path)
+    if file_path is not None:
+        _record_cache_file_read("area", file_path, area)
+    return area
+
+
+def _read_area_file(file_path):
+    """_READ_CACHED_AREA_FILE without recording the read."""
+    if file_path is None or not os.path.exists(file_path):
+        return None
+    text = open(file_path).read().strip()
+    try:
+        value_str, unit = text.rsplit(" ", 1)
+        value = float(value_str)
+    except ValueError:
+        return None
+    if SYN_TOOL is DEVICE_MODELS and unit != DEVICE_MODELS.AREA_UNIT:
+        return None
+    return value, unit
+
+
+def GET_CACHED_LEAF_AREA(logic, parser_state):
+    """Read one leaf's cached area as (value, unit), or None on a cache
+    miss: no area source, no file on disk, or malformed contents. See
+    _READ_CACHED_AREA_FILE for the unit-mismatch handling."""
+    if not logic.is_c_built_in and LOGIC.FUNC_IS_OP_OVERLOAD(logic.func_name):
+        return None
+    return _READ_CACHED_AREA_FILE(
+        GET_CACHED_LEAF_AREA_FILE_PATH(logic, parser_state)
+    )
+
+
+def GET_CACHED_LEAF_AREA_BY_KEY(key, parser_state):
+    """GET_CACHED_LEAF_AREA's cache read, keyed directly rather than via a
+    Logic object -- see GET_CACHED_LEAF_AREA_FILE_PATH_BY_KEY."""
+    return _READ_CACHED_AREA_FILE(
+        GET_CACHED_LEAF_AREA_FILE_PATH_BY_KEY(key, parser_state)
+    )
+
+
+def WRITE_CACHED_LEAF_AREA(logic, parser_state, value, unit):
+    file_path = GET_CACHED_LEAF_AREA_FILE_PATH(logic, parser_state)
+    if file_path is None:
+        return
+    cache_dir = os.path.dirname(file_path)
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    with open(file_path, "w") as f:
+        f.write(f"{value} {unit}\n")
+
+
+# Synthesis run reuse (docs/SYN_DESIGN.md#6-caches)
+#
+# A synthesis run is identified by everything that can change its result:
+# - the bytes of every HDL and constraint file, in order;
+# - the part and the top entity;
+# - the tool installation;
+# - the compiler module that writes the run's scripts;
+# - run settings such as a placement seed.
+#
+# Paths are not part of the identity, so the same design in another output
+# directory, or in another checkout, has the same identity. Python source and
+# design parameters are not part of it either: only their effect on the HDL
+# counts.
+#
+# Two places hold results:
+# - the output directory itself (the default): a backend's log is reused only
+#   when its `<log>.inputs.json` record equals the current run's identity. A log
+#   without a record (written before this check existed, or by a run that never
+#   finished) or with a different record is stale. It is moved aside, never read;
+# - an optional shared store (`--syn_cache DIR`), consulted when the output
+#   directory has no matching log and filled after every successful run. Entries
+#   are written atomically, validated in full on every use, and safe to delete at
+#   any time.
+#
+# Vivado and DEVICE_MODELS keep their own, older input records
+# (VIVADO.INPUT_MANIFEST, DEVICE_MODELS._synthesis_input_identity) and use only
+# the store functions here.
+
+# --syn_cache DIR: a store shared by several output directories. None: each
+# --out_dir's own logs are its only cache.
+SYNTHESIS_STORE_DIR = None
+SYNTHESIS_STORE_LAYOUT = "v1"
+
+_synthesis_reuse_stats_lock = threading.Lock()
+SYNTHESIS_REUSE_STATS = {"out_dir": 0, "store": 0, "run": 0, "stale": 0}
+
+# A lookup (STORED_MEASUREMENT) calls a backend exactly as a real run would,
+# inside REUSE_ONLY: every backend's reuse decision goes through
+# REUSE_SYNTHESIS_LOG or SYNTHESIS_STORE_FETCH, and there a miss raises
+# SynthesisNotStored instead of letting the backend go on to run the tool.
+# Per thread: real runs in the synthesis thread pool are unaffected.
+_reuse_only = threading.local()
+
+
+class SynthesisNotStored(Exception):
+    """Inside REUSE_ONLY: no earlier result for these exact inputs."""
+
+
+class SynthesisRanDuringLookup(Exception):
+    """Inside REUSE_ONLY: a backend ran its tool anyway (an internal error)."""
+
+
+@contextlib.contextmanager
+def REUSE_ONLY():
+    _reuse_only.active = True
+    try:
+        yield
+    finally:
+        _reuse_only.active = False
+
+
+def REUSE_ONLY_MISS():
+    """Called where a backend would go on to run: inside REUSE_ONLY, stop."""
+    if getattr(_reuse_only, "active", False):
+        raise SynthesisNotStored()
+
+
+def COUNT_SYNTHESIS_RESULT(kind):
+    if kind == "run" and getattr(_reuse_only, "active", False):
+        # A backend that decides to run without asking REUSE_SYNTHESIS_LOG or
+        # SYNTHESIS_STORE_FETCH must call REUSE_ONLY_MISS first
+        raise SynthesisRanDuringLookup(
+            "internal error: a backend ran synthesis while only looking up an earlier result"
+        )
+    with _synthesis_reuse_stats_lock:
+        SYNTHESIS_REUSE_STATS[kind] += 1
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_or_missing(path):
+    # A listed input that does not exist is part of the identity, not an error
+    # here: a run that needs it fails in the tool, as it always has
+    try:
+        return _sha256_file(path)
+    except OSError:
+        return None
+
+
+def _manifest_digest(obj):
+    text = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _tool_files_identity(paths):
+    """The tool installation a run uses: name, size and modification time of
+    each executable or package directory. Reinstalling or upgrading a tool
+    re-synthesizes."""
+    identity = []
+    for path in paths:
+        if not path:
+            continue
+        name = os.path.basename(path.rstrip(os.sep))
+        try:
+            stat = os.stat(path)
+            identity.append([name, stat.st_size, stat.st_mtime_ns])
+        except OSError:
+            identity.append([name, None, None])
+    return identity
+
+
+# COMPILER_SOURCE_HASH's value, computed once per process
+_COMPILER_SOURCE_HASH = None
+
+
+def COMPILER_SOURCE_HASH():
+    """sha256 over the Python sources of src/ (tests excluded), src/pipelinec
+    and include/pypeline/: which compiler a result came from. An AUTO_FSM
+    search result is reused only by the code that searched it, and a
+    built_hardware.json record only by the compiler that built it."""
+    global _COMPILER_SOURCE_HASH
+    if _COMPILER_SOURCE_HASH is None:
+        src = os.path.dirname(os.path.abspath(__file__))
+        digest = hashlib.sha256()
+        for root in (src, os.path.join(src, "..", "include", "pypeline")):
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = sorted(
+                    d for d in dirnames if d not in ("__pycache__", "tests")
+                )
+                for name in sorted(filenames):
+                    if not (name.endswith(".py") or name == "pipelinec"):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    digest.update(os.path.relpath(path, src).encode() + b"\0")
+                    with open(path, "rb") as f:
+                        digest.update(hashlib.sha256(f.read()).digest())
+        _COMPILER_SOURCE_HASH = digest.hexdigest()
+    return _COMPILER_SOURCE_HASH
+
+
+def SYNTHESIS_INPUT_MANIFEST(
+    tool,
+    part,
+    top_entity,
+    vhdl_files_texts,
+    constraint_paths=(),
+    tool_paths=(),
+    recipe_modules=(),
+    extra=None,
+):
+    """Identity of one synthesis run (see "Synthesis run reuse" above).
+
+    vhdl_files_texts: the space-separated HDL file list the run reads
+    (GET_VHDL_FILES_TCL_TEXT_AND_TOP), in its analysis order.
+    recipe_modules: the compiler modules that generate the run's scripts.
+    extra: run settings that change the result and appear in no file.
+    """
+    hdl = [path for path in vhdl_files_texts.split() if path.strip()]
+    manifest = {
+        "schema_version": 1,
+        "tool": tool,
+        "part": part,
+        "top_entity": top_entity,
+        # Basenames: entity names are unique per run, and the output
+        # directory's spelling must not change the identity
+        "hdl": [[os.path.basename(path), _sha256_or_missing(path)] for path in hdl],
+        "constraints": [
+            [os.path.basename(path), _sha256_or_missing(path)]
+            for path in constraint_paths
+            if path
+        ],
+        "tool_files": _tool_files_identity(tool_paths),
+        "recipe": sorted(
+            [os.path.basename(module.__file__), _sha256_file(module.__file__)]
+            for module in recipe_modules
+        ),
+        "extra": dict(extra or {}),
+    }
+    manifest["signature"] = _manifest_digest(manifest)
+    return manifest
+
+
+def SYNTHESIS_INPUT_RECORD_PATH(log_path):
+    return log_path + ".inputs.json"
+
+
+def _read_json_or_none(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json_atomic(path, obj):
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _manifest_difference(recorded, manifest):
+    """The first input that differs, for the stale-log message."""
+    for key in ("tool", "part", "top_entity", "recipe", "tool_files", "extra", "constraints"):
+        if recorded.get(key) != manifest.get(key):
+            return f"{key} changed"
+    old, new = recorded.get("hdl") or [], manifest.get("hdl") or []
+    for before, after in zip(old, new):
+        if before != after:
+            return f"HDL {after[0]} changed"
+    if len(old) != len(new):
+        return f"HDL file count {len(old)} -> {len(new)}"
+    return "input record differs"
+
+
+def _move_stale_aside(path):
+    """Keep a stale artifact for inspection under a name no run reads."""
+    target = path + ".stale"
+    n = 1
+    while os.path.exists(target):
+        n += 1
+        target = f"{path}.stale{n}"
+    os.replace(path, target)
+    return target
+
+
+def REUSE_SYNTHESIS_LOG(
+    tool, log_path, manifest, use_existing_log_file=True, read_errors=None
+):
+    """The log text a backend may reuse instead of running, or None to run.
+
+    A log in the output directory counts only when its input record equals
+    this run's identity; otherwise it (and its record) are moved aside. With
+    --syn_cache, an entry for this identity is copied into place next. A miss
+    leaves log_path free for a fresh run."""
+    record_path = SYNTHESIS_INPUT_RECORD_PATH(log_path)
+    if os.path.exists(log_path):
+        recorded = _read_json_or_none(record_path)
+        if use_existing_log_file and recorded == manifest:
+            COUNT_SYNTHESIS_RESULT("out_dir")
+            print("Reading log", log_path, flush=True)
+            with open(log_path, "r", errors=read_errors) as f:
+                return f.read()
+        if not use_existing_log_file:
+            reason = "a fresh run was requested"
+        elif recorded is None:
+            reason = (
+                "it has no input record (an older compiler wrote it, or its run "
+                "did not finish)"
+            )
+        else:
+            reason = "its inputs differ: " + _manifest_difference(recorded, manifest)
+        moved = _move_stale_aside(log_path)
+        if os.path.exists(record_path):
+            _move_stale_aside(record_path)
+        COUNT_SYNTHESIS_RESULT("stale")
+        print(f"Not reusing {log_path}: {reason}. Moved it to {moved}.", flush=True)
+    if use_existing_log_file and SYNTHESIS_STORE_FETCH(
+        tool, manifest["signature"], {"log": log_path}, manifest
+    ):
+        _write_json_atomic(record_path, manifest)
+        store = f"(from synthesis store {SYNTHESIS_STORE_DIR})"
+        print("Reading log", log_path, store, flush=True)
+        with open(log_path, "r", errors=read_errors) as f:
+            return f.read()
+    REUSE_ONLY_MISS()
+    return None
+
+
+def RECORD_SYNTHESIS_LOG(tool, log_path, manifest):
+    """After a successful run: record the log's inputs (which also marks it
+    complete) and add it to the store."""
+    COUNT_SYNTHESIS_RESULT("run")
+    _write_json_atomic(SYNTHESIS_INPUT_RECORD_PATH(log_path), manifest)
+    SYNTHESIS_STORE_INSERT(tool, manifest["signature"], {"log": log_path}, manifest)
+
+
+def _synthesis_store_entry_dir(tool, signature):
+    return os.path.join(
+        SYNTHESIS_STORE_DIR, SYNTHESIS_STORE_LAYOUT, tool, signature[:2], signature
+    )
+
+
+def SYNTHESIS_STORE_FETCH(tool, signature, files, manifest):
+    """Copy a stored result into place: files maps each stored name to its
+    destination path. Only an entry whose full recorded identity equals
+    manifest is used (a truncated or foreign entry is a miss).
+
+    Every backend asks the store last, right before it would run, so inside
+    REUSE_ONLY a miss raises SynthesisNotStored."""
+    if _SYNTHESIS_STORE_COPY(tool, signature, files, manifest):
+        return True
+    REUSE_ONLY_MISS()
+    return False
+
+
+def _SYNTHESIS_STORE_COPY(tool, signature, files, manifest):
+    if SYNTHESIS_STORE_DIR is None:
+        return False
+    entry = _synthesis_store_entry_dir(tool, signature)
+    stored = _read_json_or_none(os.path.join(entry, "manifest.json"))
+    if stored is None:
+        if os.path.isdir(entry):
+            print(f"Synthesis store entry {entry} is unreadable; not using it.", flush=True)
+        return False
+    if stored != manifest:
+        print(f"Synthesis store entry {entry} records other inputs; not using it.", flush=True)
+        return False
+    if not all(os.path.isfile(os.path.join(entry, name)) for name in files):
+        return False
+    try:
+        for name, dest in files.items():
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            tmp = f"{dest}.tmp.{os.getpid()}.{threading.get_ident()}"
+            shutil.copyfile(os.path.join(entry, name), tmp)
+            os.replace(tmp, dest)
+        os.utime(os.path.join(entry, "manifest.json"))  # last used, for pruning
+    except OSError as e:
+        print(f"WARNING: could not copy synthesis store entry {entry}: {e}", flush=True)
+        return False
+    COUNT_SYNTHESIS_RESULT("store")
+    return True
+
+
+def SYNTHESIS_STORE_INSERT(tool, signature, files, manifest):
+    """Add a successful run's files (stored name -> source path) to the store.
+    Atomic: readers see a complete entry or none, and concurrent writers of
+    one identity are harmless because their files are identical."""
+    if SYNTHESIS_STORE_DIR is None:
+        return
+    entry = _synthesis_store_entry_dir(tool, signature)
+    if os.path.isdir(entry):
+        if _read_json_or_none(os.path.join(entry, "manifest.json")) == manifest:
+            return
+        # A damaged or foreign entry: replace it with this run's result
+        bad = f"{entry}.bad.{os.getpid()}.{time.time_ns()}"
+        try:
+            os.rename(entry, bad)
+            shutil.rmtree(bad, ignore_errors=True)
+        except OSError:
+            return
+    tmp = f"{entry}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
+    try:
+        os.makedirs(tmp)
+        for name, src in files.items():
+            shutil.copyfile(src, os.path.join(tmp, name))
+        _write_json_atomic(os.path.join(tmp, "manifest.json"), manifest)
+        os.rename(tmp, entry)
+    except OSError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not os.path.isdir(entry):
+            print(f"WARNING: could not add {entry} to the synthesis store: {e}", flush=True)
+
+
+def SYNTHESIS_STORE_PRUNE(days):
+    """Remove store entries no build has used for `days` days, and any
+    half-written entry an interrupted insert left behind that long."""
+    if SYNTHESIS_STORE_DIR is None:
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    root = os.path.join(SYNTHESIS_STORE_DIR, SYNTHESIS_STORE_LAYOUT)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".tmp." in os.path.basename(dirpath) or ".bad." in os.path.basename(dirpath):
+            dirnames[:] = []
+            try:
+                abandoned = os.path.getmtime(dirpath) < cutoff
+            except OSError:
+                continue
+            if abandoned:
+                shutil.rmtree(dirpath, ignore_errors=True)
+            continue
+        if "manifest.json" in filenames:
+            dirnames[:] = []
+            try:
+                stale = os.path.getmtime(os.path.join(dirpath, "manifest.json")) < cutoff
+            except OSError:
+                continue
+            if stale:
+                shutil.rmtree(dirpath, ignore_errors=True)
+                removed += 1
+    # Latency v2 pieces and AUTO_FSM search results, touched on reuse/write.
+    # Also prune obsolete latency v1 files; current builds never load them.
+    for dirpath, _dirnames, filenames in (
+        walked
+        for kind in ("latency", "auto_fsm")
+        for walked in os.walk(os.path.join(SYNTHESIS_STORE_DIR, kind))
+    ):
+        for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            try:
+                stale = os.path.getmtime(path) < cutoff
+            except OSError:
+                continue
+            if stale:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def SYNTHESIS_REUSE_SUMMARY_LINE():
+    stats = SYNTHESIS_REUSE_STATS
+    if not any(stats.values()):
+        return None
+    line = f"Synthesis results: {stats['out_dir']} reused from the output directory, "
+    if SYNTHESIS_STORE_DIR:
+        line += f"{stats['store']} from the store {SYNTHESIS_STORE_DIR}, "
+    line += f"{stats['run']} new run(s)"
+    if stats["stale"]:
+        line += f", {stats['stale']} stale log(s) set aside"
+    return line
+
+
+def SYNTHESIS_REUSE_EXIT_REPORT(prune_days):
+    """End of a build (an atexit hook, so it prints just before the elapsed
+    summary): the SYNTHESIS_REUSE_SUMMARY_LINE, then, for --syn_cache_prune,
+    removing store entries no build has used for prune_days days (None: no
+    pruning)."""
+    line = SYNTHESIS_REUSE_SUMMARY_LINE()
+    if line:
+        print(line, flush=True)
+    if prune_days is not None:
+        removed = SYNTHESIS_STORE_PRUNE(prune_days)
+        print(
+            f"Synthesis store {SYNTHESIS_STORE_DIR}: removed {removed} "
+            f"entr{'y' if removed == 1 else 'ies'} unused for "
+            f"{prune_days:g} days",
+            flush=True,
+        )
+
+
+def _FUNC_NEEDS_SUBMODULE_DELAYS(func_name, parser_state):
+    """Legacy descent predicate used only by --full_hier_syn."""
+    import AUTO_PIPELINE
+
+    return AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(func_name, parser_state)
+
+
+def RECURSIVE_GET_FUNCS_FOR_PATH_DELAYS(func_names, parser_state):
+    """Legacy hierarchy characterization walk, used only by --full_hier_syn."""
+    funcs_to_synth = []
+    for func_name in func_names:
+        if _FUNC_NEEDS_SUBMODULE_DELAYS(func_name, parser_state):
+            func_logic = parser_state.FuncLogicLookupTable[func_name]
+            # Recurse into submodules whose subtree delays are needed
+            for sub_inst in func_logic.submodule_instances:
+                sub_func_name = func_logic.submodule_instances[sub_inst]
+                if _FUNC_NEEDS_SUBMODULE_DELAYS(sub_func_name, parser_state):
+                    sub_funcs_to_synth = RECURSIVE_GET_FUNCS_FOR_PATH_DELAYS(
+                        [sub_func_name], parser_state
+                    )
+                    for sub_func_to_synth in sub_funcs_to_synth:
+                        if sub_func_to_synth not in funcs_to_synth:
+                            funcs_to_synth.append(sub_func_to_synth)
+            # Include self and all submodules for synth
+            for sub_inst in func_logic.submodule_instances:
+                sub_func_name = func_logic.submodule_instances[sub_inst]
+                if sub_func_name not in funcs_to_synth:
+                    funcs_to_synth.append(sub_func_name)
+            if func_name not in funcs_to_synth:
+                funcs_to_synth.append(func_name)
+        # Explicit full-hierarchy diagnostics include MAINs as well.
+        if func_name in parser_state.main_mhz.keys() and HIER_SYN_MODE == "full":
+            if func_name not in funcs_to_synth:
+                funcs_to_synth.append(func_name)
+    return funcs_to_synth
+
+
+def COLLECT_PATH_DELAY_REQUIREMENTS(parser_state, root_func_names=None):
+    """Collect actual geometry consumers and their primitive dependencies.
+
+    Returns ordered dependencies and the two eligibility/frontier sets without
+    mutating ParserState. ADD_PATH_DELAY_TO_LOOKUP owns the full-parse scope.
+    AUTO_FSM's bootstrap operations and operand muxes are independent timing
+    consumers; a scheduled (stateful) FSM is one atomic span, measured only
+    when it has no installed schedule (SCHEDULED_FSM_DELAYS).
+    """
+    import AUTO_FSM
+    import AUTO_PIPELINE
+
+    needed, eligible, frontier = AUTO_PIPELINE.COLLECT_PIPELINE_DELAY_REQUIREMENTS(
+        parser_state, root_func_names
+    )
+    atomic_fsms = set()
+    if root_func_names is None:
+        extra_roots = set(AUTO_FSM.AUTO_FSM_MUX_ENTITIES(parser_state))
+        for logic in list(parser_state.FuncLogicLookupTable.values()):
+            for local, key in getattr(logic, "sub_inst_to_auto_fsm_key", {}).items():
+                func = logic.submodule_instances[local]
+                # A scheduled FSM holds state. Nothing inside it is collected,
+                # so rescheduling keeps the operation delays carried from the
+                # bootstrap pass (AUTO_FSM._schedule_delays). With an installed
+                # schedule its delay comes from that (SCHEDULED_FSM_DELAYS);
+                # otherwise one whole-module synthesis measures it.
+                if HIER_SYN_MODE != "prim" and FUNC_SUBTREE_HAS_STATE(func, parser_state):
+                    if AUTO_FSM.SCHEDULED_FSM_DELAY_DU(key) is None:
+                        atomic_fsms.add(func)
+                else:
+                    extra_roots.add(func)
+        needed.update(atomic_fsms)
+        frontier.update(atomic_fsms)
+        if extra_roots:
+            extra, extra_eligible, extra_frontier = (
+                AUTO_PIPELINE.COLLECT_PIPELINE_DELAY_REQUIREMENTS(parser_state, extra_roots)
+            )
+            needed.update(extra)
+            eligible.update(extra_eligible)
+            frontier.update(extra_frontier)
+    result, seen = [], set()
+
+    def visit(func):
+        if func in seen:
+            return
+        seen.add(func)
+        logic = parser_state.FuncLogicLookupTable[func]
+        if logic.vhdl_module_text is None and func not in atomic_fsms:
+            for child in logic.submodule_instances.values():
+                visit(child)
+        result.append(func)
+
+    for func in sorted(needed):
+        visit(func)
+    return result, eligible, frontier
+
+
+def PATH_DELAY_IS_PRIMITIVE(logic):
+    """Actual operator leaves, not opaque vhdl() text or generated hierarchy."""
+    return not logic.submodule_instances and logic.vhdl_module_text is None
+
+
+def PATH_DELAY_IS_MEASURABLE(logic, parser_state, refine_opaque=False):
+    """Whether a delay consumer permits a new standalone measurement."""
+    if any(scope is None for scope in (
+        parser_state.path_delay_funcs, parser_state.path_delay_measure_funcs,
+        parser_state.path_delay_frontier_funcs,
+    )):
+        raise RuntimeError("Initialize delay scope with ADD_PATH_DELAY_TO_LOOKUP before measurement")
+    if logic.func_name not in parser_state.path_delay_funcs:
+        return False
+    if logic.vhdl_module_text is not None:
+        # Unknown text starts with zero geometry. Only a failing path through
+        # this region can justify its standalone fallback measurement.
+        return refine_opaque and HIER_SYN_MODE == "leaf"
+    if PATH_DELAY_IS_PRIMITIVE(logic):
+        return True
+    return (
+        HIER_SYN_MODE != "prim"
+        and logic.func_name in parser_state.path_delay_measure_funcs
+        and not FUNC_SUBTREE_HAS_STATE(logic.func_name, parser_state)
+        and logic.func_name not in getattr(parser_state, "func_force_estimated", ())
+    )
+
+
+_FUNC_SUBTREE_HAS_STATE_cache = {}
+
+
+def FUNC_SUBTREE_HAS_STATE(func_name, parser_state):
+    # Does this func or ANY submodule below it hold Reg/Feedback state?
+    # (recursive: only a fully combinational subtree guarantees that a
+    # per-module synthesis run measures input-to-output through delay -
+    # any state inside, at any depth, means the reported critical path may
+    # be an internal register-involved path instead)
+    if func_name in _FUNC_SUBTREE_HAS_STATE_cache:
+        return _FUNC_SUBTREE_HAS_STATE_cache[func_name]
+    logic = parser_state.FuncLogicLookupTable[func_name]
+    rv = logic.uses_nonvolatile_state_regs or len(logic.feedback_vars) > 0
+    if not rv:
+        for sub_func_name in logic.submodule_instances.values():
+            if sub_func_name in parser_state.FuncLogicLookupTable:
+                if FUNC_SUBTREE_HAS_STATE(sub_func_name, parser_state):
+                    rv = True
+                    break
+    _FUNC_SUBTREE_HAS_STATE_cache[func_name] = rv
+    return rv
+
+
+def FUNC_PATH_DELAY_IS_ESTIMABLE(logic, parser_state, frontier_funcs):
+    # Can this func's path delay be derived from its submodule delays
+    # (zero clock pipeline map) instead of a real synthesis run?
+    if logic.vhdl_module_text is not None or PATH_DELAY_IS_PRIMITIVE(logic):
+        return False
+    if logic.func_name in parser_state.func_marked_blackbox:
+        return False
+    # Explicitly forced to be estimated rather than synthesized. Used by
+    # AUTO_FSM for the combinational passthrough it wraps a tagged function in
+    # on the bootstrap pass: that wrapper looks exactly like a measurement
+    # frontier (fully combinational, inside a stateful caller) and would
+    # therefore get one whole-blob synthesis run -- of precisely the giant
+    # parallel logic the user asked NOT to build, which for something like a
+    # float64 polynomial does not finish in reasonable time. Nothing needs that
+    # number: the scheduler works from the individual operations' delays
+    # underneath, which are measured and cached as usual.
+    if logic.func_name in getattr(parser_state, "func_force_estimated", ()):
+        return True
+    # Measured: combinational pipeline frontiers and scheduled AUTO_FSM spans.
+    # Other stateful hierarchy reports internal register paths, not
+    # through-delays, so it and blocked helpers use primitive estimates.
+    return HIER_SYN_MODE == "prim" or logic.func_name not in frontier_funcs
+
+
+def SET_MEASURED_DELAY_FROM_REPORT(logic, parsed_timing_report, parser_state):
+    # Parse a single path report from a per-func synthesis run and record
+    # the measured delay on the logic object (+ disk cache for non-user code).
+    # Sanity should be one path reported
+    import AUTO_PIPELINE
+
+    if len(parsed_timing_report.path_reports) > 1:
+        print(
+            "Too many paths reported!",
+            logic.func_name,
+            parsed_timing_report.orig_text,
+        )
+        sys.exit(-1)
+    if len(parsed_timing_report.path_reports) == 0:
+        print(
+            "No timing paths reported!",
+            logic.func_name,
+            parsed_timing_report.orig_text,
+        )
+        sys.exit(-1)
+    path_report = list(parsed_timing_report.path_reports.values())[0]
+    if path_report.path_delay_ns is None:
+        print(
+            "Cannot parse synthesized path report for path delay ",
+            logic.func_name,
+        )
+        print(parsed_timing_report.orig_text)
+        sys.exit(-1)
+    logic.delay = int(path_report.path_delay_ns * DELAY_UNIT_MULT)
+    logic.delay_is_estimated = False
+    delay_components = _PATH_REPORT_DELAY_COMPONENTS(path_report)
+    _SET_LOGIC_DELAY_COMPONENTS(logic, delay_components)
+    # The same run measured area too, where the backend can (DEVICE_MODELS).
+    # Kept for every function, user code included (MEASURED_AREA).
+    # combinational_cell_area, deliberately NOT total_cell_area: see the
+    # leaf-area cache write below.
+    area_value = getattr(path_report, "combinational_cell_area", None)
+    area_unit = getattr(path_report, "area_unit", None)
+    if area_value is not None and area_unit is not None:
+        logic.measured_area = (area_value, area_unit)
+    if logic.delay > 0 and AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+        logic.func_name, parser_state
+    ):
+        print(
+            f"{logic.func_name} Path delay (maybe to be pipelined): {path_report.path_delay_ns:.3f} ns"
+        )
+    # Sanity check multiplier is working
+    if path_report.path_delay_ns > 0.0 and logic.delay == 0:
+        print(
+            "WARNING: Found",
+            logic.func_name,
+            "delay path of",
+            path_report.path_delay_ns,
+            "ns",
+            "which is to small to represent. Increase delay multiplier?",
+        )
+        logic.delay = 1  # Set to smallest non zero for now?
+    # Make adjustment for 0 LLs to have 0 delay
+    if (SYN_TOOL is VIVADO) and path_report.logic_levels == 0:
+        logic.delay = 0
+    # Cache delay syn result if not user code, or if this is a built-in MUX
+    # whose user type has a canonical packed-width cache identity.
+    # (never cache estimated delays - cache holds measured values only)
+    if LOGIC_PATH_DELAY_IS_CACHEABLE(logic, parser_state):
+        filepath = GET_CACHED_PATH_DELAY_FILE_PATH(logic, parser_state)
+        PATH_DELAY_CACHE_DIR = GET_PATH_DELAY_CACHE_DIR(parser_state)
+        if not os.path.exists(PATH_DELAY_CACHE_DIR):
+            os.makedirs(PATH_DELAY_CACHE_DIR)
+        f = open(filepath, "w")
+        f.write(str(path_report.path_delay_ns))
+        f.close()
+        _WRITE_CACHED_PATH_DELAY_COMPONENTS(
+            logic, parser_state, delay_components
+        )
+        # Cache leaf area alongside delay when the active tool measured one
+        # -- only DEVICE_MODELS does (GET_AREA_CACHE_DIR is None for every
+        # other SYN_TOOL, and their PathReport classes carry no area
+        # attributes, so this is a no-op there via getattr's default).
+        #
+        # combinational_cell_area, deliberately NOT total_cell_area: an
+        # isolated leaf is wrapped in dont_touch input/output registers
+        # (VHDL.WRITE_LOGIC_TOP) purely to give it a register-to-register path
+        # for STA, and total_cell_area includes them. For a narrow leaf that
+        # harness dominates -- e.g. BIN_OP_AND_uint16_t_uint16_t's old
+        # (AREA_MODEL_VERSION 1) total_cell_area of 2563.1232 um2 was 91%
+        # harness flip-flop, 11.7x its real combinational area (218.8032
+        # um2). combinational_cell_area (MEASURE_NETLIST_AREA already splits
+        # it by each cell's own is_sequential flag) excludes them.
+        if area_value is not None and area_unit is not None:
+            WRITE_CACHED_LEAF_AREA(logic, parser_state, area_value, area_unit)
+
+
+def ESTIMATE_HIER_PATH_DELAYS(funcs_to_estimate, parser_state, quiet=False):
+    # Derive hierarchical func delays from their zero clock pipeline maps
+    # (critical topological path through already-known submodule delays).
+    # funcs_to_estimate must be bottom up ordered (children before parents)
+    # so each map only consumes already-resolved delays.
+    import AUTO_PIPELINE
+
+    for logic_func_name in funcs_to_estimate:
+        logic = parser_state.FuncLogicLookupTable[logic_func_name]
+        if logic.vhdl_module_text is not None:
+            # Its zero estimate has no inspectable pipeline map to compose.
+            continue
+        if not logic.submodule_instances:
+            # A primitive (its delay modeled from measured widths): nothing
+            # below it to derive a delay from, so it keeps its estimate.
+            continue
+        if logic_func_name not in parser_state.FuncToInstances:
+            continue
+        inst_name = list(parser_state.FuncToInstances[logic_func_name])[0]
+        zero_added_clks_pipeline_map = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_PIPELINE_MAP(
+            inst_name, logic, parser_state
+        )
+        logic.delay = zero_added_clks_pipeline_map.zero_clk_max_delay
+        logic.delay_is_estimated = True
+        logic.delay_components = None
+        logic.planner_delay = None
+        if not quiet:
+            print(
+                f"Function: {logic.func_name} estimated path delay: {logic.delay / DELAY_UNIT_MULT:.3f} ns (derived from submodules)"
+            )
+        parser_state.FuncLogicLookupTable[logic_func_name] = logic
+
+
+def _HAS_SYNTHESIS_LOG(directory):
+    # Every backend's result is a log; pipeline_map.log is not: an output
+    # directory written before the design diagram replaced it may still hold one
+    try:
+        return any(
+            name.endswith(".log") and name != "pipeline_map.log"
+            for name in os.listdir(directory)
+        )
+    except OSError:
+        return False
+
+
+def STORED_MEASUREMENT(logic, parser_state, inst_name=None, TimingParamsLookupTable=None):
+    """An earlier run's synthesis report for exactly this function's
+    zero-added-clock inputs, or None (docs/SYN_DESIGN.md#stored-measurements).
+
+    Calls the backend as for a real run, inside REUSE_ONLY: the backend renders
+    the inputs and looks in the output directory's logs, then the --syn_cache
+    store, but never runs the tool. A hit is a real measurement, so callers use
+    it in place of an estimate. Asked once per function per parse: the answers
+    live on parser_state, so a re-parse (the next AUTO_PIPELINE pass) asks
+    again and finds what the previous pass synthesized.
+
+    Only once ADD_PATH_DELAY_TO_LOOKUP has started on this parse: it leaves
+    the zero-added-clock timing params here. Before that the parse may be
+    incomplete (AUTO_COMB_OPT prices candidates during elaboration).
+    """
+    if not USE_STORED_MEASUREMENTS:
+        return None
+    if TimingParamsLookupTable is None:
+        TimingParamsLookupTable = getattr(parser_state, "stored_measurement_timing_params", None)
+        if TimingParamsLookupTable is None:
+            return None
+    func_name = logic.func_name
+    memo = getattr(parser_state, "stored_measurements", None)
+    if memo is None:
+        memo = parser_state.stored_measurements = {}
+    if func_name in memo:
+        return memo[func_name]
+    memo[func_name] = None
+    logic = parser_state.FuncLogicLookupTable.get(func_name, logic)
+    if inst_name is None:
+        insts = parser_state.FuncToInstances.get(func_name)
+        if not insts:
+            return None
+        inst_name = list(insts)[0]  # Any inst will do, as for a real run
+    # Never synthesized per function, so never stored
+    if LOGIC_IS_ZERO_DELAY(logic, parser_state, allow_none_delay=True):
+        return None
+    # Cheap before rendering and hashing the inputs: without a store, only a log
+    # in the function's own output directory can be an earlier result
+    if SYNTHESIS_STORE_DIR is None and not _HAS_SYNTHESIS_LOG(GET_OUTPUT_DIRECTORY(logic)):
+        return None
+    try:
+        with REUSE_ONLY():
+            report = SYN_TOOL.SYN_AND_REPORT_TIMING(
+                inst_name, logic, parser_state, TimingParamsLookupTable
+            )
+    except SynthesisNotStored:
+        return None
+    except SynthesisRanDuringLookup:
+        raise
+    except Exception as e:
+        # An earlier result this build cannot use (an errored Vivado log, a
+        # netlist with no timing paths, ...) is no measurement: estimate as if
+        # it were not there. A real run of it would raise the same error.
+        print(f"Function: {func_name}: not using its earlier synthesis result: {e}", flush=True)
+        return None
+    paths = list(report.path_reports.values())
+    if len(paths) != 1 or paths[0].path_delay_ns is None:
+        print(
+            f"Function: {func_name}: not using its earlier synthesis result: "
+            f"{len(paths)} timing paths reported, expected one with a delay",
+            flush=True,
+        )
+        return None
+    memo[func_name] = report
+    return report
+
+
+def STORED_DELAY_IS_USABLE(logic, parser_state):
+    """Whether an earlier run of this function measured the delay a build would
+    otherwise estimate for it.
+
+    Fully combinational reports measure through-delay. Inspectable stateful
+    hierarchy reports internal register paths instead and stays estimated.
+    Opaque vhdl() text starts at zero even with a warm measurement cache;
+    only path-directed fallback may replace that estimate.
+    """
+    return logic.vhdl_module_text is None and (
+        PATH_DELAY_IS_PRIMITIVE(logic)
+        or not FUNC_SUBTREE_HAS_STATE(logic.func_name, parser_state)
+    )
+
+
+def SET_STORED_DELAY(logic, parser_state, inst_name, TimingParamsLookupTable):
+    """Measure logic's delay from an earlier run of its exact inputs, if one
+    exists (STORED_MEASUREMENT). True when it did."""
+    report = STORED_MEASUREMENT(logic, parser_state, inst_name, TimingParamsLookupTable)
+    if report is None:
+        return False
+    SET_MEASURED_DELAY_FROM_REPORT(logic, report, parser_state)
+    print(
+        f"Function: {logic.func_name} stored path delay: "
+        f"{logic.delay / DELAY_UNIT_MULT:.3f} ns (an earlier run synthesized these exact inputs)",
+        flush=True,
+    )
+    return True
+
+
+def MEASURED_AREA(logic, parser_state):
+    """(value, unit): the combinational cell area that a synthesis run of
+    exactly this function measured, or None. The run is one this build did, or
+    an earlier run of the same inputs (STORED_MEASUREMENT). Only DEVICE_MODELS
+    measures area. The area estimates use it in place of summing the
+    function's leaves (GET_ESTIMATED_COMBINATIONAL_AREA,
+    AUTO.ESTIMATE_ENTITY_AREA)."""
+    if SYN_TOOL is not DEVICE_MODELS:
+        return None
+    logic = parser_state.FuncLogicLookupTable.get(logic.func_name, logic)
+    measured = getattr(logic, "measured_area", None)
+    if measured is None:
+        report = STORED_MEASUREMENT(logic, parser_state)
+        if report is not None:
+            path_report = list(report.path_reports.values())[0]
+            value = getattr(path_report, "combinational_cell_area", None)
+            unit = getattr(path_report, "area_unit", None)
+            if value is not None and unit is not None:
+                measured = logic.measured_area = (value, unit)
+    # A unit other than the active model's is not comparable (see
+    # GET_CACHED_LEAF_AREA)
+    if measured is None or measured[1] != DEVICE_MODELS.AREA_UNIT:
+        return None
+    return measured
+
+
+@PHASED("per-function delay measurement")
+def MEASURE_DELAYS(func_names, parser_state, refine_opaque=False):
+    # Fallback from estimated to measured delays: really synthesize the given
+    # funcs (estimates only guide slice placement - when they prove inaccurate,
+    # ex. because of optimizations that only happen in synthesis, the only way
+    # to get the true delay is to synthesize, not estimate harder).
+    # Afterwards re-estimates any still-estimated ancestor funcs with the new
+    # measured child delays and invalidates stale pipeline map caches.
+    # Shared consumer/caller rules exclude inspectable stateful hierarchy
+    # and blocked-only helpers. Opaque text is opt-in for a path-directed
+    # refinement, never a reason to characterize every FIFO during fallback.
+    import AUTO_PIPELINE
+
+    funcs_to_measure = []
+    for func_name in func_names:
+        logic = parser_state.FuncLogicLookupTable[func_name]
+        if not PATH_DELAY_IS_MEASURABLE(logic, parser_state, refine_opaque):
+            continue
+        if logic.delay is None or logic.delay_is_estimated:
+            if func_name in parser_state.FuncToInstances:
+                funcs_to_measure.append(func_name)
+    if len(funcs_to_measure) == 0:
+        return set()
+    print(
+        "Replacing estimated delays with measured synthesis results for:",
+        ", ".join(funcs_to_measure),
+        flush=True,
+    )
+    TimingParamsLookupTable = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+    my_thread_pool = ThreadPool(processes=GET_NUM_PROCESSES())
+    func_name_to_async_result = {}
+    for func_name in funcs_to_measure:
+        logic = parser_state.FuncLogicLookupTable[func_name]
+        inst_name = list(parser_state.FuncToInstances[func_name])[0]
+        print(
+            "Synthesizing function:",
+            func_name + LOGIC.FUNC_SRC_LOC_STR(parser_state, func_name),
+            flush=True,
+        )
+        func_name_to_async_result[func_name] = my_thread_pool.apply_async(
+            SYN_TOOL.SYN_AND_REPORT_TIMING,
+            (inst_name, logic, parser_state, TimingParamsLookupTable),
+        )
+    for func_name, my_async_result in func_name_to_async_result.items():
+        logic = parser_state.FuncLogicLookupTable[func_name]
+        parsed_timing_report = my_async_result.get()
+        SET_MEASURED_DELAY_FROM_REPORT(logic, parsed_timing_report, parser_state)
+        print(
+            f"Function: {logic.func_name} measured path delay: {logic.delay / DELAY_UNIT_MULT:.3f} ns"
+        )
+        parser_state.FuncLogicLookupTable[func_name] = logic
+    # Pipeline maps built from the old estimated delays are stale now
+    AUTO_PIPELINE._GET_ZERO_ADDED_CLKS_PIPELINE_MAP_cache.clear()
+    # Re-estimate remaining estimated funcs bottom up with updated child delays
+    all_funcs_ordered = parser_state.path_delay_funcs
+    still_estimated = [
+        f
+        for f in all_funcs_ordered
+        if parser_state.FuncLogicLookupTable[f].delay_is_estimated
+    ]
+    ESTIMATE_HIER_PATH_DELAYS(still_estimated, parser_state, quiet=True)
+    my_thread_pool.close()
+    my_thread_pool.join()
+    return set(funcs_to_measure)
+
+
+def SCHEDULED_FSM_DELAYS(parser_state):
+    """Give each generated FSM with an installed schedule its schedule's worst
+    state as an estimated delay (AUTO_FSM.SCHEDULED_FSM_DELAY_DU). A
+    whole-module synthesis took minutes per FSM and reported an input-to-output
+    figure, not a state's register-to-register delay; the sweep cannot
+    pipeline an FSM, and AUTO_FSM's own loop attributes in-context paths."""
+    import AUTO_FSM
+
+    if HIER_SYN_MODE == "prim":
+        return
+    for logic in list(parser_state.FuncLogicLookupTable.values()):
+        for local, key in sorted(getattr(logic, "sub_inst_to_auto_fsm_key", {}).items()):
+            func = logic.submodule_instances[local]
+            scheduled = AUTO_FSM.SCHEDULED_FSM_DELAY_DU(key)
+            if scheduled is None or not FUNC_SUBTREE_HAS_STATE(func, parser_state):
+                continue
+            fsm = parser_state.FuncLogicLookupTable[func]
+            if fsm.delay == scheduled and fsm.delay_is_estimated:
+                continue
+            fsm.delay = scheduled
+            fsm.delay_is_estimated = True
+            _SET_LOGIC_DELAY_COMPONENTS(fsm, None)
+            print(
+                f"Function: {func} delay from its AUTO_FSM schedule's worst state: "
+                f"{scheduled / DELAY_UNIT_MULT:.3f} ns",
+                flush=True,
+            )
+
+
+@PHASED("per-function delay measurement")
+def ADD_PATH_DELAY_TO_LOOKUP(parser_state, root_func_names=None):
+    # root_func_names: measure only the subtrees of these funcs instead of the
+    # whole design's mains (+ AUTO_FSM muxes) -- used by builds that never sweep
+    # but must still place fixed AUTO_PIPELINE latency= registers
+    # (BUILD_FIXED_AUTO_PIPELINE_TIMING_PARAMS).
+    # Make sure synthesis tool is set
+    import AUTO_MULTI_CYCLE
+    import AUTO_PIPELINE
+
+    import AUTO_FSM
+
+    PART_SET_TOOL(parser_state.part)
+
+    print("Synthesizing before pipelining to get path delays...", flush=True)
+    print("", flush=True)
+    TimingParamsLookupTable = AUTO_PIPELINE.GET_ZERO_ADDED_CLKS_TIMING_PARAMS_LOOKUP(parser_state)
+    multimain_timing_params = AUTO_PIPELINE.MultiMainTimingParams()
+    multimain_timing_params.TimingParamsLookupTable = TimingParamsLookupTable
+    # The parse is complete: area estimates may look up earlier runs from here
+    # on (STORED_MEASUREMENT)
+    parser_state.stored_measurement_timing_params = TimingParamsLookupTable
+
+    # Re-write black box modules that are no longer in final state starting throughput sweep
+    WRITE_BLACK_BOX_FILES(parser_state, multimain_timing_params, False)
+
+    # Get the functions that need to be synthed for path delay
+    requirements = COLLECT_PATH_DELAY_REQUIREMENTS(parser_state, root_func_names)
+    if root_func_names is None:
+        (parser_state.path_delay_funcs, parser_state.path_delay_measure_funcs,
+         parser_state.path_delay_frontier_funcs) = requirements
+        SCHEDULED_FSM_DELAYS(parser_state)
+    if HIER_SYN_MODE != "full":
+        funcs_to_synth = requirements[0]
+        _auto_fsm_muxes = []
+    elif root_func_names is not None:
+        funcs_to_synth = []
+        for func_name in RECURSIVE_GET_FUNCS_FOR_PATH_DELAYS(
+            root_func_names, parser_state
+        ) + list(root_func_names):
+            if func_name not in funcs_to_synth:
+                funcs_to_synth.append(func_name)
+        _auto_fsm_muxes = []
+    else:
+        funcs_to_synth = RECURSIVE_GET_FUNCS_FOR_PATH_DELAYS(
+            parser_state.main_mhz.keys(), parser_state
+        )
+        # ...plus AUTO_FSM's operand multiplexers, which the walk above cannot
+        # reach (see AUTO_FSM_MUX_ENTITIES). Their own subtrees first, so the
+        # list stays bottom-up ordered.
+        _auto_fsm_muxes = sorted(AUTO_FSM.AUTO_FSM_MUX_ENTITIES(parser_state))
+    if _auto_fsm_muxes:
+        for extra in RECURSIVE_GET_FUNCS_FOR_PATH_DELAYS(
+            _auto_fsm_muxes, parser_state
+        ) + _auto_fsm_muxes:
+            if extra not in funcs_to_synth:
+                funcs_to_synth.append(extra)
+
+    # Record stats on functions with globals
+    main_to_min_mhz = {}
+    main_to_min_mhz_func_name = {}
+
+    # Primitive widths this tool/part has measured, fitted once per call
+    delay_model = (
+        PrimitiveDelayModel(GET_PATH_DELAY_CACHE_DIR(parser_state))
+        if USE_PRIMITIVE_DELAY_MODEL
+        else None
+    )
+    # Run multiple syn runs in parallel
+    my_thread_pool = ThreadPool(processes=GET_NUM_PROCESSES())
+    func_name_to_async_result = {}
+    func_name_to_async_owner = {}
+    mux_cache_key_to_async_owner = {}
+    func_names_done_so_far = set()
+    # Hierarchical funcs deferred for delay estimation from submodule delays
+    # instead of a real syn run (leaf-only syn mode). funcs_to_synth is bottom
+    # up ordered (children before parents) so appending preserves that order.
+    funcs_to_estimate = []
+
+    # Start synth runs
+    for logic_func_name in funcs_to_synth:
+        # print("func to synth",logic_func_name)
+        # Get logic
+        logic = parser_state.FuncLogicLookupTable[logic_func_name]
+        # Any inst will do, skip func if was never used as instance
+        inst_name = None
+        if logic_func_name in parser_state.FuncToInstances:
+            inst_name = list(parser_state.FuncToInstances[logic_func_name])[0]
+
+        if logic.vhdl_module_text is not None:
+            # vhdl() text has no input-to-output model. Start with zero
+            # geometry, bypassing cached/stored scalar delays in every mode.
+            # Preserve a measurement made by targeted fallback in this parse.
+            if logic.delay is None:
+                logic.delay = 0
+                logic.delay_is_estimated = True
+                _SET_LOGIC_DELAY_COMPONENTS(logic, None)
+            func_names_done_so_far.add(logic_func_name)
+            continue
+
+        # Estimate a built-in primitive at a new width from measured widths
+        # (PrimitiveDelayModel); exact cache and store entries still win
+        modeled_path_delay = None
+        modeled_error_ns = None
+        if delay_model is not None and logic.is_c_built_in:
+            modeled = delay_model.estimate(logic.func_name)
+            if modeled is not None:
+                modeled_path_delay, modeled_error_ns = modeled
+        # Try to get cached path delay
+        cached_path_delay = GET_CACHED_PATH_DELAY(logic, parser_state)
+        if not STORED_DELAY_IS_USABLE(logic, parser_state):
+            cached_path_delay = None
+        cached_delay_components = None
+        if cached_path_delay is not None:
+            cached_delay_components = GET_CACHED_PATH_DELAY_COMPONENTS(
+                logic, parser_state, cached_path_delay
+            )
+            if (
+                USE_COMBINATIONAL_PLANNER_WEIGHTS
+                and SYN_TOOL is DEVICE_MODELS
+                and cached_delay_components is None
+            ):
+                # The experimental planner cache identity requires timing
+                # components. A lone legacy/partial .delay file cannot supply
+                # its geometry, so measure once and populate the sidecar.
+                cached_path_delay = None
+            if (
+                SYN_TOOL is DEVICE_MODELS
+                and cached_path_delay is not None
+                and LOGIC_PATH_DELAY_IS_CACHEABLE(logic, parser_state)
+                and GET_CACHED_LEAF_AREA(logic, parser_state) is None
+            ):
+                # Leaf area is a free byproduct of the exact same synthesis
+                # run that produces delay (DEVICE_MODELS._run_synth_and_sta
+                # measures both from one mapped netlist), but a warm delay
+                # cache short-circuits before that run ever happens. Force
+                # one real synthesis so a cold cache/area entry gets filled
+                # exactly the way a cold cache/delay entry would --
+                # mirrors the combinational-planner-weights clause just
+                # above, which does the same thing for a missing sidecar.
+                cached_path_delay = None
+        # Prefer cache over model
+        if cached_path_delay is not None:
+            logic.delay = int(cached_path_delay * DELAY_UNIT_MULT)
+            _SET_LOGIC_DELAY_COMPONENTS(logic, cached_delay_components)
+            print(
+                f"Function: {logic.func_name} cached path delay: {cached_path_delay:.3f} ns"
+            )
+            if cached_path_delay > 0.0 and logic.delay == 0:
+                print(
+                    "WARNING: Found cached",
+                    logic_func_name,
+                    "delay path of",
+                    cached_path_delay,
+                    "ns",
+                    "which is to small to represent. Increase delay multiplier?",
+                )
+                logic.delay = 1  # Set to smallest non zero for now?
+        # Then check for known delays
+        elif LOGIC_IS_ZERO_DELAY(logic, parser_state, allow_none_delay=True):
+            logic.delay = 0
+            _SET_LOGIC_DELAY_COMPONENTS(logic, None)
+        elif modeled_path_delay is not None and not (
+            # An earlier run of these exact inputs is a measurement
+            STORED_DELAY_IS_USABLE(logic, parser_state)
+            and SET_STORED_DELAY(logic, parser_state, inst_name, TimingParamsLookupTable)
+        ):
+            logic.delay = max(1, int(modeled_path_delay * DELAY_UNIT_MULT))
+            logic.delay_is_estimated = True
+            logic.delay_model_error = int(math.ceil(modeled_error_ns * DELAY_UNIT_MULT))
+            _SET_LOGIC_DELAY_COMPONENTS(logic, None)
+            print(
+                f"Function: {logic.func_name} modeled path delay: {modeled_path_delay:.3f} ns "
+                f"(within {modeled_error_ns:.2f} ns, from measured widths)"
+            )
+
+        # Prepare for syn to determine
+        if logic.delay is None:
+            if HIER_SYN_MODE != "full" and FUNC_PATH_DELAY_IS_ESTIMABLE(
+                logic, parser_state, requirements[2]
+            ):
+                # Hierarchical func on the pipelining path: derive delay from
+                # submodule delays after leaf syn results are in (see below).
+                # Estimates are guidance for slice placement only - full design
+                # synthesis during the throughput sweep remains the ground truth,
+                # and MEASURE_DELAYS() is the fallback when estimates are off.
+                # An earlier run of these exact inputs is a measurement, though.
+                if not (
+                    STORED_DELAY_IS_USABLE(logic, parser_state)
+                    and SET_STORED_DELAY(
+                        logic, parser_state, inst_name, TimingParamsLookupTable
+                    )
+                ):
+                    funcs_to_estimate.append(logic_func_name)
+            else:
+                cache_key, owner = CLAIM_MUX_PATH_DELAY_SYNTH_OWNER(
+                    logic, parser_state, mux_cache_key_to_async_owner
+                )
+                if owner is not None and owner != logic_func_name:
+                    func_name_to_async_result[logic_func_name] = (
+                        func_name_to_async_result[owner]
+                    )
+                    func_name_to_async_owner[logic_func_name] = owner
+                    print(
+                        f"Sharing MUX path-delay synthesis for {logic.func_name} "
+                        f"with {owner} (cache key {cache_key})",
+                        flush=True,
+                    )
+                else:
+                    # Run real syn in parallel
+                    print(
+                        "Synthesizing function:",
+                        logic.func_name + LOGIC.FUNC_SRC_LOC_STR(parser_state, logic.func_name),
+                        flush=True,
+                    )
+                    # Start Syn
+                    my_async_result = my_thread_pool.apply_async(
+                        SYN_TOOL.SYN_AND_REPORT_TIMING,
+                        (inst_name, logic, parser_state, TimingParamsLookupTable),
+                    )
+                    func_name_to_async_result[logic_func_name] = my_async_result
+                    func_name_to_async_owner[logic_func_name] = logic_func_name
+        else:
+            func_names_done_so_far.add(logic_func_name)
+
+    # Finish parallel syns
+    for logic_func_name in funcs_to_synth:
+        # Get logic
+        logic = parser_state.FuncLogicLookupTable[logic_func_name]
+        func_names_done_so_far.add(logic_func_name)
+        if logic_func_name in func_name_to_async_result:
+            # Get result
+            my_async_result = func_name_to_async_result[logic_func_name]
+            print(
+                f"Function {len(func_names_done_so_far)}/{len(funcs_to_synth)}, elapsed time {ELAPSED_STR()}..."
+            )
+            owner = func_name_to_async_owner[logic_func_name]
+            print("...Waiting on synthesis for:", owner, flush=True)
+            # TODO better than simple loop doing .get() on each and waiting some
+            parsed_timing_report = my_async_result.get()
+            SET_MEASURED_DELAY_FROM_REPORT(logic, parsed_timing_report, parser_state)
+
+        # Syn results are delay and clock
+        # Try to communicate if is a problem path that cant be auto-pipelined
+        # (delay is None here for funcs deferred to estimation below - they are
+        #  all on the pipelining path so would not be reported here anyway)
+        if (
+            logic.delay is not None
+            and logic.delay > 0
+            and not AUTO_PIPELINE.FUNC_HAS_HIER_ALLOWING_ADDED_LATENCY_TO_RAW_VHDL(
+                logic.func_name, parser_state
+            )
+        ):
+            path_delay_ns = logic.delay / DELAY_UNIT_MULT
+            mhz = 1000.0 / path_delay_ns
+            print(
+                f"{logic_func_name} FMAX: {mhz:.3f} MHz ({path_delay_ns:.3f} ns path delay)"
+            )
+            # Record worst non slicable logic
+            insts = list(parser_state.FuncToInstances[logic_func_name])
+            for inst in insts:
+                main_inst = LOGIC.RECURSIVE_FIND_MAIN_FUNC_FROM_INST(
+                    inst, parser_state
+                )
+                if main_inst not in main_to_min_mhz:
+                    main_to_min_mhz[main_inst] = 9999
+                if mhz < main_to_min_mhz[main_inst]:
+                    main_to_min_mhz_func_name[main_inst] = logic.func_name
+                    main_to_min_mhz[main_inst] = mhz
+
+        # Save logic with delay into lookup (should not be needed)
+        parser_state.FuncLogicLookupTable[logic_func_name] = logic
+
+    # Estimate hierarchical func delays from submodule delays (leaf-only mode).
+    # All real syn results are in at this point; bottom up order resolves
+    # estimated children before estimated parents.
+    ESTIMATE_HIER_PATH_DELAYS(funcs_to_estimate, parser_state)
+    if root_func_names is None:
+        AUTO_MULTI_CYCLE.MEASURE_REQUIRED_ENDPOINTS(
+            parser_state, TimingParamsLookupTable, my_thread_pool
+        )
+    my_thread_pool.close()
+    my_thread_pool.join()
+
+    for logic_func_name in funcs_to_synth:
+        if parser_state.FuncLogicLookupTable[logic_func_name].delay is None:
+            print("None delay for func to synth?", logic_func_name)
+
+    # Report worst timing modules
+    for main_inst in main_to_min_mhz if root_func_names is None else ():
+        min_mhz = main_to_min_mhz[main_inst]
+        mhz = parser_state.main_mhz[main_inst]
+        if mhz is not None and mhz > min_mhz:
+            min_mhz_func_name = main_to_min_mhz_func_name[main_inst]
+            print(
+                f"Isolated effective stage-delay estimate ~{1000.0/min_mhz:.3f} ns (~{min_mhz:.3f} MHz), "
+                "not a whole-design limit; MCP values use their current cycle allowance. Function: "
+                f"{min_mhz_func_name}{LOGIC.FUNC_SRC_LOC_STR(parser_state, min_mhz_func_name)}"
+            )
+    WRITE_MODULE_INSTANCES_REPORT_BY_DELAY_USAGE(parser_state)
+
+    return parser_state
+
+
+def WRITE_MODULE_INSTANCES_REPORT_BY_DELAY_USAGE(parser_state):
+    # print(
+    #    "Updating modules instances log to list longest delay, most used modules only..."
+    # )
+    top_n_delay_usage = 10
+
+    # Calc delay*n uses
+    func_to_delay_usage = {}
+    for func_name in parser_state.FuncToInstances:
+        func_logic = parser_state.FuncLogicLookupTable[func_name]
+        if func_logic.delay is None:
+            continue
+        func_path_delay_ns = float(func_logic.delay) / DELAY_UNIT_MULT
+        n_instances = len(parser_state.FuncToInstances[func_name])
+        delay_usage = func_path_delay_ns * n_instances
+        func_to_delay_usage[func_name] = delay_usage
+
+    # Print top N funcs
+    text = ""
+    for n in range(0, top_n_delay_usage):
+        if len(func_to_delay_usage) <= 0:
+            break
+        max_delay_usage = max(func_to_delay_usage.values())
+        for func_name in sorted(func_to_delay_usage):
+            func_logic = parser_state.FuncLogicLookupTable[func_name]
+            func_path_delay_ns = float(func_logic.delay) / DELAY_UNIT_MULT
+            instances = sorted(parser_state.FuncToInstances[func_name])
+            n_instances = len(instances)
+            delay_usage = func_path_delay_ns * n_instances
+            if delay_usage >= max_delay_usage:
+                func_to_delay_usage.pop(func_name, None)
+                text += f"{func_name} {n_instances} instances:\n"
+                for instance in instances:
+                    text += instance.replace(LOGIC.SUBMODULE_MARKER, "/") + "\n"
+                text += "\n"
+
+    out_file = SYN_OUTPUT_DIRECTORY + "/module_instances.log"
+    f = open(out_file, "w")
+    f.write(text)
+    f.close()
+
+    WRITE_NAME_INDEX_LOG(parser_state)
+
+
+def INSTANCE_IS_INSIDE_BUILT_IN_OP(parser_state, inst_name):
+    container_inst = LOGIC.GET_CONTAINER_INST(inst_name)
+    if container_inst:
+        container_func_logic = parser_state.LogicInstLookupTable[container_inst]
+        if container_func_logic.is_c_built_in:
+            return True
+        else:
+            return INSTANCE_IS_INSIDE_BUILT_IN_OP(parser_state, container_inst)
+    return False
+
+
+def WRITE_INTEGER_MODULE_INSTANCES_REPORT(
+    multimain_timing_params, parser_state, exclude_built_in_op_insides=True
+):
+    # Easier to just exclude non integer ops
+    # Even FPGA wires like "shift by constant" are considered integer ops, like in a CPU
+
+    # Keep just integer ops that are built in
+    int_funcs = []
+    int_func_to_max_in_width = {}
+    for func_name in parser_state.FuncToInstances:
+        func_logic = parser_state.FuncLogicLookupTable[func_name]
+        func_types = []
+        # INputs types
+        for input_port in func_logic.inputs:
+            input_c_type = func_logic.wire_to_c_type[input_port]
+            func_types.append(input_c_type)
+        max_in_width = 0
+        if LOGIC.C_TYPES_ARE_INTEGERS(func_types):
+            for func_type in func_types:
+                width = LOGIC.GET_WIDTH_FROM_C_N_BITS_INT_TYPE_STR(func_type)
+                if width > max_in_width:
+                    max_in_width = width
+        # Outputs types
+        for output_port in func_logic.outputs:
+            output_c_type = func_logic.wire_to_c_type[output_port]
+            func_types.append(output_c_type)
+        # Skip casts
+        if func_name.startswith(LOGIC.CAST_FUNC_NAME_PREFIX + "_"):
+            continue
+        if func_logic.is_c_built_in and LOGIC.C_TYPES_ARE_INTEGERS(func_types):
+            int_funcs.append(func_name)
+            int_func_to_max_in_width[func_name] = max_in_width
+
+    if len(int_funcs) <= 0:
+        return
+
+    # Write instance of each func
+    text = ""
+    for func_name in sorted(int_funcs):
+        instances = parser_state.FuncToInstances[func_name]
+        max_in_width = int_func_to_max_in_width[func_name]
+
+        # Filter instances to ones that dont occur inside another built in operation
+        if exclude_built_in_op_insides:
+            instances_to_keep = []
+            for instance in instances:
+                if not INSTANCE_IS_INSIDE_BUILT_IN_OP(parser_state, instance):
+                    instances_to_keep.append(instance)
+            instances = instances_to_keep
+        if len(instances) <= 0:
+            continue
+
+        # Sort by main func
+        main_to_insts = {}
+        for instance in instances:
+            main_func = instance.split(LOGIC.SUBMODULE_MARKER)[0]
+            if main_func not in main_to_insts:
+                main_to_insts[main_func] = []
+            main_to_insts[main_func].append(instance)
+
+        # Print total and then by main func
+        text += f"{func_name} MaxInputWidth= {max_in_width} num_instances= {len(instances)} :\n"
+        for main_func in sorted(main_to_insts):
+            this_main_insts = main_to_insts[main_func]
+            text += f"{func_name} main: {main_func} MaxInputWidth= {max_in_width} num_instances= {len(this_main_insts)} :\n"
+            for instance in sorted(this_main_insts):
+                text += instance.replace(LOGIC.SUBMODULE_MARKER, "/") + "\n"
+        text += "\n"
+
+    out_file = SYN_OUTPUT_DIRECTORY + "/integer_module_instances.log"
+    print(f"Writing log of integer module instances: {out_file}")
+    f = open(out_file, "w")
+    f.write(text)
+    f.close()
+
+
+def WRITE_FLOAT_MODULE_INSTANCES_REPORT(multimain_timing_params, parser_state):
+    # Collect float func names dumb way
+    # looking for any built in funcs with 'float' in the name
+
+    float_funcs = set()
+    for func_name in parser_state.FuncToInstances:
+        func_logic = parser_state.FuncLogicLookupTable[func_name]
+        # Also ignore 'CONST_' things like CONST_REF, and muxes
+        if (
+            "float" in func_name
+            and func_logic.is_c_built_in
+            and "CONST_" not in func_name
+            and "MUX_" not in func_name
+        ):
+            float_funcs.add(func_name)
+
+    if len(float_funcs) <= 0:
+        return
+
+    text = ""
+    for func_name in sorted(float_funcs):
+        instances = sorted(parser_state.FuncToInstances[func_name])
+        # Sort by main func
+        main_to_insts = {}
+        for instance in instances:
+            main_func = instance.split(LOGIC.SUBMODULE_MARKER)[0]
+            if main_func not in main_to_insts:
+                main_to_insts[main_func] = []
+            main_to_insts[main_func].append(instance)
+
+        # Print total and then by main func
+        text += f"{func_name} num_instances= {len(instances)} :\n"
+        for main_func in sorted(main_to_insts):
+            this_main_insts = main_to_insts[main_func]
+            text += f"{func_name} main: {main_func} num_instances= {len(this_main_insts)} :\n"
+            for instance in sorted(this_main_insts):
+                text += instance.replace(LOGIC.SUBMODULE_MARKER, "/") + "\n"
+        text += "\n"
+
+    out_file = SYN_OUTPUT_DIRECTORY + "/float_module_instances.log"
+    print(f"Writing log of floating point module instances: {out_file}")
+    f = open(out_file, "w")
+    f.write(text)
+    f.close()
+
+
+def FUNC_IS_PRIMITIVE(func_name, parser_state):
+    # Try to use the tool assume false otherwise
+    PART_SET_TOOL(parser_state.part, allow_fail=True)
+    try:
+        return SYN_TOOL.FUNC_IS_PRIMITIVE(func_name)
+    except:
+        return False
+
+
+def WRITE_NAME_INDEX_LOG(parser_state):
+    """Index logical/emitted names, complete source descriptions and call sites.
+
+    Includes nested type origins, generated source files, timing variants and
+    per-scope wire/hierarchy mappings. Also called for --no_synth. Pypeline
+    side-tables are optional; classic C builds retain their source/timing index.
+    """
+    name_full = getattr(parser_state, "pypeline_name_full", {})
+    type_canonical = getattr(parser_state, "pypeline_type_canonical", {})
+    hash_ext_info = getattr(parser_state, "pypeline_hash_ext_info", {})
+    names = getattr(parser_state, "pypeline_emission_names", None)
+
+    lines = ["ENTITIES"]
+    for func_name in sorted(parser_state.FuncToInstances.keys()):
+        logic = parser_state.FuncLogicLookupTable.get(func_name)
+        if logic is None:
+            continue
+        loc = None
+        ast_meta = getattr(logic, "ast_meta", None)
+        if ast_meta is not None:
+            loc = f"{ast_meta.src_file}:{ast_meta.line}"
+            if ast_meta.col is not None:
+                loc += f":{ast_meta.col}"
+        full = name_full.get(func_name)
+        if loc is None and full is None:
+            continue  # nothing decodable to report (e.g. a plain built-in)
+        lines.append(f"  {func_name}")
+        if names is not None:
+            lines.append(f"    vhdl:   {names.identifier(func_name)}")
+        if loc is not None:
+            lines.append(f"    source: {loc}")
+        if full is not None:
+            lines.append(f"    full:   {full}")
+        lines.append(f"    insts:  {len(parser_state.FuncToInstances[func_name])}")
+
+    lines.append("")
+    lines.append("TYPES")
+    for type_name in sorted(type_canonical.keys()):
+        lines.append(f"  {type_name}")
+        lines.append(f"    full:   {type_canonical[type_name]}")
+
+    # Present only when the design gave something a name= (see
+    # docs/SYN_DESIGN.md#build-output-name_indexlog)
+    user_names = getattr(parser_state, "pypeline_user_names", {})
+    named_tags = pypeline.USER_NAMED_AUTO_TAGS()
+    if user_names or named_tags:
+        lines.extend(["", "USER NAMES"])
+        for key, (kind, user_name, replaces, source) in sorted(user_names.items()):
+            lines.append(f"  {user_name} ({kind})")
+            lines.append(f"    logical:  {key}")
+            if names is not None:
+                lines.append(f"    vhdl:     {names.identifier(key)}")
+            if replaces:
+                lines.append(f"    replaces: {replaces}")
+            lines.append(f"    source:   {source}")
+        for kind, user_name, key, site in named_tags:
+            lines.append(f"  {user_name} ({kind})")
+            lines.append(f"    key:      {key}")
+            lines.append(f"    source:   {site}")
+
+    if names is not None:
+        lines.extend(["", "SOURCE DESCRIPTIONS"])
+        seen_descriptions = set()
+
+        def describe(info, indent="    "):
+            key = (info.identity, info.source, info.line, info.kind)
+            lines.append(f"{indent}{info.kind}: {info.render(user=False)}")
+            if info.user_name:
+                lines.append(f"{indent}user name: {info.user_name}")
+            lines.append(
+                f"{indent}source: {info.source}:{info.line} ({info.module}.{info.qualname})"
+            )
+            if key in seen_descriptions:
+                return
+            seen_descriptions.add(key)
+            lines.append(f"{indent}identity: {info.identity}")
+            for label, child in info.params + info.fields:
+                if hasattr(child, "render"):
+                    lines.append(f"{indent}{label}:")
+                    describe(child, indent + "  ")
+
+        for raw, infos in sorted(names.descriptions.items()):
+            lines.append(f"  {names.identifier(raw)}")
+            lines.append(f"    logical: {raw}")
+            for info in sorted(infos, key=lambda n: (n.source, n.line, n.qualname)):
+                describe(info)
+
+        lines.extend(["", "INSTANCES AND WIRES"])
+        for func_name in sorted(parser_state.FuncToInstances):
+            logic = parser_state.FuncLogicLookupTable[func_name]
+            lines.append(f"  scope: {names.identifier(func_name)}")
+            for inst in sorted(parser_state.FuncToInstances[func_name]):
+                path = "/".join(
+                    VHDL.WIRE_TO_VHDL_NAME(t, parser_state)
+                    for t in inst.split(LOGIC.SUBMODULE_MARKER)
+                )
+                lines.append(f"    hierarchy: {path}")
+            for inst, child in sorted(logic.submodule_instances.items()):
+                lines.append(
+                    f"    instance: {VHDL.WIRE_TO_VHDL_NAME(inst, parser_state)} -> {names.identifier(child)}"
+                )
+                for origin in sorted(
+                    logic.submodule_instance_to_source_origins.get(inst, ())
+                ):
+                    source, line, col, end_line, end_col = origin
+                    lines.append(
+                        f"      source: {source}:{line}:{col}-{end_line}:{end_col}"
+                    )
+            for wire in sorted(logic.wires):
+                lines.append(f"    wire: {VHDL.WIRE_TO_VHDL_NAME(wire, parser_state)}")
+                lines.append(f"      logical: {wire}")
+                lines.append(f"      type: {logic.wire_to_c_type.get(wire, '?')}")
+
+        lines.extend(["", "EMITTED IDENTIFIERS"])
+        for emitted, (raw, full) in sorted(names.full.items()):
+            lines.append(f"  {emitted}")
+            lines.append(f"    logical: {raw}")
+            lines.append(f"    full: {full}")
+
+    lines.append("")
+    lines.append("GENERATED SOURCES")
+    try:
+        gen_dir = SYN_OUTPUT_DIRECTORY + "/pypeline_generated_source"
+        written = pypeline.dump_generated_sources(gen_dir)
+        for gen_path in sorted(written):
+            lines.append(f"  {gen_path}")
+    except Exception as e:
+        lines.append(f"  (failed to dump generated sources: {e})")
+
+    lines.append("")
+    lines.append("PIPELINE VARIANTS")
+    for hash_ext in sorted(hash_ext_info.keys()):
+        owner, detail = hash_ext_info[hash_ext]
+        lines.append(f"  {hash_ext} -> {owner}, {detail}")
+
+    out_file = SYN_OUTPUT_DIRECTORY + "/name_index.log"
+    with open(out_file, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# Generalizing is a bad thing to do
+# Abstracting is something more
+
+
+# Should this branch to call syn tool specific includes of like ieee files?
+# returns vhdl_files_txt,top_entity_name
+def GET_VHDL_FILES_TCL_TEXT_AND_TOP(
+    multimain_timing_params, parser_state, inst_name=None, is_final_top=False
+):
+    # Read in vhdl files with a single (faster than multiple) read_vhdl
+    files_txt = ""
+
+    # Built in src/vhdl #TODO just auto add every file in dir
+    files_txt += SYN_OUTPUT_DIRECTORY + "/" + "built_in/pipelinec_fifo_fwft.vhd" + " "
+    files_txt += (
+        SYN_OUTPUT_DIRECTORY + "/" + "built_in/pipelinec_async_fifo_fwft.vhd" + " "
+    )
+
+    # C defined structs
+    files_txt += SYN_OUTPUT_DIRECTORY + "/" + "c_structs_pkg" + VHDL.VHDL_PKG_EXT + " "
+
+    # Clocking crossing if needed
+
+    if not inst_name and len(parser_state.clk_cross_var_info) > 0:
+        # Multimain needs clk cross entities
+        # Clock crossing entities
+        files_txt += (
+            SYN_OUTPUT_DIRECTORY + "/" + "clk_cross_entities" + VHDL.VHDL_FILE_EXT + " "
+        )
+
+    needs_global_t = (
+        VHDL.NEEDS_GLOBAL_WIRES_VHDL_PACKAGE(parser_state) and not inst_name
+    )  # is multimain
+    if inst_name:
+        # Does inst need clk cross?
+        Logic = parser_state.LogicInstLookupTable[inst_name]
+        needs_global_to_module = LOGIC.LOGIC_NEEDS_GLOBAL_TO_MODULE(
+            Logic, parser_state
+        )  # , multimain_timing_params.TimingParamsLookupTable)
+        needs_module_to_global = LOGIC.LOGIC_NEEDS_MODULE_TO_GLOBAL(
+            Logic, parser_state
+        )  # , multimain_timing_params.TimingParamsLookupTable)
+        needs_global_t = needs_global_to_module or needs_module_to_global
+    if needs_global_t:
+        # Clock crossing record
+        files_txt += (
+            SYN_OUTPUT_DIRECTORY + "/" + "global_wires_pkg" + VHDL.VHDL_PKG_EXT + " "
+        )
+
+    # Top not shared
+    top_entity_name = VHDL.GET_TOP_ENTITY_NAME(
+        parser_state, multimain_timing_params, inst_name, is_final_top
+    )
+    if inst_name:
+        Logic = parser_state.LogicInstLookupTable[inst_name]
+        output_directory = GET_OUTPUT_DIRECTORY(Logic)
+        files_txt += output_directory + "/" + top_entity_name + VHDL.VHDL_FILE_EXT + " "
+    else:
+        # Entity and file name
+        filename = top_entity_name + VHDL.VHDL_FILE_EXT
+        files_txt += (
+            SYN_OUTPUT_DIRECTORY + "/" + TOP_LEVEL_MODULE + "/" + filename + " "
+        )
+
+    # Write all entities starting at this inst/multi main
+    inst_names = set()
+    if inst_name:
+        inst_names = set([inst_name])
+    else:
+        inst_names = set(parser_state.main_mhz.keys())
+
+    entities_so_far = set()
+    while len(inst_names) > 0:
+        next_inst_names = set()
+        # Sets are useful for frontier deduplication, but their iteration
+        # order is process-randomized. Keep the ordered VHDL input list
+        # deterministic: it participates in synthesis cache identity and two
+        # byte-identical designs must not re-map merely because siblings were
+        # discovered in a different hash order.
+        for inst_name_i in sorted(inst_names):
+            logic_i = parser_state.LogicInstLookupTable[inst_name_i]
+            # Write file text
+            # ONly write non vhdl
+            if (
+                logic_i.is_vhdl_func
+                or logic_i.is_vhdl_expr
+                or logic_i.func_name == LOGIC.VHDL_FUNC_NAME
+            ):
+                continue
+            # Dont write clock cross
+            if logic_i.is_clock_crossing:
+                continue
+            entity_filename = (
+                VHDL.GET_ENTITY_NAME(
+                    inst_name_i,
+                    logic_i,
+                    multimain_timing_params.TimingParamsLookupTable,
+                    parser_state,
+                )
+                + ".vhd"
+            )
+            if entity_filename not in entities_so_far:
+                entities_so_far.add(entity_filename)
+                # Include entity file for this functions slice variant
+                syn_output_directory = GET_OUTPUT_DIRECTORY(logic_i)
+                files_txt += syn_output_directory + "/" + entity_filename + " "
+
+            # Add submodules as next inst_names
+            for submodule_inst in sorted(logic_i.submodule_instances):
+                full_submodule_inst_name = (
+                    inst_name_i + LOGIC.SUBMODULE_MARKER + submodule_inst
+                )
+                next_inst_names.add(full_submodule_inst_name)
+
+        # Use next insts as current
+        inst_names = set(next_inst_names)
+
+    if inst_name and not is_final_top:
+        # An isolated synthesis reads only the types its files use, so a
+        # type changing elsewhere in the design keeps its cached result.
+        full_pkg = SYN_OUTPUT_DIRECTORY + "/" + "c_structs_pkg" + VHDL.VHDL_PKG_EXT
+        others = [f for f in files_txt.split() if f != full_pkg]
+        scoped = VHDL.SCOPED_C_STRUCTS_PACKAGE(others, parser_state)
+        if scoped is not None:
+            files_txt = files_txt.replace(full_pkg + " ", scoped + " ", 1)
+
+    return files_txt, top_entity_name

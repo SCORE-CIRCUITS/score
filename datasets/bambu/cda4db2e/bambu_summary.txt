@@ -1,0 +1,4 @@
+PandA-Bambu SCORE snapshot (ferrandi/PandA-bambu)
+Commit: cda4db2e
+Dataset: /home/yongfu/proj/score/datasets/bambu/cda4db2e
+Snapshot files: 28

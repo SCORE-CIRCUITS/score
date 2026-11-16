@@ -1,0 +1,5 @@
+c910 SCORE snapshot (T-head-Semi/openc910)
+Commit: b91c9091
+Dataset: /home/yongfu/proj/score/datasets/c910/b91c9091
+Simulation model: OK (SIM=iverilog)
+Design files: 544

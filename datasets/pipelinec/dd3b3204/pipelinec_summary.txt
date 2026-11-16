@@ -1,0 +1,5 @@
+PipelineC SCORE snapshot (JulianKemmerer/PipelineC)
+Commit: dd3b3204
+Dataset: /home/yongfu/proj/score/datasets/pipelinec/dd3b3204
+Generated HDL files: 30
+Snapshot files: 5

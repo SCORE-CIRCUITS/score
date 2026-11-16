@@ -1,0 +1,40 @@
+ARG BASE=ubuntu:focal
+
+FROM ${BASE} AS openroad
+ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBCONF_NONINTERACTIVE_SEEN=true
+RUN { echo 'tzdata tzdata/Areas select Etc'; echo 'tzdata tzdata/Zones/Etc select UTC'; } | debconf-set-selections \
+   && apt-get update && apt-get -y install --no-install-recommends \
+   automake bison ca-certificates flex g++ gcc git make python3-dev tcl-dev wget \
+   && rm -rf /var/lib/apt/lists/* \
+   && update-ca-certificates \
+   && git clone --depth 1 --recursive https://github.com/The-OpenROAD-Project/OpenROAD.git /OpenROAD \
+   && cd /OpenROAD \
+   && ./etc/DependencyInstaller.sh -common \
+   && ./etc/Build.sh -dir="build" -no-warnings -no-gui -threads=16 -cmake="-DCMAKE_INSTALL_PREFIX=/opt/openroad" \
+   && cmake --install build
+
+FROM ${BASE} AS yosys
+ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBCONF_NONINTERACTIVE_SEEN=true
+RUN apt-get update -qq && apt-get -y install --no-install-recommends \
+   bison ca-certificates curl flex g++ gcc git libffi-dev libreadline-dev make python3 pkg-config tcl-dev \
+   && rm -rf /var/lib/apt/lists/* \
+   && update-ca-certificates \
+   && git clone --depth 1 --branch yosys-0.36 https://github.com/The-OpenROAD-Project/yosys.git /yosys \
+   && cd /yosys \
+   && sed -i 's/CONFIG := clang/CONFIG := gcc/;s/ENABLE_COVER := 1/ENABLE_COVER := 0/' Makefile \
+   && make install -j16 PREFIX=/opt/yosys
+
+
+FROM ${BASE} AS base
+ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBCONF_NONINTERACTIVE_SEEN=true
+RUN { echo 'tzdata tzdata/Areas select Etc'; echo 'tzdata tzdata/Zones/Etc select UTC'; } | debconf-set-selections \
+   && apt-get update && apt-get -y install --no-install-recommends \
+   binutils curl libpython3.9 python3 readline-common tcl tcl-tclreadline tzdata \
+   && rm -rf /var/lib/apt/lists/*
+COPY --link --from=yosys /opt/yosys /opt/yosys
+COPY --link --from=openroad /opt/openroad /opt/openroad
+COPY --link --from=openroad /opt/or-tools /opt/or-tools
+ENV PATH=/opt/openroad/bin:/opt/yosys/bin:$PATH

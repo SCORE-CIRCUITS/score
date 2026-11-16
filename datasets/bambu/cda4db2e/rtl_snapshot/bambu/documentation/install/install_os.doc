@@ -1,0 +1,53 @@
+/*
+ *
+ *                   _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *                  _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *                 _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *                _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *               _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *             ***********************************************
+ *                              PandA Project 
+ *                     URL: http://panda.dei.polimi.it
+ *                       Politecnico di Milano - DEIB
+ *                        System Architectures Group
+ *             ***********************************************
+ *              Copyright (c) 2023-2026 Politecnico di Milano
+ *
+ *   This file is part of the PandA framework.
+ *
+ *   The PandA framework is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+*/
+/*!
+  \page install_supportedos Supported Operating Systems
+  PandA is developed and validated primarily on 64-bit Linux systems.
+
+  This page intentionally avoids a frozen distro/version matrix: exact host distributions change over time more quickly than the documentation, while the practical requirement is a recent Linux environment with the tools needed by the selected build flow.
+
+  The most stable choices are:
+  - a recent Debian- or Ubuntu-based distribution;
+  - a recent Red Hat, Rocky, AlmaLinux, or Fedora-derived distribution;
+  - a containerized Linux environment built from the recipes shipped in the repository.
+
+  \section install_supportedos_notes Notes
+  Keep the following in mind:
+  - CMake is the preferred build system for current development flows;
+  - Autotools remains available for compatibility, but should not be treated as the default path for new instructions;
+  - synthesis, simulation, and FPGA back-end flows may require additional vendor tools beyond the base host OS;
+  - if host-package availability is a concern, prefer the container-based workflow described in \ref install_docker.
+
+  Operating systems not listed above may still work, but they should be treated as best-effort configurations unless they are covered by current CI or actively maintained developer environments.
+
+*/

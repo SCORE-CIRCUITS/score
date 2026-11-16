@@ -1,0 +1,370 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/**
+ * @file language_writer.hpp
+ * @brief This class writes different HDL based descriptions (VHDL, Verilog, SystemC) starting from a structural
+ * representation.
+ *
+ * @author Fabrizio Ferrandi <fabrizio.ferrandi@polimi.it>
+ * @author Christian Pilato <pilato@elet.polimi.it>
+ *
+ */
+#ifndef LANGUAGE_WRITER_HPP
+#define LANGUAGE_WRITER_HPP
+
+#include "custom_set.hpp"
+#include "dbgPrintHelper.hpp"
+#include "refcount.hpp"
+
+#include <list>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "config_HAVE_FROM_C_BUILT.hpp"
+
+CONSTREF_FORWARD_DECL(Parameter);
+CONSTREF_FORWARD_DECL(structural_object);
+CONSTREF_FORWARD_DECL(technology_manager);
+REF_FORWARD_DECL(IndentedOutputStream);
+REF_FORWARD_DECL(language_writer);
+REF_FORWARD_DECL(structural_object);
+REF_FORWARD_DECL(structural_type_descriptor);
+
+#define BITSIZE_PREFIX "BITSIZE_"
+#define PORTSIZE_PREFIX "PORTSIZE_"
+#define NUM_ELEM_PREFIX "NUM_ELEM_"
+enum class HDLWriter_Language
+{
+   VERILOG = 0,
+   SYSTEM_VERILOG,
+   VHDL
+};
+
+/**
+ * HDL writer base class used to specify the interface of the different language writers
+ */
+class language_writer
+{
+ protected:
+   inline std::string encode_one_hot(unsigned int n_states, unsigned int val) const
+   {
+      std::string res;
+      for(unsigned int i = 0; i < n_states; ++i)
+      {
+         res = (val == i ? "1" : "0") + res;
+      }
+      return res;
+   }
+
+   /// Represents the stream we are currently writing to
+   const IndentedOutputStreamRef indented_output_stream;
+
+   /// list of library imported (e.g., includes).
+   CustomOrderedSet<std::string> list_of_lib;
+
+   /// list of customized gates
+   CustomOrderedSet<std::string> list_of_customized_gates;
+
+   friend class HDL_manager;
+   /// the set of input parameters
+   const ParameterConstRef parameters;
+
+   /// debugging level of the class
+   int debug_level;
+
+ public:
+   language_writer(char open_char, char close_char, const ParameterConstRef parameters);
+
+   virtual ~language_writer() = default;
+
+   /**
+    * Creates the specialization of the writer based on the desired language
+    * @param language is the desired language
+    * @param TM is the technology manager
+    * @param parameters is the set of input parameters
+    */
+   static language_writerRef create_writer(HDLWriter_Language language, const technology_managerConstRef TM,
+                                           const ParameterConstRef parameters);
+
+   /**
+    * Returns the name of the language writer.
+    */
+   virtual std::string get_name() const = 0;
+
+   /**
+    * Returns the filename extension associated with the specification.
+    */
+   virtual std::string get_extension() const = 0;
+
+   /**
+    * Writes a raw string into the stream.
+    * @param rawString is the string to be written.
+    */
+   virtual void write(const std::string& rawString);
+
+   /**
+    * Writes the header part of the file. Write some lines of comments and possibly global libraries.
+    * @param is_library true if writing PandA/Bambu IP library file
+    */
+   virtual void write_header(bool is_library);
+
+   /**
+    * Prints a comment.
+    * @param comment_string is the string to be printed as a comment.
+    */
+   virtual void write_comment(const std::string& comment_string) = 0;
+
+   /**
+    * Return a language based type string given a structural_type_descriptor.
+    * @param Type is the structural_type_descriptor.
+    */
+   virtual std::string type_converter(structural_type_descriptorRef Type) = 0;
+
+   /**
+    * Return a language based size string given the object
+    * @param cir is the object
+    */
+   virtual std::string type_converter_size(const structural_objectRef& cir) = 0;
+
+   /**
+    * Write the declaration of the library.
+    * @param cir is the component for which the library declarations are written.
+    */
+   virtual void write_library_declaration(const structural_objectRef& cir) = 0;
+   /**
+    * Write the declaration of the module.
+    * @param cir is the module to be written.
+    * @param is_library true for PANDA/BAMBU IP library components, false for components derived from user input
+    */
+   virtual void write_module_declaration(const structural_objectRef& cir, bool is_library = true) = 0;
+   /**
+    * Write the declaration of internal objects of the module.
+    * @param cir is the module to be written.
+    */
+   virtual void write_module_internal_declaration(const structural_objectRef& cir) = 0;
+   /**
+    * Write the port declaration starting from a port object.
+    * @param cir is the port to be written.
+    * @param first_port_analyzed is true after the first port declaration has already been emitted.
+    */
+   virtual void write_port_declaration(const structural_objectRef& cir, bool first_port_analyzed) = 0;
+   /**
+    * Write the declaration of componets
+    * @param cir is the component to be declared.
+    */
+   virtual void write_component_declaration(const structural_objectRef& cir) = 0;
+   /**
+    * Write the declaration of a signal
+    * @param cir is the signal to be declared.
+    */
+   virtual void write_signal_declaration(const structural_objectRef& cir) = 0;
+   /**
+    * Write the begin part in a module declaration.
+    * @param cir is the top component to be declared.
+    */
+   virtual void write_module_definition_begin(const structural_objectRef& cir) = 0;
+   /**
+    * Write the initial part of the instance of a module.
+    * @param cir is the module to be instanced.
+    * @param module_name is the name of the module to be instanced. It has to be specified since VHDL and Verilog can
+    * print instances in different ways.
+    * @param write_parametrization selects whether parameter or generic bindings have to be emitted.
+    */
+   virtual void write_module_instance_begin(const structural_objectRef& cir, const std::string& module_name,
+                                            bool write_parametrization) = 0;
+   /**
+    * Write the ending part of the instance of a module.
+    * @param cir is the module to be instanced.
+    */
+   virtual void write_module_instance_end(const structural_objectRef& cir) = 0;
+   /**
+    * Write the binding of a port. It follows the name binding style.
+    * @param port is the port to be bounded.
+    * @param top is the component owner of the component that has the port to be bounded.
+    * @param first_port_analyzed is true after the first port binding has already been emitted.
+    */
+   virtual void write_port_binding(const structural_objectRef& port, const structural_objectRef& top,
+                                   bool first_port_analyzed) = 0;
+
+   virtual void write_vector_port_binding(const structural_objectRef& port, bool first_port_analyzed) = 0;
+   /**
+    * Write the end part in a module declaration.
+    * @param cir is the top component to be declared.
+    * @param is_library true for PANDA/BAMBU IP library components, false for components derived from user input
+    */
+   virtual void write_module_definition_end(const structural_objectRef& cir, bool is_library = true) = 0;
+   /**
+    * Write some code managing primary ports to signals connections.
+    * Loop signals are present for example in this bench circuit:
+    * INPUT(X)
+    * OUTPUT(Z)
+    * Y = DFF(Z)
+    * Z = AND(X,Y)
+    * The circuit builder adds an internal signal Z_sign allowing the write and read of the Z values.
+    * @param port is the primary port for which this problem happens.
+    * @param sig is the attached signal.
+    */
+   virtual void write_io_signal_post_fix(const structural_objectRef& port, const structural_objectRef& sig) = 0;
+   virtual void write_io_signal_post_fix_vector(const structural_objectRef& port, const structural_objectRef& sig) = 0;
+   /**
+    * Module can be parametrized with respect different features. Port vectors are parametrized with the number of port
+    * associated, while ports are parametrized in case the type is a integer with the number of bits. The id of the
+    * module is modified by adding the parameters at its end. For example an AND_GATE with a port_vector of 2 will be
+    * declared as: AND_GATE_2. Moreover, a multiplier with the first input of four bits, the second input with eight
+    * bits and an output of twelve bits will be declared as: MULT_4_8_12. Note that parametrization has a meaning only
+    * in case the functionality come from the STD technology library.
+    * @param cir is the component to be declared.
+    */
+   virtual void write_module_parametrization(const structural_objectRef& cir) = 0;
+   /**
+    * write the declaration of all the states of the finite state machine.
+    * @param cir is the component containing the FSM.
+    * @param list_of_states is the list of all the states.
+    * @param reset_port is the reset port.
+    * @param reset_state is the reset state.
+    * @param one_hot selects one-hot state encoding when true.
+    */
+   virtual void write_state_declaration(const structural_objectRef& cir, const std::list<std::string>& list_of_states,
+                                        const std::string& reset_port, const std::string& reset_state,
+                                        bool one_hot) = 0;
+
+   /**
+    * write the declaration for the stage register
+    * @param cir is the component containing the stage register.
+    * @param nStages is the number of stages.
+    */
+   virtual void write_stage_declaration(const structural_objectRef& cir, int nStages) = 0;
+
+   /**
+    * write the present_state update process
+    * @param cir is the component containing the FSM.
+    * @param reset_state is the reset state.
+    * @param reset_port is the reset port.
+    * @param clock_port is the clock port.
+    * @param reset_type identifies the reset style to be emitted.
+    * @param connect_present_next_state_signals selects whether the present/next state signals have to be connected.
+    */
+   virtual void write_present_state_update(const structural_objectRef cir, const std::string& reset_state,
+                                           const std::string& reset_port, const std::string& clock_port,
+                                           const std::string& reset_type, bool connect_present_next_state_signals) = 0;
+
+   /**
+    * write the present_stages update process
+    * @param cir is the component containing the stage register.
+    * @param reset_port is the reset port.
+    * @param clock_port is the clock port.
+    * @param reset_type identifies the reset style to be emitted.
+    * @param start_port is the start port used to initialize stage tracking.
+    * @param nStages is the number of stages to be updated.
+    */
+   virtual void write_present_stages_update(const structural_objectRef cir, const std::string& reset_port,
+                                            const std::string& clock_port, const std::string& reset_type,
+                                            const std::string& start_port, int nStages) = 0;
+
+   /**
+    * Write the transition and output functions.
+    * @param single_proc selects a single-process FSM style when true.
+    * @param output_index is the output-function index to be emitted.
+    * @param cir is the component.
+    * @param reset_state is the reset state.
+    * @param reset_port is the reset port.
+    * @param start_port is the start port.
+    * @param clock_port is the clock port.
+    * @param first is the first iterator of the state table.
+    * @param end is the end iterator of the state table.
+    * @param is_yosys is true when the transition table is meant for YOSYS.
+    * @param bypass_signals contains the bypass-signal mapping indexed by output and state.
+    * @param fsm_stage_i is the current FSM stage identifier when stage-aware output logic is emitted.
+    */
+   virtual void write_transition_output_functions(
+       bool single_proc, unsigned int output_index, const structural_objectRef& cir, const std::string& reset_state,
+       const std::string& reset_port, const std::string& start_port, const std::string& clock_port,
+       std::vector<std::string>::const_iterator& first, std::vector<std::string>::const_iterator& end, bool is_yosys,
+       const std::map<unsigned int, std::map<std::string, std::set<unsigned int>>>& bypass_signals,
+       const std::string& fsm_stage_i) = 0;
+
+   /**
+    * Write in the proper language the behavioral description of the module described in "Not Parsed" form.
+    * @param cir is the component.
+    */
+   virtual void write_NP_functionalities(const structural_objectRef& cir) = 0;
+
+   /**
+    * Write the header for generics
+    */
+   virtual void write_port_decl_header() = 0;
+
+   /**
+    * Write the tail for generics
+    */
+   virtual void write_port_decl_tail() = 0;
+
+   /**
+    * Write the declaration of the module parameters
+    */
+   virtual void write_module_parametrization_decl(const structural_objectRef& cir) = 0;
+
+   virtual void write_assign(const std::string& op0, const std::string& op1) = 0;
+
+   virtual bool has_output_prefix() const = 0;
+
+   /**
+    * Counts the number of bits in an unsigned int.
+    * @param n is the number.
+    */
+   static unsigned int bitnumber(unsigned long long n);
+
+   virtual bool check_keyword(const std::string& id) const = 0;
+
+   /**
+    * Write a builtin component
+    * @param component is the component to be printed
+    */
+   virtual void WriteBuiltin(const structural_objectConstRef component) = 0;
+
+   /**
+    * Dump the content of the write as a string
+    */
+   const std::string WriteString() const;
+
+   /**
+    * Write content to a file
+    * @param filename is the destination file path.
+    */
+   void WriteFile(const std::string& filename) const;
+
+   /**
+    * Write the license
+    * @param is_library true if writing PandA/Bambu IP library file
+    */
+   void WriteLicense(bool is_library = true);
+
+   /**
+    * Return the names of auxiliary signals which will be used by backend
+    */
+   static const CustomSet<std::string>& GetHDLReservedNames();
+};
+/// RefCount definition of the class
+using language_writerRef = refcount<language_writer>;
+
+#endif

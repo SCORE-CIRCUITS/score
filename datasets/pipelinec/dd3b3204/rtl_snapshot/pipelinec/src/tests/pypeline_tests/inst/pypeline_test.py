@@ -1,0 +1,366 @@
+# pyright: reportInvalidTypeForm=none
+import sys, os
+
+# Path for pypeline import
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../")
+)
+
+from pypeline import (
+    MAIN,
+    Reg,
+    Feedback,
+    uint1_t,
+    uint8_t,
+    uint32_t,
+    uint34_t,
+    hw_func,
+    sim_reset,
+    sim_call,
+    Input,
+    make_reset,
+)
+
+# Path for pypeline_tests import
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "def")
+)
+import pypeline_tests
+
+
+# Synchronous reset pin (pulsed in cycle 0 by the simulators): every @MAIN
+# resets every register with it
+rst: Input[uint1_t] = make_reset()
+
+
+@MAIN(reset=rst, reset_registers="all")
+def regs_multi_inst(sel: uint1_t, data_in: uint32_t) -> uint32_t:
+    rv: uint32_t
+    if sel:
+        rv = pypeline_tests.accumulator(data_in)  # instance1
+    else:
+        rv = pypeline_tests.accumulator(data_in)  # instance0
+    return rv
+
+
+def test_regs_multi_inst():
+    sim_reset()
+    assert sim_call(regs_multi_inst, sel=1, data_in=1) == 1  # instance1 acc: 0→1
+    assert sim_call(regs_multi_inst, sel=0, data_in=1) == 1  # instance0 acc: 0→1
+    assert sim_call(regs_multi_inst, sel=1, data_in=1) == 2  # instance1 acc: 1→2
+    print("test_regs_multi_inst PASS")
+
+
+if __name__ == "__main__":
+    test_regs_multi_inst()
+
+
+@MAIN(reset=rst, reset_registers="all")
+def feedback_test(a: uint1_t, b: uint1_t) -> uint1_t:
+    # Declare feedback, is not zero initalized in hardware
+    # (is zero initialized for simulation evaluation)
+    f: Feedback[uint1_t]
+    # Use feedback before it has been assigned a value
+    # (typically would be zeros for hw elab, but not for feedback)
+    # (is zero for simulation first pass of evaluation before feedback)
+    rv: uint1_t = f | a
+    # Do the 'later' computation that needs to be fed back
+    f = ~b
+    return rv
+
+
+def sim_feedback_test():
+    sim_reset()
+    # b=0 → f=~0=1, rv=1|a
+    assert sim_call(feedback_test, a=0, b=0) == 1
+    assert sim_call(feedback_test, a=1, b=0) == 1
+    # b=1 → f=~1=0, rv=0|a
+    assert sim_call(feedback_test, a=0, b=1) == 0
+    assert sim_call(feedback_test, a=1, b=1) == 1
+    print("sim_feedback_test PASS")
+
+
+if __name__ == "__main__":
+    sim_feedback_test()
+
+
+@MAIN(reset=rst, reset_registers="all")
+def fb_reg_accumulate(load: uint1_t, data: uint8_t) -> uint8_t:
+    acc: Reg[uint8_t]  # accumulates across calls
+    f: Feedback[uint1_t]  # 1 when acc is odd (LSB of acc)
+    # use feedback before it is driven
+    out: uint8_t = acc + f
+    # feedback driver: LSB of the initial acc value for this cycle
+    f = acc & 1
+    # conditionally load a new value or accumulate
+    if load:
+        acc = data
+    else:
+        acc = out
+    return out
+
+
+def sim_fb_reg_accumulate_test():
+    sim_reset()
+    # load=1, data=3: acc_init=0, f=0&1=0 (converges immediately),
+    #   out=0+0=0, acc committed=3, return 0
+    assert sim_call(fb_reg_accumulate, load=1, data=3) == 0
+    # load=0: acc_init=3, f=3&1=1 (needs 2 passes to converge),
+    #   out=3+1=4, acc committed=4, return 4
+    assert sim_call(fb_reg_accumulate, load=0, data=0) == 4
+    # load=0: acc_init=4, f=4&1=0 (converges immediately),
+    #   out=4+0=4, acc committed=4, return 4
+    assert sim_call(fb_reg_accumulate, load=0, data=0) == 4
+    print("sim_fb_reg_accumulate_test PASS")
+
+
+if __name__ == "__main__":
+    sim_fb_reg_accumulate_test()
+
+
+@MAIN(reset=rst, reset_registers="all")
+def ce_accum_test(sel0: uint1_t, sel1: uint1_t, data_in: uint32_t) -> uint32_t:
+    rv: uint32_t
+    if sel0:
+        if sel1:
+            rv = pypeline_tests.accumulator(data_in)
+    return rv
+
+
+@MAIN(reset=rst, reset_registers="all")
+def comp_null_test(sel: uint1_t) -> pypeline_tests.point_xy_t:
+    p: pypeline_tests.point_xy_t
+    if sel:
+        p.x = 1
+    else:
+        p.y = 1
+    return p
+
+
+@MAIN(reset=rst, reset_registers="all")
+def void_ret_test2(sel: uint1_t):
+    p: pypeline_tests.point_xy_t
+    if sel:
+        p.x = 1
+    else:
+        p.y = 1
+
+
+@MAIN(reset=rst, reset_registers="all")
+def test_point_u8_t(point: pypeline_tests.point_u8_t) -> pypeline_tests.point_u8_t:
+    return point
+
+
+@MAIN(reset=rst, reset_registers="all")
+def types_test_main(point: pypeline_tests.point_t) -> pypeline_tests.point_t:
+    return pypeline_tests.types_test_foo(point)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def reg_test(data_in: uint32_t) -> uint32_t:
+    acc: Reg[uint32_t]
+    acc = acc + data_in
+    return acc
+
+
+@MAIN(reset=rst, reset_registers="all")
+def while_concat_main(bits_lo: uint1_t[5], bits_hi: uint1_t[6]) -> uint1_t[11]:
+    bits: uint1_t[11]
+    b = 0
+    i = 0
+    while i < 5:
+        bits[b] = bits_lo[i]
+        b = b + 1
+        i = i + 1
+    i = 0
+    while i < 6:
+        bits[b] = bits_hi[i]
+        b = b + 1
+        i = i + 1
+    return bits
+
+
+@MAIN(reset=rst, reset_registers="all")
+def adder_extra(a: uint32_t, b: uint32_t, c: uint32_t) -> uint34_t:
+    return (a + b) + c
+
+
+@MAIN(reset=rst, reset_registers="all")
+def adder(l: uint32_t, r: uint32_t) -> uint32_t:
+    return l + r
+
+
+@MAIN(reset=rst, reset_registers="all")
+def main_const_ref_rd(
+    my_points: pypeline_tests.point_xy_t[10],
+) -> pypeline_tests.point_xy_t[10]:
+    p0 = my_points[0]  # CONST_REF_RD(my_points) -> p0_alias
+
+    my_points[1].x = 1  # env["my_points[1].x"] = alias_1x (driven by const 1)
+    my_points[1].y = 2  # env["my_points[1].y"] = alias_1y (driven by const 2)
+
+    my_points[2] = p0  # env["my_points[2]"] = alias_2 driven directly by p0_alias
+
+    p1 = my_points[1]  # CONST_REF_RD(alias_1x, alias_1y) -> p1_alias
+
+    p2 = my_points[2]  # no CONST_REF_RD needed - alias_2 covers [2] entirely
+
+    my_points[3] = p1  # env["my_points[3]"] = alias_3 driven directly by p1_alias
+
+    my_points[4] = p2  # env["my_points[4]"] = alias_4 driven directly by p2_alias
+
+    return my_points
+
+
+@MAIN(reset=rst, reset_registers="all")
+def adder_factory_test(a: uint32_t, b: uint32_t) -> uint32_t:
+    return pypeline_tests.add_u32(a, b)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def adder_factory_dedup_test(a: uint32_t, b: uint32_t) -> uint32_t:
+    return pypeline_tests.add_u32_dup(a, b)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def adder_factory_u8_test(a: uint8_t, b: uint8_t) -> uint8_t:
+    return pypeline_tests.add_u8(a, b)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_func_factory_test(a: uint32_t, b: uint32_t, c: uint32_t) -> uint32_t:
+    return pypeline_tests.sum3_u32(a, b, c)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_func_factory_dedup_test(a: uint32_t, b: uint32_t, c: uint32_t) -> uint32_t:
+    return pypeline_tests.sum3_u32_dup(a, b, c)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_func_factory_u8_test(a: uint8_t, b: uint8_t, c: uint8_t) -> uint8_t:
+    return pypeline_tests.sum3_u8(a, b, c)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def pair_passthrough(p: pypeline_tests.pair_u32_t) -> pypeline_tests.pair_u32_t:
+    return p
+
+
+@MAIN(reset=rst, reset_registers="all")
+def pair_swap_fields(p: pypeline_tests.pair_u32_t) -> pypeline_tests.pair_u32_t:
+    rv: pypeline_tests.pair_u32_t = pypeline_tests.pair_u32_t(a=p.b, b=p.a)
+    return rv
+
+
+@MAIN(reset=rst, reset_registers="all")
+def pair_dup_passthrough(
+    p: pypeline_tests.pair_u32_t_dup,
+) -> pypeline_tests.pair_u32_t_dup:
+    return p
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_factory_swap_test(p: pypeline_tests.pair_u32_t) -> pypeline_tests.pair_u32_t:
+    return pypeline_tests.swap_u32(p)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_factory_def_test(a: uint32_t) -> uint32_t:
+    return pypeline_tests.double_inv_u32(a)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def nested_factory_def_u8_test(a: uint8_t) -> uint8_t:
+    return pypeline_tests.double_inv_u8(a)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def shift_const_param(v: uint32_t) -> uint32_t:
+    return v << pypeline_tests.SHIFT_AMOUNT
+
+
+@MAIN(reset=rst, reset_registers="all")
+def shift_const_local_param(v: uint32_t) -> uint32_t:
+    AMOUNT = 5
+    return v << AMOUNT
+
+
+@MAIN(reset=rst, reset_registers="all")
+def shift_const(v: uint32_t) -> uint32_t:
+    return v << 5
+
+
+@MAIN(reset=rst, reset_registers="all")
+def uint_inv_test(a: uint32_t) -> uint32_t:
+    return ~a
+
+
+@MAIN(reset=rst, reset_registers="all")
+def main_foo_foo_fooo(x: uint1_t) -> uint1_t:
+    return pypeline_tests.foo(pypeline_tests.foo(pypeline_tests.foo(x)))
+
+
+@MAIN(reset=rst, reset_registers="all")
+def main_foo(x: uint1_t) -> uint1_t:
+    return pypeline_tests.foo(x)
+
+
+@MAIN(reset=rst, reset_registers="all")
+def point_max(points: pypeline_tests.point2d_t[3]) -> uint32_t:
+    max_val: uint32_t = points[0].dim[0]
+    for i in range(3):
+        for j in range(2):
+            if points[i].dim[j] > max_val:
+                max_val = points[i].dim[j]
+    return max_val
+
+
+def test_point_max():
+    def make_points(*pairs):
+        return [pypeline_tests.point2d_t(dim=list(pair)) for pair in pairs]
+
+    cases = [
+        (make_points((1, 2), (3, 4), (5, 6)), 6),
+        (make_points((10, 0), (0, 10), (5, 5)), 10),
+        (make_points((0, 0), (0, 0), (0, 0)), 0),
+        (make_points((100, 50), (200, 10), (150, 75)), 200),
+        (make_points((7, 7), (7, 7), (7, 8)), 8),
+    ]
+    for points, expected in cases:
+        result = sim_call(point_max, points)
+        assert (
+            int(result) == expected
+        ), f"point_max(points) = {result}, expected {expected}"
+    print("test_point_max passed")
+
+
+# cd /media/1TB/Dropbox/PipelineC/git/PipelineC/src && PYTHONPATH=. python3 tests/pypeline_tests/inst/pypeline_test.py 2>&1
+if __name__ == "__main__":
+    test_point_max()
+
+
+@MAIN(reset=rst, reset_registers="all")
+def feedback_struct_test(x: uint32_t, y: uint32_t) -> uint32_t:
+    # Feedback of a struct type -- the sim zero-bootstrap used to hardcode a bare
+    # int 0 regardless of T, which crashed here on the first convergence pass's
+    # field read (before f's own later assignment executes).
+    f: Feedback[pypeline_tests.point_xy_t]
+    rv: uint32_t = f.x | x
+    f = pypeline_tests.point_xy_t(x=y, y=y)
+    return rv
+
+
+def sim_feedback_struct_test():
+    sim_reset()
+    # y=0 -> f settles to point_xy_t(x=0, y=0), rv=0|x
+    assert sim_call(feedback_struct_test, x=0, y=0) == 0
+    assert sim_call(feedback_struct_test, x=1, y=0) == 1
+    # y=5 -> f settles to point_xy_t(x=5, y=5), rv=5|x
+    assert sim_call(feedback_struct_test, x=0, y=5) == 5
+    assert sim_call(feedback_struct_test, x=2, y=5) == 7
+    print("sim_feedback_struct_test PASS")
+
+
+if __name__ == "__main__":
+    sim_feedback_struct_test()

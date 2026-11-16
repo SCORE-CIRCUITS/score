@@ -1,0 +1,42 @@
+/*
+ *
+ *        _/_/_/    _/_/   _/    _/ _/_/_/    _/_/
+ *       _/   _/ _/    _/ _/_/  _/ _/   _/ _/    _/
+ *      _/_/_/  _/_/_/_/ _/  _/_/ _/   _/ _/_/_/_/
+ *     _/      _/    _/ _/    _/ _/   _/ _/    _/
+ *    _/      _/    _/ _/    _/ _/_/_/  _/    _/
+ *
+ *  ***********************************************
+ *                   PandA Project
+ *   URL: https://github.com/ferrandi/PandA-bambu
+ *            Politecnico di Milano - DEIB
+ *             System Architectures Group
+ *  ***********************************************
+ *   Copyright (C) 2004-2026 Politecnico di Milano
+ *
+ * Part of the PandA Project, under the Apache License v2.0 with LLVM Exceptions.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ */
+/*!
+   \mainpage PandA Project Documentation
+   The primary objective of the PandA project is to develop a usable framework that will enable the research of new ideas in the HW-SW Co-Design field.<br/>
+   The PandA framework includes methodologies supporting the research on the high-level synthesis of hardware accelerators, parallelism extraction for embedded systems, hardware/software partitioning and mapping, metrics for performance estimation of embedded software applications, and dynamically reconfigurable devices.
+
+   PandA software is released under the \ref panda_license "GNU General Public License version 3" and developed at Politecnico di Milano (Italy).
+
+
+   \section main_getstarted Getting started
+   The following can be helpful to start using the PandA framework and understand its features:
+   - \ref panda_install
+   - \ref bambu101_page
+
+
+   \section main_devlines Developer's guidelines
+   The PandA framework is an open-source project where you can integrate your own algorithms to enhance the available features and build new ones as needed.<br/>
+   The following can be useful to approach the PandA codebase and start developing:
+   - \ref install_docker
+   - \ref dev_page
+
+
+*/

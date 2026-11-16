@@ -1,0 +1,2484 @@
+#!/usr/bin/env python3
+"""In-process unit tests for the AUTO_FSM scheduler and code generator.
+
+These run the real elaborator (PY_TO_LOGIC.PARSE_FILE) but no synthesis, so
+they are fast and can assert on things a build log cannot show: the exact
+schedule, the generated source text, and the invariants that keep the driver's
+schedule-and-confirm loop sound.
+
+What is covered, and why each matters:
+  - binding: several operations of one kind bind to ONE unit (the feature)
+  - one operation per unit per state (what makes a unit shareable at all)
+  - dependencies: an operation is never scheduled before its inputs
+  - registers: any value crossing a state boundary gets one (otherwise the FSM
+    silently reads whatever the shared unit happens to be computing)
+  - budget: a tighter per-state budget produces more/smaller states
+  - floors: an indivisible operation bigger than a state is reported, not
+    looped on forever
+  - determinism: the same design schedules identically and generates
+    byte-identical source, which is what keeps entity names stable across the
+    driver's repeated re-elaborations
+  - the schedule is plain picklable data (it is carried across design re-execs)
+"""
+import copy
+import json
+import os
+import pickle
+import re
+import sys
+import tempfile
+import textwrap
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../")
+)
+
+import AUTO_FSM
+import C_TO_LOGIC
+import DEVICE_MODELS
+import PY_TO_LOGIC
+import SYN
+import AUTO
+import pypeline
+
+FAILURES = []
+
+
+def check(cond, msg):
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        FAILURES.append(msg)
+
+
+DESIGN_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, hw_func, int16_t,
+                          struct, uint1_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+
+    @struct
+    class in_t(NamedTuple):
+        a: int16_t
+        b: int16_t
+        c: int16_t
+        d: int16_t
+
+    @hw_func
+    def chain(x: in_t) -> int16_t:
+        t0: int16_t = x.a + x.b
+        t1: int16_t = t0 + x.c
+        t2: int16_t = t1 + x.d
+        return t2
+
+    FSM = AUTO_FSM(chain)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> int16_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[int16_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+CROSS_FU_SRC = (
+    DESIGN_SRC.replace("x.a + x.b", "x.a ^ x.b")
+    .replace("t0 + x.c", "t0 & x.c")
+    .replace("t1 + x.d", "t1 | x.d")
+)
+
+FACTOR_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, concat, hw_func,
+                          struct, uint1_t, uint8_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+
+    @struct
+    class in_t(NamedTuple):
+        seed: uint8_t
+        word: uint8_t
+
+    @hw_func
+    def chain(x: in_t) -> uint8_t:
+        t0: uint8_t = concat(x.seed[6:0], x.word[0]) + x.seed
+        t1: uint8_t = concat(t0[6:0], x.word[1]) + x.seed
+        t2: uint8_t = concat(t1[6:0], x.word[2]) + x.seed
+        t3: uint8_t = concat(t2[6:0], x.word[3]) + x.seed
+        return t3
+
+    FSM = AUTO_FSM(chain)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> uint8_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[uint8_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+PACK_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, concat, hw_func,
+                          struct, uint1_t, uint8_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+
+    @struct
+    class in_t(NamedTuple):
+        word: uint8_t
+        key: uint8_t
+
+    @struct
+    class out_t(NamedTuple):
+        packed: uint8_t
+        tail: uint1_t
+
+    @hw_func
+    def chain(x: in_t) -> out_t:
+        b0: uint1_t = x.word[0] ^ x.key[0]
+        b1: uint1_t = x.word[1] ^ x.key[1]
+        b2: uint1_t = x.word[2] ^ x.key[2]
+        b3: uint1_t = x.word[3] ^ x.key[3]
+        b4: uint1_t = x.word[4] ^ x.key[4]
+        q: uint8_t = 0
+        q = concat(q[6:0], b0)
+        q = concat(q[6:0], b1)
+        q = concat(q[6:0], b2)
+        q = concat(q[6:0], b3)
+        return out_t(packed=q, tail=b4)
+
+    FSM = AUTO_FSM(chain)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> out_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[out_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+FUSED_PACK_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, concat, hw_func,
+                          struct, uint1_t, uint4_t, uint6_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+
+    @struct
+    class in_t(NamedTuple):
+        word: uint4_t
+        key: uint4_t
+
+    @struct
+    class out_t(NamedTuple):
+        packed: uint4_t
+        tail: uint4_t
+
+    @hw_func
+    def chain(x: in_t) -> out_t:
+        # A generic consume/produce recurrence: descending source bits enter a
+        # shared accumulator operation while one result bit is produced each
+        # step.  This is the same storage shape used by serializers, CRC-like
+        # walkers and iterative arithmetic, without relying on a special
+        # divider operation in AUTO_FSM.
+        source: uint4_t = x.word ^ x.key
+        wide_key: uint6_t = x.key
+        accum: uint4_t = 0
+        packed: uint4_t = 0
+        for j in range(3, -1, -1):
+            source_bit: uint1_t = source[j]
+            accum_ext: uint6_t = concat(0, accum[3:0], source_bit)
+            delta: uint6_t = accum_ext - wide_key
+            produced: uint1_t = delta[5] ^ 1
+            if delta[5]:
+                accum = accum_ext[3:0]
+            else:
+                accum = delta[3:0]
+            packed = concat(packed[2:0], produced)
+        # One final use of the shared uint6 subtractor makes the result state
+        # explicit, just as a hand FSM has a state after its last produced bit.
+        tail_wide: uint6_t = concat(0, accum[3:0], 0) - wide_key
+        return out_t(packed=packed, tail=tail_wide[3:0])
+
+    FSM = AUTO_FSM(chain)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> out_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[out_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+# A pinned multiplier (make_inferred_mult: a scoped operator registration) makes
+# AUTO_COMB_OPT.prepare keep the original graph and return before it prepares
+# soft equivalents; x.a * x.c is the built-in multiply a schedule opens into
+# soft_mult_shift_add, whose adder tree is an entity of its own.
+SCOPED_SOFT_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, hw_func, make_uint_t,
+                          struct, uint1_t, uint8_t, uint16_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+    from operators.soft_mult import make_inferred_mult
+
+    uint3_t = make_uint_t(3)
+    uint11_t = make_uint_t(11)
+    uint17_t = make_uint_t(17)
+    pinned_mult = make_inferred_mult(uint8_t, uint8_t)
+
+    @struct
+    class in_t(NamedTuple):
+        a: uint8_t
+        b: uint8_t
+        c: uint3_t
+
+    @hw_func
+    def mix(x: in_t) -> uint17_t:
+        p: uint16_t = pinned_mult(x.a, x.b)
+        q: uint11_t = x.a * x.c
+        return p + q
+
+    FSM = AUTO_FSM(mix)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> uint17_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[uint17_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+# Two operations slower than one state that descent cannot open: a call whose
+# body reads an array at a variable index (no source form yet, see
+# auto_fsm_var_index_read_test.py), and a signed multiply (no soft equivalent).
+# The pinned multiplier makes AUTO_COMB_OPT.prepare return before its delay
+# search, which would otherwise crash on that read during elaboration.
+BLOCKED_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, hw_func, int8_t,
+                          int16_t, make_uint_t, struct, uint1_t, uint8_t, uint16_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+    from operators.soft_mult import make_inferred_mult
+
+    uint2_t = make_uint_t(2)
+    pinned_mult = make_inferred_mult(uint8_t, uint8_t)
+
+    @struct
+    class in_t(NamedTuple):
+        vals: uint16_t[4]
+        idx: uint2_t
+        c: uint8_t
+        d: uint8_t
+        a: int8_t
+        b: int8_t
+
+    @struct
+    class out_t(NamedTuple):
+        u: uint16_t
+        s: int16_t
+
+    @hw_func
+    def pick(x: in_t) -> uint16_t:
+        v: uint16_t = x.vals[x.idx]
+        r: uint16_t = v + pinned_mult(x.c, x.d)
+        return r
+
+    @hw_func
+    def mix(x: in_t) -> out_t:
+        o: out_t
+        o.u = pick(x)
+        o.s = x.a * x.b
+        return o
+
+    FSM = AUTO_FSM(mix)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> out_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[out_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+# Wide arithmetic in the shape of the WireGuard Poly1305 epilogue that once
+# folded 31,494 one-bit ANDs onto one unit: a Karatsuba product with inferred
+# 32/33-bit leaves, then a 128-bit add and subtract. Under a budget too small
+# for its multiplies and adds, forced descent must split them into narrower
+# INFERRED operators, never into one-bit gates.
+WIDE_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, hw_func, make_uint_t,
+                          struct, uint1_t, uint64_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+    from operators.soft_mult import make_mult_karatsuba_inferred_leaves
+
+    uint128_t = make_uint_t(128)
+    multiply = make_mult_karatsuba_inferred_leaves(uint64_t, uint64_t, threshold=34)
+
+    @struct
+    class in_t(NamedTuple):
+        a: uint64_t
+        b: uint64_t
+        c: uint128_t
+
+    @hw_func
+    def wide(x: in_t) -> uint128_t:
+        p: uint128_t = multiply(x.a, x.b)
+        s: uint128_t = p + x.c
+        d: uint128_t = s - x.c
+        return d
+
+    FSM = AUTO_FSM(wide)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> uint128_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[uint128_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+
+# Five independent adds and five independent subtracts. With each operation
+# just inside the descent test's flat operand-mux allowance, sharing all five
+# on one unit charges a 5-way mux that does not fit a state; two units of EACH
+# kind (3-way muxes) do. Unsharing either kind alone still leaves the other
+# over budget.
+TWO_FLOORS_SRC = textwrap.dedent(
+    """
+    # pyright: reportInvalidTypeForm=none
+    import os, sys
+    sys.path.insert(0, {repo!r})
+    from pypeline import (AUTO_FSM, MAIN, NamedTuple, Reg, hw_func, make_uint_t,
+                          struct, uint1_t, uint32_t)
+    from pypeline import Input, make_reset, uint1_t
+    rst: Input[uint1_t] = make_reset()  # every register resets; pulsed in cycle 0
+
+    uint33_t = make_uint_t(33)
+
+    @struct
+    class in_t(NamedTuple):
+        a: uint32_t[5]
+        b: uint32_t[5]
+
+    @struct
+    class out_t(NamedTuple):
+        s: uint33_t[5]
+        d: uint32_t[5]
+
+    @hw_func
+    def ten(x: in_t) -> out_t:
+        o: out_t
+        for i in range(5):
+            o.s[i] = x.a[i] + x.b[i]
+            o.d[i] = x.a[i] - x.b[i]
+        return o
+
+    FSM = AUTO_FSM(ten)
+
+    @MAIN({mhz}, reset=rst, reset_registers="all")
+    def top(start: uint1_t, x: in_t) -> out_t:
+        s: FSM.in_stream_t
+        s.data = x
+        s.valid = start
+        o = FSM(s)
+        r: Reg[out_t]
+        if o.valid:
+            r = o.data
+        return r
+    """
+)
+
+REPO = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
+)
+
+
+def parse_design(tmpdir, mhz=25.0, name="af_unit_design", source=DESIGN_SRC):
+    """Elaborate a fresh copy of the design and hand back the parser state plus
+    its AUTO_FSM tag. A distinct file name per call keeps Python's import
+    machinery from returning a stale module."""
+    path = os.path.join(tmpdir, name + ".py")
+    with open(path, "w") as f:
+        f.write(source.format(repo=REPO, mhz=mhz))
+    parser_state = PY_TO_LOGIC.PARSE_FILE(path)
+    tags = AUTO_FSM.GET_TAGS(parser_state)
+    assert len(tags) == 1, f"expected one AUTO_FSM tag, got {list(tags)}"
+    (key,) = list(tags)
+    return parser_state, key, tags[key]
+
+
+def fake_delays(parser_state, key, tag, adder_du=115):
+    """Delays as a real build would have measured them, without running one:
+    every adder costs adder_du, all rewiring is free."""
+    func_entity = AUTO._entity_key_for_callable(parser_state, tag.func)
+    logic = parser_state.FuncLogicLookupTable[func_entity]
+    for entity in set(logic.submodule_instances.values()):
+        sub = parser_state.FuncLogicLookupTable[entity]
+        sub.delay = adder_du if entity.startswith("BIN_OP_") else 0
+    parser_state.FuncLogicLookupTable[func_entity].delay = adder_du * 3
+    return func_entity
+
+
+def schedule_with(parser_state, key, tag, budget_scale):
+    return AUTO_FSM.BUILD_SCHEDULE(parser_state, key, tag, budget_scale)
+
+
+def _cleanup_node(op, operands, ports=None, result="uint8_t", casts=None):
+    ports = ports or ["uint8_t"] * len(operands)
+    return dict(
+        kind="binop",
+        op={"kind": "binop", "op": op},
+        entity="BIN_OP_" + op,
+        operands=operands,
+        casts=casts or [[] for _ in operands],
+        port_types=ports,
+        out_type=result,
+        delay_du=10,
+    )
+
+
+def _cleanup_graph(nodes, output):
+    return dict(nodes=nodes, output=output, out_type="uint8_t", output_casts=[])
+
+
+def test_cleanup_constant_casts():
+    import LOGIC
+
+    ps = LOGIC.ParserState()
+    n = _cleanup_node(
+        "+",
+        [["lit", 255, "uint8_t"], ["lit", 1, "uint1_t"]],
+        ["uint16_t", "uint16_t"],
+        "uint17_t",
+        [["int8_t"], []],
+    )
+    dag, counts = AUTO.cleanup(_cleanup_graph({"sum": n}, ["node", "sum"]), ps, "root")
+    assert dag["output"] == ["lit", 65536, "uint17_t"], dag
+    assert counts["folded"] == 1
+
+
+def test_cleanup_identity_preserves_narrowing():
+    import LOGIC
+
+    ps = LOGIC.ParserState()
+    n = _cleanup_node(
+        "+",
+        [["in", "x"], ["lit", 0, "uint1_t"]],
+        ["uint16_t", "uint1_t"],
+        "uint17_t",
+        [["uint4_t"], []],
+    )
+    dag, counts = AUTO.cleanup(_cleanup_graph({"sum": n}, ["node", "sum"]), ps, "root")
+    result = dag["nodes"][dag["output"][1]]
+    assert result["kind"] == "copy" and result["casts"][0] == [
+        "uint4_t",
+        "uint16_t",
+        "uint17_t",
+    ]
+    assert counts["identities"] == 1
+
+
+def test_cleanup_refuses_custom_operator_identity():
+    import LOGIC
+
+    ps = LOGIC.ParserState()
+    node = _cleanup_node("+", [["in", "x"], ["lit", 0, "uint1_t"]])
+    node.update(kind="call", op={"kind": "call"}, entity="custom_add")
+    dag, _counts = AUTO.cleanup(
+        _cleanup_graph({"call": node}, ["node", "call"]), ps, "root"
+    )
+    assert dag["nodes"]["call"]["entity"] == "custom_add"
+
+
+def test_cleanup_folds_width_decided_comparisons():
+    """A comparison of a function input that its width alone decides folds,
+    so no measured constant wrapper is built for it (issue #288: Vivado
+    reports no timing path for `uint1 > 1` and the build stops)."""
+    import LOGIC
+
+    ps = LOGIC.ParserState()
+    cases = [
+        # (op, input port, constant, constant port, input casts, folded value)
+        (">", "uint1_t", 1, "uint1_t", [], 0),
+        (">=", "uint3_t", 8, "uint4_t", [], 0),
+        ("<", "uint3_t", 8, "uint4_t", [], 1),
+        (">", "int4_t", 7, "int4_t", [], 0),
+        (">=", "int4_t", -8, "int4_t", [], 1),
+        ("<", "uint8_t", 4, "uint8_t", [["uint2_t"]], 1),
+        ("==", "uint2_t", 4, "uint3_t", [], 0),
+        (">", "uint8_t", 1, "uint8_t", [], None),
+    ]
+    for op, port, value, const_port, casts, folded in cases:
+        node = _cleanup_node(
+            op,
+            [["in", "x"], ["lit", value, const_port]],
+            [port, const_port],
+            "uint1_t",
+            (casts or [[]]) + [[]],
+        )
+        dag, counts = AUTO.cleanup(
+            _cleanup_graph({"cmp": node}, ["node", "cmp"]), ps, "root"
+        )
+        if folded is None:
+            assert dag["output"] == ["node", "cmp"], (op, port, value, dag)
+            assert counts["folded"] == 0
+        else:
+            assert dag["output"] == ["lit", folded, "uint1_t"], (op, port, value, dag)
+            assert counts["folded"] == 1
+
+
+def test_area_frontier_keeps_points_fewer_states_do_not_beat():
+    """The area search reports its latency/area trade so a caller can pick a
+    max_latency= cap without synthesis. A point is kept only when it is
+    cheaper than every point with fewer states; the report is diagnostic and
+    never part of the FSM's hardware identity."""
+    frontier = AUTO_FSM._pareto_frontier({50: 100.0, 45: 120.0, 64: 90.0, 55: 110.0})
+    assert frontier == [[45, 120.0], [50, 100.0], [64, 90.0]], frontier
+    assert "area_frontier" in AUTO_FSM._SCHEDULE_NON_HARDWARE_KEYS
+
+
+def test_cleanup_cse_is_deterministic():
+    import LOGIC
+
+    ps = LOGIC.ParserState()
+    a = _cleanup_node("+", [["in", "a"], ["in", "b"]])
+    b = _cleanup_node("+", [["in", "b"], ["in", "a"]])
+    total = _cleanup_node("^", [["node", "a"], ["node", "b"]])
+    dag = _cleanup_graph(dict(a=a, b=b, total=total), ["node", "total"])
+    cleaned, counts = AUTO.cleanup(dag, ps, "root")
+    assert counts["merged"] == 1
+    assert AUTO.cleanup(dag, ps, "root")[0] == cleaned
+
+
+def test_cleanup_factoring_preserves_reconvergent_glue():
+    nodes = {}
+    for side, inputs in (("left", ("a", "b")), ("right", ("c", "d"))):
+        for level in range(12):
+            refs = (
+                [["in", name] for name in inputs]
+                if level == 0
+                else [["node", f"{side}{level-1}"]] * 2
+            )
+            nodes[f"{side}{level}"] = _cleanup_node("^", refs)
+            nodes[f"{side}{level}"]["delay_du"] = 0
+    plan = AUTO_FSM._operand_factor_plan(
+        nodes,
+        [(0, ["node", "left11"], (), 1), (1, ["node", "right11"], (), 2)],
+        {},
+        2,
+        "uint8_t",
+    )
+    for _ in range(11):
+        assert plan["children"][0] is plan["children"][1]
+        plan = plan["children"][0]
+    assert len(tuple(AUTO_FSM._factor_plan_muxes(plan))) == 2
+
+
+def _pipeline_test_graph(dependent=False):
+    nodes = {}
+    for i in range(3):
+        ref = ["node", str(i - 1)] if dependent and i else ["in", "x"]
+        nodes[str(i)] = _cleanup_node("*", [ref, ["lit", 3, "uint2_t"]])
+    return _cleanup_graph(nodes, ["node", "2"])
+
+
+def test_pipelined_unit_launches_each_cycle():
+    dag = _pipeline_test_graph()
+    implementation = {
+        "BIN_OP_*": dict(
+            latency=2, ii=1, input_stage_du=3, output_stage_du=2, worst_stage_du=5
+        )
+    }
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag, 10, lambda _nid: 0, implementations=implementation
+    )
+    assert sorted(schedule["launch_of"].values()) == [1, 2, 3]
+    assert sorted(schedule["state_of"].values()) == [3, 4, 5]
+    assert len(schedule["fus"]) == 1 and schedule["n_states"] == 5
+
+
+def test_pipelined_dependency_waits_for_completion():
+    dag = _pipeline_test_graph(dependent=True)
+    implementation = {
+        "BIN_OP_*": dict(
+            latency=2, ii=1, input_stage_du=3, output_stage_du=2, worst_stage_du=5
+        )
+    }
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag, 10, lambda _nid: 0, implementations=implementation
+    )
+    assert schedule["launch_of"] == {"0": 1, "1": 3, "2": 5}
+    assert schedule["state_of"] == {"0": 3, "1": 5, "2": 7}
+    assert len(schedule["fus"]) == 1 and schedule["n_states"] == 7
+
+
+def test_late_pipeline_result_waits_for_the_next_state():
+    dag = _pipeline_test_graph(dependent=True)
+    implementation = {
+        "BIN_OP_*": dict(
+            latency=1, ii=1, input_stage_du=7, output_stage_du=7, worst_stage_du=7
+        )
+    }
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag, 10, lambda _nid: 0, max_states=6, implementations=implementation
+    )
+    assert schedule["launch_of"] == {"0": 1, "1": 3, "2": 5}
+    assert schedule["state_of"] == {"0": 2, "1": 4, "2": 6}
+    assert not schedule["at_floor"] and not schedule["latency_infeasible"]
+
+
+def test_pipelined_initiation_interval_and_cap():
+    dag = _pipeline_test_graph()
+    implementation = {
+        "BIN_OP_*": dict(
+            latency=2, ii=2, input_stage_du=3, output_stage_du=2, worst_stage_du=5
+        )
+    }
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag, 10, lambda _nid: 0, max_states=5, implementations=implementation
+    )
+    assert sorted(schedule["launch_of"].values()) == [1, 3, 5]
+    assert schedule["n_states"] == 7 and schedule["latency_infeasible"]
+    copies = AUTO_FSM._replication_for_latency({"BIN_OP_*": 3}, 5, implementation)
+    assert copies == {"BIN_OP_*": 2}
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag,
+        10,
+        lambda _nid: 0,
+        max_states=5,
+        copies=copies,
+        implementations=implementation,
+    )
+    assert schedule["n_states"] == 5 and not schedule["latency_infeasible"]
+
+
+def test_mixed_units_break_only_registered_ordering_edges():
+    add = _cleanup_node("+", [["in", "x"], ["lit", 1, "uint1_t"]])
+    multiply = _cleanup_node("*", [["node", "add"], ["lit", 3, "uint2_t"]])
+    tail = _cleanup_node("+", [["node", "multiply"], ["lit", 1, "uint1_t"]])
+    dag = _cleanup_graph(dict(add=add, multiply=multiply, tail=tail), ["node", "tail"])
+    implementation = {
+        "BIN_OP_*": dict(
+            latency=2, ii=1, input_stage_du=3, output_stage_du=2, worst_stage_du=5
+        )
+    }
+    schedule = AUTO_FSM.SCHEDULE_DAG(
+        dag, 30, lambda _nid: 0, implementations=implementation
+    )
+    assert schedule["launch_of"] == {"add": 1, "multiply": 1, "tail": 3}
+    assert len(schedule["fus"]) == 2 and schedule["n_states"] == 3
+
+
+def test_area_search_memo_reuses_plans_byte_identically(tmp):
+    """Bindings of one graph share SCHEDULE_DAG plans through the area search's
+    memo: a cap's one-unit-per-operation trial, and bisection points that
+    coincide. A schedule built from reused plans, its operand-mux snapshot
+    included, is the one scheduling again builds."""
+    ps, key, tag = parse_design(tmp, mhz=25.0, name="d_plan_memo")
+    fake_delays(ps, key, tag)
+    tag.max_latency = 3
+    adder = next(iter(AUTO_FSM.BUILD_SCHEDULE(ps, key, tag, 0.9)["fus"].values()))
+    bindings = [(), ((adder, 2),), ((adder, 3),)]
+    calls = []
+    real_schedule_dag = AUTO_FSM.SCHEDULE_DAG
+
+    def counting_schedule_dag(*args, **kwargs):
+        calls.append(1)
+        return real_schedule_dag(*args, **kwargs)
+
+    AUTO_FSM.SCHEDULE_DAG = counting_schedule_dag
+    try:
+        memo = AUTO_FSM._AreaSearchMemo()
+        shared = [
+            AUTO_FSM.BUILD_SCHEDULE(
+                ps, key, tag, 0.9, None, (), None, unshared, _graph_memo=memo
+            )
+            for unshared in bindings
+        ]
+        n_shared = len(calls)
+        del calls[:]
+        alone = [
+            AUTO_FSM.BUILD_SCHEDULE(ps, key, tag, 0.9, None, (), None, unshared)
+            for unshared in bindings
+        ]
+        n_alone = len(calls)
+    finally:
+        AUTO_FSM.SCHEDULE_DAG = real_schedule_dag
+    for unshared, a, b in zip(bindings, shared, alone):
+        assert json.dumps(a, sort_keys=True, default=str) == json.dumps(
+            b, sort_keys=True, default=str
+        ), f"binding {unshared}: a schedule from reused plans differs"
+    assert n_shared < n_alone, (n_shared, n_alone)
+    print(
+        f"PASS: bindings share plans through the area search memo, byte for "
+        f"byte ({n_shared} SCHEDULE_DAG runs vs {n_alone} without it)"
+    )
+
+
+def test_forked_map_keeps_order_merges_caches_and_raises():
+    """_map_forked returns results in item order, merges back what workers add
+    to its caches, and raises a worker's exception in the caller."""
+    cache = {"before": 0}
+
+    def square(item):
+        if item == "boom":
+            raise AUTO_FSM.AutoFsmInternalError("boom")
+        cache[("square", item)] = item * item
+        cache[("absent", item)] = None  # a None result is an entry too
+        return item * 10
+
+    old_jobs = SYN.NUM_PROCESSES
+    SYN.NUM_PROCESSES = 3
+    try:
+        items = list(range(7))
+        assert AUTO_FSM._map_forked(square, items, [cache]) == [i * 10 for i in items]
+        assert cache == dict(
+            [("before", 0)]
+            + [(("square", i), i * i) for i in items]
+            + [(("absent", i), None) for i in items]
+        ), cache
+        try:
+            AUTO_FSM._map_forked(square, [1, "boom", 2], [cache])
+            raised = False
+        except AUTO_FSM.AutoFsmInternalError:
+            raised = True
+        assert raised, "a worker's exception is raised in the caller"
+        try:
+            # A worker killed outright (by the OOM killer, say) stops the
+            # search with an error instead of leaving the caller waiting.
+            AUTO_FSM._map_forked(lambda _item: os._exit(3), [1, 2])
+            stopped = False
+        except AUTO_FSM.AutoFsmInternalError as error:
+            stopped = "code 3" in str(error)
+        assert stopped, "a worker that dies raises an error naming its exit code"
+    finally:
+        SYN.NUM_PROCESSES = old_jobs
+    print(
+        "PASS: forked builds keep item order, merge caches back, raise errors "
+        "and report a worker that dies"
+    )
+
+
+def test_area_search_is_the_same_at_any_jobs(parser_state, key, tag):
+    """An area search builds each step's candidates in forked workers under
+    -j 3 and returns the schedule -j 1 returns, byte for byte."""
+    forks = []
+    real_get_context = AUTO_FSM.multiprocessing.get_context
+
+    def counting_get_context(method):
+        forks.append(method)
+        return real_get_context(method)
+
+    old_jobs = SYN.NUM_PROCESSES
+    AUTO_FSM.multiprocessing.get_context = counting_get_context
+    try:
+        SYN.NUM_PROCESSES = 1
+        serial = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(parser_state, key, tag, 0.9)
+        n_serial_forks = len(forks)
+        SYN.NUM_PROCESSES = 3
+        forked = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(parser_state, key, tag, 0.9)
+    finally:
+        SYN.NUM_PROCESSES = old_jobs
+        AUTO_FSM.multiprocessing.get_context = real_get_context
+    assert n_serial_forks == 0 and forks, (n_serial_forks, forks)
+    assert json.dumps(serial, sort_keys=True, default=str) == json.dumps(
+        forked, sort_keys=True, default=str
+    ), "an area search returned a different schedule under -j 3"
+    print(
+        f"PASS: the area search returns the same schedule under -j 3 "
+        f"({len(forks)} forked steps) as under -j 1"
+    )
+
+
+def main():
+    test_cleanup_constant_casts()
+    test_forked_map_keeps_order_merges_caches_and_raises()
+    test_cleanup_identity_preserves_narrowing()
+    test_cleanup_refuses_custom_operator_identity()
+    test_cleanup_folds_width_decided_comparisons()
+    test_area_frontier_keeps_points_fewer_states_do_not_beat()
+    test_cleanup_cse_is_deterministic()
+    test_cleanup_factoring_preserves_reconvergent_glue()
+    test_pipelined_unit_launches_each_cycle()
+    test_pipelined_dependency_waits_for_completion()
+    test_late_pipeline_result_waits_for_the_next_state()
+    test_pipelined_initiation_interval_and_cap()
+    test_mixed_units_break_only_registered_ordering_edges()
+    # A diamond chain contains O(N) nodes but exponentially many paths. Input
+    # storage analysis must visit each node once per state, not once per path.
+    class CountedNodes(dict):
+        reads = 0
+
+        def get(self, key, default=None):
+            self.reads += 1
+            assert self.reads < 5000, "input-storage analysis expanded DAG paths"
+            return super().get(key, default)
+
+    diamond = CountedNodes({"field": {"delay_du": 0, "out_type": "uint8_t",
+        "op": {"kind": "ref", "toks": ["a"]}, "operands": [["in", "x"]]}})
+    last = "field"
+    for i in range(40):
+        nid = "diamond" + str(i)
+        diamond[nid] = {"delay_du": 0, "out_type": "uint8_t", "op": {"kind": "copy"},
+                        "operands": [["node", last], ["node", last]]}
+        last = nid
+    diamond["op"] = {"delay_du": 1, "state": 1, "out_type": "uint8_t",
+                     "op": {"kind": "call"}, "operands": [["node", last]]}
+    plan = AUTO_FSM._INPUT_STORAGE_PLAN(diamond, ["node", "op"], 1)
+    check(plan["stored_fields"][0]["field"] == "a", "linear input-storage walk preserves field storage")
+
+    # SCHEDULE_DAG's unit-order check searches only from the new edges'
+    # targets. It must answer exactly what checking the whole graph with the
+    # new edges added answers, on graphs that are acyclic before the check.
+    def acyclic_whole_graph(edges, new_edges):
+        trial = {k: set(v) for k, v in edges.items()}
+        for a, b in new_edges:
+            if a == b:
+                return False
+            trial.setdefault(a, set()).add(b)
+        indegree = {n: 0 for n in trial}
+        for targets in trial.values():
+            for m in targets:
+                indegree[m] = indegree.get(m, 0) + 1
+        ready = [n for n, d in indegree.items() if d == 0]
+        seen = 0
+        while ready:
+            n = ready.pop()
+            seen += 1
+            for m in trial.get(n, ()):
+                indegree[m] -= 1
+                if indegree[m] == 0:
+                    ready.append(m)
+        return seen == len(indegree)
+
+    import random
+
+    rng = random.Random(1)
+    mismatches = 0
+    n_cyclic = 0
+    for _trial in range(3000):
+        n = rng.randint(2, 9)
+        order = list(range(n))
+        rng.shuffle(order)
+        edges = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                if rng.random() < 0.3:
+                    edges.setdefault(order[i], set()).add(order[j])
+        new_edges = {
+            (rng.randrange(n), rng.randrange(n)) for _e in range(rng.randint(1, 3))
+        }
+        expected = acyclic_whole_graph(edges, new_edges)
+        n_cyclic += not expected
+        if AUTO_FSM._edges_stay_acyclic(edges, new_edges) != expected:
+            mismatches += 1
+    check(
+        mismatches == 0 and 0 < n_cyclic < 3000,
+        f"the unit-order cycle check matches a whole-graph check on 3000 random "
+        f"graphs ({n_cyclic} of them closing a cycle, {mismatches} mismatches)",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        print("[binding and scheduling]")
+        ps, key, tag = parse_design(tmp, mhz=25.0, name="d1")
+        fake_delays(ps, key, tag)
+        # 40 ns period; 3 adds at 11.5 ns each could all fit one state by delay
+        # alone, so anything beyond one state per add comes from the
+        # one-operation-per-unit-per-state rule, which is the point.
+        sched = schedule_with(ps, key, tag, 0.9)
+
+        scheduled = {n: v for n, v in sched["nodes"].items() if v.get("fu")}
+        check(len(scheduled) == 3, f"3 adds scheduled (got {len(scheduled)})")
+        check(
+            len(sched["fus"]) == 1,
+            f"3 adds bound to 1 shared unit (got {len(sched['fus'])})",
+        )
+        check(sched["n_states"] == 3, f"3 states (got {sched['n_states']})")
+        check(
+            sched["latency"] == sched["n_states"] + 1,
+            "latency == states + 1 accept cycle",
+        )
+
+        per_state = {}
+        for nid, node in scheduled.items():
+            per_state.setdefault((node["state"], node["fu"]), []).append(nid)
+        check(
+            all(len(v) == 1 for v in per_state.values()),
+            "at most one operation per unit per state",
+        )
+
+        # Dependencies: an operand may only come from an earlier-or-equal state.
+        sched_ids = set(scheduled)
+        ok_deps = True
+        for nid, node in scheduled.items():
+            deps = set()
+            for operand in node["operands"]:
+                AUTO_FSM._scheduled_deps(
+                    {"nodes": sched["nodes"]}, operand, sched_ids, deps
+                )
+            for dep in deps - {nid}:
+                if scheduled[dep]["state"] > node["state"]:
+                    ok_deps = False
+        check(ok_deps, "no operation is scheduled before its inputs")
+
+        print("[registers for values crossing states]")
+        cg = AUTO_FSM._Codegen(tag, sched, ps)
+        cross = cg._cross_state_nodes()
+        # In a 3-add chain each intermediate is produced in one state and
+        # consumed in the next, so both must be registered.
+        check(len(cross) == 2, f"2 intermediates registered (got {len(cross)})")
+        ok_reg = True
+        for nid in scheduled:
+            producer_state = scheduled[nid]["state"]
+            for other, onode in scheduled.items():
+                deps = set()
+                for operand in onode["operands"]:
+                    AUTO_FSM._scheduled_deps(
+                        {"nodes": sched["nodes"]}, operand, sched_ids, deps
+                    )
+                if nid in deps and onode["state"] > producer_state:
+                    if nid not in cross:
+                        ok_reg = False
+        check(ok_reg, "every value read in a later state has a register")
+
+        print("[generated source]")
+        name, src, _globals = AUTO_FSM.GENERATE_FSM_SOURCE(tag, sched, ps)
+        check(name == sched["entity"], "generated function name is the schedule entity")
+        check(
+            src.count("+") == 1,
+            f"exactly one '+' in the generated FSM (got {src.count('+')})",
+        )
+        check("if (st == 0) & s.valid:" in src, "accepts input only while idle")
+        # v3 drives valid straight from the last-state pulse bit rather than
+        # defaulting it to 0 and setting 1 inside a state comparison.
+        check("out_valid_r = ow" in src, "pulses valid when the result is ready")
+        check(
+            src.index("st: ") < src.index("st_r = "),
+            "state is snapshotted before it is written",
+        )
+
+        print("[v3 control path]")
+        # The whole point of ctl v3: state is compared ONCE per FSM, in the
+        # accept. Everything else -- unit selects, register write enables, the
+        # next state -- reads a constant table indexed by the state instead.
+        check(
+            src.count("st == ") == 1,
+            f"exactly one state comparator in the whole FSM "
+            f"(got {src.count('st == ')})",
+        )
+        check("ns_lut: " in src, "next state comes from a constant table")
+        check(
+            src.index("st_r = ns_lut[st]") < src.index("if (st == 0) & s.valid:"),
+            "the next-state table is written BEFORE the accept, so accepting "
+            "an input overrides it (pypeline assignment is sequential)",
+        )
+        # 3 adds on one unit over 3 states: one select table, and the only
+        # value crossing a state boundary is the running sum.
+        check(
+            "u0_sel0_lut: " in src,
+            "the shared unit's select comes from a table",
+        )
+        check(
+            src.count("_wel: ") == 1,
+            f"one write-enable table per cross-state register "
+            f"(got {src.count('_wel: ')})",
+        )
+        check(
+            "if v0_we:" in src,
+            "the register write is a plain one-bit enable, which PY_TO_LOGIC "
+            "turns into a clock enable rather than a comparator",
+        )
+        # State 1 runs fold 0, state 2 fold 1, state 3 fold 2; state 0 is idle
+        # and reads 0, which is harmless because nothing is enabled there.
+        check("[0, 0, 1, 2]" in src, "select table maps state -> fold index")
+        check("[0, 2, 3, 0]" in src, "next-state table advances then wraps to idle")
+
+        print("[v2 control path is still available for A/B]")
+        ps_v2, key_v2, tag_v2 = parse_design(tmp, mhz=25.0, name="d1b")
+        fake_delays(ps_v2, key_v2, tag_v2)
+        sched_v2 = AUTO_FSM.BUILD_SCHEDULE(ps_v2, key_v2, tag_v2, 0.9, ctl="v2")
+        _n2, src_v2, _g2 = AUTO_FSM.GENERATE_FSM_SOURCE(tag_v2, sched_v2, ps_v2)
+        check("elif st == " in src_v2, "ctl v2 still emits comparator chains")
+        check(
+            src_v2.count("st == ") > 1,
+            "ctl v2 compares the state many times (what v3 removes)",
+        )
+        check(
+            sched_v2["entity"] != sched["entity"],
+            "the control path is part of the schedule identity, so measured "
+            "delays cached for one are never reused for the other",
+        )
+        check(
+            AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps_v2, sched_v2)
+            > AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps, sched),
+            "the area model prices v3's control path below v2's (which is what "
+            "lets the sweep share further before muxes overtake the saving)",
+        )
+
+        print("[one-hot control path]")
+        ps_oh, key_oh, tag_oh = parse_design(tmp, mhz=25.0, name="d1c")
+        fake_delays(ps_oh, key_oh, tag_oh)
+        sched_oh = AUTO_FSM.BUILD_SCHEDULE(ps_oh, key_oh, tag_oh, 0.9, ctl="onehot")
+        _n3, src_oh, _g3 = AUTO_FSM.GENERATE_FSM_SOURCE(tag_oh, sched_oh, ps_oh)
+        check(
+            "st1h_r: " in src_oh and "= 1" in src_oh,
+            "one-hot state register resets to the idle bit",
+        )
+        check(
+            "st == " not in src_oh,
+            "one-hot compares the state ZERO times -- even the accept is a bit " "read",
+        )
+        check(
+            "u0_sel0[0:0] = " in src_oh,
+            "the operand mux select is encoded back to binary from hot bits "
+            "(the mux is a measured balanced tree and needs a binary select)",
+        )
+        check(
+            "v0_we: _af_t5 = st1h[1:1] | st1h[2:2]" in src_oh,
+            "a write enable is a plain OR of the writing states' hot bits",
+        )
+        check(
+            "(s.valid ^ 1)" in src_oh,
+            "the idle-hold term complements one bit with ^ 1, not ~ (which "
+            "would invert the whole promoted width)",
+        )
+        # One flip-flop per state plus idle, where binary needs only log2. The
+        # complete one-hot design can still win by eliminating enough decode,
+        # so pin the register term itself rather than assuming the total.
+        check(
+            AUTO_FSM._register_bit_count(sched_oh) > AUTO_FSM._register_bit_count(sched),
+            "the area model charges one-hot for its extra flip-flops",
+        )
+
+        print("[automatic control encoding]")
+        auto = AUTO_FSM.HARVEST_AUTO_FSM_SCHEDULES(ps, area_sweep=False, ctl="auto")[key]
+        auto_scores = auto.get("ctl_auto_candidates", {})
+        check(
+            auto["ctl"] in ("v3", "onehot") and len(auto_scores) == 2,
+            "auto evaluates both supported area-oriented encodings",
+        )
+        check(
+            abs(AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps, auto) - min(auto_scores.values()))
+            < 0.01,
+            "auto returns the lowest-area feasible encoding",
+        )
+        # The tighten loop reschedules only the FSMs blamed for a miss.
+        check(
+            AUTO_FSM.HARVEST_AUTO_FSM_SCHEDULES(ps, area_sweep=False, keys=set()) == {}
+            and set(
+                AUTO_FSM.HARVEST_AUTO_FSM_SCHEDULES(ps, area_sweep=False, keys={key})
+            ) == {key},
+            "keys= limits a harvest to the named call sites",
+        )
+
+        print("[budget controls state count]")
+        ps2, key2, tag2 = parse_design(tmp, mhz=25.0, name="d2")
+        fake_delays(ps2, key2, tag2)
+        loose = schedule_with(ps2, key2, tag2, 4.0)
+        tight = schedule_with(ps2, key2, tag2, 0.05)
+        check(
+            tight["n_states"] >= loose["n_states"],
+            f"a tighter budget never reduces states ({loose['n_states']} -> "
+            f"{tight['n_states']})",
+        )
+        check(
+            tight["at_floor"],
+            "a budget smaller than one indivisible operation reports at_floor "
+            "(so the driver stops tightening instead of looping)",
+        )
+        check(
+            not loose["at_floor"],
+            "a comfortable budget does not report at_floor",
+        )
+
+        print("[determinism]")
+        # Re-parse the SAME file, exactly as the driver's schedule-and-confirm
+        # loop does between passes. Node ids are derived from source
+        # coordinates (file basename, line, column), so this must reproduce the
+        # identical schedule and identical generated source -- if it did not,
+        # entity names would churn between passes and cross-pass matching would
+        # break. (Parsing a copy under a different FILE NAME legitimately gives
+        # different ids, which is why this re-parses in place.)
+        ps3, key3, tag3 = parse_design(tmp, mhz=25.0, name="d1")
+        fake_delays(ps3, key3, tag3)
+        sched3 = schedule_with(ps3, key3, tag3, 0.9)
+        check(key3 == key, "the tag's canonical key is stable across passes")
+        check(
+            AUTO_FSM.SCHEDULES_EQUAL({key: sched}, {key3: sched3}),
+            "the same design schedules identically on re-elaboration",
+        )
+        name3, src3, _g3 = AUTO_FSM.GENERATE_FSM_SOURCE(tag3, sched3, ps3)
+        check(name3 == name, f"entity name is stable across passes ({name} vs {name3})")
+        check(src3 == src, "generated source is byte-identical across passes")
+
+        print("[schedule is plain carryable data]")
+        try:
+            pickle.loads(pickle.dumps(sched))
+            json.dumps(sched, sort_keys=True, default=str)
+            ok_data = True
+        except Exception as e:  # noqa: BLE001
+            print("   ", e)
+            ok_data = False
+        check(ok_data, "schedule survives pickle/json round-trip")
+        check(
+            AUTO_FSM.SCHEDULES_EQUAL({key: sched}, {key: copy.deepcopy(sched)}),
+            "SCHEDULES_EQUAL matches a deep copy",
+        )
+        check(
+            not AUTO_FSM.SCHEDULES_EQUAL({key: sched}, {key: tight}),
+            "SCHEDULES_EQUAL distinguishes different schedules",
+        )
+        check(
+            bool(sched["entity_delays_snapshot"]),
+            "the delay snapshot is carried (later passes reschedule from it)",
+        )
+
+        print("[tightening: SCHEDULES_EQUAL compares hardware, not budget]")
+        # The tighten loop shrinks budget_scale and asks whether the plan
+        # moved. Comparing model-only budget fields would defeat the
+        # "shrinking no longer changes the schedule" stop.
+        roomy_a = schedule_with(ps2, key2, tag2, 4.0)
+        roomy_b = schedule_with(ps2, key2, tag2, 3.0)
+        check(
+            roomy_a["n_states"] == roomy_b["n_states"]
+            and roomy_a["budget_scale"] != roomy_b["budget_scale"]
+            and roomy_a["entity"] == roomy_b["entity"],
+            "precondition: two roomy budgets pack identically but differ in "
+            "budget fields while retaining their hardware entity name",
+        )
+        check(
+            AUTO_FSM.SCHEDULES_EQUAL({key2: roomy_a}, {key2: roomy_b}),
+            "SCHEDULES_EQUAL ignores budget bookkeeping when the hardware is "
+            "identical",
+        )
+
+        print("[tightening: stop when fmax did not improve]")
+        stalled = AUTO_FSM.TIGHTENING_STALLED
+        check(
+            stalled({"m": 102.26}, {"m": 102.25}) == [("m", 102.26, 102.25)],
+            "a tightened build at the same fmax is a stall (the sky130 "
+            "102.25 MHz case)",
+        )
+        check(
+            bool(stalled({"m": 100.0}, {"m": 100.5})),
+            "a gain within TIGHTEN_MIN_FMAX_GAIN is still a stall",
+        )
+        check(
+            stalled({"m": 100.0}, {"m": 105.0}) == [],
+            "a real fmax gain keeps tightening",
+        )
+        check(
+            stalled({"m": 100.0, "n": 50.0}, {"m": 100.0, "n": 60.0}) == [],
+            "any failing MAIN improving keeps tightening",
+        )
+        check(
+            stalled({"m": 100.0}, {"m": 100.0, "n": 50.0}) == []
+            and stalled({}, {"m": 100.0}) == [],
+            "a MAIN with no previous number never counts as stalled",
+        )
+        fake_params = type("P", (), {})()
+        fake_params.sweep_timing_failures = [
+            ("m", 110.0, 102.25, "why"),
+            ("n", 110.0, None, "why"),
+        ]
+        check(
+            AUTO_FSM.FAILED_MAIN_MHZ(fake_params) == {"m": 102.25},
+            "FAILED_MAIN_MHZ keeps only failures with an achieved number",
+        )
+
+        print("[unmeasured delays are resolved, never free]")
+        # No fake_delays: nothing in this parse was ever measured, exactly
+        # like a combinational candidate's never-instantiated soft-operator
+        # gates. Defaulting those to 0 turned them into glue -- a 0-op,
+        # 1-state schedule that won the area search and then hung codegen.
+        ps_u, key_u, tag_u = parse_design(tmp, mhz=25.0, name="d_unmeasured")
+        ent_u = AUTO._entity_key_for_callable(ps_u, tag_u.func)
+        delays_u = AUTO_FSM._schedule_delays(ps_u, ent_u, {})
+        adders_u = [
+            e for e in ps_u.FuncLogicLookupTable[ent_u].submodule_instances.values()
+            if e.startswith("BIN_OP_PLUS")
+        ]
+        check(
+            adders_u and all(delays_u[e] > 0 for e in adders_u),
+            f"an unmeasured adder gets a resolved, nonzero delay "
+            f"({[delays_u.get(e) for e in adders_u]})",
+        )
+        sched_u = AUTO_FSM.BUILD_SCHEDULE(ps_u, key_u, tag_u, 0.9)
+        check(
+            sum(1 for n in sched_u["nodes"].values() if n.get("fu")) == 3,
+            "an unmeasured function still schedules all 3 adds",
+        )
+        check(
+            all(sched_u["entity_delays_snapshot"].get(e, 0) > 0 for e in adders_u),
+            "the resolved delays are carried in the snapshot",
+        )
+
+        print("[zero-op guard]")
+        real_schedule_delays = AUTO_FSM._schedule_delays
+        AUTO_FSM._schedule_delays = lambda p, e, s: {
+            k: 0 for k in real_schedule_delays(p, e, s)
+        }
+        try:
+            for label, build in (
+                ("BUILD_SCHEDULE", AUTO_FSM.BUILD_SCHEDULE),
+                ("the area search", AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE),
+            ):
+                try:
+                    build(ps_u, key_u, tag_u, 0.9)
+                    raised = False
+                except AUTO_FSM.AutoFsmInternalError as e:
+                    raised = "priced at 0 ns" in str(e)
+                check(
+                    raised,
+                    f"{label} refuses a 0-op schedule built from real logic "
+                    f"priced at 0",
+                )
+        finally:
+            AUTO_FSM._schedule_delays = real_schedule_delays
+        # A gate genuinely measured below one delay unit is still legal.
+        ps_z, key_z, tag_z = parse_design(tmp, mhz=25.0, name="d_zero")
+        fake_delays(ps_z, key_z, tag_z, adder_du=0)
+        sched_z = AUTO_FSM.BUILD_SCHEDULE(ps_z, key_z, tag_z, 0.9)
+        check(
+            not any(n.get("fu") for n in sched_z["nodes"].values()),
+            "operations MEASURED at 0 still schedule as free wiring (no error)",
+        )
+
+        print("[tag API]")
+        check(tag.latency == 0, "an unscheduled tag reports latency 0")
+        check(
+            tag.in_stream_t._fields == ("data", "valid")
+            and tag.out_stream_t._fields == ("data", "valid"),
+            "in/out stream types are {data, valid}",
+        )
+        check(
+            pypeline.AUTO_FSM(tag.func, max_latency=5).max_latency == 5,
+            "max_latency is accepted and stored",
+        )
+        bad = 0
+        for value in (1, 0, -3):
+            try:
+                pypeline.AUTO_FSM(tag.func, max_latency=value)
+            except ValueError:
+                bad += 1
+        try:
+            pypeline.AUTO_FSM(tag.func, max_latency="8")
+        except TypeError:
+            bad += 1
+        check(bad == 4, "max_latency below 2, or non-int, is rejected at construction")
+        check(
+            repr(pypeline.AUTO_FSM(tag.func, max_latency=5))
+            != repr(pypeline.AUTO_FSM(tag.func)),
+            "the cap is part of the tag's repr (it feeds canonical entity names)",
+        )
+        unregistered_tag = pypeline.AUTO_FSM(
+            tag.func, max_latency=1, register_output=False
+        )
+        check(
+            unregistered_tag.canonical_key != tag.canonical_key,
+            "output-register policy is part of the canonical schedule key",
+        )
+
+        print("[optional output register]")
+        unregistered = AUTO_FSM.BUILD_SCHEDULE(
+            ps, unregistered_tag.canonical_key, unregistered_tag, 0.9, ctl="v3"
+        )
+        _nu, src_u, _gu = AUTO_FSM.GENERATE_FSM_SOURCE(
+            unregistered_tag, unregistered, ps
+        )
+        check(
+            unregistered["latency"] == unregistered["n_states"],
+            "unregistered output removes the output cycle from latency",
+        )
+        check(
+            "out_data_r" not in src_u and "out_valid_r" not in src_u,
+            "unregistered output emits no redundant result register bank",
+        )
+        check(
+            "o.valid = ow" in src_u,
+            "unregistered output is valid directly in the final execution state",
+        )
+
+        print("[max_latency caps the schedule]")
+        # The cap is a HARD constraint. Sharing everything onto one adder needs
+        # one state per add; meeting a tighter cap therefore requires giving
+        # back some sharing, which is exactly the trade the user asked for by
+        # setting a cap at all.
+        ps4, key4, tag4 = parse_design(tmp, mhz=25.0, name="d4")
+        fake_delays(ps4, key4, tag4)
+        uncapped = schedule_with(ps4, key4, tag4, 0.9)
+        tag4.max_latency = 3
+        capped = schedule_with(ps4, key4, tag4, 0.9)
+        check(
+            uncapped["latency"] > capped["latency"] <= 3,
+            f"a max_latency=3 cap is met ({uncapped['latency']} -> "
+            f"{capped['latency']} clks)",
+        )
+        check(
+            not capped["latency_infeasible"],
+            "meeting the cap is not reported as infeasible",
+        )
+        check(
+            len(capped["fus"]) > len(uncapped["fus"]),
+            f"the cap was met by unsharing ({len(uncapped['fus'])} -> "
+            f"{len(capped['fus'])} units), the only thing that can buy latency",
+        )
+        check(
+            all(
+                fu == entity or fu.startswith(entity + "#")
+                for fu, entity in capped["fus"].items()
+            ),
+            "every extra unit id maps back to the entity it is a copy of",
+        )
+        check(
+            capped["max_latency"] == 3 and uncapped["max_latency"] is None,
+            "the cap is recorded in the schedule (a cached schedule built under "
+            "a different cap must not be reused)",
+        )
+        test_area_search_memo_reuses_plans_byte_identically(tmp)
+
+        print("[operand multiplexers are array reads, not if/elif chains]")
+        name4, src4, _g4 = AUTO_FSM.GENERATE_FSM_SOURCE(tag, sched, ps)
+        check(
+            "_af_mux" in src4,
+            "a shared unit's operands go through a generated mux entity",
+        )
+        check(
+            [
+                p["n_choices"]
+                for p in AUTO_FSM._operand_mux_plan(
+                    sched,
+                    sched["fu_order"][0],
+                    AUTO_FSM.ALLOCATE_REGISTERS(
+                        sched["nodes"], sched["output"], sched["n_states"]
+                    )[0],
+                )[1]
+            ]
+            == [2, 3],
+            "each operand mux contains only distinct values (the two running "
+            "sum operands share one register row; b/c/d remain distinct)",
+        )
+
+        print("[an array-valued operand mux selects whole values]")
+        # t[n] on an array t appends an INNER dimension (C order); the mux
+        # needs n complete t values (self_check_auto_fsm_array_mux_test.py
+        # proves it in GHDL). Unequal dimensions: a square array hides it.
+        lanes_t = pypeline.uint2_t[4]
+        for n in (5, 7):
+            mux = AUTO._mux_callable(lanes_t, n)
+            choices_t = mux.__annotations__["choices"]
+            check(
+                pypeline.ctype_name(choices_t) == f"uint2_t[{n}][4]"
+                and pypeline._array_len(choices_t) == n
+                and pypeline.ctype_name(pypeline._array_elem_ctype(choices_t))
+                == "uint2_t[4]"
+                and mux.__annotations__["sel"].width == 3,
+                f"a {n}-way uint2_t[4] mux takes {n} uint2_t[4] choices and a "
+                "3-bit selector",
+            )
+        check(
+            pypeline.ctype_name(pypeline.make_array_t(pypeline.int16_t, 6))
+            == "int16_t[6]"
+            and pypeline.ctype_name(pypeline.make_array_t(pypeline.uint2_t[3][2], 4))
+            == "uint2_t[4][3][2]",
+            "make_array_t equals t[n] for a scalar and adds the outer "
+            "dimension to a multi-dimensional array",
+        )
+
+        print("[operand muxes factor through common glue]")
+        ps_factor, key_factor, tag_factor = parse_design(
+            tmp, mhz=25.0, name="d_factor", source=FACTOR_SRC
+        )
+        fake_delays(ps_factor, key_factor, tag_factor)
+        sched_factor = schedule_with(ps_factor, key_factor, tag_factor, 0.9)
+        reg_factor, _types_factor = AUTO_FSM.ALLOCATE_REGISTERS(
+            sched_factor["nodes"],
+            sched_factor["output"],
+            sched_factor["n_states"],
+            sched_factor.get("cross_fu_register_types", ()),
+        )
+        add_fu = next(
+            fu
+            for fu, entity in sched_factor["fus"].items()
+            if entity.startswith("BIN_OP_PLUS_")
+        )
+        _factor_nodes, factor_ports = AUTO_FSM._operand_mux_plan(
+            sched_factor, add_fu, reg_factor
+        )
+        factor_shapes = [
+            (ctype, n) for port in factor_ports for ctype, n, _mapping in port["muxes"]
+        ]
+        check(
+            ("uint1_t", 4) in factor_shapes and ("uint8_t", 4) not in factor_shapes,
+            "four concat operands mux only their changing one-bit leaf, not "
+            "four complete uint8 values",
+        )
+        _nf, src_factor, _gf = AUTO_FSM.GENERATE_FSM_SOURCE(
+            tag_factor, sched_factor, ps_factor
+        )
+        check(
+            src_factor.count("concat(") == 1,
+            "the shared concat structure is emitted once after factoring",
+        )
+
+        print("[unrolled output shifts use one rolling vector register]")
+        ps_pack, key_pack, tag_pack = parse_design(
+            tmp, mhz=25.0, name="d_pack", source=PACK_SRC
+        )
+        fake_delays(ps_pack, key_pack, tag_pack)
+        sched_pack = schedule_with(ps_pack, key_pack, tag_pack, 0.9)
+        packs = AUTO_FSM._OUTPUT_SHIFT_PACKS(
+            sched_pack["nodes"], sched_pack["output"], sched_pack["n_states"]
+        )
+        check(
+            len(packs) == 1 and packs[0]["width"] == 8 and len(packs[0]["steps"]) == 4,
+            "four unrolled shift/concat updates are recovered as one uint8 "
+            "rolling value",
+        )
+        packed_deps = {step["dep"] for step in packs[0]["steps"]}
+        cross_pack = AUTO_FSM._CROSS_STATE_NODES(
+            sched_pack["nodes"], sched_pack["output"], sched_pack["n_states"]
+        )
+        check(
+            not (packed_deps & set(cross_pack)),
+            "appended bits are captured in their producer states instead of "
+            "receiving separate final-state registers",
+        )
+        name_pack, src_pack, _gp = AUTO_FSM.GENERATE_FSM_SOURCE(
+            tag_pack, sched_pack, ps_pack
+        )
+        check(
+            name_pack == sched_pack["entity"]
+            and src_pack.count("pack0_r: Reg[") == 1
+            and src_pack.count("pack0_wel:") == 1
+            and "asm" in src_pack,
+            "codegen emits one rolling register/write-enable and uses it in "
+            "the compound final result",
+        )
+
+        print("[input and output share one consume/produce rolling register]")
+        ps_fused, key_fused, tag_fused = parse_design(
+            tmp, mhz=25.0, name="d_fused_pack", source=FUSED_PACK_SRC
+        )
+        fake_delays(ps_fused, key_fused, tag_fused)
+        # Keep the one-bit result operation in the same state as its producer;
+        # real sky130 measures this tiny XOR far below the wide subtract.  The
+        # generic fake_delays helper intentionally gives every BIN_OP the same
+        # delay, which would defer the first result bit and destroy the rolling
+        # recurrence shape this fixture is meant to exercise.
+        for entity, logic in ps_fused.FuncLogicLookupTable.items():
+            if entity.startswith("BIN_OP_XOR_uint1_t"):
+                logic.delay = 10
+            if entity.startswith("MUX_uint4_t"):
+                # Make the recurrence value a scheduled/captured operation.
+                # Without that register the zero-delay graph deliberately
+                # retains every older source bit, so fusing storage would not
+                # be legal and the conservative detector must reject it.
+                logic.delay = 150
+        sched_fused = schedule_with(ps_fused, key_fused, tag_fused, 0.9)
+        fused_packs = AUTO_FSM._OUTPUT_SHIFT_PACKS(
+            sched_fused["nodes"],
+            sched_fused["output"],
+            sched_fused["n_states"],
+        )
+        fusion = fused_packs[0].get("source_fusion") if len(fused_packs) == 1 else None
+        check(
+            fusion is not None
+            and fused_packs[0]["width"] == 4
+            and len(fusion["replacements"]) >= 4,
+            "a full-width descending source plus produced-bit shift is "
+            "recognized conservatively",
+        )
+        reg_fused, _types_fused = AUTO_FSM.ALLOCATE_REGISTERS(
+            sched_fused["nodes"],
+            sched_fused["output"],
+            sched_fused["n_states"],
+            sched_fused.get("cross_fu_register_types", ()),
+        )
+        if fusion is not None:
+            produced_deps = {step["dep"] for step in fused_packs[0]["steps"]}
+            check(
+                fusion["source_dep"] not in reg_fused,
+                "the original width-W source register is removed after its "
+                "later reads move to the rolling vector",
+            )
+            check(
+                produced_deps <= set(reg_fused)
+                and len({reg_fused[nid] for nid in produced_deps}) == 1,
+                "all produced bits use one shared one-bit lifetime register "
+                "instead of W final-result registers",
+            )
+        input_plan = AUTO_FSM._INPUT_STORAGE_PLAN(
+            sched_fused["nodes"],
+            sched_fused["output"],
+            sched_fused["n_states"],
+        )
+        check(
+            input_plan is not None
+            and input_plan["preloaded_fields"] == ("word",)
+            and [f["field"] for f in input_plan["stored_fields"]] == ["key"],
+            "the first-state-only input field preloads the rolling register "
+            "while the later-lived field keeps dedicated storage",
+        )
+        _nfp, src_fused, _gfp = AUTO_FSM.GENERATE_FSM_SOURCE(
+            tag_fused, sched_fused, ps_fused
+        )
+        check(
+            "pack0_wchoices" in src_fused
+            and "pack0_final" in src_fused
+            and "pack0_r: Reg[" in src_fused,
+            "codegen captures the source, shifts produced bits, and joins the "
+            "last scalar bit directly in the final result",
+        )
+        check(
+            "in_r: Reg[" not in src_fused
+            and "in_f0_r: Reg[" in src_fused
+            and "pack0_r = s.data.word" in src_fused,
+            "codegen removes the whole input struct register, retaining only "
+            "the later-lived field and loading the early field into work storage",
+        )
+
+        repeated_src = DESIGN_SRC.replace("t1 + x.d", "t1 + x.b").replace(
+            "t0 + x.c", "t0 + x.b"
+        )
+        ps_same, key_same, tag_same = parse_design(
+            tmp, mhz=25.0, name="d_same_operand", source=repeated_src
+        )
+        fake_delays(ps_same, key_same, tag_same)
+        sched_same = schedule_with(ps_same, key_same, tag_same, 0.9)
+        _ns, src_same, _gs = AUTO_FSM.GENERATE_FSM_SOURCE(tag_same, sched_same, ps_same)
+        check(
+            "u0_c1:" not in src_same and "u0_a1:" in src_same,
+            "identical operands across states bypass the operand mux entirely",
+        )
+
+        print("[cross-functional-unit register reuse]")
+        bind_nodes = {
+            "a": {
+                "delay_du": 1,
+                "state": 1,
+                "out_type": "uint8_t",
+                "fu": "add",
+                "operands": [("in", "x")],
+            },
+            "b": {
+                "delay_du": 1,
+                "state": 2,
+                "out_type": "uint8_t",
+                "fu": "xor",
+                "operands": [("node", "a")],
+            },
+            "c": {
+                "delay_du": 1,
+                "state": 3,
+                "out_type": "uint8_t",
+                "fu": "sub",
+                "operands": [("node", "b")],
+            },
+        }
+        plain_regs, _ = AUTO_FSM.ALLOCATE_REGISTERS(bind_nodes, ("node", "c"), 3)
+        shared_regs, _ = AUTO_FSM.ALLOCATE_REGISTERS(
+            bind_nodes, ("node", "c"), 3, ("uint8_t",)
+        )
+        check(
+            len(set(plain_regs.values())) == 2 and len(set(shared_regs.values())) == 1,
+            "non-overlapping values from different units can share one register",
+        )
+        ps_cross, key_cross, tag_cross = parse_design(
+            tmp, mhz=25.0, name="d_cross_fu", source=CROSS_FU_SRC
+        )
+        fake_delays(ps_cross, key_cross, tag_cross)
+        sched_cross = schedule_with(ps_cross, key_cross, tag_cross, 0.35)
+        sched_cross["cross_fu_register_types"] = ["int16_t"]
+        _nc, src_cross, _gc = AUTO_FSM.GENERATE_FSM_SOURCE(
+            tag_cross, sched_cross, ps_cross
+        )
+        cross_value_regs = re.findall(r"v\d+_r:", src_cross)
+        check(
+            "v0_wchoices:" in src_cross and "v1_r:" not in src_cross,
+            "codegen emits one measured writeback mux for a cross-unit register "
+            f"(write choices={src_cross.count('_wchoices:')}, "
+            f"value regs={cross_value_regs})",
+        )
+        # Forcing latency 2 unshares completely: three adders, one use each.
+        # A unit with a single user needs no selection at all, and paying for a
+        # multiplexer there would be pure loss.
+        tag4.max_latency = 2
+        unshared = schedule_with(ps4, key4, tag4, 0.9)
+        _n5, src5, _g5 = AUTO_FSM.GENERATE_FSM_SOURCE(tag4, unshared, ps4)
+        check(
+            len(unshared["fus"]) == 3 and "_af_mux" not in src5,
+            "a unit with a single user gets no multiplexer at all",
+        )
+
+        print("[area model and the minimum-area sweep]")
+        ps6, key6, tag6 = parse_design(tmp, mhz=25.0, name="d6")
+        fake_delays(ps6, key6, tag6)
+        base = schedule_with(ps6, key6, tag6, 0.9)
+        base_area = AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, base)
+        check(
+            base_area > 0, f"a schedule has a positive estimated area ({base_area:.0f})"
+        )
+        # Opening a 16-bit adder into gates: three shared gates instead of one
+        # shared adder, but 150-odd states' worth of registers and multiplexers
+        # to pay for them. The model has to see that as WORSE, or the search
+        # would decompose everything down to NAND.
+        adder = "BIN_OP_PLUS_int16_t_int16_t"
+        check(
+            adder in getattr(ps6, "pypeline_auto_fsm_soft_equiv", {}),
+            "a soft-operator equivalent was prepared for the built-in adder "
+            "(this is what lets descent go below the operator level at all)",
+        )
+        gates = AUTO_FSM.BUILD_SCHEDULE(ps6, key6, tag6, 0.9, None, (adder,))
+        check(
+            len(gates["nodes"]) > 10 * len(base["nodes"]),
+            f"opening the adder really decomposes it ({len(base['nodes'])} -> "
+            f"{len(gates['nodes'])} operations)",
+        )
+        check(
+            all(not e.startswith("BIN_OP_PLUS") for e in gates["fus"].values()),
+            f"the adder is gone, replaced by its gates: "
+            f"{sorted(set(gates['fus'].values()))}",
+        )
+        check(
+            AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, gates) > base_area,
+            "sharing gates instead of adders is estimated as BIGGER, not "
+            "smaller -- the multiplexers and registers outweigh the units",
+        )
+        gate_required_win = AUTO_FSM._sweep_required_improvement(base, gates)
+        check(
+            gate_required_win > AUTO_FSM.SWEEP_MIN_IMPROVEMENT,
+            "opening into a much larger scheduled shape raises the confidence "
+            f"threshold ({gate_required_win * 100.0:.1f}% required win)",
+        )
+        swept = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps6, key6, tag6, 0.9)
+        check(
+            swept["est_area"] <= swept["est_area_anchor"],
+            "the sweep never returns something its own model calls worse than "
+            "the plain schedule it started from",
+        )
+        test_area_search_is_the_same_at_any_jobs(ps6, key6, tag6)
+        check(
+            swept["opened"] == [],
+            "the sweep declines to open the adder into gates (its own model "
+            "says that costs more than it saves)",
+        )
+        check(
+            swept["est_area"] <= swept["est_area_anchor"],
+            "the sweep's answer is never estimated worse than sharing "
+            "everything at the written grain",
+        )
+        # THE calibration invariant, and the one the search gets wrong most
+        # expensively if the AREA_* constants drift: an adder bit costs several
+        # times what a multiplexer bit or a flip-flop does, so three adds
+        # sharing one adder is smaller than three adders -- even counting the
+        # multiplexers, the registers and the extra states. Confirmed against
+        # real yosys cell counts by auto_fsm_area_sweep_compare_test.py; asserted
+        # here because that test needs a full synthesis run and this does not.
+        all_unshared = AUTO_FSM.BUILD_SCHEDULE(
+            ps6, key6, tag6, 0.9, None, (), None, ((adder, 3),)
+        )
+        check(
+            len(all_unshared["fus"]) == 3
+            and AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, all_unshared)
+            > AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, base),
+            f"building three adders is estimated as BIGGER than sharing one "
+            f"({AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, base):.0f} shared vs "
+            f"{AUTO_FSM.ESTIMATE_SCHEDULE_AREA(ps6, all_unshared):.0f} unshared)",
+        )
+        check(
+            swept["unshared"] == [],
+            "...so the sweep leaves them shared",
+        )
+        ps7, key7, tag7 = parse_design(tmp, mhz=25.0, name="d6")
+        fake_delays(ps7, key7, tag7)
+        swept7 = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps7, key7, tag7, 0.9)
+        check(
+            AUTO_FSM.SCHEDULES_EQUAL({key7: swept7}, {key6: swept}),
+            "the sweep is deterministic across re-elaborations (its result "
+            "names the generated entity, so it has to be)",
+        )
+
+        print("[control encodings share one packing memo]")
+        # Under ctl auto the v3 and onehot searches visit mostly the same
+        # points. With identical select-arrival models, the second search
+        # reuses the first's packing schedules. The reused ones
+        # must be byte-identical to building fresh, entity name included.
+        def dumps(schedule):
+            return json.dumps(schedule, sort_keys=True, default=str)
+
+        built = []
+        real_build = AUTO_FSM._BUILD_SCHEDULE
+
+        def counting_build(*args):
+            built.append(args[8])
+            return real_build(*args)
+
+        AUTO_FSM._BUILD_SCHEDULE = counting_build
+        try:
+            fresh_oh = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps6, key6, tag6, 0.9, ctl="onehot")
+            n_fresh = len(built)
+            memo = {}
+            memo_v3 = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(
+                ps6, key6, tag6, 0.9, ctl="v3", build_memo=memo
+            )
+            del built[:]
+            memo_oh = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(
+                ps6, key6, tag6, 0.9, ctl="onehot", build_memo=memo
+            )
+            n_memo = len(built)
+            plain_oh = AUTO_FSM.BUILD_SCHEDULE(ps6, key6, tag6, 0.9, ctl="onehot")
+            restamped_oh = AUTO_FSM.BUILD_SCHEDULE(
+                ps6, key6, tag6, 0.9, ctl="onehot", build_memo=memo
+            )
+            del built[:]
+            refusals = []
+            for _attempt in range(2):
+                try:
+                    AUTO_FSM.BUILD_SCHEDULE(
+                        ps6, key6, tag6, 0.9, None, (adder,), 1, ctl="onehot",
+                        build_memo=memo,
+                    )
+                except AUTO.AutoError as e:
+                    refusals.append(str(e))
+            n_refused = len(built)
+        finally:
+            AUTO_FSM._BUILD_SCHEDULE = real_build
+        check(
+            dumps(memo_oh) == dumps(fresh_oh),
+            "an onehot search through the v3 search's memo returns the same "
+            "schedule, byte for byte, as an onehot search on its own",
+        )
+        check(
+            dumps(restamped_oh) == dumps(plain_oh) and restamped_oh["ctl"] == "onehot",
+            "a memoized point restamped to onehot equals building it as onehot",
+        )
+        check(
+            all(isinstance(v, (bytes, AUTO.AutoError)) for v in memo.values()),
+            "the memo holds serialized schedules, not live ones (a live "
+            "schedule of a large function is megabytes, and a search keeps "
+            "hundreds)",
+        )
+        check(
+            memo_oh["entity"] != memo_v3["entity"],
+            "restamping renames the entity: the encoding stays part of its identity",
+        )
+        check(
+            n_memo < n_fresh,
+            f"the onehot search reuses the v3 search's schedules "
+            f"({n_memo} built through the memo vs {n_fresh} on its own)",
+        )
+        check(
+            len(refusals) == 2 and refusals[0] == refusals[1] and n_refused == 1,
+            "a refused point (past max_nodes) is built once and refused again "
+            "from the memo",
+        )
+        check(
+            all(
+                v.__traceback__ is None
+                for v in memo.values()
+                if isinstance(v, AUTO.AutoError)
+            ),
+            "a remembered refusal keeps no traceback (one would keep the "
+            "refused DAG and the search's frames alive)",
+        )
+
+        print("[scheduled re-parse prepares the soft equivalents it binds]")
+        # The driver schedules on the bootstrap parse, then parses the design
+        # again with the schedule installed; the code generator calls every
+        # bound unit through a callable THAT parse recorded. Opening a built-in
+        # multiply binds units (its soft equivalent's adder tree) that exist
+        # only once the soft equivalent is elaborated, so the scheduled pass
+        # must prepare it too -- here without AUTO_COMB_OPT.prepare's help.
+        opened_mult = "BIN_OP_INFERRED_MULT_uint8_t_uint3_t"
+        ps8, key8, tag8 = parse_design(
+            tmp, mhz=25.0, name="d_scoped_soft", source=SCOPED_SOFT_SRC
+        )
+        entity8 = AUTO._entity_key_for_callable(ps8, tag8.func)
+        prepared8 = ps8.pypeline_comb_area_opt_candidates[entity8][0][1]
+        check(
+            prepared8.get("unsupported") == "scoped operator implementations retained"
+            and opened_mult in AUTO._soft_equivalents(ps8),
+            "precondition: prepare returned early, and the bootstrap pass "
+            "prepared the multiply's soft equivalent anyway",
+        )
+        # Every operator and Python-sourced call costs something, so each is a
+        # scheduled unit; wiring stays free glue.
+        soft8 = AUTO._soft_equivalents(ps8)[opened_mult]
+        callables8 = AUTO._entity_callables(ps8)
+        for entity in set(AUTO._subtree_entities(ps8, entity8)) | set(
+            AUTO._subtree_entities(ps8, soft8)
+        ):
+            logic = ps8.FuncLogicLookupTable.get(entity)
+            if logic is not None:
+                costs = entity.startswith("BIN_OP_") or entity in callables8
+                logic.delay = 100 if costs else 0
+        sched8 = AUTO_FSM.BUILD_SCHEDULE(ps8, key8, tag8, 0.9, None, (opened_mult,))
+        check(
+            any(e.startswith("soft_add_tree") for e in sched8["fus"].values()),
+            "precondition: the schedule binds the soft multiplier's adder tree",
+        )
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({key8: sched8})
+        try:
+            _ps9, _key9, tag9 = parse_design(
+                tmp, mhz=25.0, name="d_scoped_soft", source=SCOPED_SOFT_SRC
+            )
+            reparse_error = None
+        except AUTO.AutoError as e:
+            reparse_error = str(e)
+        finally:
+            pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+        check(
+            reparse_error is None and tag9._generated is not None,
+            "the scheduled re-parse generates the FSM, every bound unit callable "
+            f"(error: {reparse_error})",
+        )
+
+        print("[descent blocked: AT FLOOR names what could not be opened]")
+        ps10, key10, tag10 = parse_design(
+            tmp, mhz=25.0, name="d_blocked", source=BLOCKED_SRC
+        )
+        callables10 = AUTO._entity_callables(ps10)
+        # Indexed reads regenerate now (#377). Inject an unknown builtin into
+        # pick to keep testing the diagnostic for genuinely unsupported ops.
+        for entity, logic in list(ps10.FuncLogicLookupTable.items()):
+            if getattr(callables10.get(entity), "__name__", None) != "pick":
+                continue
+            for inst, child in list(logic.submodule_instances.items()):
+                if child.startswith("VAR_REF_RD_"):
+                    unknown = "unsupported_indexed_builtin"
+                    opaque = ps10.FuncLogicLookupTable[child].DEEPCOPY()
+                    opaque.func_name = unknown
+                    ps10.FuncLogicLookupTable[unknown] = opaque
+                    logic.submodule_instances[inst] = unknown
+        for entity, logic in ps10.FuncLogicLookupTable.items():
+            name = getattr(callables10.get(entity), "__name__", None)
+            if name == "pick" or entity.startswith("BIN_OP_INFERRED_MULT_int"):
+                logic.delay = 1000  # slower than one 25 MHz state
+            elif entity.startswith(("BIN_OP_", "VAR_REF_RD_")):
+                logic.delay = 100
+        sched10 = AUTO_FSM.BUILD_SCHEDULE(ps10, key10, tag10, 0.9)
+        report10 = AUTO_FSM.DESCRIBE_SCHEDULE(ps10, key10, sched10)
+        reasons10 = {
+            entity: why for _nid, entity, _du, why in sched10["descend_blocked"]
+        }
+        pick10 = [e for e in reasons10 if e.startswith("pick")]
+        mult10 = [e for e in reasons10 if e.startswith("BIN_OP_INFERRED_MULT_int")]
+        check(
+            sched10["at_floor"] and "descent blocked: 2 entity/ies" in report10,
+            "an AT FLOOR schedule reports both too-slow operations it kept atomic",
+        )
+        check(
+            len(pick10) == 1
+            and "VAR_REF_RD" in reasons10[pick10[0]]
+            and "d_blocked_py_l" in reasons10[pick10[0]]
+            and "cannot be regenerated" in reasons10[pick10[0]],
+            "a call kept atomic names the unsupported operation and its source coordinates",
+        )
+        check(
+            len(mult10) == 1
+            and reasons10[mult10[0]] == "no Python source or soft-operator equivalent to open",
+            "a slow signed multiply is kept atomic for want of a soft equivalent",
+        )
+        check(
+            AUTO_FSM.SCHEDULES_EQUAL(
+                {key10: sched10}, {key10: dict(sched10, descend_blocked=[])}
+            ),
+            "the blocked-descent record is diagnostic, not hardware",
+        )
+
+        print("[forced descent splits wide operators into half-width inferred ones]")
+        # Width-proportional delays (delay units): an add/subtract grows with
+        # its carry chain, an inferred multiply with its operand widths. The
+        # 100 MHz clock at scale 0.6 gives 60 units per state: too small for
+        # the 32/33-bit multiplies (~85) and the 128-bit add/subtract (~52 plus
+        # the 10-unit operand-mux allowance).
+        ps11, key11, tag11 = parse_design(
+            tmp, mhz=100.0, name="d_wide", source=WIDE_SRC
+        )
+
+        def wide_delays(parser_state):
+            info = parser_state.pypeline_builtin_op_info
+            for entity, logic in parser_state.FuncLogicLookupTable.items():
+                op = info.get(entity)
+                if op is None:
+                    if not logic.submodule_instances:
+                        logic.delay = 0  # casts, bit reads/assigns: wiring
+                    continue
+                name, ctypes = op
+                widths = [AUTO._ctype_width(t) for t in ctypes]
+                if name in ("PLUS", "MINUS"):
+                    logic.delay = 10 + max(widths) // 3
+                elif name in ("INFERRED_MULT", "MULT"):
+                    logic.delay = 20 + sum(widths)
+                else:
+                    logic.delay = 2
+
+        wide_delays(ps11)
+        split11 = AUTO._split_equivalents(ps11)
+        check(
+            "BIN_OP_PLUS_uint128_t_uint128_t" in split11
+            and "BIN_OP_INFERRED_MULT_uint32_t_uint32_t" in split11,
+            "precondition: the bootstrap parse prepared width-halving "
+            "equivalents for the wide add and the inferred-leaf multiply",
+        )
+        sched11 = AUTO_FSM.BUILD_SCHEDULE(ps11, key11, tag11, 0.6)
+        ents11 = [n["entity"] for n in sched11["nodes"].values() if n.get("fu")]
+        one_bit11 = [
+            e for e in ents11
+            if e.startswith(("BIN_OP_AND_uint1_t", "BIN_OP_OR_uint1_t", "BIN_OP_XOR_uint1_t"))
+        ]
+        widest_add11 = max(
+            (AUTO._ctype_width(t)
+             for e in ents11 if e.startswith(("BIN_OP_PLUS_", "BIN_OP_MINUS_"))
+             for t in ps11.pypeline_builtin_op_info[e][1]),
+            default=0,
+        )
+        mults11 = sorted({e for e in ents11 if "MULT" in e or "inferred_mult" in e})
+        check(
+            not one_bit11,
+            f"forced descent never reaches one-bit gates ({len(one_bit11)} found)",
+        )
+        check(
+            0 < widest_add11 < 128,
+            f"the 128-bit add/subtract were split into narrower inferred adds "
+            f"(widest {widest_add11} bits)",
+        )
+        check(
+            mults11 and not any("uint32_t_r_t_uint32_t" in e or "uint33_t_r_t_uint33_t" in e
+                                for e in mults11),
+            f"the too-slow 32/33-bit products were split into narrower inferred "
+            f"products: {mults11}",
+        )
+        check(
+            len(sched11["nodes"]) < 400,
+            f"the descended schedule stays word-level ({len(sched11['nodes'])} "
+            f"operations); bit-level descent made thousands",
+        )
+        # Sharing every 8x16 product on one unit adds a wide operand mux, so
+        # the share-everything anchor runs over budget -- but only by its mux:
+        # each operation passed the descent test, which charges a flat
+        # allowance. Giving the product more units is what the area search is
+        # for, and it must find the fitting binding rather than return the
+        # over-budget anchor.
+        over11 = [
+            n for n in sched11["nodes"].values()
+            if n.get("fu") and n["end_du"] > sched11["budget_du"]
+        ]
+        check(
+            all(n["delay_du"] + AUTO.MUX_PENALTY_DU <= sched11["budget_du"] for n in over11),
+            "whatever runs over budget in the anchor does so only through its "
+            "operand mux",
+        )
+        best11 = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps11, key11, tag11, 0.6)
+        check(
+            best11["worst_state_du"] <= best11["budget_du"] and not best11["at_floor"],
+            f"the area search reaches a binding that fits the clock "
+            f"(worst {best11['worst_state_du']} of {best11['budget_du']}, "
+            f"unshared {best11['unshared']})",
+        )
+        print("[max_latency is met down to the dependency-chain minimum]")
+        # One unit per operation leaves only the dependency chain setting the
+        # state count: the shortest schedule there is. A cap at exactly that
+        # latency must be met (giving units back one at a time to the most
+        # loaded entity, eight times at most, did not get there), and still
+        # with some sharing where the chain allows it; a cap one below it
+        # cannot be met, and the report says what the minimum is.
+        folds11 = {}
+        for n in sched11["nodes"].values():
+            if n.get("fu"):
+                folds11[n["entity"]] = folds11.get(n["entity"], 0) + 1
+        alone11 = AUTO_FSM.BUILD_SCHEDULE(
+            ps11, key11, tag11, 0.6, unshared=tuple(sorted(folds11.items()))
+        )
+        try:
+            tag11.max_latency = alone11["latency"]
+            capped11 = AUTO_FSM.BUILD_SCHEDULE(ps11, key11, tag11, 0.6)
+            tag11.max_latency = alone11["latency"] - 1
+            short11 = AUTO_FSM.BUILD_SCHEDULE(ps11, key11, tag11, 0.6)
+        finally:
+            tag11.max_latency = None
+        check(
+            alone11["latency"] < sched11["latency"]
+            and not capped11["latency_infeasible"]
+            and capped11["latency"] <= alone11["latency"],
+            f"a cap at the minimum latency ({alone11['latency']}, uncapped "
+            f"{sched11['latency']}) is met: {capped11['latency']}",
+        )
+        check(
+            len(capped11["fus"]) < sum(folds11.values()),
+            f"meeting it keeps some sharing ({len(capped11['fus'])} units for "
+            f"{sum(folds11.values())} operations)",
+        )
+        check(
+            short11["latency_infeasible"]
+            and short11["latency"] == alone11["latency"]
+            and f"needs {alone11['n_states']} states"
+            in AUTO_FSM.LATENCY_INFEASIBLE_MESSAGE(key11, short11),
+            "a cap below the minimum is infeasible, and the report names the "
+            "minimum",
+        )
+
+        # The area search's CHOSEN opens keep the soft-operator flavor: with
+        # room for every operation, opening the 128-bit add is a ripple adder.
+        roomy11 = AUTO_FSM.BUILD_SCHEDULE(
+            ps11, key11, tag11, 4.0, None, ("BIN_OP_PLUS_uint128_t_uint128_t",)
+        )
+        check(
+            any(n["entity"].startswith("BIN_OP_XOR_uint1_t")
+                for n in roomy11["nodes"].values()),
+            "a chosen (not forced) open still uses the bit-level soft adder",
+        )
+
+        print("[area search walks through over-budget intermediates]")
+        # Each add/subtract fits the descent test's flat 10-unit operand-mux
+        # allowance (80 + 10 <= 90), so neither is opened -- but five of them
+        # on one unit charge a 5-way mux (14 units) and do not fit. The anchor
+        # is therefore over budget twice over, and only giving BOTH kinds a
+        # second unit fixes it. Unsharing one kind alone is no closer to
+        # fitting, which the search used to reject outright, leaving the
+        # over-budget anchor as its answer.
+        ps12, key12, tag12 = parse_design(
+            tmp, mhz=100.0, name="d_two_floors", source=TWO_FLOORS_SRC
+        )
+        for entity, logic in ps12.FuncLogicLookupTable.items():
+            if entity.startswith(("BIN_OP_PLUS_", "BIN_OP_MINUS_")):
+                logic.delay = 80
+            elif not logic.submodule_instances:
+                logic.delay = 0
+        anchor12 = AUTO_FSM.BUILD_SCHEDULE(ps12, key12, tag12, 0.9)
+        check(
+            anchor12["worst_state_du"] > anchor12["budget_du"]
+            and not anchor12["opened"],
+            "precondition: sharing everything is over budget, and nothing was "
+            "opened to avoid it",
+        )
+        best12 = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps12, key12, tag12, 0.9)
+        units12 = dict((e, n) for e, n in best12["unshared"])
+        check(
+            best12["worst_state_du"] <= best12["budget_du"]
+            and not best12["latency_infeasible"],
+            f"the search reaches a feasible implementation (unshared "
+            f"{best12['unshared']}, worst {best12['worst_state_du']} of "
+            f"{best12['budget_du']})",
+        )
+        old_cap = AUTO_FSM.MAX_SWEEP_DAG_NODES
+        print("[area search permits coarsening an anchor beyond the DAG cap]")
+        try:
+            AUTO_FSM.MAX_SWEEP_DAG_NODES = len(anchor12["nodes"]) - 1
+            capped12 = AUTO_FSM.SWEEP_MIN_AREA_SCHEDULE(ps12, key12, tag12, 0.9)
+        finally:
+            AUTO_FSM.MAX_SWEEP_DAG_NODES = old_cap
+        check(
+            capped12["sweep_skipped_dag_nodes"] == len(anchor12["nodes"])
+            and (
+                AUTO_FSM.SCHEDULES_EQUAL({key12: capped12}, {key12: anchor12})
+                or len(capped12["nodes"]) <= len(anchor12["nodes"])
+            ),
+            "an oversized anchor keeps the incumbent or a coarsened candidate",
+        )
+        check(
+            "area search skipped" in AUTO_FSM.DESCRIBE_SCHEDULE(ps12, key12, capped12),
+            "the schedule report says the search was skipped and why",
+        )
+
+        print("[tightening steps by the measured miss and past the worst state]")
+        def fake_state(mhz):
+            # Call site "k" under MAIN "m" (AUTO.COLLECT_AUTO_OWNERS)
+            fake = type("PS", (), {})()
+            fake.main_mhz = {"m": mhz}
+            fake.main_syn_mhz = {"m": mhz}
+            fake.pypeline_auto_owner_mains = {("AUTO_FSM", "k"): ("m",)}
+            return fake
+
+        fake80 = fake_state(80.0)  # 125 delay units per period
+        tighten = AUTO_FSM.TIGHTENED_BUDGET_SCALE
+        check(
+            abs(tighten(fake80, "k", 0.9, 72.65 / 80.0, 112) - 0.9 * 72.65 / 80.0) < 1e-9,
+            "a 72.65-of-80 MHz miss shrinks the budget by that ratio (11.2 -> "
+            "10.2 ns), not by the fixed fallback step (8.4 ns)",
+        )
+        near = tighten(fake80, "k", 0.9, 79.99 / 80.0, 110)
+        check(
+            AUTO_FSM._budget_du(fake80, "k", near) == 109,
+            "a near miss still steps just below the current worst state",
+        )
+        check(
+            abs(tighten(fake80, "k", 0.9, None, 112) - 0.9 * AUTO_FSM.BUDGET_TIGHTEN_FACTOR) < 1e-9,
+            "with no achieved MHz the fixed BUDGET_TIGHTEN_FACTOR applies",
+        )
+        fake85 = fake_state(85.0)  # 117.6 delay units: not an integer
+        check(
+            AUTO_FSM._budget_du(fake85, "k", tighten(fake85, "k", 0.95, 0.9999, 110)) == 109,
+            "the below-worst step survives a non-integer clock period",
+        )
+        params13 = type("P", (), {})()
+        params13.sweep_timing_failures = [
+            ("main_a", 80.0, 72.65, "path through fsm_x_entity"),
+            ("main_b", 80.0, 79.99, "path through fsm_x_entity"),
+            ("main_c", 80.0, None, "path through fsm_y_entity"),
+        ]
+        scheds13 = {"kx": {"entity": "fsm_x_entity"}, "ky": {"entity": "fsm_y_entity"}}
+        ratios13 = AUTO_FSM._BLAMED_MISS_RATIOS(None, params13, scheds13)
+        check(
+            ratios13 == {"kx": 72.65 / 80.0, "ky": None},
+            f"each blamed FSM takes its worst miss; no number gives None ({ratios13})",
+        )
+        check(
+            AUTO_FSM.BLAMED_AUTO_FSM_KEYS(None, params13, scheds13) == {"kx", "ky"},
+            "BLAMED_AUTO_FSM_KEYS is the same attribution",
+        )
+        # A pinned unit's region stop names the unit, not its FSM. Blaming
+        # every FSM under the MAIN instead would tighten FSMs that met timing.
+        pinned = dict(
+            unit_entity="unit_e", latency=3, ii=1, registered_selection=True,
+            placement_digest="5c58",
+        )
+        scheds14 = {
+            "kx": {"entity": "fsm_x_entity", "implementations": {"e": pinned}},
+            "ky": {"entity": "fsm_y_entity"},
+        }
+        params14 = type("P", (), {})()
+        params14.sweep_timing_failures = [(
+            "main_a", 80.0, 43.71, "auto_pipeline_latency_limit: "
+            + AUTO_FSM._pinned_unit_name(pinned) + "_latency_3",
+        )]
+        ratios14 = AUTO_FSM._BLAMED_MISS_RATIOS(None, params14, scheds14)
+        check(
+            ratios14 == {"kx": 43.71 / 80.0},
+            f"a pinned unit's miss blames only its owning FSM ({ratios14})",
+        )
+
+    # ── soft-operator equivalents: which built-ins can be opened, and into
+    #    WHAT. Signedness is the sharp edge -- substituting an unsigned
+    #    algorithm for a signed operator does not make a slower design, it makes
+    #    a wrong one, and _open_target's return-type/arity check cannot see the
+    #    difference (same widths, different answers).
+    print("\n[soft-operator equivalents]")
+
+    class _FakeParserState:
+        pass
+
+    ps_soft = _FakeParserState()
+    ps_soft.pypeline_builtin_op_info = {
+        "u_mult": ("INFERRED_MULT", ("uint16_t", "uint16_t")),
+        "s_mult": ("INFERRED_MULT", ("int16_t", "int16_t")),
+        "u_div": ("DIV", ("uint16_t", "uint16_t")),
+        "s_div": ("DIV", ("int16_t", "int16_t")),
+        "u_mod": ("MOD", ("uint16_t", "uint16_t")),
+        "shift": ("SR", ("uint32_t", "uint8_t")),
+        "f_add": ("PLUS", ("float32_t", "float32_t")),
+    }
+
+    def soft_name(entity):
+        fn = AUTO._soft_equivalent_callable(ps_soft, entity)
+        return getattr(fn, "__name__", None)
+
+    check(
+        soft_name("u_div") == "soft_div_radix",
+        "an unsigned divide opens into the radix restoring divider (the one "
+        "operation expensive enough that opening it buys real area)",
+    )
+    check(
+        soft_name("s_div") == "soft_div_signed_radix",
+        "a SIGNED divide opens into the signed divider, not the unsigned one",
+    )
+    # Modulo shares the divider's structure and, in the library, its function
+    # NAME too (one factory, `want_remainder` picking which value comes out).
+    # So the check that matters is not the name but that the two are different
+    # functions computing different things -- a collision here would silently
+    # turn `a % b` into `a / b`.
+    div_fn = AUTO._soft_equivalent_callable(ps_soft, "u_div")
+    mod_fn = AUTO._soft_equivalent_callable(ps_soft, "u_mod")
+    check(
+        mod_fn is not None and mod_fn is not div_fn,
+        "unsigned modulo opens into its own function, not the divider's",
+    )
+    if mod_fn is not None and div_fn is not None:
+        wrong = [
+            (a, b)
+            for a, b in ((100, 7), (255, 16), (9, 3), (1, 1))
+            if pypeline.sim_call(div_fn, a, b) != a // b
+            or pypeline.sim_call(mod_fn, a, b) != a % b
+        ]
+        check(
+            not wrong,
+            "the divide/modulo soft equivalents compute divide and remainder"
+            + (f" -- wrong for {wrong[:2]}" if wrong else ""),
+        )
+    check(
+        soft_name("u_mult") == "soft_mult_shift_add",
+        "an unsigned multiply opens into the shift-and-add multiplier",
+    )
+    check(
+        soft_name("s_mult") is None,
+        "a SIGNED multiply is NOT openable: both soft multipliers treat the "
+        "second operand as unsigned, so substituting one computes the wrong "
+        "product (int16 -3 * 4 comes out as 1048564)",
+    )
+    check(
+        soft_name("shift") is None,
+        "shifts are not openable: the barrel shifter takes log2(width) amount "
+        "bits where the built-in takes the operand's own width, so the two "
+        "disagree for out-of-range shift amounts",
+    )
+    check(
+        soft_name("f_add") is None,
+        "floating-point operands have no soft equivalent",
+    )
+
+    # The soft adders have to widen their operands to the result type
+    # themselves, bit by bit. Above an operand's own width a SIGNED value
+    # continues with its sign bit, not with zero -- get that wrong and the
+    # adder is right for every non-negative input and quietly wrong for the
+    # rest, which is exactly what descending into a signed add used to build.
+    print("\n[soft adder sign extension]")
+    try:
+        from operators.soft_add import make_soft_add_ripple, make_soft_add_carry_select
+
+        # Compared against the BUILT-IN adder rather than Python's `+`: that is
+        # the actual contract ("computes what + computes"), and it sidesteps
+        # how a simulated value of a signed type prints.
+        @pypeline.hw_func
+        def _builtin_add(a: pypeline.int16_t, b: pypeline.int16_t) -> pypeline.int17_t:
+            r: pypeline.int17_t = a + b
+            return r
+
+        cases = ((-3, 4), (-3, -4), (-1, 1), (-32768, 5), (-32768, -32768), (7, 9))
+        for factory in (make_soft_add_ripple, make_soft_add_carry_select):
+            f = factory(pypeline.int16_t, pypeline.int16_t)
+            bad = [
+                (a, b)
+                for a, b in cases
+                if (pypeline.sim_call(f, a, b) & 0x1FFFF)
+                != (pypeline.sim_call(_builtin_add, a, b) & 0x1FFFF)
+            ]
+            check(
+                not bad,
+                f"{factory.__name__} sign-extends signed operands"
+                + (f" -- wrong for {bad[:2]}" if bad else ""),
+            )
+    except ImportError:
+        print("  skip: operators.soft_add not importable")
+
+    # _TypeResolver.resolve rebuilds a live type from the C type name string a
+    # Logic graph carries. Scalars always worked; an ARRAY of a reconstructible
+    # type should too -- 'uint16_t[16]' is just 'uint16_t' plus a dimension,
+    # regardless of whether anything in the design ever carried that exact
+    # array type standalone. This is what a descended soft multiplier's local
+    # partial-products array needs (see docs/AUTO_FSM_DESIGN.md and
+    # soft_mult.py's make_soft_mult_shift_add) -- entities fully consumed by
+    # descent contribute nothing to the usual fus/node seeding, so the type
+    # must be reconstructible from its name alone, not merely seeded.
+    print("\n[type resolver: array reconstruction]")
+    import typing
+
+    @pypeline.struct
+    class _seeded_leaf_t(typing.NamedTuple):
+        a: pypeline.uint8_t
+        b: pypeline.uint8_t
+
+    resolver = AUTO._TypeResolver()
+    t1 = resolver.resolve("uint16_t[16]")
+    check(
+        t1 is not None and pypeline.ctype_name(t1) == "uint16_t[16]",
+        "an array of a scalar (uint16_t[16]) resolves from its name alone, unseeded",
+    )
+    # Dimension order must match _CTypeMeta.__getitem__ (outer/first bracket
+    # applied first, C-declaration order) -- get it backwards and this
+    # round-trip silently produces the wrong shape instead of raising.
+    t2 = resolver.resolve("uint2_t[4][16]")
+    check(
+        t2 is not None
+        and pypeline.ctype_name(t2) == "uint2_t[4][16]"
+        and pypeline._array_len(t2) == 4
+        and pypeline.ctype_name(pypeline._array_elem_ctype(t2)) == "uint2_t[16]",
+        "a 2-D array (uint2_t[4][16]) round-trips with the outer dimension "
+        "(4) first, matching C's T x[A][B]",
+    )
+    resolver.seed(_seeded_leaf_t)
+    struct_arr_name = f"{pypeline.ctype_name(_seeded_leaf_t)}[8]"
+    t3 = resolver.resolve(struct_arr_name)
+    check(
+        t3 is not None and pypeline.ctype_name(t3) == struct_arr_name,
+        "an array of a SEEDED struct resolves",
+    )
+    raised_name = None
+    try:
+        resolver.resolve("some_unseeded_struct_t[8]")
+    except AUTO.AutoError as e:
+        raised_name = str(e)
+    check(
+        raised_name is not None and "some_unseeded_struct_t" in raised_name,
+        "an array of an UNSEEDED struct still raises, naming the base type "
+        "(not the whole array name) -- a struct genuinely cannot be rebuilt "
+        "from its name alone",
+    )
+
+    # Real sky130 area (docs/AUTO_FSM_DESIGN.md section 3.8): ESTIMATE_SCHEDULE_AREA's
+    # unit/mux/register terms consult SYN.GET_CACHED_LEAF_AREA under
+    # DEVICE_MODELS instead of the abstract AREA_* constants. A synthetic
+    # SYN_TOOL/cache-dir override here, no real synthesis -- same shape as
+    # area_model_test.py's own fixtures, just exercised through AUTO_FSM's own
+    # entry points rather than SYN's directly.
+    print("\n[area model: real sky130 um2]")
+    with tempfile.TemporaryDirectory() as design_tmp, tempfile.TemporaryDirectory() as cache_tmp:
+        ps2, key2, tag2 = parse_design(design_tmp, mhz=25.0, name="af_unit_area_design")
+        func_entity2 = AUTO._entity_key_for_callable(ps2, tag2.func)
+        add_logic = None
+        for entity in set(
+            ps2.FuncLogicLookupTable[func_entity2].submodule_instances.values()
+        ):
+            if entity.startswith("BIN_OP_PLUS_") or entity.startswith("BIN_OP_"):
+                add_logic = (entity, ps2.FuncLogicLookupTable[entity])
+                break
+        assert add_logic is not None, "expected chain() to contain a BIN_OP entity"
+        add_entity, add_logic = add_logic
+
+        old_tool = SYN.SYN_TOOL
+        old_env = os.environ.get("PYPELINEC_CACHE_DIR")
+        old_force = AUTO.FORCE_ABSTRACT_AREA
+        try:
+            # Not DEVICE_MODELS: unchanged from every tool's existing
+            # abstract-units-only behavior, regardless of cache contents.
+            SYN.SYN_TOOL = SYN.PYRTL
+            check(
+                AUTO._area_unit_scale(ps2) == 1.0,
+                "non-DEVICE_MODELS tools stay in abstract units (scale 1.0)",
+            )
+
+            SYN.SYN_TOOL = DEVICE_MODELS
+            os.environ["PYPELINEC_CACHE_DIR"] = cache_tmp + "/"
+            check(
+                AUTO._area_unit_scale(ps2) == AUTO.UM2_PER_ABSTRACT_AREA_UNIT,
+                "DEVICE_MODELS scales into real um2",
+            )
+
+            # Cold cache: falls back to the abstract estimate scaled into
+            # um2, NOT to zero -- a zero-area leaf would read as free wiring
+            # and never get shared (the same failure mode _resolve_delay_du's
+            # own tiering exists to avoid for delay).
+            cold_tally = {}
+            cold_val = AUTO._leaf_area_um2(ps2, add_entity, add_logic, cold_tally)
+            expected_cold = (
+                AUTO._leaf_area(add_entity, add_logic)
+                * AUTO.UM2_PER_ABSTRACT_AREA_UNIT
+            )
+            check(
+                cold_val > 0.0 and abs(cold_val - expected_cold) < 1e-6,
+                "a leaf with no cached area falls back to the scaled abstract "
+                "estimate, not zero",
+            )
+            check(cold_tally == {"estimated": 1}, "cold leaf tallies as estimated")
+
+            # Warm cache: a real measurement wins outright, however far it
+            # sits from the abstract guess -- ground truth here is always
+            # synthesis, never the fallback model.
+            SYN.WRITE_CACHED_LEAF_AREA(add_logic, ps2, 999.5, "um2")
+            warm_tally = {}
+            warm_val = AUTO._leaf_area_um2(ps2, add_entity, add_logic, warm_tally)
+            check(warm_val == 999.5, "a cached real area is used as-is")
+            check(warm_tally == {"measured": 1}, "warm leaf tallies as measured")
+
+            # --auto_fsm_abstract_area (FORCE_ABSTRACT_AREA): reproduces the
+            # non-DEVICE_MODELS numbers exactly, even with a warm cache --
+            # the escape hatch this session's own A/B measurement needs.
+            AUTO.FORCE_ABSTRACT_AREA = True
+            check(
+                AUTO._area_unit_scale(ps2) == 1.0,
+                "--auto_fsm_abstract_area forces scale back to 1.0",
+            )
+            forced_val = AUTO._leaf_area_um2(ps2, add_entity, add_logic)
+            check(
+                forced_val == AUTO._leaf_area(add_entity, add_logic),
+                "--auto_fsm_abstract_area ignores a warm cache entirely",
+            )
+            AUTO.FORCE_ABSTRACT_AREA = False
+
+            # Flip-flop area needs no cache at all -- a closed-form liberty
+            # lookup, not a per-shape measurement.
+            ff_val = AUTO._ff_area_um2(ps2)
+            expected_ff, _unit = DEVICE_MODELS.GET_SEQUENTIAL_CELL_AREA()
+            check(
+                ff_val == expected_ff,
+                f"_ff_area_um2 returns the real sequential cell area "
+                f"({expected_ff} um2), no cache needed",
+            )
+        finally:
+            SYN.SYN_TOOL = old_tool
+            AUTO.FORCE_ABSTRACT_AREA = old_force
+            if old_env is None:
+                os.environ.pop("PYPELINEC_CACHE_DIR", None)
+            else:
+                os.environ["PYPELINEC_CACHE_DIR"] = old_env
+
+    if FAILURES:
+        print(f"\n{len(FAILURES)} AUTO_FSM unit check(s) FAILED")
+        sys.exit(1)
+    print("\nAll AUTO_FSM unit tests passed.")
+
+
+if __name__ == "__main__":
+    main()

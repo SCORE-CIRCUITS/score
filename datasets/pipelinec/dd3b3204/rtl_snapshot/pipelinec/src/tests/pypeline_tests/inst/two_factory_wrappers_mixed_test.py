@@ -1,0 +1,91 @@
+# pyright: reportInvalidTypeForm=none
+import sys, os
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "..",
+        "..",
+        "include",
+        "pypeline",
+    ),
+)
+from typing import NamedTuple
+from pypeline import MAIN, PART, hw_func, struct, uint1_t, uint32_t, Input, make_reset
+
+from stream.stream import make_stream_interface
+from stream.stream_auto_pipeline import make_stream_auto_pipeline
+from stream.stream_multi_cycle import make_stream_multi_cycle
+
+# make_stream_multi_cycle's MULTI_CYCLE constraints are only supported by Vivado
+# synthesis (see stream_multi_cycle.py / stream_multi_cycle_test.py), so this design
+# needs a real Xilinx PART to be synth-testable at all.
+PART("xc7a35ticsg324-1l")
+
+# Regression test for a closure-callable name collision in FuncLogicLookupTable
+# (see two_factory_wrappers_test.py for the same-factory silent-miscompile
+# variant). This is the loud-failure variant, matching the shape that actually
+# blocked the wireguard-fpga ChaCha20/Poly1305 port: two *different* factories
+# (make_stream_multi_cycle + make_stream_auto_pipeline) each wrapping a different
+# top-level function, with assignment-incompatible return types. Pre-fix, the
+# second wrapper's inner `func` call resolves to the first wrapper's already-
+# elaborated function and fails to drive its differently-typed output wires.
+# Elaboration succeeding cleanly is the pass condition -- checked via the
+# `pypelinec ... --comb` exit code in synth_tests.py (synth_vivado, since the
+# design needs its Xilinx PART), no sim_call needed since
+# make_stream_auto_pipeline doesn't support it.
+
+
+@struct
+class wide_t(NamedTuple):
+    a: uint32_t
+    b: uint32_t
+    c: uint32_t
+    d: uint32_t
+
+
+@hw_func
+def scalar_round(x: uint32_t) -> uint32_t:
+    return x + 1
+
+
+@hw_func
+def wide_round(x: wide_t) -> wide_t:
+    rv: wide_t
+    rv.a = x.a + 1
+    rv.b = x.b + 1
+    rv.c = x.c + 1
+    rv.d = x.d + 1
+    return rv
+
+
+uint32_stream_intrf = make_stream_interface(uint32_t)
+wide_stream_intrf = make_stream_interface(wide_t)
+scalar_mcp = make_stream_multi_cycle(scalar_round, 2)
+
+wide_pipeline = make_stream_auto_pipeline(wide_round)
+
+
+# Synchronous reset pin (pulsed in cycle 0 by the simulators): every @MAIN
+# resets every register with it
+rst: Input[uint1_t] = make_reset()
+
+
+@MAIN(50.0, reset=rst, reset_registers="all")
+def scalar_main(
+    stream_in_if: uint32_stream_intrf.fwd_t, stream_out_if: scalar_mcp.out_fb_t
+) -> scalar_mcp.return_t:
+    return scalar_mcp(stream_in_if, stream_out_if)
+
+
+@MAIN(50.0, reset=rst, reset_registers="all")
+def wide_main(
+    stream_in_if: wide_stream_intrf.fwd_t, stream_out_if: wide_pipeline.out_fb_t
+) -> wide_pipeline.return_t:
+    return wide_pipeline(stream_in_if, stream_out_if)

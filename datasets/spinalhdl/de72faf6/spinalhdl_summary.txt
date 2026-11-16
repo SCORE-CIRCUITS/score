@@ -1,0 +1,4 @@
+SpinalHDL SCORE snapshot (SpinalHDL/SpinalHDL)
+Commit: de72faf6
+Dataset: /home/yongfu/proj/score/datasets/spinalhdl/de72faf6
+Snapshot files: 5

@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""Multi-MAIN global-wire simulation runner for pypeline designs.
+
+Usage:
+    pypeline_sim.py <design_file.py> --run <N>
+
+Runs the pypeline design for N clock cycles, simulating all @MAIN functions
+and global Wire[T]/Input[T]/Output[T] signals with delta-cycle convergence.
+
+Each clock cycle:
+  1. All MAINs are queued and run; wires that change cause dependent MAINs to
+     be re-queued until a global fixed point is reached (like VHDL delta cycles).
+  2. All registers commit simultaneously after convergence (mimicking clock edge).
+  3. A final pass runs all MAINs with _sim_converging=False so that @sim_output
+     functions fire exactly once per cycle with the correct converged values.
+
+Global wires persist their values across cycles; registers commit at end of each.
+
+A @MAIN's arguments are top-level input ports that nothing drives here, so every call
+passes a fresh typed zero for each (like an undriven Input[T]) and drops the return
+value (an output port); a notice names such MAINs once at the start of the run.
+
+Multi-file designs are supported: @MAIN functions and Wire[T]/Input[T]/Output[T]
+declarations in imported sub-modules are discovered automatically, transitively --
+including "pass-through" modules that declare no Wire[T] of their own but import
+ones that do (e.g. a module whose only job is cross-module wiring between other
+modules' globals).
+
+Wire[T]/Input[T]/Output[T] sim keys are module-qualified ("<module>.<wire>"), matching
+pypeline.py's _GlobalWireRewriter, so two unrelated modules declaring a same-named
+Wire[T] (e.g. both calling it "key" for unrelated purposes) do not collide in
+_sim_wire_state.
+"""
+
+import argparse
+import copy
+import importlib.util
+import inspect
+import itertools
+import sys
+import os
+import time
+from collections import deque
+
+# Ensure the src directory is on the path so pypeline can be imported.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import pypeline
+
+# Sentinel for --run all: run cycles indefinitely, relying on sim_finish() to stop
+# the simulation, instead of a fixed pre-guessed cycle count.
+RUN_ALL = "all"
+
+# Safety cap for --run all so a design that never calls sim_finish() (a bug) fails
+# loudly instead of hanging forever.
+_RUN_ALL_SAFETY_CAP = 10_000_000
+
+
+def parse_run_arg(s: str):
+    """argparse type= callable for --run: accepts a positive int cycle count, or the
+    literal string "all" (case-insensitive) meaning run until sim_finish() is called."""
+    if s.strip().lower() == RUN_ALL:
+        return RUN_ALL
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--run must be a positive integer or 'all', got {s!r}"
+        )
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"--run must be positive, got {n}")
+    return n
+
+
+def run_sim(
+    design_file: str,
+    num_cycles,
+    sim_mode: str = "strict",
+    main_latencies=None,
+    auto_pipeline_latencies=None,
+    auto_fsm_schedules=None,
+    pipeline_timing=None,
+    auto_multi_cycle_latencies=None,
+    auto_pipeline_ram_plans=None,
+    part=None,
+    syn_tool=None,
+    built_hardware_from=None,
+    design_params=None,
+    unbuilt_latency_reads=None,
+    goal_mode=None,
+) -> None:
+    """Run the native simulation.
+
+    main_latencies / auto_pipeline_latencies / auto_fsm_schedules are passed only
+    by the pipelinec driver after a non---comb build (SIM.DO_OPTIONAL_SIM):
+    {main hw name -> total latency} from the final TimingParams, {AUTO_PIPELINE
+    canonical_key -> stage count} from the converged harvest, and {AUTO_FSM
+    canonical_key -> schedule} from the installed cache. They make the native
+    sim emulate what was actually built -- AUTO_PIPELINE call sites via
+    per-call-site delay lines (AUTO_PIPELINE._sim_delay_line), AUTO_FSM call
+    sites via a register-level model of the generated FSM (AUTO_FSM._sim_fsm),
+    and naturally-pipelined pure MAINs via write-side delay
+    (pypeline._sim_pipelined_main_info). pipeline_timing carries final placements
+    for selective execution around @pipeline_latency boundaries. Plain native
+    runs leave these parameters None: explicit user registers still advance,
+    and only callers needing fixed-pipeline alignment prepare a stage model.
+    Replayed RAM plans preserve geometry and write visibility. Without a build,
+    source/CLI part and tool declarations settle fixed RAM geometry after import,
+    before hooks or clocks, while flexible RAMs retain their one-cycle default.
+    Each run starts with fresh RAM plans unless plans are explicitly replayed.
+
+    built_hardware_from names the build directory these arguments came from when
+    simulating a top other than the one built there (SIM.SIMULATE_BUILT_HARDWARE).
+    Then the build's decisions must cover the design: an AUTO tag or RAM it never
+    decided, or a pipelinable @MAIN it never built, is an error, and so is a
+    design parameter (design_params, {name: value}) whose value differs.
+    unbuilt_latency_reads ({kind: {binding: value}}) are the .latency
+    values that build read for tags it never instantiated; reading one returns
+    the same value, and only calling it is an error.
+
+    A build records the results of an AUTO key used at several clock goals per
+    goal (pypeline.GOAL_BINDING). Replaying such a record, a first import
+    shows the one clock this simulation runs; in the import that runs, every
+    object then takes its key's results at that clock's goal, as goal_mode
+    ("pnr": the clock's mhz, "syn": its syn_mhz) says the build chose goals
+    (_run_goal_text).
+    """
+    # Apply sim mode before importing the design: @hw_func decorators read these
+    # flags at decoration time, so they must be set before import_design runs.
+    if sim_mode == "strict":
+        pypeline.SIM_STRICT_ARITH = True
+        pypeline.SIM_RAW_INTS = False
+    elif sim_mode == "loose":
+        pypeline.SIM_STRICT_ARITH = False
+        pypeline.SIM_RAW_INTS = False
+    elif sim_mode == "raw":
+        pypeline.SIM_STRICT_ARITH = False
+        pypeline.SIM_RAW_INTS = True
+    else:
+        raise ValueError(
+            f"Unknown sim_mode {sim_mode!r}; expected strict, loose, or raw"
+        )
+    pypeline.SET_AUTO_RUN_GOAL(None)
+    if built_hardware_from is not None and _per_goal_results(
+        auto_pipeline_latencies, auto_fsm_schedules, unbuilt_latency_reads
+    ):
+        # Results recorded per clock goal: a first import, with no results and
+        # no built-hardware checks, shows the clock this simulation runs
+        pypeline.SET_BUILT_HARDWARE_SOURCE(None)
+        pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE({})
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE({})
+        pypeline.RESET_AUTO_MULTI_CYCLE_TRACKING()
+        _evict_design_modules()
+        import_design(design_file)
+        pypeline.SET_AUTO_RUN_GOAL(
+            _run_goal_text(list(pypeline._main_registry), goal_mode)
+        )
+    pypeline.SET_BUILT_HARDWARE_SOURCE(built_hardware_from, unbuilt_latency_reads)
+    # Install harvested AUTO_PIPELINE latencies BEFORE importing the design:
+    # AUTO_PIPELINE objects capture ._latency at construction (import time),
+    # and .latency-derived structure (e.g. make_stream_auto_pipeline FIFO depths)
+    # must elaborate identically to the VHDL build's pin-and-confirm pass.
+    pypeline.SET_AUTO_PIPELINE_RAM_PLAN_CACHE(auto_pipeline_ram_plans or {})
+    # Simulating built hardware installs even empty caches: an earlier run's
+    # results must not stand in for decisions this build never made
+    replaying = built_hardware_from is not None
+    if auto_pipeline_latencies or replaying:
+        pypeline.SET_AUTO_PIPELINE_LATENCY_CACHE(auto_pipeline_latencies or {})
+    # Same reasoning for AUTO_FSM: the tag captures ._schedule/._latency at
+    # construction, and .latency-derived Python sizing must match the build's.
+    if auto_fsm_schedules or replaying:
+        pypeline.SET_AUTO_FSM_SCHEDULE_CACHE(auto_fsm_schedules or {})
+    # And for AUTO_MULTI_CYCLE: the tag resolves .latency at construction, and the
+    # handshake it drives must count the cycles the build constrained.
+    if auto_multi_cycle_latencies or replaying:
+        pypeline.SET_AUTO_MULTI_CYCLE_LATENCY_CACHE(auto_multi_cycle_latencies or {})
+    # Construction ordinals (part of each AUTO_MULTI_CYCLE's cache key) restart with
+    # the design's re-import, exactly as they did for each build pass.
+    pypeline.RESET_AUTO_MULTI_CYCLE_TRACKING()
+    _evict_design_modules()
+    pypeline._auto_pipeline_ram_native_target = None
+    modules_before = set(sys.modules)
+    module = import_design(design_file)
+    if auto_pipeline_ram_plans is None and pypeline._auto_pipeline_ram_served:
+        import AUTO_PIPELINE
+
+        target = AUTO_PIPELINE.RAM_PREPARE_NATIVE(part, syn_tool)
+        if target is not None:
+            pypeline._auto_pipeline_ram_native_target = target
+            for name in set(sys.modules) - modules_before:
+                del sys.modules[name]
+            pypeline.RESET_AUTO_MULTI_CYCLE_TRACKING()
+            module = import_design(design_file)
+
+    if design_params:
+        _check_built_design_params(design_params, built_hardware_from)
+
+    design_wires = _discover_wire_names(module)
+    wire_info, inst_decls = design_wires
+
+    # Reset and initialise all wire and register state.
+    pypeline.sim_reset()
+    for name, inner_ctype in wire_info:
+        pypeline._sim_wire_state[name] = pypeline.sim_zero(inner_ctype)
+    pypeline._sim_wire_readers.clear()
+
+    # Each global instance and FIFO runs as the MAIN the compiler makes for
+    # it, built by the same generator and registered like any made @MAIN.
+    # Native sim runs one clock, so a FIFO's is single-clock too.
+    inst_mains = set()
+    for mod, bare_name, ann in inst_decls:
+        mod_globals = vars(mod)
+        hardware = ann.hardware(bare_name, mod_globals.get(bare_name))
+        main_name = pypeline._global_inst_main_name(mod.__name__, bare_name, ann)
+        inst_mains.add(
+            pypeline._register_main(
+                pypeline._make_global_inst_main(
+                    main_name, bare_name, ann, hardware, mod_globals
+                ),
+                None,
+                main_name,
+                f"{ann.kind_name} {bare_name}",
+            )
+        )
+
+    mains = list(pypeline._main_registry)
+    if not mains:
+        print("No @MAIN functions found in design — nothing to simulate.")
+        return
+    _refuse_multi_clock(mains)
+    # Each MAIN's name is its root instance frame (_call_main), so two MAINs
+    # with one name would share state, as their hardware cannot
+    duplicate = pypeline._duplicate_main_names(mains)
+    if duplicate is not None:
+        sys.exit(f"ERROR: {duplicate}")
+    _sim_reset_table(mains, inst_mains, design_wires)
+
+    # A @MAIN's arguments are top-level input ports with no driver in native sim:
+    # they read as typed zeros, like an undriven Input[T] (see _call_main).
+    main_arg_types = {}
+    for fn in mains:
+        arg_types = pypeline.hw_arg_types(fn)
+        main_arg_types[fn] = arg_types
+        if arg_types:
+            arg_names = ", ".join(inspect.signature(inspect.unwrap(fn)).parameters)
+            print(
+                f"Native sim: @MAIN {fn._pypeline_main.name}'s arguments "
+                f"({arg_names}) are top-level input ports with no driver; they "
+                f"read as zero every cycle. Drive values through Input[T] wires "
+                f"and @sim_input."
+            )
+
+    pipeline_models = set()
+    if pypeline._pipeline_latency_declared:
+        candidates = [
+            fn
+            for fn in mains
+            if getattr(fn, "_pipeline_latency", None) is None
+            and pypeline._pipeline_latency_reachable(fn)
+        ]
+        if candidates:
+            import PY_TO_LOGIC
+
+            pipeline_models = PY_TO_LOGIC.PREPARE_PIPELINE_LATENCY_SIM(
+                candidates, pipeline_timing
+            )
+
+    # Wire up write-side latency emulation for naturally-pipelined pure MAINs.
+    pypeline._sim_pipelined_main_info.clear()
+    if built_hardware_from is not None:
+        _check_built_mains(mains, main_latencies or {}, built_hardware_from)
+    if main_latencies:
+        # Only reachable from the pipelinec driver flow: the build's MAIN
+        # names, which the design's re-import gives its MAINs again
+        hw_name_to_fn = _mains_by_name(mains)
+        for hw_name, latency in main_latencies.items():
+            if latency <= 0:
+                continue
+            fn = hw_name_to_fn.get(hw_name)
+            if fn is None and built_hardware_from is not None:
+                # Another top's MAIN this testbench does not run
+                continue
+            if fn is None:
+                raise RuntimeError(
+                    f"Pipelined MAIN {hw_name!r} (latency {latency}) has no "
+                    f"matching @MAIN function in the native sim registry "
+                    f"(known: {sorted(hw_name_to_fn)}) -- cannot emulate its "
+                    f"latency."
+                )
+            if fn in pipeline_models or getattr(fn, "_pipeline_latency", None) is not None:
+                # The stage model (or the tagged body's explicit registers)
+                # already supplies its complete timing.
+                continue
+            if getattr(fn, "_pypeline_has_state", False):
+                # A stateful (Reg/Feedback) MAIN is never sliced by the sweep;
+                # its explicit registers already provide all of its timing in
+                # native sim (any AUTO_PIPELINE children inside it are delayed
+                # at their own call sites). A nonzero reported latency here is
+                # a build-side accounting artifact -- applying a write delay
+                # on top would double-count.
+                print(
+                    f"Native sim: ignoring reported latency {latency} for "
+                    f"stateful MAIN {hw_name!r} (stateful MAINs are "
+                    f"self-timed; only pure MAINs get write-side delay "
+                    f"emulation)."
+                )
+                continue
+            pypeline._sim_pipelined_main_info[fn] = {
+                "latency": latency,
+                "queue": deque(),
+                "collector": [],
+                # Region context (pypeline._sim_regions) entered by _call_main
+                "root": fn,
+                "name": fn._pypeline_main.name,
+            }
+
+    # Activate simulation mode so @hw_func wrappers use sim bodies instead of
+    # falling through to raw functions (which the elaborator relies on for its
+    # exception-based hardware-function detection via _try_eval_const).
+    pypeline._sim_active = True
+    # @initial(sim) hooks run before cycle 0 (so before any @sim_input);
+    # @final(sim) hooks run however the run ends -- sim_finish(), --run N
+    # reaching N, or an error, which stays the error that propagates.
+    pending_exc = None
+    # The @MAINs are collected: MAIN() refuses from here to the end of the run
+    pypeline._sim_run_in_progress = True
+    try:
+        pypeline.RUN_INITIAL_HOOKS("sim")
+        t0 = time.perf_counter()
+        run_all = num_cycles == RUN_ALL
+        cycle_iter = itertools.count() if run_all else range(num_cycles)
+        finished = False
+        cycles_run = 0
+        for cycle in cycle_iter:
+            if run_all and cycle >= _RUN_ALL_SAFETY_CAP:
+                raise RuntimeError(
+                    f"--run all exceeded {_RUN_ALL_SAFETY_CAP} cycles without "
+                    f"sim_finish() ever being called -- likely a design bug (a design "
+                    f"that should terminate but never does), not a slow-but-working "
+                    f"simulation."
+                )
+            print("Clock: ", cycle, flush=True)
+            cycles_run = cycle + 1
+            if cycle < 2:
+                _drive_reset_pulse(cycle)
+            try:
+                _run_clock_cycle(mains, main_arg_types, cycle)
+                if cycle == 0:
+                    _check_global_inst_resets(inst_decls, inst_mains)
+            except pypeline.SimFinish:
+                print("")
+                print(f"sim_finish() called — stopping early at cycle {cycle}")
+                finished = True
+                break
+            print("")
+        if run_all and not finished:
+            raise RuntimeError(
+                "--run all: cycle loop ended without sim_finish() ever being called "
+                "(unreachable in normal operation -- itertools.count() only stops via "
+                "the safety cap above, which raises separately)."
+            )
+        elapsed = time.perf_counter() - t0
+        print(
+            f"{cycles_run} cycles in {elapsed:.3f}s"
+            f"  ({elapsed / cycles_run * 1000:.2f} ms/cycle,"
+            f" {cycles_run / elapsed:.1f} cycles/s)"
+        )
+    except BaseException as e:
+        pending_exc = e
+        raise
+    finally:
+        # An error mid-cycle can leave convergence gating on (which would
+        # silence sim_print in the hooks) and a half-cycle of buffered
+        # register writes that never reached its clock edge.
+        pypeline._sim_converging = False
+        pypeline._sim_reg_write_buffer = None
+        try:
+            pypeline.RUN_FINAL_HOOKS("sim", pending_exc=pending_exc)
+        finally:
+            pypeline._sim_run_in_progress = False
+
+
+def _refuse_multi_clock(mains) -> None:
+    """Stop when the @MAINs name more than one clock: each cycle steps every
+    MAIN once, so different clocks would run in lockstep (issue #354). Clocks
+    are told apart as everywhere: by rate, then by name, so two named clocks
+    of one rate are two clocks. Bare @MAINs (a global instance's or FIFO's
+    MAIN among them) name no clock and do not count."""
+    by_clock = {}
+    for fn in mains:
+        info = fn._pypeline_main
+        if info.clock is not None:
+            by_clock.setdefault(info.clock.identity, (info.clock, []))[1].append(
+                info.name
+            )
+    if len(by_clock) > 1:
+        clocks = "; ".join(
+            f"{clock.port_name}: {', '.join(names)}"
+            for _ident, (clock, names) in sorted(by_clock.items(), key=str)
+        )
+        sys.exit(
+            f"ERROR: native simulation runs one clock, but this design's @MAINs "
+            f"name {len(by_clock)} clocks ({clocks}). Simulate one clock domain "
+            f"at a time; simulating several clocks is not supported yet."
+        )
+
+
+def _per_goal_results(
+    auto_pipeline_latencies, auto_fsm_schedules, unbuilt_latency_reads
+) -> bool:
+    """Whether a build's recorded results hold a key used at several clock
+    goals: a binding key@goal (pypeline.GOAL_BINDING)."""
+    keys = list(auto_pipeline_latencies or {}) + list(auto_fsm_schedules or {})
+    for reads in (unbuilt_latency_reads or {}).values():
+        keys += list(reads)
+    return any("@" in key for key in keys)
+
+
+def _run_goal_text(mains, goal_mode) -> str:
+    """pypeline.GOAL_TEXT of the clock this simulation's MAINs run on
+    (_refuse_multi_clock allows one): its mhz, or under goal_mode "syn" its
+    syn_mhz when it has one. MAINs naming no clock run on no goal."""
+    for fn in mains:
+        clock = fn._pypeline_main.clock
+        if clock is not None:
+            use_syn = goal_mode == "syn" and clock.syn_mhz is not None
+            return pypeline.GOAL_TEXT(clock.syn_mhz if use_syn else clock.mhz)
+    return pypeline.GOAL_TEXT(None)
+
+
+def _mains_by_name(mains) -> dict:
+    """MAIN name -> @MAIN wrapper: how build results keyed by the build's MAIN
+    names (main_latencies) find the re-imported design's MAINs."""
+    return {fn._pypeline_main.name: fn for fn in mains}
+
+
+def _check_built_design_params(design_params, built_hardware_from) -> None:
+    """A design parameter the build and this simulation both declare must have
+    the value the build used: it may shape the hardware."""
+    current = {entry["name"]: entry["value"] for entry in pypeline.DESIGN_PARAM_REPORT()}
+    differ = [
+        f"{name}={current[name]!r} (built with {value!r})"
+        for name, value in sorted(design_params.items())
+        if name in current and current[name] != value
+    ]
+    if differ:
+        raise pypeline.BuiltHardwareError(
+            f"design parameters differ from the hardware built in "
+            f"{built_hardware_from}: {', '.join(differ)}"
+        )
+
+
+def _main_needs_build(fn) -> bool:
+    """A @MAIN the sweep could pipeline: not @wires, not stateful (stateful
+    MAINs are self-timed) and without @pipeline_latency."""
+    if getattr(fn, "_pypeline_has_state", False) or getattr(fn, "_pipeline_latency", None) is not None:
+        return False
+    layer = fn
+    while layer is not None:
+        if getattr(layer, "_is_func_wires_pragma", False):
+            return False
+        layer = getattr(layer, "__wrapped__", None)
+    return True
+
+
+def _check_built_mains(mains, main_latencies, built_hardware_from) -> None:
+    """Simulating another top on built hardware: a pipelinable @MAIN of this
+    design that the build never built has an unknown latency."""
+    unbuilt = sorted(
+        fn._pypeline_main.name
+        for fn in mains
+        if fn._pypeline_main.name not in main_latencies and _main_needs_build(fn)
+    )
+    if unbuilt:
+        raise pypeline.BuiltHardwareError(
+            f"@MAIN {', '.join(unbuilt)} is not part of the hardware built in "
+            f"{built_hardware_from}, so its pipeline latency is unknown. Make it "
+            "@wires or stateful, or build it as part of that top."
+        )
+
+
+def _call_main(main_fn, arg_types: tuple) -> None:
+    # Fresh zeros on every call, so no call can see an argument object a previous
+    # call (or cycle) was handed.
+    args = [pypeline.sim_zero(t) for t in arg_types]
+    # A root instance frame per MAIN: every state below it (registers,
+    # @sim_model state, AUTO_PIPELINE delay lines, AUTO_FSM state) is this
+    # MAIN's own. Without it two MAINs made by one factory, which share every
+    # qualname and source line, would share all of it; so would two stateless
+    # MAINs calling one model, as a stateless function pushes no frame.
+    pypeline._sim_inst_stack.append(
+        (pypeline._SIM_MAIN_FRAME_PREFIX + main_fn._pypeline_main.name, None)
+    )
+    try:
+        region = pypeline._sim_pipelined_main_info.get(main_fn)
+        if region is None:
+            pypeline.sim_call(main_fn, *args)
+        else:
+            # A pipelined pure MAIN: its global writes go to its collector, its
+            # own reads see its own writes (see pypeline._sim_region_for)
+            pypeline._sim_run_in_region(region, pypeline.sim_call, main_fn, *args)
+    finally:
+        pypeline._sim_inst_stack.pop()
+
+
+def _run_clock_cycle(mains: list, main_arg_types: dict, cycle: int) -> None:
+    # Apply pipelined MAINs' N-cycles-old write-sets first: the wire values
+    # everyone reads this cycle are what those MAINs computed N cycles ago
+    # (their outputs crossing N pipeline register stages in hardware). Values
+    # are cycle-constant, and every MAIN starts queued each cycle, so
+    # applying before convergence is stable. During warm-up (queue shorter
+    # than the latency) nothing is applied -- wires hold their typed-zero
+    # reset values, like hardware's empty pipeline.
+    for info in pypeline._sim_pipelined_main_info.values():
+        if len(info["queue"]) >= info["latency"]:
+            pypeline._sim_apply_delayed_writes(info["queue"].popleft())
+    # Likewise each AUTO_PIPELINE call site's global writes from N cycles ago.
+    pypeline._sim_apply_ap_delayed_writes()
+    # Reset @sim_input's once-per-cycle result cache before anything else runs
+    # this cycle, so the first call anywhere (convergence loop or final pass)
+    # computes fresh and every later call this cycle reuses that same result.
+    pypeline._sim_input_cache.clear()
+    # Buffer register writes so they all commit together after convergence.
+    pypeline._sim_reg_begin_buffer()
+    pypeline._sim_converging = True
+    try:
+        _convergence_loop(mains, main_arg_types, cycle)
+    finally:
+        pypeline._sim_converging = False
+
+    # Final pass: _sim_converging is False so @sim_output functions execute.
+    # _sim_current_main is set like in the convergence loop so pipelined
+    # MAINs' write diversion (and reader tracking) sees the executing MAIN.
+    for main_fn in mains:
+        pypeline._sim_current_main = main_fn
+        try:
+            _call_main(main_fn, main_arg_types[main_fn])
+        finally:
+            pypeline._sim_current_main = None
+
+    # Commit all register writes simultaneously — the simulated clock edge —
+    # then the synchronous resets of that edge.
+    pypeline._sim_reg_flush_buffer()
+    pypeline._sim_apply_resets()
+
+    # Push this cycle's collected pipelined-MAIN write-sets into their delay
+    # queues (deepcopy: entries must not alias objects the design mutates
+    # in later cycles) and start fresh collectors for the next cycle. After
+    # a reset of the MAIN, _sim_apply_resets has made its collector zeros.
+    for info in pypeline._sim_pipelined_main_info.values():
+        info["queue"].append(copy.deepcopy(info["collector"]))
+        info["collector"].clear()
+
+
+def _check_global_inst_resets(inst_decls, inst_mains) -> None:
+    """A reset_registers="all" MAIN that reads a global instance's or FIFO's
+    wire must reset with that instance's reset, its clock's primary reset (the
+    rule PY_TO_LOGIC._assign_resets enforces). Checked once, after cycle 0,
+    when the wires' readers are known."""
+    resets = pypeline._sim_root_resets
+    prefix = pypeline._SIM_MAIN_FRAME_PREFIX
+    for mod, bare_name, ann in inst_decls:
+        wire = f"{mod.__name__}.{bare_name}"
+        main_name = pypeline._global_inst_main_name(mod.__name__, bare_name, ann)
+        own = resets.get(prefix + main_name)
+        for reader in sorted(
+            pypeline._sim_wire_readers.get(wire, ()), key=lambda f: f._pypeline_main.name
+        ):
+            if reader in inst_mains:
+                continue
+            entry = resets.get(prefix + reader._pypeline_main.name)
+            if entry is None or entry[1] != "all":
+                continue
+            if own is None or own[0] != entry[0]:
+                sys.exit(
+                    f"ERROR: @MAIN '{reader._pypeline_main.name}' resets with "
+                    f"{entry[0]} under reset_registers=\"all\", but it uses "
+                    f"{ann.kind_name} {bare_name}, which resets with its clock's "
+                    f"primary reset ({'none' if own is None else own[0]}). Make "
+                    f"{entry[0]} the clock's reset: make_clock(..., reset=...)."
+                )
+
+
+def _drive_reset_pulse(cycle: int) -> None:
+    """The default reset pulse: before cycle 0 each reset Input pin is set to
+    1, and before cycle 1 to 0 -- unless Python code (a @sim_input, a
+    testbench MAIN) wrote it in cycle 0, which then drives it. HDL simulation
+    drives the same pulse (SIM.SimGenInfo.reset_inputs)."""
+    for wire, driven in pypeline._sim_reset_inputs.items():
+        if cycle == 0:
+            pypeline._sim_wire_state[wire] = pypeline._sim_cast(1, pypeline.uint1_t)
+        elif not driven:
+            pypeline._sim_wire_state[wire] = pypeline.sim_zero(pypeline.uint1_t)
+
+
+def _convergence_loop(mains: list, main_arg_types: dict, cycle: int) -> None:
+    _MAX_EXECUTIONS = 10_000  # guard against combinatorial loops
+
+    # Start with every MAIN in the queue (first cycle, or after clock edge).
+    queue: deque = deque(mains)
+    queued: set = set(mains)
+    total_executions = 0
+
+    while queue:
+        if total_executions >= _MAX_EXECUTIONS:
+            raise RuntimeError(
+                f"Cycle {cycle}: convergence failed after {_MAX_EXECUTIONS} "
+                f"MAIN executions — likely a combinatorial loop.\n"
+                f"Wires with tracked readers: "
+                f"{list(pypeline._sim_wire_readers.keys())}"
+            )
+
+        main_fn = queue.popleft()
+        queued.discard(main_fn)
+
+        # Snapshot wire values before this MAIN runs.
+        wire_snap = dict(pypeline._sim_wire_state)
+
+        # Run the MAIN.  _sim_wire_read records reads into _sim_wire_readers
+        # so we know which MAINs to re-queue when a wire changes.
+        pypeline._sim_current_main = main_fn
+        try:
+            _call_main(main_fn, main_arg_types[main_fn])
+        finally:
+            pypeline._sim_current_main = None
+        total_executions += 1
+
+        # For every wire whose value changed, re-queue dependent MAINs.
+        for name, new_val in pypeline._sim_wire_state.items():
+            if new_val != wire_snap.get(name):
+                for reader in pypeline._sim_wire_readers.get(name, ()):
+                    if reader is not main_fn and reader not in queued:
+                        queue.append(reader)
+                        queued.add(reader)
+
+
+class _DesignWires(tuple):
+    """What _discover_wire_names found: unpacks as (wires, insts); .resets
+    holds (sim name, its _Reset, "Input" or "Wire") for each reset binding and
+    .clocks every _Clock a wire is marked with or bound to."""
+
+    resets = ()
+    clocks = ()
+
+
+def _discover_wire_names(module) -> tuple:
+    """Return (wires, insts): (qualified_name, inner_ctype) for all
+    Wire/Input/Output/Inst/Fifo in module and imported sub-modules,
+    recursively/transitively, and (module, name, annotation) for each
+    Inst[f] / Fifo[T] declaration. Names are module-qualified ("<module>.<wire>",
+    matching pypeline.py's _GlobalWireRewriter) so two unrelated modules
+    declaring a same-named Wire[T] (e.g. both calling it "key") don't collide.
+    The result also carries the reset bindings and wire clocks (_DesignWires).
+    """
+    import types
+
+    seen_ids: set = set()
+    result: list = []
+    result_keys: set = set()
+    insts: list = []
+    resets: list = []
+    clocks: list = []
+
+    def _scan(mod):
+        if id(mod) in seen_ids:
+            return
+        seen_ids.add(id(mod))
+        for name, ann in getattr(mod, "__annotations__", {}).items():
+            if isinstance(
+                ann, (pypeline._WireType, pypeline._InputType, pypeline._OutputType)
+            ):
+                qualified = f"{mod.__name__}.{name}"
+                if qualified not in result_keys:
+                    result.append((qualified, pypeline._wire_ann_inner_ctype(ann)))
+                    result_keys.add(qualified)
+                    if isinstance(ann, pypeline._GlobalInstType):
+                        insts.append((mod, name, ann))
+                    value = vars(mod).get(name)
+                    if isinstance(value, pypeline._Reset):
+                        kind = "Input" if isinstance(ann, pypeline._InputType) else "Wire"
+                        resets.append((qualified, value, kind))
+                    elif isinstance(value, pypeline._Clock):
+                        clocks.append(value)
+                    if getattr(ann, "clock", None) is not None:
+                        clocks.append(ann.clock)
+                if ann.volatile:
+                    pypeline._sim_wire_volatile.add(qualified)
+        for attr in vars(mod).values():
+            if isinstance(attr, types.ModuleType):
+                _scan(attr)
+            elif isinstance(attr, pypeline._Clock) and all(attr is not c for c in clocks):
+                # a make_clock(rate, reset=) no MAIN names: @MAIN(rate)'s clock
+                clocks.append(attr)
+
+    _scan(module)
+    found = _DesignWires((result, insts))
+    found.resets = tuple(resets)
+    found.clocks = tuple(clocks)
+    return found
+
+
+def _sim_reset_table(mains, inst_mains, design_wires) -> None:
+    """Fill pypeline._sim_root_resets and _sim_reset_inputs for a run of
+    `mains` (@MAIN wrappers; `inst_mains` the global instances' among them):
+    each MAIN's reset and reset_registers policy, by the rules elaboration
+    uses (pypeline._resolve_main_reset, _global_inst_main_reset). Native sim
+    runs one clock, so a bare MAIN runs on the design's one named clock."""
+    clocks = list(design_wires.clocks) + [
+        fn._pypeline_main.clock for fn in mains if fn._pypeline_main.clock is not None
+    ]
+    conflict = pypeline._clock_conflict(clocks)
+    if conflict is not None:
+        sys.exit(f"ERROR: {conflict}")
+    primaries = pypeline._clock_primary_resets(clocks)
+    named = {fn._pypeline_main.clock.identity for fn in mains if fn._pypeline_main.clock}
+    run_clock = next(iter(named)) if len(named) == 1 else (None, None)
+    wire_of = {id(reset): name for name, reset, _kind in design_wires.resets}
+    for name, _reset, kind in design_wires.resets:
+        if kind == "Input":
+            pypeline._sim_reset_inputs[name] = False
+    for fn in mains:
+        info = fn._pypeline_main
+        identity = info.clock.identity if info.clock is not None else run_clock
+        if fn in inst_mains:
+            reset, policy = pypeline._global_inst_main_reset(identity, primaries)
+        else:
+            reset, policy = pypeline._resolve_main_reset(info, identity, primaries)
+        if reset is None:
+            if policy == "all" and fn not in inst_mains:
+                sys.exit(
+                    f"ERROR: @MAIN '{info.name}' ({info.origin}) has "
+                    f"reset_registers=\"all\" but no reset: its clock has no "
+                    f"primary reset and it names none. Give one with "
+                    f"make_clock(..., reset=rst) or MAIN(..., reset=rst)."
+                )
+            continue
+        wire = wire_of.get(id(reset))
+        if wire is None:
+            sys.exit(
+                f"ERROR: @MAIN '{info.name}' ({info.origin}) resets with "
+                f"{reset!r}, which is bound to no wire. Bind it on the line that "
+                f"makes it: `rst: Input[uint1_t] = make_reset()`."
+            )
+        root = pypeline._SIM_MAIN_FRAME_PREFIX + info.name
+        pypeline._sim_root_resets[root] = (wire, policy)
+
+
+def _evict_design_modules():
+    """Evict modules imported since PY_TO_LOGIC's first PARSE_FILE from
+    sys.modules, so import_design re-imports the design graph fresh in sim
+    mode. Needed in the pipelinec non---comb --sim flow: elaboration imported
+    the design's sub-modules with sim flags unset (decoration-time flags) and
+    with an empty/older AUTO_PIPELINE latency cache. Self-guarding no-op in
+    every other context: pure native runs never import PY_TO_LOGIC, and the
+    comb short-circuit runs before any parse (snapshot still None)."""
+    ptl = sys.modules.get("PY_TO_LOGIC")
+    if ptl is None or getattr(ptl, "_modules_before_first_parse", None) is None:
+        return
+    for mod_name in set(sys.modules) - ptl._modules_before_first_parse:
+        del sys.modules[mod_name]
+
+
+def import_design(path: str):
+    """Import a pypeline design file, triggering all decorator registrations."""
+    # Clear any previously registered MAINs/hooks/param() declarations from a
+    # prior import in the same process (param() values persist: one per process).
+    pypeline._main_registry.clear()
+    pypeline._hook_registry.clear()
+    pypeline._part_registry = None
+    pypeline._syn_tool_registry = None
+    pypeline._auto_pipeline_ram_served.clear()
+    pypeline.RESET_DESIGN_PARAM_DECLARATIONS()
+
+    abs_path = os.path.abspath(path)
+    spec = importlib.util.spec_from_file_location("pypeline_design", abs_path)
+    module = importlib.util.module_from_spec(spec)
+    # Add the design file's directory to sys.path so its local imports work.
+    design_dir = os.path.dirname(abs_path)
+    if design_dir not in sys.path:
+        sys.path.insert(0, design_dir)
+    # Bootstrap the reusable include/pypeline library onto sys.path so designs
+    # can `from stream import ...`, `from dsp.fir import ...`, etc. without
+    # requiring PYTHONPATH to be set up manually.
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _include_pypeline = os.path.join(_repo_root, "include", "pypeline")
+    if _include_pypeline not in sys.path:
+        sys.path.insert(0, _include_pypeline)
+    # Mirror PY_TO_LOGIC.PARSE_FILE's default soft-operator registration (int
+    # NEGATE/compare/DIV/MOD, variable shift). Pure native runs never import
+    # PY_TO_LOGIC, so this is the only place that registration happens for
+    # them; the pipelinec --sim (non---comb) flow gets it from PARSE_FILE
+    # too, and operators.soft de-dupes so registering it twice is harmless.
+    #
+    # Whether those implementations then EXECUTE in sim -- structural fidelity
+    # rather than golden-value correctness -- is pypeline.SIM_SOFT_OPS, set by
+    # PYPELINE_SIM_SOFT_OPS or set_sim_soft_ops(). It defaults to executing
+    # them. They are all matcher (any_integer_t) registrations, which for a
+    # long time never reached native sim at all; this comment used to assert
+    # that they did. Dispatching is expensive (a uint16 DIV is ~42 ms against
+    # ~1.5 us for the built-in), and the built-in fallbacks are value- and
+    # ctype-faithful to elaboration, so PYPELINE_SIM_SOFT_OPS=none is a
+    # speed-only trade. See docs/pypeline_sim_DESIGN.md.
+    import operators.soft as _pypeline_default_soft_ops
+
+    _pypeline_default_soft_ops.register_sw_lib_replacements()
+    modules_before = set(sys.modules)
+    spec.loader.exec_module(module)
+    # Same -D checks and parameter table as PY_TO_LOGIC.PARSE_FILE
+    pypeline.CHECK_DESIGN_PARAM_USE(
+        pypeline.DESIGN_PARAM_SOURCE_FILES(set(sys.modules) - modules_before, abs_path)
+    )
+    pypeline.PRINT_DESIGN_PARAM_BANNER_ONCE()
+    return module
+
+
+def design_param_list_text(path: str) -> str:
+    """pypelinec --list_params: import the design (no elaboration) and return
+    the parameters it declares (pypeline.DESIGN_PARAM_LIST_TEXT). The listing
+    replaces the parameter banner the import would otherwise print."""
+    pypeline._design_param_banner_printed = True
+    import_design(path)
+    return pypeline.DESIGN_PARAM_LIST_TEXT(path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Simulate a pypeline design with global wires for N clock cycles."
+    )
+    parser.add_argument("design_file", help="Path to the pypeline design Python file.")
+    parser.add_argument(
+        "--run",
+        metavar="N",
+        type=parse_run_arg,
+        required=True,
+        help="Number of clock cycles to simulate, or 'all' to run until sim_finish() "
+        "is called (subject to a safety cap).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["strict", "loose", "raw"],
+        default="strict",
+        help=(
+            "Simulation accuracy mode (default: strict). "
+            "strict: full hardware accuracy, every arithmetic op masks to declared bit width. "
+            "loose: SimVal typed objects preserved (bit-indexing works), but no bit-width masking. "
+            "raw: maximum speed, plain Python ints throughout, no casting; "
+            "bit-indexing on arithmetic results will not work."
+        ),
+    )
+    parser.add_argument(
+        "-D",
+        "--define",
+        action="append",
+        default=[],
+        metavar="NAME[=VALUE]",
+        help="Set a design parameter, as for pypelinec (see param()). Repeatable.",
+    )
+    args = parser.parse_args()
+    try:
+        pypeline.SET_DESIGN_PARAMS(pypeline.PARSE_DESIGN_PARAM_DEFINES(args.define))
+    except pypeline.DesignParamError as e:
+        parser.error(str(e))
+    run_sim(args.design_file, args.run, sim_mode=args.mode)
+
+
+if __name__ == "__main__":
+    main()

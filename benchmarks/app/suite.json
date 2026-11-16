@@ -115,6 +115,53 @@
           "runner": "scripts/benchmarks/run_cva6_benchmarks.sh pmp"
         }
       }
+    },
+    {
+      "score_tool": "c906",
+      "profile": "app_iverilog",
+      "architecture": "rv64gcv",
+      "config": "c906fd_sv39",
+      "description": "Alibaba T-Head XuanTie C906 64-bit 5-stage in-order application core with MMU, FPU, Vector 0.7.1, and AXI interconnect",
+      "workloads": {
+        "csr": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c906_benchmarks.sh csr"
+        },
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c906_benchmarks.sh coremark"
+        }
+      }
+    },
+    {
+      "score_tool": "c910",
+      "profile": "app_iverilog",
+      "architecture": "rv64gcv",
+      "config": "c910_12stage_ooo",
+      "description": "Alibaba T-Head XuanTie C910 64-bit 12-stage Out-of-Order superscalar core with dual-issue vector execution and Sv39 MMU",
+      "workloads": {
+        "hello_world": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c910_benchmarks.sh hello_world"
+        },
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c910_benchmarks.sh coremark"
+        }
+      }
+    },
+    {
+      "score_tool": "nutshell",
+      "profile": "app_chisel",
+      "architecture": "rv64imac",
+      "config": "inorder_sim",
+      "description": "UCAS NutShell 64-bit 8-stage in-order application core with Sv39 MMU and AXI4 interconnect",
+      "workloads": {
+        "microbench": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_nutshell_benchmarks.sh microbench"
+        }
+      }
     }
   ]
 }

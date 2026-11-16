@@ -1,0 +1,946 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package chisel3
+package properties
+
+import firrtl.{ir => fir}
+import firrtl.annotations.{InstanceTarget, IsMember, ModuleTarget, ReferenceTarget, Target}
+import chisel3.RawModule
+import chisel3.internal._
+import chisel3.internal.binding._
+import chisel3.internal.firrtl.{ir, Converter}
+import chisel3.experimental.{prefix, requireIsHardware, Analog, SourceInfo}
+import chisel3.experimental.hierarchy.Instance
+import scala.annotation.{implicitAmbiguous, implicitNotFound}
+import chisel3.experimental.BaseModule
+import chisel3.internal.NamedComponent
+
+/** PropertyType defines a typeclass for valid Property types.
+  *
+  * Typeclass instances will be defined for Scala types that can be used as
+  * properties. This includes builtin Scala types as well as types defined in
+  * Chisel.
+  */
+@implicitNotFound("unsupported Property type ${T}")
+sealed trait PropertyType[T] {
+
+  /** The property type coreesponding to T. This is the type parameter of the property returned by Property.apply
+    */
+  type Type
+
+  /** Internal representation of T. This is the value that gets stored and bound in PropertyLit values
+    */
+  type Underlying
+
+  /** Get the IR PropertyType for this PropertyType.
+    */
+  def getPropertyType(): fir.PropertyType
+
+  /** Get convert from the underlying representation to firrtl expression
+    */
+  def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression
+
+  /** Get convert from the raw type T to this type's internal, underlying representation
+    */
+  def convertUnderlying(value: T, info: SourceInfo): Underlying
+}
+
+/** Trait for PropertyTypes that may lookup themselves up during implicit resolution
+  *
+  * This is to disallow nested Property types e.g. Property[Property[Property[Int]]](), Property[Property[Seq[Property[Int]]]]()
+  */
+private[chisel3] trait RecursivePropertyType[T] extends PropertyType[T]
+
+private[chisel3] object RecursivePropertyType {
+
+  /** Type alias for simplifying explicit RecursivePropertyType type ascriptions */
+  type Aux[T, Type0, Underlying0] = RecursivePropertyType[T] { type Type = Type0; type Underlying = Underlying0 }
+}
+
+/** PropertyType where Type and Underlying are the same as T
+  */
+private[chisel3] trait SimplePropertyType[T] extends RecursivePropertyType[T] {
+  final type Type = T
+  final type Underlying = T
+  def convert(value:           T):                                       fir.Expression
+  def convert(value:           T, ctx:  ir.Component, info: SourceInfo): fir.Expression = convert(value)
+  def convertUnderlying(value: T, info: SourceInfo):                     T = value
+}
+
+private[chisel3] class SeqPropertyType[A, F[A] <: Seq[A], PT <: PropertyType[A]](val tpe: PT)
+    extends PropertyType[F[A]] {
+  type Type = F[tpe.Type]
+  override def getPropertyType(): fir.PropertyType =
+    fir.SequencePropertyType(tpe.getPropertyType())
+
+  type Underlying = Seq[tpe.Underlying]
+  override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression =
+    fir.SequencePropertyValue(tpe.getPropertyType(), value.map(tpe.convert(_, ctx, info)))
+  override def convertUnderlying(value: F[A], info: SourceInfo) =
+    value.map(v => tpe.convertUnderlying(v, info))
+}
+
+/** This contains recursive versions of Seq PropertyTypes. These instances need be lower priority to prevent ambiguous implicit errors with the non-recursive versions.
+  */
+private[chisel3] trait LowPriorityPropertyTypeInstances {
+  implicit def sequencePropertyTypeInstance[A, F[A] <: Seq[A]](
+    implicit tpe: RecursivePropertyType[A]
+  ): SeqPropertyType[A, F, tpe.type] with RecursivePropertyType[F[A]] =
+    new SeqPropertyType[A, F, tpe.type](tpe) with RecursivePropertyType[F[A]]
+}
+
+private[chisel3] abstract class ClassTypePropertyType[T](val classType: fir.PropertyType)
+    extends RecursivePropertyType[T] {
+  type Type = ClassType
+  override def getPropertyType(): fir.PropertyType = classType
+}
+
+private[chisel3] object ClassTypePropertyType {
+
+  /** Type alias for simplifying explicit ClassTypePropertyType type ascriptions */
+  type Aux[T, Underlying0] = ClassTypePropertyType[T] { type Underlying = Underlying0 }
+}
+
+/** Companion object for PropertyType.
+  *
+  * Typeclass instances for valid Property types are defined here, so they will
+  * be in the implicit scope and available for users.
+  */
+private[chisel3] object PropertyType extends LowPriorityPropertyTypeInstances {
+
+  /** Type alias for simplifying explicit PropertyType type ascriptions */
+  type Aux[T, Type0, Underlying0] = PropertyType[T] { type Type = Type0; type Underlying = Underlying0 }
+
+  def makeSimple[T](tpe: fir.PropertyType, getExpression: T => fir.Expression): SimplePropertyType[T] =
+    new SimplePropertyType[T] {
+      def getPropertyType(): fir.PropertyType = tpe
+      def convert(value: T): fir.Expression = getExpression(value)
+    }
+
+  @implicitAmbiguous("unable to infer Property type. Please specify it explicitly in square brackets on the LHS.")
+  implicit val intPropertyTypeInstance: SimplePropertyType[Int] =
+    makeSimple[Int](fir.IntegerPropertyType, fir.IntegerPropertyLiteral(_))
+
+  @implicitAmbiguous("unable to infer Property type. Please specify it explicitly in square brackets on the LHS.")
+  implicit val longPropertyTypeInstance: SimplePropertyType[Long] =
+    makeSimple[Long](fir.IntegerPropertyType, fir.IntegerPropertyLiteral(_))
+
+  @implicitAmbiguous("unable to infer Property type. Please specify it explicitly in square brackets on the LHS.")
+  implicit val bigIntPropertyTypeInstance: SimplePropertyType[BigInt] =
+    makeSimple[BigInt](fir.IntegerPropertyType, fir.IntegerPropertyLiteral(_))
+
+  @implicitAmbiguous("unable to infer Property type. Please specify it explicitly in square brackets on the LHS.")
+  implicit val doublePropertyTypeInstance: SimplePropertyType[Double] =
+    makeSimple[Double](fir.DoublePropertyType, fir.DoublePropertyLiteral(_))
+
+  implicit def classTypePropertyType[T](
+    implicit provider: ClassTypeProvider[T]
+  ): ClassTypePropertyType.Aux[T, Nothing] =
+    new ClassTypePropertyType[T](provider.classType) {
+      // we rely on the fact there are no public constructors for values that provide
+      // ClassTypePropertyType (AnyClassType, ClassType#Type, Property[ClassType]#ClassType)
+      // so users can never create a property literal of these values so
+      // these methods should never be called
+      type Underlying = Nothing
+      override def convert(value:           Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression = ???
+      override def convertUnderlying(value: T, info:         SourceInfo) = ???
+    }
+
+  implicit val stringPropertyTypeInstance: SimplePropertyType[String] =
+    makeSimple[String](fir.StringPropertyType, s => fir.StringPropertyLiteral(fir.StringLit(s)))
+
+  implicit val boolPropertyTypeInstance: SimplePropertyType[Boolean] =
+    makeSimple[Boolean](fir.BooleanPropertyType, fir.BooleanPropertyLiteral(_))
+
+  implicit val pathTypeInstance: SimplePropertyType[Path] = makeSimple[Path](fir.PathPropertyType, _.convert())
+
+  implicit def modulePathTypeInstance[M <: BaseModule]: RecursivePropertyType.Aux[M, Path, Path] =
+    new RecursivePropertyType[M] {
+      type Type = Path
+      override def getPropertyType(): fir.PropertyType = fir.PathPropertyType
+      override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression = value.convert()
+      type Underlying = Path
+      override def convertUnderlying(value: M, info: SourceInfo) = Path(value)
+    }
+
+  private def dataPathTypeInstance[D <: Data]: RecursivePropertyType.Aux[D, Path, Path] = new RecursivePropertyType[D] {
+    type Type = Path
+    override def getPropertyType(): fir.PropertyType = fir.PathPropertyType
+    override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression = value.convert()
+    type Underlying = Path
+    override def convertUnderlying(value: D, info: SourceInfo) = Path(value)
+  }
+
+  // We can't just do <: Element because Property subclasses Element
+  implicit def aggregatePathTypeInstance[A <: Aggregate]: RecursivePropertyType.Aux[A, Path, Path] =
+    dataPathTypeInstance[A]
+  implicit def bitsPathTypeInstance[E <: ToBoolable]: RecursivePropertyType.Aux[E, Path, Path] = dataPathTypeInstance[E]
+  implicit def clockPathTypeInstance[E <: Clock]:     RecursivePropertyType.Aux[E, Path, Path] = dataPathTypeInstance[E]
+  implicit def analogPathTypeInstance[E <: Analog]:   RecursivePropertyType.Aux[E, Path, Path] = dataPathTypeInstance[E]
+  implicit def enumPathTypeInstance[E <: EnumType]:   RecursivePropertyType.Aux[E, Path, Path] = dataPathTypeInstance[E]
+
+  implicit def memPathTypeInstance[M <: MemBase[_]]: RecursivePropertyType.Aux[M, Path, Path] =
+    new RecursivePropertyType[M] {
+      type Type = Path
+      override def getPropertyType(): fir.PropertyType = fir.PathPropertyType
+      override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression = value.convert()
+      type Underlying = Path
+      override def convertUnderlying(value: M, info: SourceInfo) = Path(value)
+    }
+
+  implicit def propertyTypeInstance[T](
+    implicit pte: RecursivePropertyType[T]
+  ): PropertyType.Aux[Property[T], pte.Type, ir.Arg] = new PropertyType[Property[T]] {
+    type Type = pte.Type
+    override def getPropertyType(): fir.PropertyType = pte.getPropertyType()
+    override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression =
+      Converter.convert(value, ctx, info)
+    type Underlying = ir.Arg
+    override def convertUnderlying(value: Property[T], info: SourceInfo) = value.ref(info)
+  }
+
+  implicit def recursiveSequencePropertyTypeInstance[A, F[A] <: Seq[A]](
+    implicit tpe: PropertyType[A]
+  ): SeqPropertyType[A, F, tpe.type] =
+    new SeqPropertyType[A, F, tpe.type](tpe)
+}
+
+/** Property is the base type for all properties.
+  *
+  * Properties are similar to normal Data types in that they can be used in
+  * ports, connected to other properties, etc. However, they are used to
+  * describe a set of non-hardware types, so they have no width, cannot be used
+  * in aggregate Data types, and cannot be connected to Data types.
+  */
+sealed trait Property[T] extends Element { self =>
+  sealed trait ClassType
+  private object ClassType {
+    implicit def classTypeProvider(
+      implicit evidence: T =:= chisel3.properties.ClassType
+    ): ClassTypeProvider[ClassType] = ClassTypeProvider(getPropertyType)
+    implicit def propertyType(
+      implicit evidence: T =:= chisel3.properties.ClassType
+    ): ClassTypePropertyType.Aux[Property[ClassType] with self.ClassType, ir.Arg] =
+      new ClassTypePropertyType[Property[ClassType] with self.ClassType](getPropertyType) {
+        override def convert(value: Underlying, ctx: ir.Component, info: SourceInfo): fir.Expression =
+          Converter.convert(value, ctx, info)
+        type Underlying = ir.Arg
+        override def convertUnderlying(value: Property[ClassType] with self.ClassType, info: SourceInfo) =
+          value.ref(info)
+      }
+  }
+
+  protected[chisel3] val tpe: PropertyType[_]
+
+  private[chisel3] def _asUIntImpl(first: Boolean)(implicit sourceInfo: SourceInfo): chisel3.UInt = {
+    Builder.error(s"${this._localErrorContext} does not support .asUInt.")
+    0.U
+  }
+  override protected def _fromUInt(that: UInt)(implicit sourceInfo: SourceInfo): Data = {
+    Builder.exception(s"${this._localErrorContext} cannot be driven by UInt")
+  }
+
+  override private[chisel3] def firrtlConnect(that: Data)(implicit sourceInfo: SourceInfo): Unit = {
+    that match {
+      case pthat: Property[_] => MonoConnect.propConnect(sourceInfo, this, pthat, Builder.forcedUserModule)
+      case other => Builder.error(s"${this._localErrorContext} cannot be connected to ${that._localErrorContext}")
+    }
+
+  }
+
+  override def litOption: Option[BigInt] = None
+
+  /** Return whether this Property is a literal.
+    *
+    * Since we override litOption to always be None, we need to override this method to check the Binding.
+    */
+  override def isLit: Boolean = topBindingOpt match {
+    case Some(PropertyValueBinding) => true
+    case _                          => false
+  }
+
+  def toPrintable: Printable = {
+    throwException(s"Properties do not support hardware printing" + this._errorContext)
+  }
+  private[chisel3] def _width: Width = UnknownWidth
+
+  override def typeName: String = s"Property[${tpe.getPropertyType().serialize}]"
+
+  override def toString: String = stringAccessor("Property")
+
+  /** Bind this node to the in-memory graph.
+    */
+  private[chisel3] override def bind(target: Binding, parentDirection: SpecifiedDirection): Unit = {
+    this.maybeAddToParentIds(target)
+    binding = target
+    val resolvedDirection = SpecifiedDirection.fromParent(parentDirection, specifiedDirection)
+    direction = ActualDirection.fromSpecified(resolvedDirection)
+  }
+
+  /** Clone type by simply constructing a new Property[T].
+    *
+    * The instance mixes in `AnyClassType` (a no-member marker) so that the phantom
+    * `asInstanceOf[Property[ClassType] with AnyClassType]` casts (and `convertUnderlying` bridges) used
+    * for class-reference properties succeed under Scala 3. The static type is unchanged.
+    */
+  override def cloneType: this.type = new Property[T] with AnyClassTypeUnsealed {
+    val tpe = self.tpe
+  }.asInstanceOf[this.type]
+
+  /** Clone type with extra information preserved.
+    *
+    * The only extra information present on a Property type is directionality.
+    */
+  private[chisel3] override def cloneTypeFull: this.type = {
+    val clone: this.type = this.cloneType
+    clone.specifiedDirection = specifiedDirection
+    clone
+  }
+
+  /** Get the IR PropertyType for this Property.
+    *
+    * This delegates to the PropertyType to convert itself to an IR PropertyType.
+    */
+  private[chisel3] def getPropertyType: fir.PropertyType = {
+    tpe.getPropertyType()
+  }
+
+  /** Perform addition as defined by FIRRTL spec section Integer Add Operation.
+    */
+  final def +(that: Property[T])(implicit ev: PropertyArithmeticOps[Property[T]], sourceInfo: SourceInfo): Property[T] =
+    ev.add(this, that)
+
+  /** Perform multiplication as defined by FIRRTL spec section Integer Multiply Operation.
+    */
+  final def *(that: Property[T])(implicit ev: PropertyArithmeticOps[Property[T]], sourceInfo: SourceInfo): Property[T] =
+    ev.mul(this, that)
+
+  /** Perform shift right as defined by FIRRTL spec section Integer Shift Right Operation.
+    */
+  final def >>(
+    that: Property[T]
+  )(
+    implicit ev: PropertyArithmeticOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] =
+    ev.shr(this, that)
+
+  /** Perform shift left as defined by FIRRTL spec section Integer Shift Left Operation.
+    */
+  final def <<(
+    that: Property[T]
+  )(
+    implicit ev: PropertyArithmeticOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] =
+    ev.shl(this, that)
+
+  /** Perform integer bitwise AND as defined by the FIRRTL Integer And Operation.
+    */
+  final def &(that: Property[T])(
+    implicit ev: PropertyBitwiseOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] =
+    ev.and(this, that)
+
+  /** Perform integer bitwise OR as defined by the FIRRTL Integer Or Operation.
+    */
+  final def |(that: Property[T])(
+    implicit ev: PropertyBitwiseOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] =
+    ev.or(this, that)
+
+  /** Perform integer bitwise NOT as defined by the FIRRTL Integer Not Operation.
+    */
+  final def unary_~(
+    implicit ev: PropertyBitwiseOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] =
+    ev.not(this)
+
+  /** Perform concatenation as defined by FIRRTL spec section List Concatenation Operation.
+    */
+  final def ++(
+    that: Property[T]
+  )(
+    implicit ev: PropertySequenceOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[T] = {
+    ev.concat(this, that)
+  }
+
+  /** Assert that this boolean property holds (only available for Property[Boolean])
+    *
+    * This can be used to build up interpolated string messages as opposed to
+    * purely static messages.
+    *
+    * @param message a string property message
+    */
+  final def assert[U](message: Property[U])(
+    implicit evT: T =:= Boolean,
+    evU:          U =:= String,
+    sourceInfo:   SourceInfo
+  ): Unit = {
+    PropertyBooleanOps.assert(this.asInstanceOf[Property[Boolean]], message.asInstanceOf[Property[String]])
+  }
+
+  /** Assert that this boolean property holds (only available for Property[Boolean])
+    *
+    * This is a legacy method that supports a constant assertion message.  If
+    * you need an interpolated message, use the alternative assert that takes a
+    * `Property[String]` message.
+    *
+    * @param message the assertion message
+    */
+  final def assert(message: String)(
+    implicit evT: T =:= Boolean,
+    sourceInfo:   SourceInfo
+  ): Unit = {
+    PropertyBooleanOps.assert(this.asInstanceOf[Property[Boolean]], Property[String](message))
+  }
+
+  /** Check whether a sequence property contains a property value.
+    *
+    * @param that the property value to search for
+    * @return Property[Boolean] indicating whether the sequence contains the value
+    */
+  final def contains[U](that: Property[U])(
+    implicit ev: PropertySequenceContainsOps[T, U],
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    ev.contains(this, that)
+  }
+
+  /** Property equality comparison
+    *
+    * Compares two properties of the same type and returns a Property[Boolean].
+    *
+    * @param that the property to compare with
+    * @return Property[Boolean] indicating whether the two properties are equal
+    */
+  final def ===(that: Property[T])(
+    implicit ev: PropertyEqualityOps[Property[T]],
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    ev.propEq(this, that)
+  }
+
+  /** Boolean AND of two boolean properties (only available for Property[Boolean])
+    *
+    * @param that the other boolean property
+    * @return Property[Boolean] that is the AND of this and that
+    */
+  final def &&(that: Property[T])(
+    implicit ev: T =:= Boolean,
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    PropertyBooleanBinaryOps.and(
+      this.asInstanceOf[Property[Boolean]],
+      that.asInstanceOf[Property[Boolean]]
+    )
+  }
+
+  /** Boolean OR of two boolean properties (only available for Property[Boolean])
+    *
+    * @param that the other boolean property
+    * @return Property[Boolean] that is the OR of this and that
+    */
+  final def ||(that: Property[T])(
+    implicit ev: T =:= Boolean,
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    PropertyBooleanBinaryOps.or(
+      this.asInstanceOf[Property[Boolean]],
+      that.asInstanceOf[Property[Boolean]]
+    )
+  }
+
+  /** Boolean XOR of two boolean properties (only available for Property[Boolean])
+    *
+    * @param that the other boolean property
+    * @return Property[Boolean] that is the XOR of this and that
+    */
+  final def ^(that: Property[T])(
+    implicit ev: T =:= Boolean,
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    PropertyBooleanBinaryOps.xor(
+      this.asInstanceOf[Property[Boolean]],
+      that.asInstanceOf[Property[Boolean]]
+    )
+  }
+
+  /** Boolean NOT of a boolean property (only available for Property[Boolean])
+    *
+    * Implemented as XOR with the constant `true`.
+    *
+    * @return Property[Boolean] that is the logical negation of this
+    */
+  final def unary_!(
+    implicit ev: T =:= Boolean,
+    sourceInfo:  SourceInfo
+  ): Property[Boolean] = {
+    PropertyBooleanBinaryOps.not(this.asInstanceOf[Property[Boolean]])
+  }
+}
+
+private[chisel3] sealed trait ClassTypeProvider[A] {
+  val classType: fir.PropertyType
+}
+
+private[chisel3] object ClassTypeProvider {
+  def apply[A](className: String) = new ClassTypeProvider[A] {
+    val classType: fir.ClassPropertyType = fir.ClassPropertyType(className)
+  }
+  def apply[A](_classType: fir.PropertyType) = new ClassTypeProvider[A] {
+    val classType = _classType
+  }
+}
+
+/** Helpers for building Property expressions.
+  */
+private object PropertyExpressionHelpers {
+  import chisel3.internal.binding.{ClassBinding, WireBinding}
+
+  // Helper to create a Property wire that works in RawModule contexts.  Class
+  // contexts don't support intermediate wires for property expressions.
+  private def createPropertyWire[T](template: Property[T])(
+    implicit sourceInfo: SourceInfo
+  ): Property[T] = {
+    val contextMod = Builder.referenceUserContainer
+    contextMod match {
+      case mod: RawModule => {
+        val wire = Property.makeWithValueOpt(template.tpe)
+        wire.autoSeed("_propExpr")
+        wire.bind(WireBinding(mod, Builder.currentBlock))
+        mod.addCommand(ir.DefWire(sourceInfo, wire))
+        wire.asInstanceOf[Property[T]]
+      }
+      case _: Class =>
+        Builder.exception(
+          "Property expressions are currently only supported in RawModules (not yet supported in Classes)"
+        )
+      case _ =>
+        Builder.exception("Property expressions are currently only supported in RawModules")
+    }
+  }
+
+  // Helper function to create Property expression IR.
+  def binOp[T](
+    sourceInfo: SourceInfo,
+    op:         fir.PropPrimOp,
+    lhs:        Property[T],
+    rhs:        Property[T]
+  ): Property[T] = {
+    implicit val info = sourceInfo
+
+    // Create a temporary Wire to assign the expression to (validates we're in a RawModule).
+    val wire = createPropertyWire(lhs)(sourceInfo)
+
+    // Create a PropExpr with the correct type, operation, and operands.
+    val propExpr = ir.PropExpr(sourceInfo, lhs.tpe.getPropertyType(), op, List(lhs.ref, rhs.ref))
+
+    // Add the PropAssign command.
+    val mod = Builder.referenceUserContainer.asInstanceOf[RawModule]
+    mod.addCommand(ir.PropAssign(sourceInfo, wire.lref, propExpr))
+
+    // Return the temporary Wire as the result.
+    wire.asInstanceOf[Property[T]]
+  }
+
+  // Helper function to create a unary Property expression IR.
+  def unaryOp[T](
+    sourceInfo: SourceInfo,
+    op:         fir.PropPrimOp,
+    value:      Property[T]
+  ): Property[T] = {
+    implicit val info = sourceInfo
+
+    // Create a temporary Wire to assign the expression to (validates we're in a RawModule).
+    val wire = createPropertyWire(value)(sourceInfo)
+
+    // Create a PropExpr with the same type and the single operand.
+    val propExpr = ir.PropExpr(sourceInfo, value.tpe.getPropertyType(), op, List(value.ref))
+
+    // Add the PropAssign command.
+    val mod = Builder.referenceUserContainer.asInstanceOf[RawModule]
+    mod.addCommand(ir.PropAssign(sourceInfo, wire.lref, propExpr))
+
+    // Return the temporary Wire as the result.
+    wire.asInstanceOf[Property[T]]
+  }
+
+  // Helper function for comparison operations that return Property[Boolean].
+  def cmpOp[L, R](
+    sourceInfo: SourceInfo,
+    op:         fir.PropPrimOp,
+    lhs:        Property[L],
+    rhs:        Property[R]
+  ): Property[Boolean] = {
+    implicit val info = sourceInfo
+
+    // Create a temporary Wire for the Boolean result (validates we're in a RawModule).
+    val boolTemplate = Property[Boolean]()
+    val wire = createPropertyWire(boolTemplate)(sourceInfo)
+
+    // Create a PropExpr with Boolean type, operation, and operands.
+    val propExpr = ir.PropExpr(sourceInfo, fir.BooleanPropertyType, op, List(lhs.ref, rhs.ref))
+
+    // Add the PropAssign command.
+    val mod = Builder.referenceUserContainer.asInstanceOf[RawModule]
+    mod.addCommand(ir.PropAssign(sourceInfo, wire.lref, propExpr))
+
+    // Return the temporary Wire as the result.
+    wire.asInstanceOf[Property[Boolean]]
+  }
+
+  // Helper function to create variadic Property expression IR.
+  def variadicOp[T](
+    sourceInfo: SourceInfo,
+    op:         fir.PropPrimOp,
+    operands:   Property[T]*
+  ): Property[T] = {
+    require(operands.nonEmpty, "variadicOp requires at least one operand")
+    implicit val info = sourceInfo
+
+    // Create a temporary Wire to assign the expression to (validates we're in a RawModule).
+    val wire = createPropertyWire(operands.head)(sourceInfo)
+
+    // Create a PropExpr with the correct type, operation, and operands.
+    val propExpr = ir.PropExpr(sourceInfo, operands.head.tpe.getPropertyType(), op, operands.map(_.ref).toList)
+
+    // Add the PropAssign command.
+    val mod = Builder.referenceUserContainer.asInstanceOf[RawModule]
+    mod.addCommand(ir.PropAssign(sourceInfo, wire.lref, propExpr))
+
+    // Return the temporary Wire as the result.
+    wire.asInstanceOf[Property[T]]
+  }
+}
+
+/** Typeclass for Property arithmetic.
+  */
+@implicitNotFound("arithmetic operations are not supported on Property type ${T}")
+sealed trait PropertyArithmeticOps[T] {
+  def add(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): T
+  def mul(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): T
+  def shr(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): T
+  def shl(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): T
+}
+
+object PropertyArithmeticOps {
+  import PropertyExpressionHelpers._
+
+  // Type class instances for Property arithmetic.
+  implicit val intArithmeticOps: PropertyArithmeticOps[Property[Int]] =
+    new PropertyArithmeticOps[Property[Int]] {
+      def add(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAddOp, lhs, rhs)
+      def mul(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerMulOp, lhs, rhs)
+      def shr(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShrOp, lhs, rhs)
+      def shl(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShlOp, lhs, rhs)
+    }
+
+  implicit val longArithmeticOps: PropertyArithmeticOps[Property[Long]] =
+    new PropertyArithmeticOps[Property[Long]] {
+      def add(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAddOp, lhs, rhs)
+      def mul(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerMulOp, lhs, rhs)
+      def shr(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShrOp, lhs, rhs)
+      def shl(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShlOp, lhs, rhs)
+    }
+
+  implicit val bigIntArithmeticOps: PropertyArithmeticOps[Property[BigInt]] =
+    new PropertyArithmeticOps[Property[BigInt]] {
+      def add(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAddOp, lhs, rhs)
+      def mul(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerMulOp, lhs, rhs)
+      def shr(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShrOp, lhs, rhs)
+      def shl(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerShlOp, lhs, rhs)
+    }
+}
+
+/** Typeclass for integral Property bitwise operations.
+  */
+@implicitNotFound("bitwise operations are not supported on Property type ${T}")
+sealed trait PropertyBitwiseOps[T] {
+  def and(lhs:   T, rhs:                 T)(implicit sourceInfo: SourceInfo): T
+  def or(lhs:    T, rhs:                 T)(implicit sourceInfo: SourceInfo): T
+  def not(value: T)(implicit sourceInfo: SourceInfo):                         T
+}
+
+object PropertyBitwiseOps {
+  import PropertyExpressionHelpers._
+
+  // Type class instances for integral Property bitwise operations.
+  implicit val intBitwiseOps: PropertyBitwiseOps[Property[Int]] =
+    new PropertyBitwiseOps[Property[Int]] {
+      def and(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAndOp, lhs, rhs)
+      def or(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerOrOp, lhs, rhs)
+      def not(value: Property[Int])(implicit sourceInfo: SourceInfo) =
+        unaryOp(sourceInfo, fir.IntegerNotOp, value)
+    }
+
+  implicit val longBitwiseOps: PropertyBitwiseOps[Property[Long]] =
+    new PropertyBitwiseOps[Property[Long]] {
+      def and(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAndOp, lhs, rhs)
+      def or(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerOrOp, lhs, rhs)
+      def not(value: Property[Long])(implicit sourceInfo: SourceInfo) =
+        unaryOp(sourceInfo, fir.IntegerNotOp, value)
+    }
+
+  implicit val bigIntBitwiseOps: PropertyBitwiseOps[Property[BigInt]] =
+    new PropertyBitwiseOps[Property[BigInt]] {
+      def and(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerAndOp, lhs, rhs)
+      def or(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.IntegerOrOp, lhs, rhs)
+      def not(value: Property[BigInt])(implicit sourceInfo: SourceInfo) =
+        unaryOp(sourceInfo, fir.IntegerNotOp, value)
+    }
+}
+
+/** Typeclass for Property sequence operations.
+  */
+@implicitNotFound("sequence operations are not supported on Property type ${T}")
+sealed trait PropertySequenceOps[T] {
+  def concat(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): T
+}
+
+object PropertySequenceOps {
+  import PropertyExpressionHelpers._
+
+  // Type class instances for Property sequence operations.
+  implicit def seqOps[U, S[U] <: Seq[U]]: PropertySequenceOps[Property[S[U]]] =
+    new PropertySequenceOps[Property[S[U]]] {
+      def concat(lhs: Property[S[U]], rhs: Property[S[U]])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.ListConcatOp, lhs, rhs)
+    }
+
+  // Ensure that `++` is available for `Property[String]`.
+  implicit val stringOps: PropertySequenceOps[Property[String]] =
+    new PropertySequenceOps[Property[String]] {
+      def concat(lhs: Property[String], rhs: Property[String])(implicit sourceInfo: SourceInfo) =
+        binOp(sourceInfo, fir.StringConcatOp, lhs, rhs)
+    }
+}
+
+/** Typeclass for Property sequence membership operations.
+  */
+@implicitNotFound("contains is not supported on Property type ${T} with element type ${U}")
+sealed trait PropertySequenceContainsOps[T, U] {
+  def contains(lhs: Property[T], rhs: Property[U])(implicit sourceInfo: SourceInfo): Property[Boolean]
+}
+
+object PropertySequenceContainsOps {
+  import PropertyExpressionHelpers._
+
+  private def sequenceContainsOps[S, U](implicit equality: PropertyEqualityOps[Property[U]]) =
+    new PropertySequenceContainsOps[S, U] {
+      def contains(lhs: Property[S], rhs: Property[U])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+        cmpOp(sourceInfo, fir.ListContainsOp, lhs, rhs)
+    }
+
+  implicit def seqContainsOps[U](
+    implicit equality: PropertyEqualityOps[Property[U]]
+  ): PropertySequenceContainsOps[Seq[U], U] =
+    sequenceContainsOps[Seq[U], U]
+
+  implicit def listContainsOps[U](
+    implicit equality: PropertyEqualityOps[Property[U]]
+  ): PropertySequenceContainsOps[List[U], U] =
+    sequenceContainsOps[List[U], U]
+
+  implicit def vectorContainsOps[U](
+    implicit equality: PropertyEqualityOps[Property[U]]
+  ): PropertySequenceContainsOps[Vector[U], U] =
+    sequenceContainsOps[Vector[U], U]
+}
+
+/** Typeclass for Property string operations.
+  */
+@implicitNotFound("string operations are not supported on Property type ${T}")
+sealed trait PropertyStringOps[T] {
+  def concat(operands: T*)(implicit sourceInfo: SourceInfo): T
+}
+
+object PropertyStringOps {
+  import PropertyExpressionHelpers._
+
+  // Type class instance for Property string operations.
+  private class StringOpsImpl extends PropertyStringOps[Property[String]] {
+    def concat(operands: Property[String]*)(implicit sourceInfo: SourceInfo) =
+      variadicOp(sourceInfo, fir.StringConcatOp, operands: _*)
+  }
+
+  implicit val stringOps: PropertyStringOps[Property[String]] = new StringOpsImpl
+}
+
+/** Typeclass for Property equality operations.
+  */
+@implicitNotFound("equality operations are not supported on Property type ${T}")
+sealed trait PropertyEqualityOps[T] {
+  def propEq(lhs: T, rhs: T)(implicit sourceInfo: SourceInfo): Property[Boolean]
+}
+
+object PropertyEqualityOps {
+  import PropertyExpressionHelpers._
+
+  // Type class instances for Property equality operations.
+  implicit val boolEqualityOps: PropertyEqualityOps[Property[Boolean]] =
+    new PropertyEqualityOps[Property[Boolean]] {
+      def propEq(lhs: Property[Boolean], rhs: Property[Boolean])(
+        implicit sourceInfo: SourceInfo
+      ): Property[Boolean] =
+        cmpOp(sourceInfo, fir.PropEqOp, lhs, rhs)
+    }
+
+  implicit val intEqualityOps: PropertyEqualityOps[Property[Int]] =
+    new PropertyEqualityOps[Property[Int]] {
+      def propEq(lhs: Property[Int], rhs: Property[Int])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+        cmpOp(sourceInfo, fir.PropEqOp, lhs, rhs)
+    }
+
+  implicit val longEqualityOps: PropertyEqualityOps[Property[Long]] =
+    new PropertyEqualityOps[Property[Long]] {
+      def propEq(lhs: Property[Long], rhs: Property[Long])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+        cmpOp(sourceInfo, fir.PropEqOp, lhs, rhs)
+    }
+
+  implicit val bigIntEqualityOps: PropertyEqualityOps[Property[BigInt]] =
+    new PropertyEqualityOps[Property[BigInt]] {
+      def propEq(lhs: Property[BigInt], rhs: Property[BigInt])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+        cmpOp(sourceInfo, fir.PropEqOp, lhs, rhs)
+    }
+
+  implicit val stringEqualityOps: PropertyEqualityOps[Property[String]] =
+    new PropertyEqualityOps[Property[String]] {
+      def propEq(lhs: Property[String], rhs: Property[String])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+        cmpOp(sourceInfo, fir.PropEqOp, lhs, rhs)
+    }
+}
+
+/** Operations for Property[Boolean].
+  *
+  * Property assertions do not have names or labels - just a condition and message.
+  */
+object PropertyBooleanOps {
+
+  /** Assert that a boolean property holds
+    *
+    * @param cond the boolean property condition
+    * @param message the assertion message to display if the assertion fails
+    */
+  def assert(cond: Property[Boolean], message: String)(implicit sourceInfo: SourceInfo): Unit =
+    assert(cond, Property[String](message))
+
+  /** Assert that a boolean property holds
+    *
+    * @param cond the boolean property condition
+    * @param message a string property to evaluate and display if the assertion fails
+    */
+  def assert(cond: Property[Boolean], message: Property[String])(implicit sourceInfo: SourceInfo): Unit =
+    Builder.referenceUserContainer match {
+      case rm: RawModule =>
+        rm.addCommand(firrtl.ir.PropertyAssert(sourceInfo, cond.ref, message.ref))
+      case cls: Class =>
+        cls.addCommand(firrtl.ir.PropertyAssert(sourceInfo, cond.ref, message.ref))
+    }
+}
+
+/** Binary boolean property operations: AND, OR, XOR.
+  */
+object PropertyBooleanBinaryOps {
+  import PropertyExpressionHelpers._
+
+  /** Compute the AND of two boolean properties. */
+  def and(lhs: Property[Boolean], rhs: Property[Boolean])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+    cmpOp(sourceInfo, fir.BoolAndOp, lhs, rhs)
+
+  /** Compute the OR of two boolean properties. */
+  def or(lhs: Property[Boolean], rhs: Property[Boolean])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+    cmpOp(sourceInfo, fir.BoolOrOp, lhs, rhs)
+
+  /** Compute the XOR of two boolean properties.
+    *
+    * Note: NOT can be expressed as `xor(a, Property(true))`, or more
+    * conveniently via the `not` helper or `unary_!` operator.
+    */
+  def xor(lhs: Property[Boolean], rhs: Property[Boolean])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+    cmpOp(sourceInfo, fir.BoolXorOp, lhs, rhs)
+
+  /** Compute the logical NOT of a boolean property, implemented as XOR with the constant `true`. */
+  def not(operand: Property[Boolean])(implicit sourceInfo: SourceInfo): Property[Boolean] =
+    xor(operand, Property(true))
+}
+
+/** Companion object for Property.
+  */
+object Property {
+
+  implicit class ClassTypePropertyOps(prop: Property[ClassType]) extends AnyRef {
+    // This cast should be safe, because there are no members of cls.Type to access
+    def as(cls: ClassType): Property[ClassType] with cls.Type =
+      prop.asInstanceOf[Property[ClassType] with cls.Type]
+
+    // This cast should be safe, because there are no members of cls.Type to access
+    def asAnyClassType: Property[ClassType] with AnyClassType =
+      prop.asInstanceOf[Property[ClassType] with AnyClassType]
+
+    // This cast should be safe, because there are no members of prop.ClassType to access
+    def as(prop: Property[ClassType]): Property[ClassType] with prop.ClassType =
+      prop.asInstanceOf[Property[ClassType] with prop.ClassType]
+  }
+
+  private[chisel3] def makeWithValueOpt[T](implicit _tpe: PropertyType[T]): Property[_tpe.Type] = {
+    // Mixes in `AnyClassType` (a no-member marker) so the phantom
+    // `asInstanceOf[Property[ClassType] with AnyClassType]` casts and
+    // `convertUnderlying` bridges used for class-reference properties
+    // succeed under Scala 3. The static return type is unchanged.
+    new Property[_tpe.Type] with AnyClassTypeUnsealed {
+      val tpe: chisel3.properties.PropertyType[T] = _tpe
+    }
+  }
+
+  /** Create a new Property based on the type T.
+    */
+  def apply[T]()(implicit tpe: PropertyType[T]): Property[tpe.Type] = {
+    makeWithValueOpt(tpe)
+  }
+
+  /** Create a new Property literal of type T.
+    */
+  def apply[T](lit: T)(implicit tpe: PropertyType[T], info: SourceInfo): Property[tpe.Type] = {
+    val literal = ir.PropertyLit[tpe.Type, tpe.Underlying](tpe, tpe.convertUnderlying(lit, info))
+    val result = makeWithValueOpt(tpe)
+    literal.bindLitArg(result)
+  }
+
+  /** Concatenate multiple string properties into a single string property.
+    *
+    * @param operands the string properties to concatenate
+    * @return a new string property containing the concatenation of all operands
+    */
+  def concat(
+    operands: Property[String]*
+  )(
+    implicit ev: PropertyStringOps[Property[String]],
+    sourceInfo:  SourceInfo
+  ): Property[String] = {
+    ev.concat(operands: _*)
+  }
+}

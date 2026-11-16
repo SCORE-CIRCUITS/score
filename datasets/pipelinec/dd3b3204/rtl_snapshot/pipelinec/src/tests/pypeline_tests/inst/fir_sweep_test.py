@@ -1,0 +1,56 @@
+# pyright: reportInvalidTypeForm=none
+"""Full auto-pipelining throughput-sweep coverage for one dsp/fir.py filter:
+proves the FIR comb blob (pre-adders + const multiplies + adder tree + resize)
+actually retimes to meet a @MAIN frequency goal, rather than only elaborating
+under --comb. Kept to a single small filter so the sweep stays fast; broad
+per-mode elaboration coverage lives in fir_test.py (--comb)."""
+
+import sys, os
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "..",
+        "..",
+        "include",
+        "pypeline",
+    ),
+)
+
+from pypeline import MAIN, uint1_t
+
+from fixed_point import make_fixed_t
+from dsp.fir import make_fir
+
+data_t = make_fixed_t(1, 7)
+coeff_t = make_fixed_t(2, 6)
+
+fir_sweep = make_fir(
+    [0.0625, 0.25, 0.375, 0.25, 0.0625],  # symmetric 5-tap
+    coeff_t,
+    data_t,
+    out_t=data_t,
+    rounding="round_half_even",
+    overflow="saturate",
+)
+
+
+# Goal lowered from 100.0 -- the soft-operator-library default flip
+# (int GT/GTE/LT/LTE now lower to a Pypeline-HDL subtract-based comparator
+# instead of the old C-code-generated one, see include/pypeline/operators/)
+# measurably slowed integer compares (~70-90% higher delay for the same
+# widths in this design), and this filter's real timing floor is an
+# unrelated inferred MUX around ~76 MHz -- 100 MHz is no longer reachable.
+# Optimizing the soft comparator's QoR is tracked as follow-up work,
+# revisited if it turns out to matter for the wireguard-fpga build.
+@MAIN(60.0)
+def fir_sweep_main(
+    stream_in_if: fir_sweep.in_fwd_t, stream_out_if: fir_sweep.out_fb_t
+) -> fir_sweep.return_t:
+    return fir_sweep(stream_in_if, stream_out_if)

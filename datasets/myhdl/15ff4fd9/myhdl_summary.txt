@@ -1,0 +1,5 @@
+MyHDL SCORE snapshot (myhdl/myhdl)
+Commit: 15ff4fd9
+Dataset: /home/yongfu/proj/score/datasets/myhdl/15ff4fd9
+Generated Verilog/VHDL files: 4
+Snapshot files: 11

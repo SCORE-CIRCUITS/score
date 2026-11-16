@@ -1,0 +1,5 @@
+c906 SCORE snapshot (T-head-Semi/openc906)
+Commit: b0c06eb1
+Dataset: /home/yongfu/proj/score/datasets/c906/b0c06eb1
+Simulation model: OK (SIM=iverilog)
+Design files: 294

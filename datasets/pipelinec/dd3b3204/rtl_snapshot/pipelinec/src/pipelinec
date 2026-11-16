@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""The pypelinec command-line build driver: parse arguments, set the settings for the
+whole run, and dispatch -- --list_params, the comb-only native simulation, or a build
+as a sequence of named calls into the compiler modules. Steps with any logic of their
+own live in those modules. See docs/SYN_DESIGN.md, "The build driver (src/pipelinec)";
+the flags are documented for users in docs/README.md.
+"""
+
+import argparse
+import atexit
+import os
+import sys
+from timeit import default_timer as timer
+
+sys.dont_write_bytecode = True
+
+import C_TO_LOGIC
+import PY_TO_LOGIC
+import OPEN_TOOLS
+import SIM
+import pypeline_sim
+import utilities
+
+# import CLANG_TO_LOGIC
+import SYN
+import AUTO_PIPELINE
+import SWEEP
+import DIAGRAM
+
+# Imported up here (elsewhere it is imported lazily, inside the functions that
+# schedule) so --auto_fsm_ctl's choices can come from AUTO_FSM itself rather than
+# being restated. Its own imports are all already loaded above.
+import AUTO_FSM
+import AUTO
+
+# Defaults
+default_src_file = utilities.REPO_ABS_DIR() + "/main.py"
+default_top_module = "top"
+
+# Parse args
+parser = argparse.ArgumentParser(description="PypelineC:")
+parser.add_argument("--stop_on_over_capacity", action="store_true", help="Stop before timing feedback if whole-design synthesis exceeds device capacity (default: warn).")
+parser.add_argument(
+    "src_file",
+    type=str,
+    default=default_src_file,
+    nargs="?",
+    help=f"Source file containing main functions. Default is {default_src_file}.",
+)
+parser.add_argument(
+    "--top",
+    help=f"Set the name of the top-level module generated. Default is {default_top_module}.",
+    type=str,
+    default=default_top_module,
+)
+parser.add_argument(
+    "--out_dir",
+    type=str,
+    default=None,
+    help="Output directory. Default is a new directory inside the current directory.",
+)
+parser.add_argument(
+    "--rebuild",
+    action="store_true",
+    help="Build even when --out_dir already holds the timing-met build of this "
+    "top from identical inputs (design sources, -D values, build settings, "
+    "compiler). By default such a build is up to date and does nothing.",
+)
+parser.add_argument(
+    "-D",
+    "--define",
+    action="append",
+    default=[],
+    metavar="NAME[=VALUE]",
+    help="Set design parameter NAME (Pypeline designs). The design reads it with "
+    "NAME = param('NAME', default), or, if it declares no such param(), as a "
+    "plain global like a C macro. A bare -D NAME means True. Repeatable. "
+    "Every build prints and records (source_provenance.json) each parameter's "
+    "value and where it came from.",
+)
+parser.add_argument(
+    "--list_params",
+    action="store_true",
+    help="Import the design (no elaboration), list the parameters it declares "
+    "with param() -- type, default, allowed values, help -- and exit.",
+)
+parser.add_argument(
+    "--verilog",
+    help="Use GHDL+Yosys to convert the final top level VHDL files to Verilog.",
+    action="store_true",
+)
+parser.add_argument(
+    "--comb",
+    help="Combinatorial logic results only. No auto-pipelining.",
+    action="store_true",
+)
+parser.add_argument(
+    "--no_synth",
+    help="Like --comb, except do not run synthesis. Just output final combinatorial logic HDL.",
+    action="store_true",
+)
+parser.add_argument(
+    "--mult",
+    type=str,
+    default=C_TO_LOGIC.MULT_STYLE_INFERRED,
+    help="infer|fabric : Global multiplier style. Default to 'inferring' multiplier DSP primitives. Alternatively implement multipliers in FPGA fabric.",
+)
+parser.add_argument(
+    "--auto_fsm_budget_scale",
+    type=float,
+    default=None,
+    help="Fraction of the clock period an AUTO_FSM state's operation chain may "
+    "fill by the delay model's reckoning (default 0.9). Lower = smaller, more "
+    "numerous states = more timing margin at the cost of latency. Timing "
+    "failures blamed on an AUTO_FSM shrink this automatically; set it explicitly "
+    "to start tighter (or, above 1.0, deliberately looser).",
+)
+parser.add_argument(
+    "--auto_fsm_no_area_sweep",
+    help="Skip AUTO_FSM's minimum-area search and use the plain greedy schedule "
+    "(one shared unit per operation as written, opened up only where an "
+    "operation is too slow to fit a state). The search is on by default and can "
+    "only improve on this by its own cost model, so this is for A/B comparison "
+    "and for debugging a schedule the search complicated.",
+    action="store_true",
+)
+parser.add_argument(
+    "--auto_fsm_abstract_area",
+    help="Rank AUTO_FSM's area search with the abstract per-bit model "
+    "(AREA_* constants) even under --syn_tool device_models, instead of real cached "
+    "leaf/register/multiplexer um2. Real area is used automatically whenever "
+    "it is available; this is the escape hatch for A/B comparison against it.",
+    action="store_true",
+)
+parser.add_argument(
+    "--auto_fsm_sweep_debug",
+    help="Print one line per candidate schedule the AUTO_FSM minimum-area search "
+    "considers: the move, its estimated area, and why it was accepted or "
+    "rejected. The search reports only its final choice by default, which makes "
+    "'it declined to move' indistinguishable from 'it never looked'.",
+    action="store_true",
+)
+parser.add_argument(
+    "--auto_fsm_open",
+    help="Force the AUTO_FSM schedule to open up (decompose into its internals) "
+    "the functional unit whose entity name contains this substring, instead of "
+    "searching. Repeatable. For A/B measurement -- it is how a test builds the "
+    "schedule the area search rejected and compares real cell counts against "
+    "it. An ambiguous or unmatched substring is an error.",
+    action="append",
+    default=[],
+    metavar="SUBSTR",
+)
+parser.add_argument(
+    "--auto_fsm_unshare",
+    help="Force SUBSTR=N physical copies of the functional unit matching SUBSTR, "
+    "instead of searching. Repeatable. Same A/B measurement purpose as "
+    "--auto_fsm_open; may be combined with it.",
+    action="append",
+    type=AUTO_FSM.PARSE_UNSHARE_SPEC,
+    default=[],
+    metavar="SUBSTR=N",
+)
+parser.add_argument(
+    "--auto_fsm_ctl",
+    help="How an AUTO_FSM's control path is built (default auto). 'auto' ranks "
+    "binary-table v3 and one-hot schedules by area and selects the smaller. "
+    "'v3' decodes "
+    "state with constant lookup tables: one select LUT per shared unit, one "
+    "write-enable LUT per register, one next-state LUT, leaving a single "
+    "comparator per FSM. 'v2' is the older comparator chain (one equality "
+    "compare per state per unit), kept for A/B comparison. 'onehot' uses "
+    "one bit per state so control enables decode directly.",
+    choices=list(AUTO_FSM.CTL_CHOICES),
+    default=AUTO_FSM.DEFAULT_CTL,
+)
+parser.add_argument(
+    "--sim",
+    help="Start simulation using final (maybe auto-pipelined) versions of functions.",
+    action="store_true",
+)
+parser.add_argument(
+    "--sim_comb",
+    help="Start simulation using just comb. logic versions of functions. Equivalent to --sim --comb.",
+    action="store_true",
+)
+parser.add_argument(
+    "--run",
+    type=pypeline_sim.parse_run_arg,
+    default=10,
+    help="Argument for simulator run command: number of clock cycles, or 'all' to "
+    "run until sim_finish() is called (subject to a safety cap). Default = '10' "
+    "clock cycles.",
+)
+parser.add_argument(
+    "--cocotb",
+    help="Use cocotb to drive simulation. Specify simulator with additional flags.",
+    action="store_true",
+)
+parser.add_argument(
+    "--makefile",
+    type=str,
+    default=None,
+    help="Specify an existing Makefile. Ex. For tools like --cocotb.",
+)
+parser.add_argument(
+    "--ghdl", help="Setup simulation files for use with GHDL.", action="store_true"
+)
+parser.add_argument(
+    "--edaplay",
+    help="Setup simulation files for use on edaplayground.com.",
+    action="store_true",
+)
+parser.add_argument(
+    "--modelsim",
+    help="Setup simulation files for use with Modelsim.",
+    action="store_true",
+)
+parser.add_argument(
+    "--cxxrtl",
+    help="Setup simulation files for use with GHDL+Yosys+CXXRTL.",
+    action="store_true",
+)
+parser.add_argument(
+    "--verilator",
+    help="Setup simulation files for use with GHDL+Yosys+Verilator.",
+    action="store_true",
+)
+parser.add_argument(
+    "--main_cpp",
+    type=str,
+    default=None,
+    help="Specify an existing main C++ file for simulators such as CXXRTL and Verilator.",
+)
+parser.add_argument(
+    "--full_hier_syn",
+    help="Measure every hierarchy level individually before pipelining instead of estimating hierarchy delays. Opaque vhdl() text still starts at zero estimated delay.",
+    action="store_true",
+)
+parser.add_argument(
+    "--no_hier_syn",
+    help="Estimate hierarchy delays from required primitive measurements and disable hierarchical fallback. Automatic multi-cycle and FSM decisions still receive required measurements; opaque vhdl() text starts at zero.",
+    action="store_true",
+)
+parser.add_argument(
+    "--no_stored_measurements",
+    help="Estimate delays and areas as if no earlier run existed. By default, before estimating a function's delay or area, a build uses an earlier synthesis of the same exact inputs when this --out_dir or the --syn_cache store holds one (never running the tool to get it), so the plan can depend on what earlier builds left behind.",
+    action="store_true",
+)
+parser.add_argument(
+    "--no_primitive_delay_model",
+    help="Synthesize every built-in add, subtract, equality and bitwise operator at a width this tool/part has not measured. By default such a width is estimated from the widths already measured, and AUTO_FSM measures only an estimate close enough to its state budget to change a decision.",
+    action="store_true",
+)
+parser.add_argument(
+    "--pipeline_min_effort",
+    type=int,
+    default=2,
+    help="Extra full-design synthesis iterations the throughput sweep may spend reducing pipeline stages after timing is met (hunting the fewest-registers solution). 0 = accept the first met result as-is (fastest, may be over-pipelined). No effect with --no_sweep (nothing ever measures as met).",
+)
+parser.add_argument(
+    "--no_sweep",
+    help="Make the throughput sweep's first planned guess, write the resulting pipelined VHDL, and stop -- zero sweep synthesis iterations. Timing is NOT verified; raise the @MAIN mhz target to get more pipeline stages. Works with both --coarse and the default planned sweep.",
+    action="store_true",
+)
+parser.add_argument(
+    "--coarse",
+    help="Do only a single coarse grain auto-pipelining sweep (as opposed to default of hierarchical several multi-level coarse sweeps).",
+    action="store_true",
+)
+parser.add_argument(
+    "--start",
+    type=int,
+    default=None,
+    help="When doing a --coarse sweep, start from START cycles latency.",
+)
+parser.add_argument(
+    "--stop",
+    type=int,
+    default=None,
+    help="When doing a --coarse sweep, stop at STOP cycles latency.",
+)
+parser.add_argument(
+    "--sweep",
+    help="When doing a --coarse sweep, sweep clock by clock upwards increasing latency.",
+    action="store_true",
+)
+parser.add_argument(
+    "--yosys_json", help="Just output the json from yosys.", action="store_true"
+)
+parser.add_argument(
+    "--xo_axis",
+    help="Write a .tcl script to package output VHDL as a Vitis IP .xo file with an AXIS interface.",
+    action="store_true",
+)
+parser.add_argument(
+    "--pins",
+    type=str,
+    default=None,
+    help="Specify a pin constraints file.",
+)
+parser.add_argument(
+    "--syn_cache",
+    type=str,
+    default=None,
+    metavar="DIR",
+    help="Share synthesis results between output directories through the store "
+    "DIR: a run whose exact inputs (HDL and constraint bytes, part, tool, "
+    "recipe) were synthesized before reuses that result. Without it, each "
+    "--out_dir's own logs are its cache. Entries are validated in full on "
+    "every use; deleting DIR is always safe.",
+)
+parser.add_argument(
+    "--latency_hints",
+    type=str,
+    action="append",
+    default=[],
+    metavar="FILE",
+    help="Starting latencies for AUTO_PIPELINE / AUTO_MULTI_CYCLE tags, keyed by "
+    "tag key (a named tag's key is its name): a latency_profile.json from an "
+    "earlier build, or {\"AUTO_PIPELINE\": {key: N}, \"AUTO_MULTI_CYCLE\": "
+    "{key: N}}. Repeatable; a later file wins. Remembered results of earlier "
+    "builds of this --out_dir take precedence.",
+)
+parser.add_argument(
+    "--no_latency_memory",
+    action="store_true",
+    default=False,
+    help="Neither use nor update the latency memory: the AUTO_PIPELINE / "
+    "AUTO_MULTI_CYCLE depths/counts, mini-sweep locks and MAIN implementations "
+    "verified by earlier builds (out_dir memory and shared --syn_cache pieces). "
+    "latency_profile.json is still written and --latency_hints still apply.",
+)
+parser.add_argument(
+    "--syn_cache_prune",
+    type=float,
+    default=None,
+    metavar="DAYS",
+    help="At the end of the build, remove --syn_cache store entries no build "
+    "has used for DAYS days.",
+)
+parser.add_argument(
+    "-j",
+    "--jobs",
+    type=int,
+    default=None,
+    help="Maximum synthesis runs in flight at once. Default is "
+    "config/num_processes.cfg. Each job is a whole vendor tool process, so "
+    "this is mostly a memory knob -- lower it for backends that need a lot of "
+    "RAM per run (ex. Efinity's efx_pnr peaks near 3.7GB per leaf).",
+)
+parser.add_argument(
+    "--part",
+    type=str,
+    default=None,
+    help="FPGA part to target, instead of PART(...) in the source. The part "
+    "selects the synthesis tool. Setting this and PART(...) to different "
+    "values is an error.",
+)
+parser.add_argument(
+    "--syn_tool",
+    type=str,
+    default=None,
+    choices=SYN.TOOL_NAMES,
+    help="Synthesis tool to build with, instead of SYN_TOOL(...) in the "
+    "source. Named alone, the tool supplies its own default part, which is "
+    "how one part-neutral source file can be built on any backend. A tool "
+    "that contradicts the part is an error, not an override: the two are one "
+    "decision spelled two ways. 'pyrtl' (generic PyRTL estimate) is the "
+    "default when neither a part nor a tool is set; 'device_models' is the "
+    "real sky130 liberty NLDM STA (src/DEVICE_MODELS.py).",
+)
+parser.add_argument(
+    "--mux_delay_by_width",
+    dest="mux_delay_by_width",
+    action="store_true",
+    default=None,
+    help="Force the mux path-delay cache key to include operand type/width "
+    "(like every other operator) instead of collapsing every mux width to "
+    "one shared cache entry. Default is automatic per --syn_tool/PART: "
+    "collapsed for pyrtl (measured width-blind there), width-keyed for "
+    "sky130 (a real mux instance's own select really does drive more sinks "
+    "the wider it is).",
+)
+parser.add_argument(
+    "--no_mux_delay_by_width",
+    dest="mux_delay_by_width",
+    action="store_false",
+    default=None,
+    help="Force the mux path-delay cache to stay collapsed to one shared "
+    "entry regardless of --syn_tool/PART.",
+)
+args = parser.parse_args()
+
+# Resolve source file arg
+src_file = os.path.abspath(args.src_file)
+pins_file = os.path.abspath(args.pins) if args.pins else None
+if not (src_file.endswith(".c") or src_file.endswith(".py")):
+    sys.exit(f"Unrecognized source file type: {src_file} (expected .c or .py)")
+
+# Design parameters (-D): installed before anything imports the design -- the
+# comb native-sim shortcut below, --list_params, or the first PARSE_FILE --
+# and kept for every later re-elaboration pass and simulation import
+import pypeline
+
+try:
+    _design_defines = pypeline.PARSE_DESIGN_PARAM_DEFINES(args.define)
+    if _design_defines and not src_file.endswith(".py"):
+        sys.exit(
+            "-D sets Pypeline (.py) design parameters; a C design uses #define."
+        )
+    pypeline.SET_DESIGN_PARAMS(_design_defines)
+    if args.list_params:
+        if not src_file.endswith(".py"):
+            sys.exit("--list_params applies to Pypeline (.py) designs.")
+        print(pypeline_sim.design_param_list_text(src_file))
+        sys.exit(0)
+except pypeline.DesignParamError as e:
+    sys.exit(f"ERROR: {e}")
+
+# Output dir:
+#   Use what user provided
+#   Or create a new dir for each run by default
+if args.out_dir is not None:
+    SYN.SYN_OUTPUT_DIRECTORY = os.path.abspath(args.out_dir)
+else:
+    # Or create a unique dir for this run in current dir
+    src_filename = os.path.basename(src_file)
+    SYN.SYN_OUTPUT_DIRECTORY = os.path.abspath(
+        "./" + SYN.OUTPUT_DIR_NAME + "_" + src_filename + "_" + str(os.getpid())
+    )
+
+# Ugh some python versions dont obey the coding comment at top of file?
+try:
+    print(
+        """
+██████╗ ██╗   ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗ ██████╗
+██╔══██╗╚██╗ ██╔╝██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝██╔════╝
+██████╔╝ ╚████╔╝ ██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  ██║     
+██╔═══╝   ╚██╔╝  ██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  ██║     
+██║        ██║   ██║     ███████╗███████╗██║██║ ╚████║███████╗╚██████╗
+╚═╝        ╚═╝   ╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝ ╚═════╝
+""",
+        flush=True,
+    )
+except UnicodeEncodeError as e:
+    print("Old python versions do not obey utf-8 file encoding...")
+    print(e)
+
+print("Version:", utilities.GET_VERSION_STR())
+print("Command:", utilities.GET_COMMAND_LINE_STR())
+print("Parsing file:", src_file)
+print("Output directory:", SYN.SYN_OUTPUT_DIRECTORY, flush=True)
+
+# Reject contradictory combinations
+if args.full_hier_syn and args.no_hier_syn:
+    sys.exit("--full_hier_syn and --no_hier_syn are opposite ends of one axis (synthesize every hierarchy level vs. synthesize none) -- pick one.")
+if args.sweep and args.no_sweep:
+    sys.exit("--sweep and --no_sweep are contradictory: --sweep asks the coarse sweep to measure every cut count one at a time, --no_sweep asks for zero sweep synthesis iterations -- pick one.")
+
+# Combine certain args
+if args.sim and args.comb:
+    args.sim_comb = True
+if args.sim_comb:
+    args.sim = True
+    args.comb = True
+
+# Apply arguments to global modules
+
+# Set top level module name
+SYN.TOP_LEVEL_MODULE = args.top
+# Flag for verilog conversion
+SYN.CONVERT_FINAL_TOP_VERILOG = args.verilog
+# Pre-pipelining per-func synthesis mode
+SYN.HIER_SYN_MODE = (
+    "full" if args.full_hier_syn else ("prim" if args.no_hier_syn else "leaf")
+)
+SYN.USE_STORED_MEASUREMENTS = not args.no_stored_measurements
+SYN.USE_PRIMITIVE_DELAY_MODEL = not args.no_primitive_delay_model
+# Post-met pipeline stage reduction effort
+SWEEP.PIPELINE_MIN_EFFORT = args.pipeline_min_effort
+SWEEP.STOP_ON_OVER_CAPACITY = args.stop_on_over_capacity
+# Plan-only: skip all sweep synthesis iterations, emit the first guess as-is
+SWEEP.NO_SWEEP = args.no_sweep
+# Multiplier style
+C_TO_LOGIC.MULT_STYLE = args.mult
+# Open tools flag to not run nextpnr
+OPEN_TOOLS.YOSYS_JSON_ONLY = args.yosys_json
+# Sim tool selection
+SIM.SET_SIM_TOOL(args, src_file)
+# A comb-only native Pypeline (.py) simulation run needs no build at all -- see
+# SIM.NATIVE_SIM_SKIPS_BUILD.
+if SIM.NATIVE_SIM_SKIPS_BUILD(args):
+    try:
+        SIM.DO_OPTIONAL_SIM(True, None, args, source_file=src_file)
+    except pypeline.DesignParamError as e:
+        sys.exit(f"ERROR: {e}")
+    sys.exit(0)
+# What the result of this build depends on besides its design sources, taken
+# before anything is read -- see SIM.BUILD_INPUTS
+build_inputs = SIM.BUILD_INPUTS(args, src_file)
+# A build of the top already built in --out_dir from identical inputs has
+# nothing to do -- see SIM.BUILT_HARDWARE_IS_CURRENT
+if SIM.BUILT_HARDWARE_IS_CURRENT(build_inputs, args):
+    sys.exit(0)
+# A native --sim of another top on the hardware already built in --out_dir needs
+# no build either; any build first forgets that record -- see
+# SIM.SIMULATE_BUILT_HARDWARE.
+if SIM.SIMULATE_BUILT_HARDWARE(args, src_file, build_inputs):
+    sys.exit(0)
+# This build writes its own design diagram; until then out_dir holds none
+DIAGRAM.FORGET_DIAGRAM(SYN.SYN_OUTPUT_DIRECTORY)
+# AXIS XO file switch
+SYN.WRITE_AXIS_XO_FILE = args.xo_axis
+# Pin constraints file (if specified)
+SYN.PIN_CONSTRAINTS_FILE = pins_file
+# --syn_tool alone can be honored before the design is parsed, and must be:
+# parsing itself calls PART_SET_TOOL(allow_fail=True) in places, and that
+# respects an already-set SYN.SYN_TOOL (its own `if SYN_TOOL is None:` guard).
+# The full reconciliation against the source's own PART()/SYN_TOOL() has to
+# wait until after parsing -- see SYN.RESOLVE_BUILD_TARGET below.
+if args.syn_tool is not None:
+    SYN.SYN_TOOL = SYN.GET_TOOL_MODULE(args.syn_tool)
+elif args.part is not None:
+    # Same idea for a CLI part with no CLI tool: without this the in-parse
+    # calls see no part yet and announce PyRTL, which the resolver then
+    # contradicts a few lines later. Any disagreement with the source's own
+    # PART()/SYN_TOOL() is still caught by SYN.RESOLVE_BUILD_TARGET below.
+    SYN.SYN_TOOL = SYN.PART_TO_TOOL(args.part)
+# Parallel synthesis run cap (None = config/num_processes.cfg)
+if args.jobs is not None and args.jobs < 1:
+    sys.exit(f"--jobs must be at least 1, got {args.jobs}")
+SYN.NUM_PROCESSES = args.jobs
+# Synthesis results shared by several output directories (SYN.SYNTHESIS_STORE_DIR)
+if args.syn_cache_prune is not None and not args.syn_cache:
+    sys.exit("--syn_cache_prune needs --syn_cache DIR (the store to prune).")
+if args.syn_cache:
+    SYN.SYNTHESIS_STORE_DIR = os.path.abspath(args.syn_cache)
+    os.makedirs(SYN.SYNTHESIS_STORE_DIR, exist_ok=True)
+# Mux path-delay cache key override (None = automatic per SYN_TOOL)
+SYN.MUX_DELAY_KEY_BY_WIDTH = args.mux_delay_by_width
+# AUTO_FSM area-search escape hatch: real sky130 um2 is used automatically
+# whenever SYN.SYN_TOOL is DEVICE_MODELS; this forces the abstract per-bit
+# model instead, for A/B comparison.
+AUTO.FORCE_ABSTRACT_AREA = args.auto_fsm_abstract_area
+# What kind of build executes the design (pypeline.SET_AUTO_PIPELINE_BUILD_MODE):
+# AUTO_PIPELINE .latency semantics depend on it -- a fixed latency= gets
+# registers in every build, start_latency= only means something to a sweep.
+# Set only after the native-sim shortcut above, which runs with no build mode.
+pypeline.SET_AUTO_PIPELINE_BUILD_MODE(
+    "fixed_only" if (args.comb or args.no_synth or args.yosys_json) else "sweep"
+)
+# Latency memory (SWEEP.APPLY_LATENCY_MEMORY) on unless --no_latency_memory or
+# PIPELINEC_INTERNAL_NO_LATENCY_MEMORY=1 (the test suite's default)
+SWEEP.LATENCY_MEMORY_ENABLED = not args.no_latency_memory and (
+    os.environ.get("PIPELINEC_INTERNAL_NO_LATENCY_MEMORY", "") != "1"
+)
+
+# Every exit from here on -- done, TIMING NOT MET, or an error -- ends by
+# saying how long the build ran and where the time went
+atexit.register(lambda: print(SYN.ELAPSED_SUMMARY_STR(), flush=True))
+# Registered after the elapsed summary, so it prints just before it
+atexit.register(SYN.SYNTHESIS_REUSE_EXIT_REPORT, args.syn_cache_prune)
+
+print(
+    "================== Parsing C Code to Logical Hierarchy ================================",
+    flush=True,
+)
+latency_hints = SWEEP.INSTALL_LATENCY_HINTS(src_file, args.latency_hints)
+if src_file.endswith(".c"):
+    parser_state = C_TO_LOGIC.PARSE_FILE(src_file)
+elif src_file.endswith(".py"):
+    parser_state = PY_TO_LOGIC.PARSE_FILE_FOR_BUILD(src_file, SYN.SYN_OUTPUT_DIRECTORY)
+SYN.PARSE_DONE_TIME = timer()
+print(f"Parsing done, elapsed time {SYN.ELAPSED_STR()}", flush=True)
+
+parser_state = SYN.RESOLVE_BUILD_TARGET(
+    parser_state,
+    src_file,
+    args.part,
+    args.syn_tool,
+    check_bitstream_tools=not args.no_synth,
+)
+
+print(
+    "================== Writing Resulting Logic to File ================================",
+    flush=True,
+)
+print("Writing output files before adding pipelining...", flush=True)
+AUTO_PIPELINE.WRITE_0_ADDED_CLKS_INIT_FILES(parser_state)
+parser_state = SWEEP.APPLY_LATENCY_MEMORY(parser_state, src_file, latency_hints)
+
+# If no synth tools installed, switch over to --comb --no_synth mode for user with warning...
+SYN.PART_SET_TOOL(parser_state.part, allow_fail=True)
+if SYN.SYN_TOOL is None:
+    if not args.no_synth or not args.comb:
+        print(
+            "WARNING: No synthesis tool install detected based on PART. Skipping synthesis and auto-pipelining."
+        )
+    args.comb = True
+    args.no_synth = True
+    parser_state = AUTO_PIPELINE.SWITCH_TO_FIXED_ONLY_BUILD(parser_state, src_file)
+
+if args.comb or args.no_synth:
+    comb_timing_params = AUTO_PIPELINE.WRITE_COMB_FINAL_FILES(parser_state, args.comb)
+    # A build that synthesizes writes its diagram after the sweep instead
+    if args.no_synth:
+        DIAGRAM.WRITE_DIAGRAM(parser_state, comb_timing_params, src_file)
+    if args.comb:
+        SIM.DO_COMB_STAGE_SIM(parser_state, args, comb_timing_params, src_file)
+
+if not args.no_synth:
+    parser_state, multimain_timing_params = AUTO_PIPELINE.DO_PIPELINED_BUILD(
+        parser_state, args, src_file
+    )
+    SWEEP.WRITE_SWEEP_RESULTS(parser_state, multimain_timing_params, src_file)
+    # Before the timing check, so a build that misses timing has one too
+    DIAGRAM.WRITE_DIAGRAM(parser_state, multimain_timing_params, src_file)
+
+    # The build must FAIL if any timing goal was not met - results above are
+    # still written (useful for debugging) but simulation and bitstream
+    # generation are skipped and the exit code is non zero
+    if SWEEP.PRINT_TIMING_FAILURES(parser_state, multimain_timing_params):
+        sys.exit(1)
+    # What native simulation of another top, and the next build's up-to-date
+    # check, take from this build
+    SIM.WRITE_BUILT_HARDWARE(
+        parser_state, multimain_timing_params, src_file, build_inputs
+    )
+
+    if SYN.PIN_CONSTRAINTS_FILE:
+        SYN.GENERATE_FINAL_BITSTREAM(parser_state, multimain_timing_params)
+
+    # Start simulation on final VHDL
+    SIM.DO_OPTIONAL_SIM(
+        args.sim, parser_state, args, multimain_timing_params, source_file=src_file
+    )
+
+import AUTO_COMB_OPT
+
+# A --no_synth build with no fixed latencies never calls SYN.WRITE_FINAL_FILES,
+# which otherwise writes the generated sources
+AUTO_COMB_OPT.DUMP_GENERATED_SOURCE(parser_state, SYN.SYN_OUTPUT_DIRECTORY)
+SYN.WRITE_NAME_INDEX_LOG(parser_state)
+print("Done.", flush=True)

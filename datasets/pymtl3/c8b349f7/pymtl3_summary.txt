@@ -1,0 +1,4 @@
+PyMTL3 SCORE snapshot (pymtl/pymtl3)
+Commit: c8b349f7
+Dataset: /home/yongfu/proj/score/datasets/pymtl3/c8b349f7
+Snapshot files: 11

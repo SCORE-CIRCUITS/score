@@ -1,0 +1,5 @@
+nutshell SCORE snapshot (OSCPU/NutShell)
+Commit: aa012afa
+Dataset: /home/yongfu/proj/score/datasets/nutshell/aa012afa
+RTL Generation: OK (Mill 0.12 Chisel 7.11)
+Generated SystemVerilog files: 110

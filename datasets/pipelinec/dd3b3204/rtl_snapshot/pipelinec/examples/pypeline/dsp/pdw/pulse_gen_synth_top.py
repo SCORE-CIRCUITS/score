@@ -1,0 +1,58 @@
+# pyright: reportInvalidTypeForm=none
+"""Standalone synthesis check for pulse_gen (see pulse_gen.py).
+
+pulse_gen itself has no top-level ports -- it's a plain submodule meant to
+be called from inside a larger design. This file exists purely to prove it
+closes timing on its own, on real hardware ports, at the README's 125 MHz
+system clock. It is not used by the native-sim testbench (pulse_gen_tb.py).
+
+Synthesize (requires Vivado):
+    pypelinec examples/pypeline/dsp/pdw/pulse_gen_synth_top.py
+"""
+
+import pdw_paths  # noqa: F401  (puts include/pypeline on sys.path)
+
+from pypeline import (
+    MAIN,
+    PART,
+    Input,
+    int16_t,
+    int32_t,
+    make_reset,
+    uint1_t,
+    uint16_t,
+    uint32_t,
+)
+
+from pulse_gen import make_pulse_gen
+
+PART("xc7a200tffg1156-2")  # AIR7310: XC7A200T-2FFG1156C, 125 MHz
+
+pulse_gen = make_pulse_gen()
+out_stream_t = pulse_gen.return_t
+
+pri: Input[uint32_t]
+width: Input[uint32_t]
+amplitude: Input[int16_t]
+# Carrier, chirp and noise controls -- the NCO is by far the largest part of
+# the generator now (a 16-iteration rotation CORDIC), so this file is what
+# proves that addition closes timing.
+freq: Input[int32_t]
+chirp_rate: Input[int32_t]
+noise_amp: Input[uint16_t]
+# A real reset pin rather than none, so the reset's own fanout (under
+# reset_registers="all" it reaches every register in the block, including the
+# LFSRs and the phase accumulator) is part of what this check measures.
+rst: Input[uint1_t] = make_reset()
+
+
+@MAIN(125.0, reset=rst, reset_registers="all")
+def pulse_gen_top() -> out_stream_t:
+    return pulse_gen(
+        pri=pri,
+        width=width,
+        amplitude=amplitude,
+        freq=freq,
+        chirp_rate=chirp_rate,
+        noise_amp=noise_amp,
+    )

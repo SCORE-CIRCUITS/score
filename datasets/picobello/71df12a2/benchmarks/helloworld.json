@@ -1,0 +1,23 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "core": "picobello",
+  "architecture": "rv64gc_cva6_snitch",
+  "profile": "soc_verilator",
+  "benchmark": "helloworld",
+  "configuration": "cheshire_cva6_8snitch_8memtile_floonoc",
+  "environment": {
+    "hostname": "workstation",
+    "os": "Linux-6.6.137+rpt-rpi-2712-aarch64-with-glibc2.36",
+    "simulator": "verilator-5.022",
+    "toolchain": "riscv64-unknown-elf-gcc-14.2.0"
+  },
+  "metrics": {
+    "execution_cycles": 462988,
+    "total_simulation_cycles": 462988,
+    "wall_time_sec": 15096.77,
+    "simulation_speed_khz": 0.03,
+    "exit_code": 0
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-16T17:11:35Z"
+}
