@@ -29,6 +29,8 @@ SOC_PLATFORMS = {
     "pulp-cluster",
     "pulp_cluster",
     "chimera",
+    "magia",
+    "picobello",
 }
 
 

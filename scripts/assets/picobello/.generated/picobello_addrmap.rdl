@@ -1,0 +1,24 @@
+// Copyright 2026 ETH Zurich and University of Bologna.
+// Solderpad Hardware License, Version 0.51, see LICENSE for details.
+// SPDX-License-Identifier: SHL-0.51
+
+// AUTOMATICALLY GENERATED! DO NOT EDIT!
+
+`include "cheshire_external.rdl"
+`include "cheshire_tile.rdl"
+`include "fhg_spu_tile.rdl"
+`include "snitch_cluster.rdl"
+
+
+addrmap picobello_addrmap {
+
+  cheshire_tile cheshire_internal @0x0;
+  snitch_cluster cluster[16] @0x20000000 += 0x40000;
+  fhg_spu_tile fhg_spu @0x40000000;
+  external mem { mementries = 0x10000; memwidth = 32; } top_spm_narrow @0x60000000;
+  external mem { mementries = 0x10000; memwidth = 32; } top_spm_wide @0x60040000;
+  external mem { mementries = 0x40000; memwidth = 32; } l2_spm[8] @0x70000000 += 0x100000;
+  cheshire_external cheshire_external @0x80000000;
+
+
+};

@@ -350,6 +350,31 @@
           "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testPeripheralsGating"
         }
       }
+    },
+    {
+      "score_tool": "magia",
+      "profile": "soc_verilator",
+      "architecture": "rv32imf",
+      "config": "cv32e40p_redmule_spm_floonoc",
+      "description": "MAGIA GenAI accelerator tile featuring CV32E40P host core, RedMulE low-precision matrix-multiplication unit, 128KB SPM, and FlooNoC mesh router",
+      "workloads": {
+        "hello_world": {
+          "status": "verified",
+          "execution_cycles": 2572,
+          "total_simulation_cycles": 2572,
+          "retired_instructions": 491,
+          "cpi": 5.24,
+          "runner": "scripts/benchmarks/run_magia_benchmarks.sh hello_world"
+        },
+        "l1_test": {
+          "status": "verified",
+          "execution_cycles": 503412,
+          "total_simulation_cycles": 503412,
+          "retired_instructions": 303087,
+          "cpi": 1.66,
+          "runner": "scripts/benchmarks/run_magia_benchmarks.sh l1_test"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": [
@@ -381,13 +406,6 @@
       "score_tool": "astral",
       "architecture": "rv64gc_carfield_derivative",
       "description": "Astral Carfield derivative automotive SoC platform",
-      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
-      "status": "commercial_eda_required"
-    },
-    {
-      "score_tool": "magia",
-      "architecture": "rv32imc_redmule",
-      "description": "MAGIA heterogeneous SoC with RedMulE accelerator and UVM testbench environment",
       "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
       "status": "commercial_eda_required"
     }

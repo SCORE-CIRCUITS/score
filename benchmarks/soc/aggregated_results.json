@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-16T03:05:15+00:00",
-  "count": 55,
+  "generated_utc": "2026-11-16T14:56:06+00:00",
+  "count": 57,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -870,6 +870,54 @@
         "riscv_gcc": "13.2.0"
       },
       "_path": "datasets/iob-soc/f9cb9558/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "magia",
+      "architecture": "rv32imf",
+      "profile": "soc_verilator",
+      "benchmark": "hello_world",
+      "configuration": "cv32e40p_redmule_spm_floonoc",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibcglibc 2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 2572,
+        "total_simulation_cycles": 2572,
+        "wall_time_sec": 0.6582,
+        "retired_instructions": 491,
+        "cpi": 5.24
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T06:20:03Z",
+      "_path": "datasets/magia/4a45e25a/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "magia",
+      "architecture": "rv32imf",
+      "profile": "soc_verilator",
+      "benchmark": "l1_test",
+      "configuration": "cv32e40p_redmule_spm_floonoc",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibcglibc 2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 503412,
+        "total_simulation_cycles": 503412,
+        "wall_time_sec": 107.4685,
+        "retired_instructions": 303087,
+        "cpi": 1.66
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T06:21:51Z",
+      "_path": "datasets/magia/4a45e25a/benchmarks/l1_test.json"
     },
     {
       "schema": "score.benchmark_results.v1",
