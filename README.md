@@ -59,11 +59,11 @@ Not every architecture has benchmark runners implemented yet — those are marke
 
 ## Website
 
-The living open-architecture platform (catalog, project pages, registry updates) is a static site under [`site/`](site/), deployed to GitHub Pages:
+The living open-architecture platform (catalog, microarchitectural dossiers, and interactive benchmark leaderboards) is hosted at:
 
-**https://SCORE-CIRCUITS.github.io/score/**
+👉 **[https://score-circuits.github.io](https://score-circuits.github.io)**
 
-Survey manuscript and evidence corpus live in the private [`score_publications`](https://github.com/SCORE-CIRCUITS/score_publications) repo, linked as the [`publications/`](publications/) git submodule — see [`publications/README.md`](publications/README.md). The site builds from `publications/papers/projects.csv`, `publications/papers/architecture_index.csv`, digests, source notes, and `publications/papers/CHANGELOG.md`. Local build and Pages setup notes are in [`site/README.md`](site/README.md).
+Survey manuscript and evidence corpus live in the private [`score_publications`](https://github.com/SCORE-CIRCUITS/score_publications) repo, linked as the [`publications/`](publications/) git submodule — see [`publications/README.md`](publications/README.md).
 
 ## Architectures supported via `scripts/`
 
@@ -154,7 +154,6 @@ score/
 ├── tools/          # Upstream generator clones (git submodules) and local tool trees
 ├── scripts/        # install_*, generate_*, run_*, env helpers, submodule utilities
 ├── publications/   # Private survey submodule (score_publications): writings/ + papers/
-├── site/           # GitHub Pages platform (Astro) for the open-architecture catalog
 ├── docs/           # Additional documentation
 ├── installations/  # Install logs / records where used
 └── plots/          # Analysis outputs (when produced)

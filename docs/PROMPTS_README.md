@@ -1,6 +1,6 @@
 # PROMPTS_README.md — Generate comprehensive `docs/README_<project>.md` from tools + datasets
 
-This file is a **prompt library** for an LLM (or human operator) to produce documentation in the same **shape and depth** as the existing SCORE guides under `docs/README_*.md` (for example `docs/README_ROCEKT_CHIP.md`, `docs/README_IBEX.md`, `docs/README_CHIPYARD.md`). The documentation must be **grounded in the repository**: upstream source under `tools/<project>/`, generated artifacts under `datasets/<project>/<commit>/`, and SCORE automation under `scripts/`.
+This file is a **prompt library** for an LLM (or human operator) to produce documentation in the same **shape and depth** as the existing SCORE guides under `docs/README_*.md` (for example `docs/README_ROCKET_CHIP.md`, `docs/README_IBEX.md`, `docs/README_CHIPYARD.md`). The documentation must be **grounded in the repository**: upstream source under `tools/<project>/`, generated artifacts under `datasets/<project>/<commit>/`, and SCORE automation under `scripts/`.
 
 Use these prompts **after** a dataset exists (run `scripts/generate_<name>.sh` or equivalent) so manifests, summaries, and verification logs are available.
 
@@ -26,7 +26,7 @@ Use these prompts **after** a dataset exists (run `scripts/generate_<name>.sh` o
 
 **Goals**
 
-- Produce a **single** `docs/README_<PROJECT>.md` that matches the **RTL Organization** conventions in `docs/README_IBEX.md`, `docs/README_ROCEKT_CHIP.md`, and siblings: H1 + optional **badges** (when grounded), lead paragraph, **Table of Contents** (all major H2s), Overview subsections (Key Features / Scripts Overview / Architecture Overview), **SoC architecture** (block-level, evidence-based), **Licensing** (upstream + notable submodules), nested Installation and Generation sections (Basic Usage, tables, process lists), design matrix, dataset layout, usage, performance, troubleshooting (see [README style reference](#readme-style-reference-match-existing-score-readme-guides) below).
+- Produce a **single** `docs/README_<PROJECT>.md` that matches the **RTL Organization** conventions in `docs/README_IBEX.md`, `docs/README_ROCKET_CHIP.md`, and siblings: H1 + optional **badges** (when grounded), lead paragraph, **Table of Contents** (all major H2s), Overview subsections (Key Features / Scripts Overview / Architecture Overview), **SoC architecture** (block-level, evidence-based), **Licensing** (upstream + notable submodules), nested Installation and Generation sections (Basic Usage, tables, process lists), design matrix, dataset layout, usage, performance, troubleshooting (see [README style reference](#readme-style-reference-match-existing-score-readme-guides) below).
 - Tie every major claim to **evidence** in `tools/`, `scripts/`, or `datasets/` (file paths, flags from `--help`, counts from `manifest.json` / `*_summary.txt`, verification summaries).
 - Explain **what the benchmark artifact is** (per-commit dataset tree, logs, verification) and **how it differs** from “using upstream the normal way.”
 
@@ -41,7 +41,7 @@ Use these prompts **after** a dataset exists (run `scripts/generate_<name>.sh` o
 
 ## README style reference (match existing SCORE README guides)
 
-Use the **RTL Organization** pattern from `docs/README_IBEX.md`, `docs/README_ROCEKT_CHIP.md`, `docs/README_GEMMINI.md`, and `docs/README_HERO.md` as the default shape. Longer guides (for example `docs/README_CHIPYARD.md`) add extra top-level sections such as prerequisites or conda vs venv—only include those when the attached install script and upstream flow actually match that style.
+Use the **RTL Organization** pattern from `docs/README_IBEX.md`, `docs/README_ROCKET_CHIP.md`, `docs/README_GEMMINI.md`, and `docs/README_HERO.md` as the default shape. Longer guides (for example `docs/README_CHIPYARD.md`) add extra top-level sections such as prerequisites or conda vs venv—only include those when the attached install script and upstream flow actually match that style.
 
 ### Document framing
 
@@ -89,7 +89,7 @@ Include when inputs show a **system** view (SoC, multi-tile, test harness, perip
 
 ### Installation Script (`## Installation Script`)
 
-Mirror `README_IBEX.md` / `README_ROCEKT_CHIP.md`:
+Mirror `README_IBEX.md` / `README_ROCKET_CHIP.md`:
 
 - **`### Overview`:** One short paragraph tied to what `install_<name>.sh` actually installs.
 - **`### Basic Usage`:** Fenced `bash` block; every command prefixed with `./scripts/...` from repo root; use **comment lines** (`# ...`) above groups of commands (first-time, check-only, debug, etc.).
@@ -103,7 +103,7 @@ Mirror `README_IBEX.md` / `README_ROCEKT_CHIP.md`:
 
 - **`### Overview`:** Scope of generation, outputs, and verification at a high level (from script comments/`--help`).
 - **`### Basic Usage`:** Same bash + `#` comment pattern as install.
-- **Options tables:** If the script groups flags (as in `README_ROCEKT_CHIP.md`), use separate tables:
+- **Options tables:** If the script groups flags (as in `README_ROCKET_CHIP.md`), use separate tables:
   - **Configuration options** (what to generate),
   - **Generation options** (formats, verification, testbenches),
   - **Execution options** (jobs, dry-run, verbose, setup).
@@ -134,7 +134,7 @@ Mirror `README_IBEX.md` / `README_ROCEKT_CHIP.md`:
 
 - Fence code as `bash` for shell; keep **relative paths** from repo root.
 - Use consistent table header separators (`|--------|`).
-- **Naming:** The checked-in Rocket Chip guide filename is `docs/README_ROCEKT_CHIP.md` (historical spelling); new files use `docs/README_<PROJECT>.md` with a sensible `<PROJECT>` slug matching `tools/` and `scripts/`.
+- **Naming:** The checked-in Rocket Chip guide filename is `docs/README_ROCKET_CHIP.md` (historical spelling); new files use `docs/README_<PROJECT>.md` with a sensible `<PROJECT>` slug matching `tools/` and `scripts/`.
 
 ---
 
@@ -187,7 +187,7 @@ Paste this once as the **system** or leading **user** message, then follow with 
 ```text
 You are a technical writer and hardware-tooling engineer documenting the SCORE repository.
 
-Task: Write or refresh docs/README_<PROJECT>.md following the RTL Organization style used in docs/README_IBEX.md, docs/README_ROCEKT_CHIP.md, docs/README_GEMMINI.md, and docs/README_HERO.md (see PROMPTS_README.md “README style reference” in this repo for the full checklist).
+Task: Write or refresh docs/README_<PROJECT>.md following the RTL Organization style used in docs/README_IBEX.md, docs/README_ROCKET_CHIP.md, docs/README_GEMMINI.md, and docs/README_HERO.md (see PROMPTS_README.md “README style reference” in this repo for the full checklist).
 
 Required shape:
 - H1: “<Project> RTL Organization Documentation”; optional **badge row** (after H1) per PROMPTS_README “Badges” rules; then a lead paragraph (“This document provides comprehensive information about…”).
@@ -319,7 +319,7 @@ Requirements:
 ### Installation script documentation
 
 ```text
-Document scripts/install_<PROJECT>.sh in the same structure as docs/README_IBEX.md / docs/README_ROCEKT_CHIP.md.
+Document scripts/install_<PROJECT>.sh in the same structure as docs/README_IBEX.md / docs/README_ROCKET_CHIP.md.
 
 Attach: --help output or option-parsing section of the script.
 
@@ -328,7 +328,7 @@ Deliver:
 - ### Basic Usage: fenced bash, ./scripts/install_<PROJECT>.sh paths, # comment lines grouping scenarios (first-time, --check-only, --debug, --force, etc.)
 - ### Command-Line Options: table | Option | Description | (add Default column only if explicit in script/help)
 - ### Dependencies Installed: | Component | Version | Purpose | — versions ONLY from manifest, script, or upstream pins
-- ### Supported Operating Systems: only if the script has OS/package-manager branches; mirror README_ROCEKT_CHIP style (bullet per family + package manager name)
+- ### Supported Operating Systems: only if the script has OS/package-manager branches; mirror README_ROCKET_CHIP style (bullet per family + package manager name)
 - ### Installation Process: numbered steps in script order (deps → Java/toolchain → submodules → env script creation, etc.)
 - ### Usage Examples (optional): e.g. source scripts/<PROJECT>_env.sh when that file exists and install docs reference it
 
@@ -344,7 +344,7 @@ Attach: --help output and any arrays/lists of configurations inside the script.
 
 Deliver:
 - ### Overview, ### Basic Usage (bash + # comments), then option tables:
-  - If flags group naturally (see docs/README_ROCEKT_CHIP.md): ### Configuration Options, ### Generation Options, ### Execution Options with | Option | Description | Default | when defaults are stated
+  - If flags group naturally (see docs/README_ROCKET_CHIP.md): ### Configuration Options, ### Generation Options, ### Execution Options with | Option | Description | Default | when defaults are stated
   - Else: single ### Command-Line Options table like docs/README_GEMMINI.md
 - ### Generation Process: numbered list aligned with the script’s functions/main flow
 - Call out verification modes and what they guarantee (lint vs smoke vs none), quoting script comments / --help
@@ -354,7 +354,7 @@ Deliver:
 ### Available designs / configuration matrix
 
 ```text
-Build the "## Available Designs" section in README_ROCEKT_CHIP / README_IBEX style.
+Build the "## Available Designs" section in README_ROCKET_CHIP / README_IBEX style.
 
 Rules:
 - Opening sentence: state total design count and number of categories only if *summary*.txt or an enumerated listing supports it; otherwise say "The following designs appear under rtl_designs/ …" without a false total.
