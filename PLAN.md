@@ -48,25 +48,28 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 
 | Phase | Platform | Architecture Class | Complexity | Target Workloads | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Phase 1** | **Safety Island** | Dual-core lockstep **Ibex** subsystem | Low | CoreMark, UART, Freerunning Timer | 🚀 **Ready to Implement** |
-| **Phase 2** | **PULP Cluster** | Multi-core **CV32E40P** compute cluster + TCDM | Medium | Matrix Multiply, Parallel Reduction, FIR | 📋 Planned |
+| **Phase 1** | **Safety Island** | Triple-Core Lockstep (TCLS) **CV32E40P** subsystem | Low | Hello World, CoreMark | ✅ **Completed** (CoreMark: 849k cyc, CPI 1.44) |
+| **Phase 2** | **PULP Cluster** | Multi-core **CV32E40P** compute cluster + TCDM | Medium | Matrix Multiply, Parallel Reduction, FIR | 🚀 **In Progress** |
 | **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | DMA transfers, compute tiles, Hello World | 📋 Planned |
 | **Phase 4** | **MAGIA & Picobello** | GenAI **RedMulE** FP16 tiles + **FlooNoC** 2D mesh | High | GeMM matrix multiply, NoC ping-pong | 📋 Planned |
 | **Phase 5** | **Carfield & Astral** | Heterogeneous Automotive Full-SoC Integration | Very High | Full-chip heterogeneous boot & cluster handoff | 📋 Planned |
 
 ---
 
-## Phase 1: Safety Island (`tools/safety-island`)
+## Phase 1: Safety Island (`tools/safety-island`) — ✅ COMPLETED
 
 ### 1.1 Architecture & Scope
 - **Upstream Location**: `tools/safety-island/` (Commit `584eb697`)
-- **Core Architecture**: Dual-core lockstep **Ibex** (`rv32imc` / `rv32emc`) with CLIC interrupt controller, ECC-protected SRAM, and AXI4/AXI-Lite interconnect.
-- **Why it was blocked on commercial EDA**: Upstream `sim/Makefile` and `safed_sim.mk` invoke `vsim -c -do 'source compile.tcl'`. The testbench `rtl/tb/vip_safety_island_soc.sv` relies on SystemVerilog dynamic classes (`axi_ext_driver_t`), mailboxes, and delayed tasks.
-- **Software Workloads Available**:
-  - `sw/tests/runtime_coremark/` (CoreMark port)
-  - `sw/tests/runtime_uart/` (UART text streaming)
-  - `sw/tests/runtime_timer_freerunning/` (Timer cycle validation)
-  - `sw/tests/runtime_fpu/` (FP32 operations if configured)
+- **Core Architecture**: Triple-Core Lockstep (TCLS) **CV32E40P** (`rv32imc`) with CLIC interrupt controller, ECC-protected 128KB SRAM, and AXI4 crossbar.
+- **Why it was blocked on commercial EDA**: Upstream `sim/Makefile` and `safed_sim.mk` invoked `vsim -c -do 'source compile.tcl'` with UVM/SVA dependencies.
+- **Delivered Solution**:
+  - Testbench: `scripts/assets/safety_island/tb_safety_island_verilator.sv` (pure synthesizable SV harness with AXI slave preloader and TBPrintf handler).
+  - Software Suite: `scripts/assets/safety_island/sw/` (`hello.c`, `coremark` 2 iterations).
+  - Runner: `scripts/benchmarks/run_safety_island_benchmarks.sh`.
+  - Verified Benchmark Results:
+    - `hello`: 1,187 cycles (`status: passed`).
+    - `coremark`: 849,455 execution cycles, 589,747 retired instructions, CPI = 1.44, exit code 0 (`status: passed`).
+  - Suite Registration: Registered in `benchmarks/soc/suite.json` and aggregated in `benchmarks/soc/aggregated_results.json`.
 
 ### 1.2 Implementation Steps
 1. **Create Synthesizable Verilator Wrapper**:

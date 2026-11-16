@@ -260,6 +260,28 @@
           "runner": "scripts/benchmarks/run_araxl_benchmarks.sh fdotproduct"
         }
       }
+    },
+    {
+      "score_tool": "safety_island",
+      "profile": "soc_verilator",
+      "architecture": "rv32imc",
+      "config": "cv32e40p_tcls",
+      "description": "ETH Zurich / PULP Safety Island triple-core lockstep (TCLS) CV32E40P safety platform with CLIC interrupt controller, ECC-protected SRAM, and AXI4/AXI-Lite interconnect",
+      "workloads": {
+        "hello": {
+          "status": "verified",
+          "execution_cycles": 1187,
+          "total_simulation_cycles": 1187,
+          "runner": "scripts/benchmarks/run_safety_island_benchmarks.sh hello"
+        },
+        "coremark": {
+          "status": "verified",
+          "execution_cycles": 849455,
+          "total_simulation_cycles": 895756,
+          "retired_instructions": 589747,
+          "runner": "scripts/benchmarks/run_safety_island_benchmarks.sh coremark"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": [
@@ -313,13 +335,6 @@
       "score_tool": "magia",
       "architecture": "rv32imc_redmule",
       "description": "MAGIA heterogeneous SoC with RedMulE accelerator and UVM testbench environment",
-      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
-      "status": "commercial_eda_required"
-    },
-    {
-      "score_tool": "safety_island",
-      "architecture": "rv32imc_lockstep",
-      "description": "Safety Island dual-core lockstep CV32E40P safety platform with CLIC and ECC",
       "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
       "status": "commercial_eda_required"
     }

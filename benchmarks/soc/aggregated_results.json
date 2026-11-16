@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-15T23:04:02+00:00",
-  "count": 46,
+  "generated_utc": "2026-11-16T00:06:21+00:00",
+  "count": 48,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -1530,6 +1530,52 @@
         "gcc": "10.2.0"
       },
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/keccak.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "safety_island",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "coremark",
+      "configuration": "cv32e40p_tcls",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 849455,
+        "total_simulation_cycles": 895756,
+        "wall_time_sec": 68.338,
+        "retired_instructions": 589747,
+        "iterations_per_sec": 0.0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T00:06:04+00:00",
+      "_path": "datasets/safety_island/584eb697/benchmarks/coremark.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "safety_island",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "hello",
+      "configuration": "cv32e40p_tcls",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 1187,
+        "total_simulation_cycles": 1187,
+        "wall_time_sec": 0.1544
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T00:04:56+00:00",
+      "_path": "datasets/safety_island/584eb697/benchmarks/hello.json"
     },
     {
       "schema": "score.benchmark_results.v1",

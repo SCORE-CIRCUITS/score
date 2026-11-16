@@ -8,6 +8,8 @@ logs/
 *.log
 *.tmp
 *.cache
+scripts/assets/**/*.elf
+scripts/assets/**/*.dump
 
 # OS generated files
 .DS_Store

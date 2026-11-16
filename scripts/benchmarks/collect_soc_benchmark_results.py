@@ -24,6 +24,10 @@ SOC_PLATFORMS = {
     "iob_soc",
     "carfield",
     "occamy",
+    "safety-island",
+    "safety_island",
+    "pulp-cluster",
+    "chimera",
 }
 
 
