@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-16T01:05:16+00:00",
-  "count": 51,
+  "generated_utc": "2026-11-16T03:05:15+00:00",
+  "count": 55,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -451,6 +451,102 @@
         "gcc": "11.5.0"
       },
       "_path": "datasets/cheshire/a31da013/benchmarks/spm_uncached.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "chimera",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "testCfgBootAddr",
+      "configuration": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 6668,
+        "total_simulation_cycles": 6668,
+        "wall_time_sec": 8.3117,
+        "retired_instructions": 365,
+        "cpi": 18.27
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T02:58:50+00:00",
+      "_path": "datasets/chimera/208b36ef/benchmarks/testCfgBootAddr.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "chimera",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "testCluster",
+      "configuration": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 2726,
+        "total_simulation_cycles": 2726,
+        "wall_time_sec": 3.0844,
+        "retired_instructions": 122,
+        "cpi": 22.34
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T02:59:07+00:00",
+      "_path": "datasets/chimera/208b36ef/benchmarks/testCluster.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "chimera",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "testPeripheralsGating",
+      "configuration": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 1992,
+        "total_simulation_cycles": 1992,
+        "wall_time_sec": 2.1236,
+        "retired_instructions": 56,
+        "cpi": 35.57
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T02:58:57+00:00",
+      "_path": "datasets/chimera/208b36ef/benchmarks/testPeripheralsGating.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "chimera",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "testReturnZero",
+      "configuration": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 1315,
+        "total_simulation_cycles": 1315,
+        "wall_time_sec": 1.1733,
+        "retired_instructions": 45,
+        "cpi": 29.22
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T02:57:46+00:00",
+      "_path": "datasets/chimera/208b36ef/benchmarks/testReturnZero.json"
     },
     {
       "schema": "score.benchmark_results.v1",

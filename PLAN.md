@@ -50,8 +50,8 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Phase 1** | **Safety Island** | Triple-Core Lockstep (TCLS) **CV32E40P** subsystem | Low | Hello World, CoreMark | ✅ **Completed** (CoreMark: 849k cyc, CPI 1.44) |
 | **Phase 2** | **PULP Cluster** | Multi-core **CV32E40P** compute cluster + TCDM | Medium | Parallel MatMul, Parallel FIR, Hello | ✅ **Completed** (MatMul: 412k cyc, FIR: 440k cyc) |
-| **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | DMA transfers, compute tiles, Hello World | 🚀 **In Progress** |
-| **Phase 4** | **MAGIA & Picobello** | GenAI **RedMulE** FP16 tiles + **FlooNoC** 2D mesh | High | GeMM matrix multiply, NoC ping-pong | 📋 Planned |
+| **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | ReturnZero, Cluster, CfgBootAddr, Peripherals | ✅ **Completed** (Cluster: 2.7k cyc, CfgBoot: 6.6k cyc) |
+| **Phase 4** | **MAGIA & Picobello** | GenAI **RedMulE** FP16 tiles + **FlooNoC** 2D mesh | High | GeMM matrix multiply, NoC ping-pong | 🚀 **In Progress** |
 | **Phase 5** | **Carfield & Astral** | Heterogeneous Automotive Full-SoC Integration | Very High | Full-chip heterogeneous boot & cluster handoff | 📋 Planned |
 
 ---
@@ -96,22 +96,24 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 
 ---
 
-## Phase 3: Chimera (`tools/chimera`)
+## Phase 3: Chimera (`tools/chimera`) — ✅ COMPLETED
 
 ### 3.1 Architecture & Scope
 - **Upstream Location**: `tools/chimera/` (Commit `208b36ef`)
-- **Core Architecture**: Heterogeneous microcontroller SoC integrating compute clusters and dedicated hardware accelerators (HWPE / iDMA).
-- **Blocking Items**: `target/sim/sim.mk` only defines `VSIM_DIR ?= $(CHIM_ROOT)/target/sim/vsim` and `vsim compile.tcl`.
-
-### 3.2 Implementation Steps
-1. **Bender Verilator Filelist**:
-   - Run `bender script flist-plus -t verilator` to extract synthesizable RTL sources.
-2. **Verilator Testbench Wrapper**:
-   - Construct `tb_chimera_verilator.sv` with AXI memory responder.
-   - Provide C++ driver with DPI ELF loading and UART trap capture.
-3. **Benchmark Execution**:
-   - Run `helloworld` and `idma_transfer` tests from `sw/`.
-   - Emit benchmark JSON results.
+- **Core Architecture**: Heterogeneous Multi-Cluster SoC integrating a 64-bit/32-bit **CVA6** host core, 5x **Snitch** compute clusters (45 compute harts), Memory Island (32KB interleaved wide SRAM), OpenTitan peripherals, and Cheshire interconnect.
+- **Previous Blocker**: `target/sim/sim.mk` only supported Siemens QuestaSim VIP collars (`vsim compile.tcl`), requiring proprietary licenses.
+- **Completed Delivery**:
+  - Standalone Verilator testbench: `scripts/assets/chimera/tb_chimera_verilator.sv`.
+  - Cheshire package override: `scripts/assets/chimera/cheshire_pkg.sv` (configured with `PlatformRom: 0x4800_0000`, `Bootrom: 0`, and CVA6 PMA ExecuteRegion at `0x4800_0000`).
+  - Synthesizable buffer override: `scripts/assets/chimera/configurable_delay.sv`.
+  - Verilator synthesis filelist: `scripts/assets/chimera/chimera.f`.
+  - Automated baremetal runner: `scripts/benchmarks/run_chimera_benchmarks.sh`.
+  - Verified Benchmark Results:
+    - `testReturnZero`: 1,315 cycles, 45 retired instructions, CPI = 29.22 (`status: passed`).
+    - `testCluster` (inter-cluster TCDM memory access across 5 clusters): 2,726 cycles, 122 retired instructions, CPI = 22.34 (`status: passed`).
+    - `testPeripheralsGating` (Cheshire peripheral clock gating register verification): 1,992 cycles, 56 retired instructions, CPI = 35.57 (`status: passed`).
+    - `testCfgBootAddr` (configurable boot address register access & restoration): 6,668 cycles, 365 retired instructions, CPI = 18.27 (`status: passed`).
+  - Suite Registration: Promoted out of `commercial_eda_platforms` into `platforms` in `benchmarks/soc/suite.json` and aggregated in `benchmarks/soc/aggregated_results.json`.
 
 ---
 
@@ -180,8 +182,8 @@ Every converted platform must satisfy the strict SCORE benchmarking standards:
 
 ## Execution Tracker
 
-- [ ] **Phase 1: Safety Island Verilator Harness & CoreMark / UART Benchmarks**
-- [ ] **Phase 2: PULP Cluster Verilator Harness & Multi-Core Parallel Kernels**
-- [ ] **Phase 3: Chimera SoC Verilator Harness & DMA / Compute Benchmarks**
+- [x] **Phase 1: Safety Island Verilator Harness & CoreMark / UART Benchmarks**
+- [x] **Phase 2: PULP Cluster Verilator Harness & Multi-Core Parallel Kernels**
+- [x] **Phase 3: Chimera SoC Verilator Harness & Heterogeneous Multi-Cluster Benchmarks**
 - [ ] **Phase 4: MAGIA / Picobello Tile Verilator Harness & RedMulE GeMM**
 - [ ] **Phase 5: Carfield & Astral Full-SoC Verilator Boot & Multi-Domain Benchmarks**

@@ -312,6 +312,44 @@
           "runner": "scripts/benchmarks/run_pulp_cluster_benchmarks.sh parallel_fir"
         }
       }
+    },
+    {
+      "core": "chimera",
+      "commit": "208b36ef",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "config": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+      "description": "Chimera heterogeneous multi-cluster SoC (Cheshire CVA6 host + 5x Snitch compute clusters + Memory Island)",
+      "workloads": {
+        "testReturnZero": {
+          "status": "verified",
+          "execution_cycles": 1315,
+          "total_simulation_cycles": 1315,
+          "retired_instructions": 45,
+          "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testReturnZero"
+        },
+        "testCluster": {
+          "status": "verified",
+          "execution_cycles": 2726,
+          "total_simulation_cycles": 2726,
+          "retired_instructions": 122,
+          "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testCluster"
+        },
+        "testCfgBootAddr": {
+          "status": "verified",
+          "execution_cycles": 6668,
+          "total_simulation_cycles": 6668,
+          "retired_instructions": 365,
+          "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testCfgBootAddr"
+        },
+        "testPeripheralsGating": {
+          "status": "verified",
+          "execution_cycles": 1992,
+          "total_simulation_cycles": 1992,
+          "retired_instructions": 56,
+          "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testPeripheralsGating"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": [
@@ -343,13 +381,6 @@
       "score_tool": "astral",
       "architecture": "rv64gc_carfield_derivative",
       "description": "Astral Carfield derivative automotive SoC platform",
-      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
-      "status": "commercial_eda_required"
-    },
-    {
-      "score_tool": "chimera",
-      "architecture": "rv32imafd_snitch_derivative",
-      "description": "Chimera multi-core compute platform derived from Snitch cluster",
       "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
       "status": "commercial_eda_required"
     },

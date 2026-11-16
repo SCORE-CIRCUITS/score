@@ -1,0 +1,23 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "core": "chimera",
+  "architecture": "rv32imc",
+  "profile": "soc_verilator",
+  "benchmark": "testCfgBootAddr",
+  "configuration": "cheshire_cva6_5x_snitch_cluster_memisl32k",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "simulator": "verilator-5.022",
+    "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+  },
+  "metrics": {
+    "execution_cycles": 6668,
+    "total_simulation_cycles": 6668,
+    "wall_time_sec": 8.3117,
+    "retired_instructions": 365,
+    "cpi": 18.27
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-16T02:58:50+00:00"
+}
