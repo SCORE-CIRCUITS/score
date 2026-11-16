@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-16T00:06:21+00:00",
-  "count": 48,
+  "generated_utc": "2026-11-16T01:05:16+00:00",
+  "count": 51,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -1180,6 +1180,78 @@
         "riscv_gcc": "13.2.0"
       },
       "_path": "datasets/openpiton/4e8ab3db/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "pulp_cluster",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "hello",
+      "configuration": "8core_cv32e40p_tcdm128k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 43757,
+        "total_simulation_cycles": 43757,
+        "wall_time_sec": 16.9882,
+        "retired_instructions": 7852,
+        "cpi": 5.57
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T00:59:41+00:00",
+      "_path": "datasets/pulp_cluster/caaa9735/benchmarks/hello.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "pulp_cluster",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "parallel_fir",
+      "configuration": "8core_cv32e40p_tcdm128k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 440916,
+        "total_simulation_cycles": 440916,
+        "wall_time_sec": 161.4845,
+        "retired_instructions": 65898,
+        "cpi": 6.69
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T01:05:01+00:00",
+      "_path": "datasets/pulp_cluster/caaa9735/benchmarks/parallel_fir.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "pulp_cluster",
+      "architecture": "rv32imc",
+      "profile": "soc_verilator",
+      "benchmark": "parallel_matmul",
+      "configuration": "8core_cv32e40p_tcdm128k",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/ibex-host-tools/riscv/bin/riscv32-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 412093,
+        "total_simulation_cycles": 412093,
+        "wall_time_sec": 157.9773,
+        "retired_instructions": 74751,
+        "cpi": 5.51
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T01:02:19+00:00",
+      "_path": "datasets/pulp_cluster/caaa9735/benchmarks/parallel_matmul.json"
     },
     {
       "schema": "score.benchmark_results.v1",

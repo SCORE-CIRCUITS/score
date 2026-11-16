@@ -27,6 +27,7 @@ SOC_PLATFORMS = {
     "safety-island",
     "safety_island",
     "pulp-cluster",
+    "pulp_cluster",
     "chimera",
 }
 

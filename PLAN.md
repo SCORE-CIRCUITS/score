@@ -49,8 +49,8 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 | Phase | Platform | Architecture Class | Complexity | Target Workloads | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Phase 1** | **Safety Island** | Triple-Core Lockstep (TCLS) **CV32E40P** subsystem | Low | Hello World, CoreMark | ✅ **Completed** (CoreMark: 849k cyc, CPI 1.44) |
-| **Phase 2** | **PULP Cluster** | Multi-core **CV32E40P** compute cluster + TCDM | Medium | Matrix Multiply, Parallel Reduction, FIR | 🚀 **In Progress** |
-| **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | DMA transfers, compute tiles, Hello World | 📋 Planned |
+| **Phase 2** | **PULP Cluster** | Multi-core **CV32E40P** compute cluster + TCDM | Medium | Parallel MatMul, Parallel FIR, Hello | ✅ **Completed** (MatMul: 412k cyc, FIR: 440k cyc) |
+| **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | DMA transfers, compute tiles, Hello World | 🚀 **In Progress** |
 | **Phase 4** | **MAGIA & Picobello** | GenAI **RedMulE** FP16 tiles + **FlooNoC** 2D mesh | High | GeMM matrix multiply, NoC ping-pong | 📋 Planned |
 | **Phase 5** | **Carfield & Astral** | Heterogeneous Automotive Full-SoC Integration | Very High | Full-chip heterogeneous boot & cluster handoff | 📋 Planned |
 
@@ -71,44 +71,28 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
     - `coremark`: 849,455 execution cycles, 589,747 retired instructions, CPI = 1.44, exit code 0 (`status: passed`).
   - Suite Registration: Registered in `benchmarks/soc/suite.json` and aggregated in `benchmarks/soc/aggregated_results.json`.
 
-### 1.2 Implementation Steps
-1. **Create Synthesizable Verilator Wrapper**:
-   - Location: `tools/safety-island/rtl/tb/tb_safety_island_verilator.sv` (or in `scripts/assets/safety_island/`).
-   - Instantiates `safety_island_synth_wrapper`.
-   - Attaches AXI slave memory responder for memory space `[0x0000_0000 : 0x0080_0000]`.
-   - Exposes top-level clock, reset, boot address, and fetch enable.
-2. **Implement C++ Harness**:
-   - Location: `scripts/assets/safety_island/tb_safety_island.cpp`.
-   - Implements clock generation, reset sequence, ELF parsing using `libelf` or hex memory reader.
-   - Monitors `FetchEnAddr` and `CoreStatusAddr` (`0x0020_0000 + offset`) for completion.
-3. **Build Script & Automation**:
-   - Build command using `verilator --cc --exe --timing -Wno-fatal`.
-   - Create runner `scripts/benchmarks/run_safety_island_benchmarks.sh`.
-4. **Validation & Benchmark Output**:
-   - Run `runtime_coremark` on the dual-core lockstep Ibex.
-   - Emit `datasets/safety_island/584eb697/benchmarks/coremark_default.json`.
-   - Update `benchmarks/soc/suite.json` and `benchmarks/soc/aggregated_results.json`.
-
 ---
 
-## Phase 2: PULP Cluster (`tools/pulp-cluster`)
+## Phase 2: PULP Cluster (`tools/pulp-cluster`) — ✅ COMPLETED
 
 ### 2.1 Architecture & Scope
 - **Upstream Location**: `tools/pulp-cluster/` (Commit `caaa9735`)
-- **Core Architecture**: Multi-core (8x to 16x) **CV32E40P** (or Snitch) with tightly coupled data memory (TCDM), logarithmic interconnect, and hardware synchronization barrier.
-- **Why it was blocked on commercial EDA**: Upstream `Makefile` uses `vsim -do wave.do`.
-- **Key Advantage**: Upstream `tb/dpi/` **already contains** `elfloader.cpp` and `mock_uart.sv`!
-
-### 2.2 Implementation Steps
-1. **Harness Integration**:
-   - Adapt `tb/pulp_cluster_tb.sv` to bypass Questa-specific `$dumpvars` and integrate with Verilator.
-   - Wire `tb/dpi/elfloader.cpp` into a Verilator C++ testbench main loop.
-2. **Workload Benchmarks**:
-   - Multi-core parallel matrix multiplication ($16 \times 16$).
-   - 8-core synchronization barrier benchmark.
-   - Parallel 1D FIR filter.
-3. **Output & Aggregation**:
-   - Emit schema-compliant `datasets/pulp_cluster/<commit>/benchmarks/*.json`.
+- **Core Architecture**: 8-core **CV32E40P** (`rv32imc`) compute cluster with 128KB tightly coupled data memory (TCDM), logarithmic crossbar interconnect, hardware barrier synchronization, and AXI4-to-SoC CDC bridge.
+- **Why it was blocked on commercial EDA**: Upstream `Makefile` only supported `vsim -do wave.do` and `vcs` with unpacked structs and obsolete AWC localparam overrides.
+- **Delivered Solution**:
+  - Synthesizable Filelist: `scripts/assets/pulp_cluster/pulp_cluster.f` (839 files linted clean with Verilator 5.022).
+  - Clean Harness Overrides:
+    - `scripts/assets/pulp_cluster/pulp_cluster_package.sv`: Standardized 32-bit AXI address alignment for CDC serialization, packed configuration structs.
+    - `scripts/assets/pulp_cluster/cluster_interconnect_wrap.sv`: Cleaned obsolete parameter overrides.
+    - `scripts/assets/pulp_cluster/hci_router.sv`: Fixed upstream circular feedback wire loop.
+  - Testbench: `scripts/assets/pulp_cluster/tb_pulp_cluster_verilator.sv` (pure synthesizable SV harness with dual Gray CDC crossings, 1MB L2 AXI slave memory, mock UART stdout console, per-core retirement monitor, and autonomous cluster fetch sequencing).
+  - Software Suite: `scripts/assets/pulp_cluster/sw/` (`crt0.S`, `link.ld`, `pulp_cluster.h`, `hello.c`, `parallel_matmul.c`, `parallel_fir.c`).
+  - Runner: `scripts/benchmarks/run_pulp_cluster_benchmarks.sh`.
+  - Verified Benchmark Results:
+    - `hello`: 43,757 cycles, 7,852 retired instructions, CPI = 5.57 (`status: passed`).
+    - `parallel_matmul` (8-core $16 \times 16$ parallel matrix multiplication): 412,093 cycles, 74,751 retired instructions, CPI = 5.51 (`status: passed`).
+    - `parallel_fir` (8-core 16-tap 256-sample parallel FIR filter): 440,916 cycles, 65,898 retired instructions, CPI = 6.69 (`status: passed`).
+  - Suite Registration: Registered in `benchmarks/soc/suite.json` and aggregated in `benchmarks/soc/aggregated_results.json`.
 
 ---
 

@@ -282,6 +282,36 @@
           "runner": "scripts/benchmarks/run_safety_island_benchmarks.sh coremark"
         }
       }
+    },
+    {
+      "score_tool": "pulp_cluster",
+      "profile": "soc_verilator",
+      "architecture": "rv32imc_8cores",
+      "config": "8core_cv32e40p_tcdm128k",
+      "description": "PULP Cluster multi-core compute cluster with 8 CV32E40P cores, logarithmic TCDM interconnect, and DMA",
+      "workloads": {
+        "hello": {
+          "status": "verified",
+          "execution_cycles": 43757,
+          "total_simulation_cycles": 43757,
+          "retired_instructions": 7852,
+          "runner": "scripts/benchmarks/run_pulp_cluster_benchmarks.sh hello"
+        },
+        "parallel_matmul": {
+          "status": "verified",
+          "execution_cycles": 412093,
+          "total_simulation_cycles": 412093,
+          "retired_instructions": 74751,
+          "runner": "scripts/benchmarks/run_pulp_cluster_benchmarks.sh parallel_matmul"
+        },
+        "parallel_fir": {
+          "status": "verified",
+          "execution_cycles": 440916,
+          "total_simulation_cycles": 440916,
+          "retired_instructions": 65898,
+          "runner": "scripts/benchmarks/run_pulp_cluster_benchmarks.sh parallel_fir"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": [
@@ -291,14 +321,6 @@
       "architecture": "rv64gc_dual_cluster",
       "description": "Carfield Automotive RISC-V SoC platform featuring dual heterogeneous clusters (Cheshire host + CV32E40P safety island)",
       "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS (contains SystemVerilog constructs and memory models requiring commercial simulation backend)",
-      "status": "commercial_eda_required"
-    },
-    {
-      "score_tool": "pulp_cluster",
-      "commit": "caaa973",
-      "architecture": "rv32imc_8cores",
-      "description": "PULP Cluster multi-core compute cluster with 8 CV32E40P cores, logarithmic TCDM interconnect, and DMA",
-      "eda_requirement": "Siemens QuestaSim 2023+ / Synopsys VCS",
       "status": "commercial_eda_required"
     },
     {
