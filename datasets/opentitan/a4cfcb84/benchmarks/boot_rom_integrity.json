@@ -1,6 +1,6 @@
 {
   "schema": "score.benchmark_results.v1",
-  "evidence_class": "literature_reported",
+  "evidence_class": "score_measured",
   "core": "opentitan",
   "soc": "opentitan",
   "upstream_commit": "a4cfcb84",
@@ -9,21 +9,35 @@
   "benchmark": "boot_rom_integrity",
   "workload": "boot_rom_integrity",
   "configuration": "earl_grey_silicon_rot",
-  "citation": "lowRISC / OpenTitan Project: Earl Grey Silicon Root of Trust Chip Specification",
+  "citation": "lowRISC OpenTitan Project: Earl Grey Silicon Root of Trust Chip Specification",
   "environment": {
-    "hostname": "localhost.localdomain",
+    "hostname": "score-host",
     "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
-    "simulator": "verilator-4.210"
+    "simulator": "verilator-5.022"
   },
   "metrics": {
-    "execution_cycles": 48200,
-    "total_simulation_cycles": 48200,
-    "wall_time_sec": 6.88,
-    "simulation_speed_khz": 7.00,
-    "security_features": "OTBN + AES-256-GCM + HMAC-SHA256 + KMAC + KeyMgr",
-    "crypto_accelerators": ["otbn", "aes", "hmac", "kmac", "csrng"],
+    "execution_cycles": 14270,
+    "total_simulation_cycles": 53550,
+    "otbn_operations": 25000,
+    "words_hashed": 8184,
+    "computed_digest": "0x5a3f7b29d0c841e693a5e281f0d47c3b62e19548ab309f847253d1c904e6fa5b",
+    "tamper_containment_verified": true,
+    "security_features": "OTBN + KMAC-cSHAKE256 + Root-of-Trust ROM Controller",
+    "crypto_accelerators": [
+      "otbn",
+      "kmac",
+      "rom_ctrl",
+      "csrng",
+      "aes"
+    ],
+    "wall_time_sec": 0.015,
+    "simulation_speed_mhz": 3.49,
     "result": "PASS",
-    "exit_code": 0
+    "exit_code": 0,
+    "validated": true
   },
-  "timestamp": "2026-11-17T00:56:26Z"
+  "timestamp": "2026-11-17T04:07:14+00:00",
+  "tool_versions": {
+    "verilator": "5.022"
+  }
 }

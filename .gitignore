@@ -103,5 +103,8 @@ datasets/vortex/*/rtl_snapshot/vortex/tests/opencl/spmv/*.mtx
 
 # Standalone website repository (score-circuits.github.io)
 website/
+scripts/assets/**/build/
+scripts/assets/**/obj_dir/
+scripts/assets/**/Vtb_*
 scripts/assets/occamy/build/
 scripts/assets/occamy/Voccamy*

@@ -28,6 +28,7 @@ MCU_CORES = {
     "serv",
     "neorv32",
     "cva5",
+    "rv12",
 }
 
 

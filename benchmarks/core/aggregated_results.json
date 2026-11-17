@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-17T02:06:52+00:00",
-  "count": 40,
+  "generated_utc": "2026-11-17T04:07:57+00:00",
+  "count": 42,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -845,6 +845,68 @@
         "verilator": "5.022"
       },
       "_path": "datasets/picorv32/a473fc8f/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "rv12",
+      "upstream_commit": "526bd14d",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 1.7063,
+        "iterations": 10,
+        "total_cycles": 5860531,
+        "instructions_retired": 2764348,
+        "ipc": 0.4674,
+        "cpi": 2.12,
+        "tb_cycles": 5914628,
+        "validated": true,
+        "simulator": "verilator"
+      },
+      "generated_utc": "2026-11-17T03:45:43Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/rv12/526bd14d/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "rv12",
+      "upstream_commit": "526bd14d",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dhrystone_dmips_per_mhz": 0.402,
+        "dhrystones_per_sec_per_mhz": 708,
+        "runs": 10000,
+        "benchmark_cycles": 14120137,
+        "benchmark_instructions": 5590020,
+        "cpi": 2.526,
+        "tb_cycles": 14258733,
+        "total_retired_instructions": 5642647,
+        "ipc": 0.3957,
+        "validated": true,
+        "simulator": "verilator"
+      },
+      "generated_utc": "2026-11-17T03:46:08Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/rv12/526bd14d/benchmarks/dhrystone_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",

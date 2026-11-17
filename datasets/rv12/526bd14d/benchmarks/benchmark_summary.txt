@@ -1,0 +1,7 @@
+RoaLogic RV12 Benchmark Summary (SCORE)
+Commit: 526bd14d
+Profile: mcu_verilator
+Config: default
+Results: /home/yongfu/proj/score/datasets/rv12/526bd14d/benchmarks
+CoreMark/MHz: 1.7063
+Dhrystone DMIPS/MHz: 0.402

@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-17T01:58:09+00:00",
-  "count": 37,
+  "generated_utc": "2026-11-17T04:08:07+00:00",
+  "count": 38,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -1334,6 +1334,44 @@
       },
       "generated_utc": "2026-11-17T01:57:54Z",
       "_path": "datasets/vortex/26d2bc4b/benchmarks/opencl_vecadd.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "xls",
+      "upstream_commit": "cf337d11",
+      "profile": "coprocessor_verilator",
+      "workload": "pipeline_datapath",
+      "config": "default",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "total_cycles": 503740,
+        "total_operations": 2000010,
+        "pipeline_ops_per_cycle": 3.9703,
+        "tree_reduction_ops": 500000,
+        "tree_latency_cycles": 3,
+        "tree_initiation_interval": 1,
+        "multiplier_ops": 500000,
+        "multiplier_latency_cycles": 2,
+        "multiplier_initiation_interval": 1,
+        "valid_signal_ops": 500000,
+        "valid_latency_cycles": 2,
+        "repeat_byte_ops": 500000,
+        "uart_loopback_frames": 10,
+        "verification_errors": 0,
+        "wall_time_ms": 132.05,
+        "simulation_speed_mhz": 3.81
+      },
+      "generated_utc": "2026-11-17T03:55:02+00:00",
+      "host": {
+        "hostname": "score-host",
+        "platform": "linux"
+      },
+      "tool_versions": {
+        "verilator": "5.022"
+      },
+      "_path": "datasets/xls/cf337d11/benchmarks/pipeline_datapath.json"
     }
   ]
 }

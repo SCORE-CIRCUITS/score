@@ -21,6 +21,7 @@ VECTOR_CORES = {
     "hwacha",
     "matrix_extensions",
     "matrix-extensions",
+    "xls",
 }
 
 

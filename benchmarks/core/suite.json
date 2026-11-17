@@ -195,6 +195,23 @@
           "runner": "scripts/benchmarks/run_cva5_benchmarks.sh microbench"
         }
       }
+    },
+    {
+      "score_tool": "rv12",
+      "profile": "mcu_verilator",
+      "architecture": "rv32im",
+      "config": "default",
+      "description": "RoaLogic RV12 32-bit single-issue in-order RISC-V core with AHB3-Lite bus interface, branch predictor, and PMA",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rv12_benchmarks.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_rv12_benchmarks.sh"
+        }
+      }
     }
   ]
 }

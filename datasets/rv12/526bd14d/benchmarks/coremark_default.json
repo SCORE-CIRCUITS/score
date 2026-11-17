@@ -1,0 +1,29 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "rv12",
+  "upstream_commit": "526bd14d",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "default",
+  "metrics": {
+    "coremark_per_mhz": 1.7063,
+    "iterations": 10,
+    "total_cycles": 5860531,
+    "instructions_retired": 2764348,
+    "ipc": 0.4674,
+    "cpi": 2.12,
+    "tb_cycles": 5914628,
+    "validated": true,
+    "simulator": "verilator"
+  },
+  "generated_utc": "2026-11-17T03:45:43Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "5.022"
+  }
+}

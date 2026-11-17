@@ -529,12 +529,14 @@
       "profile": "soc_verilator",
       "architecture": "rv32imc_earl_grey",
       "config": "earl_grey_silicon_rot",
-      "description": "OpenTitan Earl Grey silicon root of trust platform with Ibex core and hardware crypto engines",
+      "description": "OpenTitan Earl Grey silicon root of trust platform with Ibex core, hardware KMAC/cSHAKE256 ROM checker, and OTBN 256-bit crypto engine",
       "workloads": {
         "boot_rom_integrity": {
           "status": "verified",
-          "execution_cycles": 48200,
-          "total_simulation_cycles": 48200,
+          "execution_cycles": 14270,
+          "total_simulation_cycles": 53550,
+          "otbn_operations": 25000,
+          "tamper_containment_verified": true,
           "runner": "scripts/benchmarks/run_opentitan_benchmarks.sh boot_rom_integrity"
         }
       }

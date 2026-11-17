@@ -490,6 +490,32 @@
           }
         }
       }
+    },
+    {
+      "score_tool": "xls",
+      "profile": "coprocessor_verilator",
+      "architecture": "hls_pipeline",
+      "config": "default",
+      "description": "Google XLS (Accelerated Development of Hardware Designs) HLS/DSLX synthesized pipelined reduction trees, multipliers, and uncore streaming accelerators",
+      "workloads": {
+        "pipeline_datapath": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_xls_benchmarks.sh",
+          "result_file": "datasets/xls/cf337d11/benchmarks/pipeline_datapath.json",
+          "metrics": {
+            "total_cycles": 503740,
+            "total_operations": 2000010,
+            "pipeline_ops_per_cycle": 3.9703,
+            "tree_reduction_ops": 500000,
+            "tree_latency_cycles": 3,
+            "multiplier_ops": 500000,
+            "multiplier_latency_cycles": 2,
+            "valid_signal_ops": 500000,
+            "repeat_byte_ops": 500000,
+            "uart_loopback_frames": 10
+          }
+        }
+      }
     }
   ]
 }
