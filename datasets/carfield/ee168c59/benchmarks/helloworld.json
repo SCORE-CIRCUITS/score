@@ -1,0 +1,23 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "core": "carfield",
+  "architecture": "rv64gc_dual_cluster",
+  "profile": "soc_verilator",
+  "benchmark": "helloworld",
+  "configuration": "carfield_cheshire_cva6_pulp_safety_island",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "simulator": "verilator-5.022",
+    "toolchain": "/home/yongfu/proj/score/tools/riscv_toolchain_wrapper/riscv64-unknown-elf-"
+  },
+  "metrics": {
+    "execution_cycles": 872052,
+    "total_simulation_cycles": 872052,
+    "wall_time_sec": 4674.69,
+    "simulation_speed_khz": 0.19,
+    "exit_code": 0
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-17T00:03:46Z"
+}

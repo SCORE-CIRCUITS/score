@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-16T14:56:06+00:00",
-  "count": 57,
+  "generated_utc": "2026-11-17T00:13:41+00:00",
+  "count": 59,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -161,6 +161,30 @@
         "gcc": "11.5.0"
       },
       "_path": "datasets/araxl/bc876e2a/benchmarks/imatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "carfield",
+      "architecture": "rv64gc_dual_cluster",
+      "profile": "soc_verilator",
+      "benchmark": "helloworld",
+      "configuration": "carfield_cheshire_cva6_pulp_safety_island",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/riscv_toolchain_wrapper/riscv64-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 872052,
+        "total_simulation_cycles": 872052,
+        "wall_time_sec": 4674.69,
+        "simulation_speed_khz": 0.19,
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-17T00:03:46Z",
+      "_path": "datasets/carfield/ee168c59/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -1324,6 +1348,30 @@
         "riscv_gcc": "13.2.0"
       },
       "_path": "datasets/openpiton/4e8ab3db/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "core": "picobello",
+      "architecture": "rv64gc_cva6_snitch",
+      "profile": "soc_verilator",
+      "benchmark": "helloworld",
+      "configuration": "cheshire_cva6_8snitch_8memtile_floonoc",
+      "environment": {
+        "hostname": "workstation",
+        "os": "Linux-6.6.137+rpt-rpi-2712-aarch64-with-glibc2.36",
+        "simulator": "verilator-5.022",
+        "toolchain": "riscv64-unknown-elf-gcc-14.2.0"
+      },
+      "metrics": {
+        "execution_cycles": 462988,
+        "total_simulation_cycles": 462988,
+        "wall_time_sec": 15096.77,
+        "simulation_speed_khz": 0.03,
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-16T17:11:35Z",
+      "_path": "datasets/picobello/71df12a2/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",
