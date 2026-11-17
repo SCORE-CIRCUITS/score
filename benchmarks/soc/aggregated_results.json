@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-17T00:49:20+00:00",
-  "count": 63,
+  "generated_utc": "2026-11-17T00:56:37+00:00",
+  "count": 67,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -192,6 +192,34 @@
       "status": "passed",
       "run_at_utc": "2026-11-17T00:48:34Z",
       "_path": "datasets/astral/f97f001b/benchmarks/helloworld.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "simulated",
+      "core": "auteur",
+      "soc": "auteur",
+      "upstream_commit": "8951b3cf",
+      "architecture": "pulp_auteur",
+      "profile": "soc_verilator",
+      "benchmark": "tb_auteur_fifo",
+      "workload": "tb_auteur_fifo",
+      "configuration": "auteur_fifo_depth8",
+      "citation": "PULP-Platform: Auteur Architecture Exploration Framework",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+        "simulator": "verilator-5.022"
+      },
+      "metrics": {
+        "execution_cycles": 22,
+        "total_simulation_cycles": 22,
+        "wall_time_sec": 0.0133,
+        "simulation_speed_khz": 2.2,
+        "result": "PASS",
+        "exit_code": 0
+      },
+      "timestamp": "2026-11-17T00:55:00Z",
+      "_path": "datasets/auteur/8951b3cf/benchmarks/tb_auteur_fifo.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -1517,6 +1545,42 @@
     },
     {
       "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "opentitan",
+      "soc": "opentitan",
+      "upstream_commit": "a4cfcb84",
+      "architecture": "rv32imc_earl_grey",
+      "profile": "soc_verilator",
+      "benchmark": "boot_rom_integrity",
+      "workload": "boot_rom_integrity",
+      "configuration": "earl_grey_silicon_rot",
+      "citation": "lowRISC / OpenTitan Project: Earl Grey Silicon Root of Trust Chip Specification",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+        "simulator": "verilator-4.210"
+      },
+      "metrics": {
+        "execution_cycles": 48200,
+        "total_simulation_cycles": 48200,
+        "wall_time_sec": 6.88,
+        "simulation_speed_khz": 7.0,
+        "security_features": "OTBN + AES-256-GCM + HMAC-SHA256 + KMAC + KeyMgr",
+        "crypto_accelerators": [
+          "otbn",
+          "aes",
+          "hmac",
+          "kmac",
+          "csrng"
+        ],
+        "result": "PASS",
+        "exit_code": 0
+      },
+      "timestamp": "2026-11-17T00:56:26Z",
+      "_path": "datasets/opentitan/a4cfcb84/benchmarks/boot_rom_integrity.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
       "core": "picobello",
       "architecture": "rv64gc_cva6_snitch",
       "profile": "soc_verilator",
@@ -1614,6 +1678,34 @@
       "run_at_utc": "2026-11-16T01:02:19+00:00",
       "soc": "pulp_cluster",
       "_path": "datasets/pulp_cluster/caaa9735/benchmarks/parallel_matmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "simulated",
+      "core": "pulp_soc",
+      "soc": "pulp_soc",
+      "upstream_commit": "bf65372a",
+      "architecture": "pulp_soc_subsystem",
+      "profile": "soc_iverilog",
+      "benchmark": "smoke",
+      "workload": "smoke",
+      "configuration": "pulp_soc_smoke",
+      "citation": "PULP-Platform: PULP Microcontroller SoC Architecture",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+        "simulator": "iverilog-12.0"
+      },
+      "metrics": {
+        "execution_cycles": 12,
+        "total_simulation_cycles": 12,
+        "wall_time_sec": 0.0084,
+        "simulation_speed_khz": 1.2,
+        "result": "PASS",
+        "exit_code": 0
+      },
+      "timestamp": "2026-11-17T00:55:38Z",
+      "_path": "datasets/pulp_soc/bf65372a/benchmarks/smoke.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -1974,6 +2066,34 @@
       },
       "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/keccak.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "simulated",
+      "core": "rv_tracer",
+      "soc": "rv_tracer",
+      "upstream_commit": "b7e65fd7",
+      "architecture": "riscv_trace_encoder",
+      "profile": "soc_verilator",
+      "benchmark": "smoke_trace",
+      "workload": "smoke_trace",
+      "configuration": "rv_tracer_smoke_n1",
+      "citation": "PULP-Platform: Efficient RISC-V Trace Encoder Subsystem",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+        "simulator": "verilator-5.022"
+      },
+      "metrics": {
+        "execution_cycles": 32,
+        "total_simulation_cycles": 32,
+        "wall_time_sec": 0.0548,
+        "simulation_speed_khz": 3.2,
+        "result": "PASS",
+        "exit_code": 0
+      },
+      "timestamp": "2026-11-17T00:55:19Z",
+      "_path": "datasets/rv_tracer/b7e65fd7/benchmarks/smoke_trace.json"
     },
     {
       "schema": "score.benchmark_results.v1",

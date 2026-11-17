@@ -118,6 +118,62 @@
           "runner": "scripts/benchmarks/run_neorv32_coremark.sh"
         }
       }
+    },
+    {
+      "score_tool": "femtorv",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_femtorv_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_femtorv_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "cv32e40p",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "veer_eh1",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_eh1_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_eh1_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "veer_eh2",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_eh2_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_veer_eh2_dhrystone.sh"
+        }
+      }
     }
   ]
 }

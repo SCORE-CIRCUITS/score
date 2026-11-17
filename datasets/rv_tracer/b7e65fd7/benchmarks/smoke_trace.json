@@ -1,0 +1,27 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "simulated",
+  "core": "rv_tracer",
+  "soc": "rv_tracer",
+  "upstream_commit": "b7e65fd7",
+  "architecture": "riscv_trace_encoder",
+  "profile": "soc_verilator",
+  "benchmark": "smoke_trace",
+  "workload": "smoke_trace",
+  "configuration": "rv_tracer_smoke_n1",
+  "citation": "PULP-Platform: Efficient RISC-V Trace Encoder Subsystem",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+    "simulator": "verilator-5.022"
+  },
+  "metrics": {
+    "execution_cycles": 32,
+    "total_simulation_cycles": 32,
+    "wall_time_sec": 0.0548,
+    "simulation_speed_khz": 3.20,
+    "result": "PASS",
+    "exit_code": 0
+  },
+  "timestamp": "2026-11-17T00:55:19Z"
+}

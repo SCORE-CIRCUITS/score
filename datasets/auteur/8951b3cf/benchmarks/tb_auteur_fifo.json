@@ -1,0 +1,27 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "simulated",
+  "core": "auteur",
+  "soc": "auteur",
+  "upstream_commit": "8951b3cf",
+  "architecture": "pulp_auteur",
+  "profile": "soc_verilator",
+  "benchmark": "tb_auteur_fifo",
+  "workload": "tb_auteur_fifo",
+  "configuration": "auteur_fifo_depth8",
+  "citation": "PULP-Platform: Auteur Architecture Exploration Framework",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+    "simulator": "verilator-5.022"
+  },
+  "metrics": {
+    "execution_cycles": 22,
+    "total_simulation_cycles": 22,
+    "wall_time_sec": 0.0133,
+    "simulation_speed_khz": 2.20,
+    "result": "PASS",
+    "exit_code": 0
+  },
+  "timestamp": "2026-11-17T00:55:00Z"
+}

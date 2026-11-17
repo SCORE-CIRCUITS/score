@@ -1,0 +1,27 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "simulated",
+  "core": "pulp_soc",
+  "soc": "pulp_soc",
+  "upstream_commit": "bf65372a",
+  "architecture": "pulp_soc_subsystem",
+  "profile": "soc_iverilog",
+  "benchmark": "smoke",
+  "workload": "smoke",
+  "configuration": "pulp_soc_smoke",
+  "citation": "PULP-Platform: PULP Microcontroller SoC Architecture",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64",
+    "simulator": "iverilog-12.0"
+  },
+  "metrics": {
+    "execution_cycles": 12,
+    "total_simulation_cycles": 12,
+    "wall_time_sec": 0.0084,
+    "simulation_speed_khz": 1.20,
+    "result": "PASS",
+    "exit_code": 0
+  },
+  "timestamp": "2026-11-17T00:55:38Z"
+}

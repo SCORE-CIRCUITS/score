@@ -466,6 +466,66 @@
           "runner": "scripts/benchmarks/run_occamy_benchmarks.sh hbm_offload"
         }
       }
+    },
+    {
+      "score_tool": "auteur",
+      "profile": "soc_verilator",
+      "architecture": "pulp_auteur",
+      "config": "auteur_fifo_depth8",
+      "description": "Auteur architecture exploration framework with clocked stream FIFO subsystem",
+      "workloads": {
+        "tb_auteur_fifo": {
+          "status": "verified",
+          "execution_cycles": 22,
+          "total_simulation_cycles": 22,
+          "runner": "scripts/benchmarks/run_auteur_benchmarks.sh tb_auteur_fifo"
+        }
+      }
+    },
+    {
+      "score_tool": "rv-tracer",
+      "profile": "soc_verilator",
+      "architecture": "riscv_trace_encoder",
+      "config": "rv_tracer_smoke_n1",
+      "description": "RV-Tracer instruction trace encoder and execution monitoring subsystem",
+      "workloads": {
+        "smoke_trace": {
+          "status": "verified",
+          "execution_cycles": 32,
+          "total_simulation_cycles": 32,
+          "runner": "scripts/benchmarks/run_rv_tracer_benchmarks.sh smoke_trace"
+        }
+      }
+    },
+    {
+      "score_tool": "pulp-soc",
+      "profile": "soc_iverilog",
+      "architecture": "pulp_soc_subsystem",
+      "config": "pulp_soc_smoke",
+      "description": "PULP SoC subsystem integrating core complex, uDMA peripherals, and logarithmic interconnect",
+      "workloads": {
+        "smoke": {
+          "status": "verified",
+          "execution_cycles": 12,
+          "total_simulation_cycles": 12,
+          "runner": "scripts/benchmarks/run_pulp_soc_benchmarks.sh smoke"
+        }
+      }
+    },
+    {
+      "score_tool": "opentitan",
+      "profile": "soc_verilator",
+      "architecture": "rv32imc_earl_grey",
+      "config": "earl_grey_silicon_rot",
+      "description": "OpenTitan Earl Grey silicon root of trust platform with Ibex core and hardware crypto engines",
+      "workloads": {
+        "boot_rom_integrity": {
+          "status": "verified",
+          "execution_cycles": 48200,
+          "total_simulation_cycles": 48200,
+          "runner": "scripts/benchmarks/run_opentitan_benchmarks.sh boot_rom_integrity"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": [
