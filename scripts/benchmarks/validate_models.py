@@ -294,12 +294,16 @@ def main() -> None:
     ss_res_aff = sum((y - (b0 + b1 * x)) ** 2 for x, y in zip(logs, tree_cyc))
     tree_aff_r2 = 1.0 - ss_res_aff / ss_tot
 
-    # 6. Eq. (10) DMA breakeven dimensional closure
+    # 6. Eq. (10) DMA breakeven dimensional closure & exact 6-point effective throughput curve
     b_core = 0.8
     b_dma = 14.8
     s_star = 256.0
     t_setup_ns = s_star * (1.0 / b_core - 1.0 / b_dma)
     s_check = t_setup_ns / (1.0 / b_core - 1.0 / b_dma)
+    dma_curve = [
+        {"payload_label": lbl, "payload_bytes": s, "effective_gb_s": round(s / (t_setup_ns + s / b_dma), 3)}
+        for lbl, s in [("64B", 64), ("256B", 256), ("1KB", 1024), ("4KB", 4096), ("16KB", 16384), ("64KB", 65536)]
+    ]
 
     # 7. Level 4 SoC Empirical Telemetry Anchors (10 verified Verilator runs cited in Section VI-B)
     l4_wanted = [
@@ -340,7 +344,7 @@ def main() -> None:
         })
 
     out = {
-        "schema": "score.model_validation.v5",
+        "schema": "score.model_validation.v6",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "corpus_accounting": {
             "tier_evaluated_targets": sum(len(v) for v in tier_sets.values()),
@@ -398,6 +402,7 @@ def main() -> None:
             "cycles_at_500mhz": round(t_setup_ns * 0.5, 1),
             "cycles_at_115mhz": round(t_setup_ns * 0.115, 1),
             "recomputed_s_star_bytes": round(s_check, 4),
+            "effective_dma_curve_64b_to_64kb": dma_curve,
         },
         "level4_soc_telemetry_anchors": {
             "exact_matches": l4_exact,

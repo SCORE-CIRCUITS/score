@@ -1,6 +1,6 @@
 {
-  "schema": "score.model_validation.v5",
-  "generated_utc": "2026-11-17T22:58:16+00:00",
+  "schema": "score.model_validation.v6",
+  "generated_utc": "2026-11-17T23:03:56+00:00",
   "corpus_accounting": {
     "tier_evaluated_targets": 56,
     "per_tier_counts": {
@@ -316,7 +316,39 @@
     "implied_t_setup_ns": 302.7,
     "cycles_at_500mhz": 151.4,
     "cycles_at_115mhz": 34.8,
-    "recomputed_s_star_bytes": 256.0
+    "recomputed_s_star_bytes": 256.0,
+    "effective_dma_curve_64b_to_64kb": [
+      {
+        "payload_label": "64B",
+        "payload_bytes": 64,
+        "effective_gb_s": 0.208
+      },
+      {
+        "payload_label": "256B",
+        "payload_bytes": 256,
+        "effective_gb_s": 0.8
+      },
+      {
+        "payload_label": "1KB",
+        "payload_bytes": 1024,
+        "effective_gb_s": 2.753
+      },
+      {
+        "payload_label": "4KB",
+        "payload_bytes": 4096,
+        "effective_gb_s": 7.069
+      },
+      {
+        "payload_label": "16KB",
+        "payload_bytes": 16384,
+        "effective_gb_s": 11.622
+      },
+      {
+        "payload_label": "64KB",
+        "payload_bytes": 65536,
+        "effective_gb_s": 13.853
+      }
+    ]
   },
   "level4_soc_telemetry_anchors": {
     "exact_matches": 10,
