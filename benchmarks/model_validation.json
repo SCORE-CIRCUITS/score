@@ -1,6 +1,6 @@
 {
-  "schema": "score.model_validation.v4",
-  "generated_utc": "2026-11-17T22:52:53+00:00",
+  "schema": "score.model_validation.v5",
+  "generated_utc": "2026-11-17T22:58:16+00:00",
   "corpus_accounting": {
     "tier_evaluated_targets": 56,
     "per_tier_counts": {
@@ -393,5 +393,20 @@
         "exact_match": true
       }
     ]
+  },
+  "manuscript_claim_consistency": {
+    "serv_to_ibex_small_throughput_ratio": 79.38,
+    "ibex_small_to_opentitan_area_delta_pct": 43.24,
+    "ibex_maxperf_to_dynbp_cm_gain_pct": 3.1,
+    "ibex_opentitan_to_dynbp_cm_gain_pct": 3.45,
+    "rocket_to_sonicboom_area_ratio": 3.11,
+    "rocket_to_xiangshan_area_ratio": 5.04,
+    "rocket_to_xiangshan_memcpy_ratio": 1.742,
+    "vcu118_rocket_over_sonicboom_fmax_ratio": 2.25,
+    "gemmini_over_ara_raw_ratio": 57.26,
+    "gemmini_over_ara_width_norm_ratio": 7.16,
+    "ara_rho_host_sweep_reduction_ratio": 1693.7,
+    "dma_over_core_bw_ratio": 18.5,
+    "amo_over_fractalsync_432c_speedup": 161.48
   }
 }

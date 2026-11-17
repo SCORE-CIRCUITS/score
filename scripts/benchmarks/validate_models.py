@@ -340,7 +340,7 @@ def main() -> None:
         })
 
     out = {
-        "schema": "score.model_validation.v4",
+        "schema": "score.model_validation.v5",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "corpus_accounting": {
             "tier_evaluated_targets": sum(len(v) for v in tier_sets.values()),
@@ -403,6 +403,21 @@ def main() -> None:
             "exact_matches": l4_exact,
             "total_checked": len(l4_anchors),
             "anchors": l4_anchors,
+        },
+        "manuscript_claim_consistency": {
+            "serv_to_ibex_small_throughput_ratio": round(2.4609 / 0.031, 2),
+            "ibex_small_to_opentitan_area_delta_pct": round((26.5 - 18.5) / 18.5 * 100.0, 2),
+            "ibex_maxperf_to_dynbp_cm_gain_pct": round((3.2256 - 3.1286) / 3.1286 * 100.0, 2),
+            "ibex_opentitan_to_dynbp_cm_gain_pct": round((3.2256 - 3.1180) / 3.1180 * 100.0, 2),
+            "rocket_to_sonicboom_area_ratio": round(420.0 / 135.0, 2),
+            "rocket_to_xiangshan_area_ratio": round(680.0 / 135.0, 2),
+            "rocket_to_xiangshan_memcpy_ratio": round(845.6 / 485.4, 3),
+            "vcu118_rocket_over_sonicboom_fmax_ratio": round(198.0 / 88.0, 2),
+            "gemmini_over_ara_raw_ratio": round(450.80 / 7.8734, 2),
+            "gemmini_over_ara_width_norm_ratio": round(450.80 / 7.8734 / 8.0, 2),
+            "ara_rho_host_sweep_reduction_ratio": round(27.2686 / 0.0161, 1),
+            "dma_over_core_bw_ratio": round(14.8 / 0.8, 2),
+            "amo_over_fractalsync_432c_speedup": round(98500.0 / 610.0, 2),
         },
     }
 
