@@ -229,6 +229,27 @@
           "runner": "scripts/benchmarks/run_xiangshan_benchmarks.sh microbench"
         }
       }
+    },
+    {
+      "score_tool": "shakti",
+      "profile": "app_verilator",
+      "architecture": "rv64imafd",
+      "config": "shakti_cclass_6stage",
+      "description": "IIT Madras SHAKTI C-Class 64-bit 6-stage in-order application core with MMU, FPU, and AXI4 interconnect",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_shakti_benchmarks.sh coremark"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_shakti_benchmarks.sh dhrystone"
+        },
+        "microbench": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_shakti_benchmarks.sh microbench"
+        }
+      }
     }
   ]
 }

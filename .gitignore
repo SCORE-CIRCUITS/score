@@ -44,12 +44,14 @@ tools/boom/
 tools/c906/
 tools/c910/
 tools/cv32e40p/
+tools/cva5/
 tools/femtorv/
 tools/hwacha/
 tools/integrated-matrix-extension/
 tools/nutshell/
 tools/riscv-matrix-extension-spec/
 tools/riscv-p-spec/
+tools/shakti/
 tools/tvm-vta/
 tools/veer-eh1/
 tools/veer-eh2/

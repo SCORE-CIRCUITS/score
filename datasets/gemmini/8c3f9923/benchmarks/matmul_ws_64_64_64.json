@@ -6,6 +6,7 @@
   "profile": "coprocessor_verilator",
   "workload": "matmul_ws_64_64_64",
   "config": "GemminiRocketConfig_16x16",
+  "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
   "metrics": {
     "validated": true,
     "simulator": "verilator",
@@ -22,19 +23,9 @@
     "kernel_cycles": 2898,
     "ideal_cycles": 1024,
     "macs_per_cycle": 90.45,
-    "performance_ops_per_cycle": 180.90,
+    "performance_ops_per_cycle": 180.9,
     "systolic_utilization_pct": 35.3,
     "exit_code": 0
   },
-  "generated_utc": "2026-11-15T12:42:00+00:00",
-  "host": {
-    "hostname": "score-bench",
-    "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-    "python": "3.9.21"
-  },
-  "tool_versions": {
-    "verilator": "5.022",
-    "gcc": "13.2.0"
-  }
+  "generated_utc": "2026-11-17T01:57:46Z"
 }
-

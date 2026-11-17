@@ -1,6 +1,6 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-17T00:37:43+00:00",
+  "generated_utc": "2026-11-17T01:58:09+00:00",
   "count": 37,
   "results": [
     {
@@ -694,6 +694,7 @@
       "profile": "coprocessor_verilator",
       "workload": "conv_2d",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -713,16 +714,7 @@
         "kernel_cycles": 2653,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/conv_2d.json"
     },
     {
@@ -733,6 +725,7 @@
       "profile": "coprocessor_verilator",
       "workload": "matmul_ws_128_128_128",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -753,16 +746,7 @@
         "systolic_utilization_pct": 69.2,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/matmul_ws_128_128_128.json"
     },
     {
@@ -773,6 +757,7 @@
       "profile": "coprocessor_verilator",
       "workload": "matmul_ws_64_64_64",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -793,16 +778,7 @@
         "systolic_utilization_pct": 35.3,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/matmul_ws_64_64_64.json"
     },
     {
@@ -813,6 +789,7 @@
       "profile": "coprocessor_verilator",
       "workload": "mvin_mvout",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -827,16 +804,7 @@
         "kernel_cycles": 63786,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/mvin_mvout.json"
     },
     {
@@ -847,6 +815,7 @@
       "profile": "coprocessor_verilator",
       "workload": "resadd",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -862,16 +831,7 @@
         "kernel_cycles": 838,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/resadd.json"
     },
     {
@@ -882,6 +842,7 @@
       "profile": "coprocessor_verilator",
       "workload": "tiled_matmul_ws_128_256_256",
       "config": "GemminiRocketConfig_16x16",
+      "citation": "DAC 2021: Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration",
       "metrics": {
         "validated": true,
         "simulator": "verilator",
@@ -904,16 +865,7 @@
         "wdma_bytes_sent": 32768,
         "exit_code": 0
       },
-      "generated_utc": "2026-11-15T12:42:00+00:00",
-      "host": {
-        "hostname": "score-bench",
-        "platform": "Linux-5.14.0-503.21.1.el9_5.x86_64-with-glibc2.34",
-        "python": "3.9.21"
-      },
-      "tool_versions": {
-        "verilator": "5.022",
-        "gcc": "13.2.0"
-      },
+      "generated_utc": "2026-11-17T01:57:46Z",
       "_path": "datasets/gemmini/8c3f9923/benchmarks/tiled_matmul_ws_128_256_256.json"
     },
     {
@@ -1353,7 +1305,7 @@
         "matrix_dimension": "64x64",
         "datatype": "fp32"
       },
-      "generated_utc": "2026-11-16T15:16:32Z",
+      "generated_utc": "2026-11-17T01:57:54Z",
       "_path": "datasets/vortex/26d2bc4b/benchmarks/opencl_sgemm.json"
     },
     {
@@ -1380,7 +1332,7 @@
         "vector_length": 4096,
         "datatype": "fp32"
       },
-      "generated_utc": "2026-11-16T15:16:32Z",
+      "generated_utc": "2026-11-17T01:57:54Z",
       "_path": "datasets/vortex/26d2bc4b/benchmarks/opencl_vecadd.json"
     }
   ]

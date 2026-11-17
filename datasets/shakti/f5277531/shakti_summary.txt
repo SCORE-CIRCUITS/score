@@ -1,0 +1,6 @@
+shakti SCORE snapshot (shaktiproject/c-class)
+Commit: f5277531
+Dataset: /home/yongfu/proj/score/datasets/shakti/f5277531
+Architecture: RV64IMAFD / RV32IMAFD 6-Stage In-Order Core (SHAKTI C-Class)
+Bluespec SystemVerilog source files: 110
+Generation Status: Ready for BSC (Bluespec Compiler) elaboration

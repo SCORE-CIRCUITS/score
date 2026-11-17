@@ -1,0 +1,6 @@
+cva5 SCORE snapshot (openhwgroup/cva5)
+Commit: 125fb2b3
+Dataset: /home/yongfu/proj/score/datasets/cva5/125fb2b3
+Architecture: RV32IMACB Decoupled In-Order / Out-of-Order Execution Core
+SystemVerilog RTL files: 99
+Generation Status: Ready for Verilator / Vivado elaboration

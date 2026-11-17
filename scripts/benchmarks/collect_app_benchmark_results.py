@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATASETS = ROOT / "datasets"
 OUT = ROOT / "benchmarks" / "app" / "aggregated_results.json"
-APP_CORES = {"rocket-chip", "cva6", "cva6-64", "rocket", "c906", "c910", "nutshell", "black-parrot", "black_parrot", "boom", "xiangshan"}
+APP_CORES = {"rocket-chip", "cva6", "cva6-64", "rocket", "c906", "c910", "nutshell", "black-parrot", "black_parrot", "boom", "xiangshan", "shakti"}
 
 
 def collect() -> list[dict]:

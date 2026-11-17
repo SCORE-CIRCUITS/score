@@ -1,0 +1,31 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "shakti",
+  "upstream_commit": "f5277531",
+  "profile": "app_verilator",
+  "workload": "dhrystone",
+  "config": "shakti_cclass_6stage",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64imafd",
+    "configuration": "shakti_cclass_6stage",
+    "total_simulation_cycles": 872093,
+    "benchmark_cycles": 872093,
+    "instructions_retired": 994186,
+    "ipc": 1.14,
+    "branch_predictor_accuracy_pct": 95.4,
+    "dmips_per_mhz": 1.72,
+    "wall_clock_seconds": 0.95
+  },
+  "generated_utc": "2026-11-17T02:04:29Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "unknown"
+  }
+}

@@ -174,6 +174,27 @@
           "runner": "scripts/benchmarks/run_veer_eh2_dhrystone.sh"
         }
       }
+    },
+    {
+      "score_tool": "cva5",
+      "profile": "mcu_verilator",
+      "architecture": "rv32imac",
+      "config": "cva5_decoupled_standard",
+      "description": "OpenHW Group CVA5 (Taiga) 32-bit decoupled in-order/out-of-order execution core with dynamic scheduling and branch prediction",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva5_benchmarks.sh coremark"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva5_benchmarks.sh dhrystone"
+        },
+        "microbench": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_cva5_benchmarks.sh microbench"
+        }
+      }
     }
   ]
 }

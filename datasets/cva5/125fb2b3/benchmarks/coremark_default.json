@@ -1,0 +1,32 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cva5",
+  "upstream_commit": "125fb2b3",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "cva5_decoupled_standard",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imac",
+    "configuration": "cva5_decoupled_standard",
+    "total_simulation_cycles": 1006711,
+    "benchmark_cycles": 1006711,
+    "instructions_retired": 1157718,
+    "ipc": 1.15,
+    "branch_predictor_accuracy_pct": 94.2,
+    "coremark_score": 2.98,
+    "coremark_per_mhz": 2.98,
+    "wall_clock_seconds": 1.12
+  },
+  "generated_utc": "2026-11-17T02:04:00Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "unknown"
+  }
+}

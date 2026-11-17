@@ -27,6 +27,7 @@ MCU_CORES = {
     "darkriscv",
     "serv",
     "neorv32",
+    "cva5",
 }
 
 
