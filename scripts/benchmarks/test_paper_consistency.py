@@ -36,6 +36,10 @@ def main() -> int:
         failures.append("Expected 21/22 exact CoreMark matches")
     if val["eq5_eq6_app_validation"]["mshr_vs_memcpy_pearson_r_log2"] < 0.96:
         failures.append("Expected log2 MSHR correlation >= 0.96")
+    if val["eq5_eq6_app_validation"].get("mshr_vs_memcpy_spearman_rho", 0.0) < 0.75:
+        failures.append("Expected nonparametric Spearman MSHR correlation >= 0.75")
+    if "eq1_area_normalization_audit" not in val:
+        failures.append("Missing eq1_area_normalization_audit in model_validation.json")
     if val["eq7_eq8_vector_validation"]["ops_per_cycle_checked"] != 13:
         failures.append("Expected 13 verified vector Ops/cyc runs")
     if val["level4_soc_telemetry_anchors"]["exact_matches"] != 10:
@@ -253,6 +257,18 @@ def main() -> int:
     ]
     if orphans:
         failures.append(f"Unreferenced orphan files in figures/: {orphans}")
+
+    stray_root = [
+        p.name for p in sorted(PAPER.iterdir())
+        if p.is_file() and (p.name.startswith("test_") or p.suffix in {".aux", ".log", ".out", ".bbl", ".blg"})
+    ]
+    if stray_root:
+        failures.append(f"Stray debug/build artifacts in manuscript root: {stray_root}")
+
+    readme_txt = (PAPER / "README.md").read_text()
+    for rtok in ["13 two-column pages", "14 vector figures", "77 references"]:
+        if rtok not in readme_txt:
+            failures.append(f"TCAS1-SCORE/README.md missing accurate spec token {rtok!r}")
 
     pdf_path = PAPER / "main.pdf"
     if pdf_path.exists():

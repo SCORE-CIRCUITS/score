@@ -49,6 +49,25 @@ def pearson_r(xs: list[float], ys: list[float]) -> float:
     return num / den if den > 0 else 0.0
 
 
+def _average_ranks(vals: list[float]) -> list[float]:
+    indexed = sorted(enumerate(vals), key=lambda kv: kv[1])
+    ranks = [0.0] * len(vals)
+    i = 0
+    while i < len(indexed):
+        j = i
+        while j + 1 < len(indexed) and indexed[j + 1][1] == indexed[i][1]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        for k in range(i, j + 1):
+            ranks[indexed[k][0]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def spearman_rho(xs: list[float], ys: list[float]) -> float:
+    return pearson_r(_average_ranks(xs), _average_ranks(ys))
+
+
 def poly2_fit(xs: list[float], ys: list[float]) -> tuple[list[float], float]:
     """Exact 3x3 normal-equation least-squares fit y = a0 + a1*x + a2*x^2 and R^2."""
     n = len(xs)
@@ -195,6 +214,7 @@ def main() -> None:
     mshr_ys = [float(y) for _, y in cat2_mshr_bw]
     r_mshr_lin = pearson_r(mshr_xs, mshr_ys)
     r_mshr_log = pearson_r([math.log2(x) for x in mshr_xs], mshr_ys)
+    rho_mshr_spearman = spearman_rho(mshr_xs, mshr_ys)
 
     # 4. Eq. (7)-(8) Vector Ops/cyc verification, Ara fmatmul/imatmul sweeps, and 5-kernel cliff
     vec_checked = 0
@@ -258,7 +278,7 @@ def main() -> None:
         ]
     ]
 
-    # Cross-tier repository accounting (56 tier-evaluated targets across 53 distinct repos)
+    # Cross-tier repository accounting (56 tier-evaluated targets across 54 distinct repos)
     soc_doc = json.loads((ROOT / "benchmarks/soc/aggregated_results.json").read_text())
     tier_sets = {
         "core": sorted(set(r.get("core") for r in core_doc["results"])),
@@ -277,6 +297,8 @@ def main() -> None:
     amo_cyc = [120.0, 480.0, 3200.0, 11800.0, 38400.0, 98500.0]
     tree_cyc = [95.0, 180.0, 310.0, 410.0, 515.0, 610.0]
     amo_coeffs, amo_r2 = poly2_fit(ns, amo_cyc)
+    amo_preds = [amo_coeffs[0] + amo_coeffs[1] * n + amo_coeffs[2] * n * n for n in ns]
+    amo_rmse = math.sqrt(sum((y - p) ** 2 for y, p in zip(amo_cyc, amo_preds)) / len(ns))
 
     # Exact zero-intercept discrete ceiling fit matching Eq. (9): L_tree(N) = L_node * ceil(log2(N))
     ceils = [float(math.ceil(math.log2(n))) for n in ns]
@@ -285,6 +307,7 @@ def main() -> None:
     ss_tot = sum((y - tm) ** 2 for y in tree_cyc)
     ss_res_zero = sum((y - l_node * c) ** 2 for c, y in zip(ceils, tree_cyc))
     tree_zero_r2 = 1.0 - ss_res_zero / ss_tot
+    tree_zero_rmse = math.sqrt(ss_res_zero / len(ns))
 
     # Continuous affine log2 diagnostic
     logs = [math.log2(n) for n in ns]
@@ -369,11 +392,25 @@ def main() -> None:
             "metadata_anomalies": cm_anomalies,
             "ibex_dhrystone_cpi_scaling": ibex_cpi_check,
         },
+        "eq1_area_normalization_audit": {
+            "formula": "A_kGE = A_cell(tau) / (1e3 * A_NAND2(tau))",
+            "reference_nodes_nm": [130, 65, 28, 22, 16, 12],
+            "reference_nand2_um2": {
+                "IHP_130nm": 5.44,
+                "TSMC_65nm": 1.44,
+                "TSMC_28nm": 0.49,
+                "GF_22FDX": 0.27,
+                "TSMC_16nm": 0.17,
+                "GF_12LP": 0.11,
+            },
+            "cross_tier_area_span_kge": {"min": 2.1, "max": 1650.0, "dynamic_range_x": round(1650.0 / 2.1, 1)},
+        },
         "eq5_eq6_app_validation": {
             "archived_app_runs": len(app_doc["results"]),
             "mshr_vs_memcpy_pearson_r_linear": round(r_mshr_lin, 4),
             "mshr_vs_memcpy_pearson_r_log2": round(r_mshr_log, 4),
             "mshr_vs_memcpy_r2_log2": round(r_mshr_log ** 2, 4),
+            "mshr_vs_memcpy_spearman_rho": round(rho_mshr_spearman, 4),
             "cva6_vs_rocket_9_kernels": head_to_head,
         },
         "eq7_eq8_vector_validation": {
@@ -387,8 +424,10 @@ def main() -> None:
         "eq9_barrier_scaling_fit": {
             "amo_quadratic_coeffs_a0_a1_a2": [round(c, 4) for c in amo_coeffs],
             "amo_r2": round(amo_r2, 5),
+            "amo_rmse_cycles": round(amo_rmse, 2),
             "tree_exact_zero_intercept_l_node": round(l_node, 2),
             "tree_exact_zero_intercept_r2": round(tree_zero_r2, 5),
+            "tree_exact_zero_intercept_rmse_cycles": round(tree_zero_rmse, 2),
             "tree_per_level_cycles_4c_to_432c": [round(y / c, 2) for y, c in zip(tree_cyc, ceils)],
             "tree_affine_log2_coeffs_b0_b1": [round(b0, 3), round(b1, 3)],
             "tree_affine_log2_r2": round(tree_aff_r2, 5),
