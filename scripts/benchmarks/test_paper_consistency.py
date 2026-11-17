@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -228,19 +229,40 @@ def main() -> int:
         if re.search(r"pp\.\s*1--1\b", bbl_txt):
             failures.append("Found placeholder 'pp. 1--1' Early Access page range in build/main.bbl")
 
-    # 8. Build log health (0 Overfull boxes, 0 prose/heading Underfull >= 2500)
+    # 8. Build log health (0 Overfull boxes, 0 prose/heading Underfull >= 2500, 0 warnings)
     log_path = PAPER / "build/main.log"
     if log_path.exists():
         log_txt = log_path.read_text()
         if re.search(r"Overfull \\", log_txt):
             failures.append("Found Overfull box in build/main.log")
-        if re.search(r"Warning:.*(Reference|Citation).*undefined", log_txt):
-            failures.append("Found undefined reference/citation in build/main.log")
+        if re.search(r"(?:LaTeX|pdfTeX|Class IEEEtran)[^\n]*[Ww]arning", log_txt):
+            failures.append("Found LaTeX/pdfTeX warning in build/main.log")
         bbl_pos = log_txt.find("build/main.bbl")
         prose_log = log_txt[:bbl_pos] if bbl_pos != -1 else log_txt
         for m in re.finditer(r"Underfull \\hbox \(badness (\d+)\)", prose_log):
             if int(m.group(1)) >= 2500:
                 failures.append(f"High-badness prose Underfull hbox ({m.group(1)}) in build/main.log")
+
+    # 9. ScholarOne Submission Archive & IEEE PDF eXpress Readiness
+    used_graphics = set(re.findall(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", tex))
+    orphans = [
+        p.relative_to(PAPER).as_posix()
+        for p in sorted((PAPER / "figures").iterdir())
+        if p.relative_to(PAPER).as_posix() not in used_graphics
+        and not (p.suffix == ".svg" and p.with_suffix(".pdf").relative_to(PAPER).as_posix() in used_graphics)
+    ]
+    if orphans:
+        failures.append(f"Unreferenced orphan files in figures/: {orphans}")
+
+    pdf_path = PAPER / "main.pdf"
+    if pdf_path.exists():
+        pinfo = subprocess.check_output(["pdfinfo", str(pdf_path)], text=True)
+        if "Title:          SCORE:" not in pinfo or "Author:         Chao Wang, Wei Mao, Xinfei Guo, and Yongfu Li" not in pinfo:
+            failures.append("main.pdf missing populated Title or Author PDF metadata")
+        pfonts = subprocess.check_output(["pdffonts", str(pdf_path)], text=True).splitlines()[2:]
+        unembedded = [ln for ln in pfonts if ln.strip() and ln.split()[-5] != "yes"]
+        if unembedded:
+            failures.append(f"Unembedded fonts in main.pdf: {unembedded}")
 
     if failures:
         print("FAILED CHECKS:")
@@ -252,7 +274,7 @@ def main() -> int:
         f"ALL CHECKS PASSED: {len(fig_labels)}/14 figs cited, {len(eq_labels)}/10 eqs cited, "
         f"{len(cites)}/{len(bib_keys)} refs matched 1:1, 10/10 L4 anchors exact, "
         f"all 8 quantitative figs (3/4/6/7/9/10/11/13) + Fig 5 + website synced, "
-        f"0 style/package violations, 0 overfull boxes, 0 high-badness prose underfull boxes."
+        f"0 orphan files, 100% embedded fonts, PDF metadata set, 0 warnings, 0 overfull boxes."
     )
     return 0
 
