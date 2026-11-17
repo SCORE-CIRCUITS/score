@@ -121,6 +121,14 @@ def main() -> int:
 
     # Fig. 6 & Fig. 7: 15 App Core Pareto & memcpy bandwidth bars
     fig7 = (PAPER / "figures/fig-app-memcpy-spectrum.svg").read_text()
+    if "1.15GHz" in fig7 or "Coherent Multicore Tile" in fig7:
+        failures.append("Fig. 7 still contains '1.15GHz' or 'Coherent Multicore Tile'")
+    fig8 = (PAPER / "figures/fig-vector-baseline-anatomy.svg").read_text()
+    if fig8.count("2 DP / 4 SP / Cyc") != 4:
+        failures.append("Fig. 8 expected 4 lane boxes with '2 DP / 4 SP / Cyc'")
+    fig12 = (PAPER / "figures/fig-soc-master-block-diagram.svg").read_text()
+    if "16 KB I$ / D$" not in fig12 or "8–432 CORES" not in fig12:
+        failures.append("Fig. 12 missing unified '16 KB I$ / D$' or '8–432 CORES'")
     rows7 = re.findall(
         r'<text[^>]*>(#\d+[^<]+)</text>\s*<rect x="232"[^>]*width="([\d.]+)"[^>]*/>\s*<text[^>]*>([\d.]+)</text>',
         fig7,
