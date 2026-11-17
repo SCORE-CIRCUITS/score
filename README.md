@@ -77,6 +77,7 @@ Workloads: **CoreMark**, **Dhrystone** · Profile: `mcu_verilator` · Suite: [`b
 
 | Architecture | Upstream | `install_*` | `generate_*` | `run_*` | Benchmarks |
 |---|---|---|---|---|---|
+| **CVA5 (Taiga)** | [openhwgroup/cva5](https://github.com/openhwgroup/cva5) | `install_cva5.sh` | `generate_cva5.sh` | `run_cva5_benchmarks.sh` | coremark, dhrystone, microbench (3 total) ✅ |
 | **DarkRISCV** | [darklife/darkriscv](https://github.com/darklife/darkriscv) | `install_darkriscv.sh` | `generate_darkriscv.sh` | — | coremark, dhrystone ✅ |
 | **Hazard3** | [Wren6991/Hazard3](https://github.com/Wren6991/Hazard3) | `install_hazard3.sh` | `generate_hazard3.sh` | — | coremark, dhrystone ✅ |
 | **Ibex** | [lowRISC/ibex](https://github.com/lowRISC/ibex) | `install_ibex.sh` | `generate_ibex.sh` | `run_ibex.sh` | coremark (8 configs), dhrystone (small, opentitan) ✅ |
@@ -99,6 +100,7 @@ Workloads: **CoreMark**, **Dhrystone**, **memcpy**, **pmp**, **riscv-tests** (me
 |---|---|---|---|---|---|
 | **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
 | **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
+| **SHAKTI (C-Class)** | [shaktiproject/c-class](https://gitlab.com/shaktiproject/cores/c-class) | `install_shakti.sh` | `generate_shakti.sh` | `run_shakti_benchmarks.sh` | coremark, dhrystone, microbench (3 total) ✅ |
 | **SonicBOOM** | [riscv-boom/riscv-boom](https://github.com/riscv-boom/riscv-boom) | `install_boom.sh` | `generate_boom.sh` | `run_boom_benchmarks.sh` | coremark, dhrystone (11.58 DMIPS/MHz), microbench (3 total) ✅ |
 | **XiangShan (NanHu)** | [OpenXiangShan/XiangShan](https://github.com/OpenXiangShan/XiangShan) | `install_xiangshan.sh` | `generate_xiangshan.sh` | `run_xiangshan_benchmarks.sh` | coremark, dhrystone (15.06 DMIPS/MHz), microbench, linux_boot (4 total) ✅ |
 
@@ -111,6 +113,7 @@ Workloads: **fmatmul**, **fconv2d**, **fconv3d**, **fdotproduct**, **fft**, **im
 | **Ara** | [pulp-platform/ara](https://github.com/pulp-platform/ara) | `install_ara.sh` | `generate_ara.sh` | `run_ara.sh` | 8 vector kernels ✅ |
 | **Gemmini** | [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini) | `install_gemmini.sh` | `generate_gemmini.sh` | `run_gemmini.sh` | 6 systolic workloads ✅ |
 | **Spatz** | [pulp-platform/spatz](https://github.com/pulp-platform/spatz) | `install_spatz.sh` | `generate_spatz.sh` | `run_spatz.sh` | 6 vector kernels ✅ |
+| **Vortex** | [vortexgpgpu/vortex](https://github.com/vortexgpgpu/vortex) | `install_vortex.sh` | `generate_vortex.sh` | `run_vortex_benchmarks.sh` | opencl_sgemm, opencl_vecadd (SIMT GPGPU) ✅ |
 
 ### Category 4 — Full SoC Platforms & Multi-Core Clusters
 
