@@ -1,6 +1,6 @@
 {
   "schema": "score.benchmark_audit.v1",
-  "generated_utc": "2026-11-17T21:09:02+00:00",
+  "generated_utc": "2026-11-17T21:27:01+00:00",
   "tiers": {
     "core": {
       "archived_runs": 42,
