@@ -1,6 +1,6 @@
 {
-  "schema": "score.model_validation.v1",
-  "generated_utc": "2026-11-17T21:47:10+00:00",
+  "schema": "score.model_validation.v2",
+  "generated_utc": "2026-11-17T22:30:40+00:00",
   "eq2_pareto_sets": {
     "cat1_pareto_optimal": [
       "SERV",
@@ -19,12 +19,29 @@
       "OpenC910",
       "XiangShan"
     ],
-    "cat2_count": "6/15"
+    "cat2_count": "6/15",
+    "cat3_raw_pareto_optimal": [
+      "CV32E40P XPULP",
+      "XLS HLS",
+      "Vicuna",
+      "Spatz 2-PE (FP32)",
+      "IME Tile",
+      "Gemmini"
+    ],
+    "cat3_raw_count": "6/10",
+    "cat3_64b_norm_pareto_optimal": [
+      "CV32E40P XPULP",
+      "XLS HLS",
+      "Spatz 2-PE (FP64)",
+      "IME Tile",
+      "Gemmini"
+    ],
+    "cat3_64b_norm_count": "5/10"
   },
-  "eq4_coremark_validation": {
-    "exact_matches": 21,
-    "total_checked": 22,
-    "max_residual_pct": 0.0023,
+  "eq3_eq4_scalar_validation": {
+    "coremark_exact_matches": 21,
+    "coremark_total_checked": 22,
+    "coremark_max_residual_pct": 0.0023,
     "metadata_anomalies": [
       {
         "core": "cv32e40p",
@@ -35,7 +52,91 @@
         "formula_cm_mhz": 2200.0022,
         "note": "iterations field reflects full suite parameter rather than single-run cycle window"
       }
-    ]
+    ],
+    "ibex_dhrystone_cpi_scaling": {
+      "small": {
+        "cpi": 1.686,
+        "cycles": 131735
+      },
+      "opentitan": {
+        "cpi": 1.188,
+        "cycles": 96378
+      },
+      "cpi_ratio": 1.4192,
+      "cycle_ratio": 1.3669,
+      "ratio_residual_pct": 3.829
+    }
+  },
+  "eq5_eq6_app_validation": {
+    "archived_app_runs": 41,
+    "mshr_vs_memcpy_pearson_r_linear": 0.8985,
+    "mshr_vs_memcpy_pearson_r_log2": 0.9083,
+    "mshr_vs_memcpy_r2_log2": 0.825,
+    "cva6_vs_rocket_9_kernels": {
+      "median": {
+        "cva6_cycles": 8366,
+        "cva6_ipc": 0.5569,
+        "rocket_cycles": 6144,
+        "rocket_ipc": 0.7583,
+        "rocket_over_cva6_cycle_ratio": 0.734
+      },
+      "memcpy": {
+        "cva6_cycles": 15067,
+        "cva6_ipc": 0.6662,
+        "rocket_cycles": 16779,
+        "rocket_ipc": 0.3293,
+        "rocket_over_cva6_cycle_ratio": 1.114
+      },
+      "mm": {
+        "cva6_cycles": 25297,
+        "cva6_ipc": 0.9781,
+        "rocket_cycles": 26769,
+        "rocket_ipc": 0.9317,
+        "rocket_over_cva6_cycle_ratio": 1.058
+      },
+      "multiply": {
+        "cva6_cycles": 30802,
+        "cva6_ipc": 0.7824,
+        "rocket_cycles": 28224,
+        "rocket_ipc": 0.8607,
+        "rocket_over_cva6_cycle_ratio": 0.916
+      },
+      "qsort": {
+        "cva6_cycles": 207419,
+        "cva6_ipc": 0.5954,
+        "rocket_cycles": 182238,
+        "rocket_ipc": 0.6877,
+        "rocket_over_cva6_cycle_ratio": 0.879
+      },
+      "rsort": {
+        "cva6_cycles": 180511,
+        "cva6_ipc": 0.9482,
+        "rocket_cycles": 212314,
+        "rocket_ipc": 0.8156,
+        "rocket_over_cva6_cycle_ratio": 1.176
+      },
+      "spmv": {
+        "cva6_cycles": 55532,
+        "cva6_ipc": 0.6264,
+        "rocket_cycles": 57123,
+        "rocket_ipc": 0.6103,
+        "rocket_over_cva6_cycle_ratio": 1.029
+      },
+      "towers": {
+        "cva6_cycles": 4599,
+        "cva6_ipc": 0.8158,
+        "rocket_cycles": 4074,
+        "rocket_ipc": 0.9283,
+        "rocket_over_cva6_cycle_ratio": 0.886
+      },
+      "vvadd": {
+        "cva6_cycles": 3424,
+        "cva6_ipc": 0.7074,
+        "rocket_cycles": 2469,
+        "rocket_ipc": 0.9785,
+        "rocket_over_cva6_cycle_ratio": 0.721
+      }
+    }
   },
   "eq7_eq8_vector_validation": {
     "ops_per_cycle_checked": 13,
@@ -92,11 +193,21 @@
       0.4454
     ],
     "amo_r2": 0.99992,
-    "tree_log2_coeffs_b0_b1": [
+    "tree_exact_zero_intercept_l_node": 61.0,
+    "tree_exact_zero_intercept_r2": 0.9345,
+    "tree_per_level_cycles_4c_to_432c": [
+      47.5,
+      45.0,
+      51.67,
+      58.57,
+      64.38,
+      67.78
+    ],
+    "tree_affine_log2_coeffs_b0_b1": [
       -97.926,
       75.725
     ],
-    "tree_r2": 0.96358,
+    "tree_affine_log2_r2": 0.96358,
     "speedup_at_432_cores": 161.48
   },
   "eq10_dma_breakeven": {
