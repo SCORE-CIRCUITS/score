@@ -11,6 +11,7 @@ Verifies in a single command:
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -83,7 +84,44 @@ def main() -> int:
         if token not in tex:
             failures.append(f"Expected validated metric token {token!r} in manuscript")
 
-    # 5. Build log health
+    # 5. SVG-to-Equation Vertex Coordinate Checks (< 0.5 px tolerance)
+    fig10 = (PAPER / "figures/fig-vector-pareto-frontier.svg").read_text()
+    if 'cx="413.5" cy="218.1"' not in fig10 or 'cx="290.7" cy="430.5"' not in fig10:
+        failures.append("Fig. 10 SVG missing exact Spatz 2-PE (84 kGE) or CV32E40P XPULP (35 kGE) coordinates")
+
+    fig11 = (PAPER / "figures/fig-vector-utilization-cliff.svg").read_text()
+    m11 = re.search(r'<polyline points="([^"]+)" fill="none" stroke="#2563eb"', fig11)
+    if not m11:
+        failures.append("Fig. 11 blue Eq. (8) polyline not found")
+    else:
+        pts11 = [tuple(float(v) for v in p.split(",")) for p in m11.group(1).split()]
+        exp11_y = [342.0 - 50.0 * e["eq8_inferred_rho_host"] for e in val["eq7_eq8_vector_validation"]["ara_5kernel_cliff_eq8"]]
+        if len(pts11) != len(exp11_y) or any(abs(p[1] - ey) > 0.5 for p, ey in zip(pts11, exp11_y)):
+            failures.append(f"Fig. 11 blue polyline drifts >0.5 px from Eq. (8): got {[p[1] for p in pts11]} vs {[round(y,1) for y in exp11_y]}")
+
+    fig13 = (PAPER / "figures/fig-soc-barrier-scaling.svg").read_text()
+    amo_vals = [120, 480, 3200, 11800, 38400, 98500]
+    tree_vals = [95, 180, 310, 410, 515, 610]
+    for color, label, vals in [("#e11d48", "AMO", amo_vals), ("#059669", "FractalSync", tree_vals)]:
+        mp = re.search(rf'<path d="([^"]+)" stroke="{color}"', fig13)
+        if not mp:
+            failures.append(f"Fig. 13(A) {label} path not found")
+            continue
+        ys = [float(y) for _, y in re.findall(r"([0-9.]+),([0-9.]+)", mp.group(1))]
+        exp_ys = [425.0 - 82.5 * (math.log10(v) - 1.0) for v in vals]
+        if len(ys) != len(exp_ys) or any(abs(a - b) > 0.5 for a, b in zip(ys, exp_ys)):
+            failures.append(f"Fig. 13(A) {label} drifts >0.5 px: got {ys} vs {[round(y,1) for y in exp_ys]}")
+
+    mp_dma = re.search(r'<path d="([^"]+)" stroke="#2563eb"', fig13)
+    if not mp_dma:
+        failures.append("Fig. 13(B) DMA path not found")
+    else:
+        ys_dma = [float(y) for _, y in re.findall(r"([0-9.]+),([0-9.]+)", mp_dma.group(1))]
+        exp_dma = [425.0 - 20.625 * pt["effective_gb_s"] for pt in val["eq10_dma_breakeven"]["effective_dma_curve_64b_to_64kb"]]
+        if len(ys_dma) != len(exp_dma) or any(abs(a - b) > 0.5 for a, b in zip(ys_dma, exp_dma)):
+            failures.append(f"Fig. 13(B) DMA drifts >0.5 px from Eq. (10): got {ys_dma} vs {[round(y,1) for y in exp_dma]}")
+
+    # 6. Build log health
     log_path = PAPER / "build/main.log"
     if log_path.exists():
         log_txt = log_path.read_text()
@@ -101,7 +139,7 @@ def main() -> int:
     print(
         f"ALL CHECKS PASSED: {len(fig_labels)}/14 figs cited, {len(eq_labels)}/10 eqs cited, "
         f"{len(cites)}/{len(bib_keys)} refs matched 1:1, 10/10 L4 anchors exact, "
-        f"0 style violations, 0 overfull boxes."
+        f"Figs 10/11/13 pixel-exact (<0.5 px), 0 style violations, 0 overfull boxes."
     )
     return 0
 
