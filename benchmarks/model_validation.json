@@ -1,6 +1,6 @@
 {
-  "schema": "score.model_validation.v3",
-  "generated_utc": "2026-11-17T22:46:52+00:00",
+  "schema": "score.model_validation.v4",
+  "generated_utc": "2026-11-17T22:52:53+00:00",
   "corpus_accounting": {
     "tier_evaluated_targets": 56,
     "per_tier_counts": {
@@ -317,5 +317,81 @@
     "cycles_at_500mhz": 151.4,
     "cycles_at_115mhz": 34.8,
     "recomputed_s_star_bytes": 256.0
+  },
+  "level4_soc_telemetry_anchors": {
+    "exact_matches": 10,
+    "total_checked": 10,
+    "anchors": [
+      {
+        "soc": "croc",
+        "workload": "test_idma",
+        "exec_cycles": 692,
+        "total_cycles": 34205,
+        "exact_match": true
+      },
+      {
+        "soc": "pulpissimo",
+        "workload": "conv2d",
+        "exec_cycles": 5248,
+        "total_cycles": 38152,
+        "exact_match": true
+      },
+      {
+        "soc": "opentitan",
+        "workload": "boot_rom_integrity",
+        "exec_cycles": 14270,
+        "total_cycles": 53550,
+        "exact_match": true
+      },
+      {
+        "soc": "snitch_cluster",
+        "workload": "barrier",
+        "exec_cycles": 2825,
+        "total_cycles": 2825,
+        "exact_match": true
+      },
+      {
+        "soc": "snitch_cluster",
+        "workload": "matmul_i32",
+        "exec_cycles": 37838,
+        "total_cycles": 108322,
+        "exact_match": true
+      },
+      {
+        "soc": "cheshire",
+        "workload": "dma_2d",
+        "exec_cycles": 103439,
+        "total_cycles": 103439,
+        "exact_match": true
+      },
+      {
+        "soc": "openpiton",
+        "workload": "helloworld",
+        "exec_cycles": 356310,
+        "total_cycles": 356310,
+        "exact_match": true
+      },
+      {
+        "soc": "picobello",
+        "workload": "helloworld",
+        "exec_cycles": 462988,
+        "total_cycles": 462988,
+        "exact_match": true
+      },
+      {
+        "soc": "mempool",
+        "workload": "conv2d_i32",
+        "exec_cycles": 5922,
+        "total_cycles": 11844,
+        "exact_match": true
+      },
+      {
+        "soc": "occamy",
+        "workload": "test_sys_dma",
+        "exec_cycles": 7476,
+        "total_cycles": 7476,
+        "exact_match": true
+      }
+    ]
   }
 }

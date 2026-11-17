@@ -301,8 +301,46 @@ def main() -> None:
     t_setup_ns = s_star * (1.0 / b_core - 1.0 / b_dma)
     s_check = t_setup_ns / (1.0 / b_core - 1.0 / b_dma)
 
+    # 7. Level 4 SoC Empirical Telemetry Anchors (10 verified Verilator runs cited in Section VI-B)
+    l4_wanted = [
+        ("croc", "test_idma", 692, 34205),
+        ("pulpissimo", "conv2d", 5248, 38152),
+        ("opentitan", "boot_rom_integrity", 14270, 53550),
+        ("snitch_cluster", "barrier", 2825, 2825),
+        ("snitch_cluster", "matmul_i32", 37838, 108322),
+        ("cheshire", "dma_2d", 103439, 103439),
+        ("openpiton", "helloworld", 356310, 356310),
+        ("picobello", "helloworld", 462988, 462988),
+        ("mempool", "conv2d_i32", 5922, 11844),
+        ("occamy", "test_sys_dma", 7476, 7476),
+    ]
+    l4_anchors = []
+    l4_exact = 0
+    for soc_name, wl, exp_exec, exp_tot in l4_wanted:
+        match = next(
+            (
+                r for r in soc_doc["results"]
+                if (r.get("soc") or r.get("core") or "").lower() == soc_name
+                and (r.get("workload") or "").lower() == wl
+            ),
+            None,
+        )
+        m = (match or {}).get("metrics") or {}
+        got_exec = m.get("execution_cycles") or m.get("kernel_execution_cycles") or m.get("total_simulation_cycles")
+        got_tot = m.get("total_simulation_cycles") or m.get("execution_cycles")
+        ok = (got_exec == exp_exec and got_tot == exp_tot)
+        if ok:
+            l4_exact += 1
+        l4_anchors.append({
+            "soc": soc_name,
+            "workload": wl,
+            "exec_cycles": got_exec,
+            "total_cycles": got_tot,
+            "exact_match": ok,
+        })
+
     out = {
-        "schema": "score.model_validation.v3",
+        "schema": "score.model_validation.v4",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "corpus_accounting": {
             "tier_evaluated_targets": sum(len(v) for v in tier_sets.values()),
@@ -360,6 +398,11 @@ def main() -> None:
             "cycles_at_500mhz": round(t_setup_ns * 0.5, 1),
             "cycles_at_115mhz": round(t_setup_ns * 0.115, 1),
             "recomputed_s_star_bytes": round(s_check, 4),
+        },
+        "level4_soc_telemetry_anchors": {
+            "exact_matches": l4_exact,
+            "total_checked": len(l4_anchors),
+            "anchors": l4_anchors,
         },
     }
 
