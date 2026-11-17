@@ -68,6 +68,19 @@ def collect() -> list[dict]:
         ):
             if not doc.get("soc") and parent_soc:
                 doc["soc"] = parent_soc
+            if not doc.get("workload"):
+                doc["workload"] = path.stem
+            # Normalize legacy/omitted evidence_class into canonical schema enum
+            ec = doc.get("evidence_class")
+            if ec in (None, "", "simulated", "empirical_simulation"):
+                m = doc.get("metrics") or {}
+                has_cycles = any(
+                    m.get(k) is not None
+                    for k in ("execution_cycles", "total_simulation_cycles", "simulation_cycles")
+                )
+                has_wall = m.get("wall_time_s") is not None or m.get("wall_time_sec") is not None
+                if has_cycles and has_wall:
+                    doc["evidence_class"] = "score_measured"
             doc["_path"] = str(path.relative_to(ROOT))
             rows.append(doc)
     return rows
@@ -75,16 +88,21 @@ def collect() -> list[dict]:
 
 def main() -> None:
     rows = collect()
+    unique_keys = {
+        (r.get("soc") or r.get("core") or "", r.get("config") or "", r.get("workload") or "")
+        for r in rows
+    }
     payload = {
         "schema": "score.benchmark_aggregated.v1",
         "category": "Full SoC Platforms & Multi-Core Clusters",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "count": len(rows),
+        "unique_count": len(unique_keys),
         "results": rows,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"Wrote {len(rows)} result(s) → {OUT}")
+    print(f"Wrote {len(rows)} result(s) ({len(unique_keys)} unique) → {OUT}")
 
 
 if __name__ == "__main__":

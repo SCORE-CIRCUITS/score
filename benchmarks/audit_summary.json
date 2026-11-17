@@ -1,0 +1,291 @@
+{
+  "schema": "score.benchmark_audit.v1",
+  "generated_utc": "2026-11-17T21:09:02+00:00",
+  "tiers": {
+    "core": {
+      "archived_runs": 42,
+      "unique_profiles": 41,
+      "targets": 15,
+      "evidence_class": {
+        "score_measured": 42
+      },
+      "simulators": {
+        "verilator": 35,
+        "icarus": 4,
+        "cxxrtl": 2,
+        "ghdl": 1
+      }
+    },
+    "app": {
+      "archived_runs": 41,
+      "unique_profiles": 41,
+      "targets": 9,
+      "evidence_class": {
+        "score_measured": 41
+      },
+      "simulators": {
+        "verilator": 37,
+        "iverilog": 4
+      }
+    },
+    "vector": {
+      "archived_runs": 38,
+      "unique_profiles": 38,
+      "targets": 10,
+      "evidence_class": {
+        "score_measured": 34,
+        "literature_reported": 4
+      },
+      "simulators": {
+        "verilator": 34,
+        "chisel-emulator": 1,
+        "spike-sme": 1,
+        "vlsim": 2
+      }
+    },
+    "soc": {
+      "archived_runs": 69,
+      "unique_profiles": 55,
+      "targets": 22,
+      "evidence_class": {
+        "score_measured": 67,
+        "literature_reported": 2
+      },
+      "simulators": {
+        "verilator": 69
+      }
+    }
+  },
+  "totals": {
+    "archived_runs": 190,
+    "unique_profiles": 175,
+    "score_measured_runs": 184,
+    "literature_reported_runs": 6,
+    "simulators": {
+      "verilator": 175,
+      "icarus": 4,
+      "cxxrtl": 2,
+      "ghdl": 1,
+      "iverilog": 4,
+      "chisel-emulator": 1,
+      "spike-sme": 1,
+      "vlsim": 2
+    },
+    "schema_issue_count": 0,
+    "cross_commit_bit_exact_matches": 14,
+    "cross_commit_total_pairs": 15
+  },
+  "cross_commit_checks": [
+    {
+      "tier": "core",
+      "profile": "ibex/small/coremark",
+      "occurrences": 2,
+      "commits": [
+        "7b5df75a",
+        "eede2fbb"
+      ],
+      "cycles": [
+        4063528,
+        4063528
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "cheshire/cva6_cfg0/dma_1d",
+      "occurrences": 2,
+      "commits": [
+        "a31da013",
+        "a31da013"
+      ],
+      "cycles": [
+        102612,
+        102612
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "cheshire/cva6_cfg0/dma_2d",
+      "occurrences": 2,
+      "commits": [
+        "a31da013",
+        "a31da013"
+      ],
+      "cycles": [
+        103439,
+        103439
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "cheshire/cva6_cfg0/helloworld",
+      "occurrences": 2,
+      "commits": [
+        "a31da013",
+        "a31da013"
+      ],
+      "cycles": [
+        449861,
+        449861
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "cheshire/cva6_cfg0/spm_uncached",
+      "occurrences": 2,
+      "commits": [
+        "a31da013",
+        "a31da013"
+      ],
+      "cycles": [
+        102193,
+        102193
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "mempool/minpool_16cores/axpy_i32",
+      "occurrences": 2,
+      "commits": [
+        "88a20ceb",
+        "88a20ceb"
+      ],
+      "cycles": [
+        44570,
+        44570
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "mempool/minpool_16cores/conv2d_i32",
+      "occurrences": 2,
+      "commits": [
+        "88a20ceb",
+        "88a20ceb"
+      ],
+      "cycles": [
+        11844,
+        11844
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "mempool/minpool_16cores/dct_i32",
+      "occurrences": 2,
+      "commits": [
+        "88a20ceb",
+        "88a20ceb"
+      ],
+      "cycles": [
+        18112,
+        18112
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "mempool/minpool_16cores/dotp_i32",
+      "occurrences": 2,
+      "commits": [
+        "88a20ceb",
+        "88a20ceb"
+      ],
+      "cycles": [
+        16462,
+        16506
+      ],
+      "bit_exact_match": false
+    },
+    {
+      "tier": "soc",
+      "profile": "mempool/minpool_16cores/hello_world",
+      "occurrences": 2,
+      "commits": [
+        "88a20ceb",
+        "88a20ceb"
+      ],
+      "cycles": [
+        51436,
+        51436
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "pulpissimo/cv32e40p_fll/bubblesort",
+      "occurrences": 2,
+      "commits": [
+        "bfc3d9a1",
+        "e30ce2ec"
+      ],
+      "cycles": [
+        163312,
+        163312
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "pulpissimo/cv32e40p_fll/conv2d",
+      "occurrences": 2,
+      "commits": [
+        "bfc3d9a1",
+        "e30ce2ec"
+      ],
+      "cycles": [
+        38152,
+        38152
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "pulpissimo/cv32e40p_fll/fibonacci",
+      "occurrences": 2,
+      "commits": [
+        "bfc3d9a1",
+        "e30ce2ec"
+      ],
+      "cycles": [
+        361410,
+        361410
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "pulpissimo/cv32e40p_fll/fir",
+      "occurrences": 2,
+      "commits": [
+        "bfc3d9a1",
+        "e30ce2ec"
+      ],
+      "cycles": [
+        58669,
+        58669
+      ],
+      "bit_exact_match": true
+    },
+    {
+      "tier": "soc",
+      "profile": "pulpissimo/cv32e40p_fll/keccak",
+      "occurrences": 2,
+      "commits": [
+        "bfc3d9a1",
+        "e30ce2ec"
+      ],
+      "cycles": [
+        212343,
+        212343
+      ],
+      "bit_exact_match": true
+    }
+  ],
+  "schema_issues": []
+}
