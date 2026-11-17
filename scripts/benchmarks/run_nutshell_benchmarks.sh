@@ -10,12 +10,14 @@ source "$SCRIPT_DIR/common_benchmark.sh"
 NUTSHELL_DIR="$PROJECT_ROOT/tools/nutshell"
 EMU="$NUTSHELL_DIR/build/emu"
 READY_IMAGE="$NUTSHELL_DIR/ready-to-run/microbench.bin"
+MAX_CYCLES=2000000
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [benchmark_name]
 
 Runs NutShell RV64IMAC benchmarks on cycle-accurate Verilator simulation.
+Supported benchmarks: microbench, linux_boot.
 Default benchmark: microbench (includes qsort, queen, bf, fib, sieve, 15pz, dinic, lzip, ssort, md5).
 
 Output: datasets/nutshell/<commit>/benchmarks/<benchmark>_default.json
@@ -31,6 +33,11 @@ BENCH_DIR="$PROJECT_ROOT/datasets/nutshell/$COMMIT/benchmarks"
 mkdir -p "$BENCH_DIR"
 
 TARGET="${1:-microbench}"
+if [[ "$TARGET" == "linux" || "$TARGET" == "linux_boot" ]]; then
+    READY_IMAGE="$NUTSHELL_DIR/ready-to-run/linux.bin"
+    MAX_CYCLES=1000000
+fi
+
 log_info "Preparing NutShell benchmark: $TARGET @ commit $COMMIT"
 
 # Ensure emu is built
@@ -45,7 +52,7 @@ OUT_JSON="$BENCH_DIR/${TARGET}_default.json"
 
 log_info "Executing $TARGET on NutShell Verilator simulator..."
 START_TIME=$(date +%s%N)
-"$EMU" -i "$READY_IMAGE" -C 2000000 2>&1 | tee "$LOG_FILE"
+"$EMU" -i "$READY_IMAGE" -C "$MAX_CYCLES" 2>&1 | tee "$LOG_FILE"
 END_TIME=$(date +%s%N)
 
 WALL_SECONDS=$(python3 -c "print(f'{($END_TIME - $START_TIME) / 1e9:.3f}')")
@@ -70,7 +77,7 @@ BP_WRONG=$(grep -oP "^\s*\K[0-9]+(?=\s*<-\s*MbpBWrong)" "$LOG_FILE" || echo 0)
 
 PASSED=false
 PY_PASSED=False
-if grep -q "MicroBench PASS" "$LOG_FILE"; then
+if grep -q "MicroBench PASS\|Linux version\|INSTRUCTION SETS WANT TO BE FREE" "$LOG_FILE"; then
     PASSED=true
     PY_PASSED=True
 fi

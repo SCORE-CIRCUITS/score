@@ -127,6 +127,10 @@
           "status": "implemented",
           "runner": "scripts/benchmarks/run_c906_benchmarks.sh csr"
         },
+        "interrupt": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c906_benchmarks.sh interrupt"
+        },
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_c906_benchmarks.sh coremark"
@@ -144,6 +148,10 @@
           "status": "implemented",
           "runner": "scripts/benchmarks/run_c910_benchmarks.sh hello_world"
         },
+        "csr": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_c910_benchmarks.sh csr"
+        },
         "coremark": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_c910_benchmarks.sh coremark"
@@ -160,6 +168,19 @@
         "microbench": {
           "status": "implemented",
           "runner": "scripts/benchmarks/run_nutshell_benchmarks.sh microbench"
+        }
+      }
+    },
+    {
+      "score_tool": "black-parrot",
+      "profile": "app_verilator",
+      "architecture": "rv64gc",
+      "config": "bp_unicore_default",
+      "description": "UW/BSG BlackParrot 64-bit Linux-capable multicore processor with BedRock coherent memory system",
+      "workloads": {
+        "demo": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_black_parrot_benchmarks.sh demo"
         }
       }
     }

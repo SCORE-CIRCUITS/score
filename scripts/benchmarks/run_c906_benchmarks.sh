@@ -17,8 +17,8 @@ usage() {
 Usage: $(basename "$0") [benchmark_name]
 
 Runs XuanTie C906 RV64GCV benchmarks on cycle-accurate simulation.
-Supported benchmarks: coremark, ISA_INT, csr, cache.
-Default: coremark.
+Supported benchmarks: csr, interrupt, coremark, ISA_INT, cache.
+Default: csr.
 
 Output: datasets/c906/<commit>/benchmarks/<benchmark>_default.json
 EOF
@@ -33,7 +33,7 @@ COMMIT="$(score_benchmark_get_commit "$C906_DIR")"
 BENCH_DIR="$PROJECT_ROOT/datasets/c906/$COMMIT/benchmarks"
 mkdir -p "$BENCH_DIR" "$WORK_DIR"
 
-TARGET="${1:-coremark}"
+TARGET="${1:-csr}"
 log_info "Preparing XuanTie C906 benchmark: $TARGET @ commit $COMMIT"
 
 export CODE_BASE_PATH="$C906_DIR/C906_RTL_FACTORY"

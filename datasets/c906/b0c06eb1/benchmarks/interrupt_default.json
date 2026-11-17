@@ -1,0 +1,29 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "c906",
+  "upstream_commit": "b0c06eb1",
+  "profile": "app_iverilog",
+  "workload": "interrupt",
+  "config": "c906fd_sv39",
+  "metrics": {
+    "validated": true,
+    "simulator": "iverilog",
+    "architecture": "rv64gcv",
+    "configuration": "c906fd_sv39",
+    "total_simulation_cycles": 3716,
+    "benchmark_cycles": 3716,
+    "instructions_retired": 2898,
+    "ipc": 0.78,
+    "wall_clock_seconds": 775.603
+  },
+  "generated_utc": "2026-11-17T00:24:29Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "unknown"
+  }
+}

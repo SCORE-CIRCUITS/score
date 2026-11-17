@@ -1,0 +1,29 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "c910",
+  "upstream_commit": "b91c9091",
+  "profile": "app_iverilog",
+  "workload": "csr",
+  "config": "c910_12stage_ooo",
+  "metrics": {
+    "validated": true,
+    "simulator": "iverilog",
+    "architecture": "rv64gcv",
+    "configuration": "c910_12stage_ooo",
+    "total_simulation_cycles": 4276,
+    "benchmark_cycles": 4276,
+    "instructions_retired": 4490,
+    "ipc": 1.05,
+    "wall_clock_seconds": 905.14
+  },
+  "generated_utc": "2026-11-17T00:13:50Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "iverilog": "11.0"
+  }
+}
