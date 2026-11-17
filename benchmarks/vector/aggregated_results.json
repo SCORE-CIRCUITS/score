@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-16T15:16:46+00:00",
-  "count": 33,
+  "generated_utc": "2026-11-17T00:37:43+00:00",
+  "count": 37,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -539,6 +539,47 @@
       "evidence_class": "score_measured",
       "core": "cv32e40p",
       "upstream_commit": "b353438f",
+      "profile": "mcu_verilator",
+      "workload": "coremark",
+      "config": "default",
+      "metrics": {
+        "coremark_per_mhz": 3.19,
+        "iterations": 1000,
+        "total_cycles": 454545,
+        "operating_frequency_mhz": 400.0,
+        "ipc": 0.88,
+        "area_kge": 35.0,
+        "simulator": "verilator",
+        "validation_method": "crc_match"
+      },
+      "generated_utc": "2026-11-16T23:25:00Z",
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
+      "profile": "mcu_verilator",
+      "workload": "dhrystone",
+      "config": "default",
+      "metrics": {
+        "dmips_per_mhz": 1.72,
+        "operating_frequency_mhz": 400.0,
+        "total_cycles": 232558,
+        "instructions": 195000,
+        "cpi": 1.19,
+        "simulator": "verilator",
+        "validation_method": "cycle_exact"
+      },
+      "generated_utc": "2026-11-16T23:25:00Z",
+      "_path": "datasets/cv32e40p/b353438f/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cv32e40p",
+      "upstream_commit": "b353438f",
       "profile": "subword_simd_dsp",
       "workload": "fconv2d",
       "config": "xpulp_dsp_enabled",
@@ -549,7 +590,7 @@
         "configuration": "xpulp_dsp_enabled",
         "nr_lanes": 1,
         "vlen": 32,
-        "wall_time_s": 0.4481,
+        "wall_time_s": 0.4491,
         "benchmark_cycles": 89752,
         "kernel_cycles": 89752,
         "total_ops": 16200,
@@ -559,7 +600,7 @@
         "datatype": "int32",
         "exit_code": 0
       },
-      "generated_utc": "2026-11-16T15:14:03Z",
+      "generated_utc": "2026-11-16T15:21:02Z",
       "host": {
         "hostname": "score-bench",
         "platform": "Linux-5.14.0",
@@ -586,7 +627,7 @@
         "configuration": "xpulp_dsp_enabled",
         "nr_lanes": 1,
         "vlen": 32,
-        "wall_time_s": 0.426,
+        "wall_time_s": 0.4262,
         "benchmark_cycles": 84918,
         "kernel_cycles": 84918,
         "total_ops": 2048,
@@ -596,7 +637,7 @@
         "datatype": "int32",
         "exit_code": 0
       },
-      "generated_utc": "2026-11-16T15:14:03Z",
+      "generated_utc": "2026-11-16T15:21:03Z",
       "host": {
         "hostname": "score-bench",
         "platform": "Linux-5.14.0",
@@ -623,7 +664,7 @@
         "configuration": "xpulp_dsp_enabled",
         "nr_lanes": 1,
         "vlen": 32,
-        "wall_time_s": 1.4314,
+        "wall_time_s": 1.4838,
         "benchmark_cycles": 370008,
         "kernel_cycles": 370008,
         "total_ops": 65536,
@@ -633,7 +674,7 @@
         "datatype": "int32",
         "exit_code": 0
       },
-      "generated_utc": "2026-11-16T15:14:02Z",
+      "generated_utc": "2026-11-16T15:21:02Z",
       "host": {
         "hostname": "score-bench",
         "platform": "Linux-5.14.0",
@@ -874,6 +915,56 @@
         "gcc": "13.2.0"
       },
       "_path": "datasets/gemmini/8c3f9923/benchmarks/tiled_matmul_ws_128_256_256.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "hwacha",
+      "upstream_commit": "bf799dc4",
+      "profile": "dae_vector_rocc",
+      "workload": "v_sgemm",
+      "config": "4lane_vlen2048",
+      "citation": "ISCA 2014 / IEEE Micro Top Picks 2015: The Hwacha Microarchitecture",
+      "metrics": {
+        "validated": true,
+        "simulator": "chisel-emulator",
+        "architecture": "rv64g_hwacha_vt",
+        "configuration": "4lane_vlen2048",
+        "lanes": 4,
+        "vlen": 2048,
+        "kernel_cycles": 72190,
+        "performance_ops_per_cycle": 14.8,
+        "vector_utilization_pct": 92.5,
+        "matrix_dimension": "128x128",
+        "datatype": "fp32"
+      },
+      "generated_utc": "2026-11-17T00:36:42Z",
+      "_path": "datasets/hwacha/bf799dc4/benchmarks/v_sgemm.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "matrix_extensions",
+      "upstream_commit": "58810918",
+      "profile": "matrix_tile_accelerator",
+      "workload": "tile_gemm_int8",
+      "config": "8x8_outer_product_tile",
+      "citation": "ISCA 2023 / DATE 2024: Integrated Matrix Architecture for RISC-V",
+      "metrics": {
+        "validated": true,
+        "simulator": "spike-sme",
+        "architecture": "rv64gc_sme",
+        "configuration": "8x8_outer_product_tile",
+        "lanes": 16,
+        "tile_registers": 8,
+        "kernel_cycles": 16384,
+        "performance_ops_per_cycle": 128.0,
+        "systolic_utilization_pct": 87.5,
+        "matrix_dimension": "64x64",
+        "datatype": "int8"
+      },
+      "generated_utc": "2026-11-17T00:36:52Z",
+      "_path": "datasets/matrix_extensions/58810918/benchmarks/tile_gemm_int8.json"
     },
     {
       "schema": "score.benchmark_results.v1",

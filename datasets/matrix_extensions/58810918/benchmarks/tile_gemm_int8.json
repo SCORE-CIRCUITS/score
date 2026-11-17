@@ -1,0 +1,24 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "literature_reported",
+  "core": "matrix_extensions",
+  "upstream_commit": "58810918",
+  "profile": "matrix_tile_accelerator",
+  "workload": "tile_gemm_int8",
+  "config": "8x8_outer_product_tile",
+  "citation": "ISCA 2023 / DATE 2024: Integrated Matrix Architecture for RISC-V",
+  "metrics": {
+    "validated": true,
+    "simulator": "spike-sme",
+    "architecture": "rv64gc_sme",
+    "configuration": "8x8_outer_product_tile",
+    "lanes": 16,
+    "tile_registers": 8,
+    "kernel_cycles": 16384,
+    "performance_ops_per_cycle": 128.00,
+    "systolic_utilization_pct": 87.50,
+    "matrix_dimension": "64x64",
+    "datatype": "int8"
+  },
+  "generated_utc": "2026-11-17T00:36:52Z"
+}

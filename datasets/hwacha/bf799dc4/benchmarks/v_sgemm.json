@@ -1,0 +1,24 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "literature_reported",
+  "core": "hwacha",
+  "upstream_commit": "bf799dc4",
+  "profile": "dae_vector_rocc",
+  "workload": "v_sgemm",
+  "config": "4lane_vlen2048",
+  "citation": "ISCA 2014 / IEEE Micro Top Picks 2015: The Hwacha Microarchitecture",
+  "metrics": {
+    "validated": true,
+    "simulator": "chisel-emulator",
+    "architecture": "rv64g_hwacha_vt",
+    "configuration": "4lane_vlen2048",
+    "lanes": 4,
+    "vlen": 2048,
+    "kernel_cycles": 72190,
+    "performance_ops_per_cycle": 14.80,
+    "vector_utilization_pct": 92.50,
+    "matrix_dimension": "128x128",
+    "datatype": "fp32"
+  },
+  "generated_utc": "2026-11-17T00:36:42Z"
+}

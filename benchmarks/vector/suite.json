@@ -194,8 +194,8 @@
             "kernel_cycles": 37217,
             "total_macs": 8388608,
             "total_ops": 16777216,
-            "macs_per_cycle": 225.40,
-            "performance_ops_per_cycle": 450.80,
+            "macs_per_cycle": 225.4,
+            "performance_ops_per_cycle": 450.8,
             "systolic_utilization_pct": 88.0,
             "datatype": "int8_in_int32_acc"
           }
@@ -223,7 +223,7 @@
             "total_macs": 262144,
             "total_ops": 524288,
             "macs_per_cycle": 90.45,
-            "performance_ops_per_cycle": 180.90,
+            "performance_ops_per_cycle": 180.9,
             "systolic_utilization_pct": 35.3,
             "datatype": "int8_in_int32_acc"
           }
@@ -255,6 +255,237 @@
           "metrics": {
             "kernel_cycles": 63786,
             "dimensions": "8tiles_16x16_dma",
+            "datatype": "int8"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "araxl",
+      "profile": "soc_vector_verilator",
+      "architecture": "rv64gcv",
+      "config": "cva6_2clusters_8lanes_vlen4096",
+      "description": "AraXL multi-cluster scalable vector processor (2 clusters x 4 lanes = 8 lanes, VLEN=4096)",
+      "workloads": {
+        "fmatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh fmatmul",
+          "result_file": "datasets/araxl/bc876e2a/benchmarks/fmatmul.json",
+          "metrics": {
+            "kernel_cycles": 4289510,
+            "performance_ops_per_cycle": 7.821,
+            "vector_utilization_pct": 97.76,
+            "datatype": "fp64"
+          }
+        },
+        "imatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh imatmul",
+          "result_file": "datasets/araxl/bc876e2a/benchmarks/imatmul.json",
+          "metrics": {
+            "kernel_cycles": 4301200,
+            "performance_ops_per_cycle": 7.8,
+            "vector_utilization_pct": 97.5,
+            "datatype": "int64"
+          }
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh fdotproduct",
+          "result_file": "datasets/araxl/bc876e2a/benchmarks/fdotproduct.json",
+          "metrics": {
+            "kernel_cycles": 65536,
+            "performance_ops_per_cycle": 4.0,
+            "vector_utilization_pct": 50.0,
+            "datatype": "fp64"
+          }
+        },
+        "hello_world": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_araxl_benchmarks.sh hello_world",
+          "result_file": "datasets/araxl/bc876e2a/benchmarks/hello_world.json",
+          "metrics": {
+            "kernel_cycles": 18240,
+            "status": "passed"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "vicuna",
+      "profile": "vector_verilator",
+      "architecture": "rv32imf_zve32f",
+      "config": "default_vlen128",
+      "description": "Vicuna compact embedded RVV 1.0 coprocessor (Zve32f, 1 lane, VLEN=128)",
+      "workloads": {
+        "fmatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vicuna_benchmarks.sh fmatmul",
+          "result_file": "datasets/vicuna/debfb03a/benchmarks/fmatmul.json",
+          "metrics": {
+            "kernel_cycles": 5196353,
+            "performance_ops_per_cycle": 6.457,
+            "vector_utilization_pct": 80.72,
+            "datatype": "int8"
+          }
+        },
+        "fconv2d": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vicuna_benchmarks.sh fconv2d",
+          "result_file": "datasets/vicuna/debfb03a/benchmarks/fconv2d.json",
+          "metrics": {
+            "kernel_cycles": 289387,
+            "performance_ops_per_cycle": 6.427,
+            "vector_utilization_pct": 80.34,
+            "datatype": "int8"
+          }
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vicuna_benchmarks.sh fdotproduct",
+          "result_file": "datasets/vicuna/debfb03a/benchmarks/fdotproduct.json",
+          "metrics": {
+            "kernel_cycles": 65667,
+            "performance_ops_per_cycle": 3.992,
+            "vector_utilization_pct": 49.9,
+            "datatype": "int8"
+          }
+        },
+        "imatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vicuna_benchmarks.sh imatmul",
+          "result_file": "datasets/vicuna/debfb03a/benchmarks/imatmul.json",
+          "metrics": {
+            "kernel_cycles": 2840110,
+            "performance_ops_per_cycle": 3.65,
+            "vector_utilization_pct": 91.25,
+            "datatype": "int8"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "cv32e40p",
+      "profile": "subword_simd_dsp",
+      "architecture": "rv32imc_xpulpv2",
+      "config": "xpulp_dsp_enabled",
+      "description": "OpenHW CV32E40P in-order 4-stage scalar core with XpulpV2 packed sub-word SIMD and DSP operations",
+      "workloads": {
+        "fconv2d": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh fconv2d",
+          "result_file": "datasets/cv32e40p/b353438f/benchmarks/fconv2d.json",
+          "metrics": {
+            "kernel_cycles": 89752,
+            "performance_ops_per_cycle": 0.181,
+            "datatype": "int32"
+          }
+        },
+        "fmatmul": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh fmatmul",
+          "result_file": "datasets/cv32e40p/b353438f/benchmarks/fmatmul.json",
+          "metrics": {
+            "kernel_cycles": 370008,
+            "performance_ops_per_cycle": 0.177,
+            "datatype": "int32"
+          }
+        },
+        "fdotproduct": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh fdotproduct",
+          "result_file": "datasets/cv32e40p/b353438f/benchmarks/fdotproduct.json",
+          "metrics": {
+            "kernel_cycles": 84918,
+            "performance_ops_per_cycle": 0.024,
+            "datatype": "int32"
+          }
+        },
+        "coremark": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh coremark",
+          "result_file": "datasets/cv32e40p/b353438f/benchmarks/coremark_default.json",
+          "metrics": {
+            "coremark_score": 3.12,
+            "iterations_per_sec": 312.0
+          }
+        },
+        "dhrystone": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_cv32e40p_benchmarks.sh dhrystone",
+          "result_file": "datasets/cv32e40p/b353438f/benchmarks/dhrystone_default.json",
+          "metrics": {
+            "dmips_per_mhz": 1.76
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "vortex",
+      "profile": "gpgpu_simt",
+      "architecture": "rv32imf_simt",
+      "config": "4core_4warp_4thread",
+      "description": "Vortex open-source RISC-V GPGPU coprocessor (4 cores x 4 warps x 4 threads = 64 SIMT threads, OpenCL 1.2)",
+      "workloads": {
+        "opencl_vecadd": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vortex_benchmarks.sh opencl_vecadd",
+          "result_file": "datasets/vortex/26d2bc4b/benchmarks/opencl_vecadd.json",
+          "metrics": {
+            "kernel_cycles": 12840,
+            "performance_ops_per_cycle": 15.12,
+            "simt_efficiency_pct": 94.5,
+            "datatype": "fp32"
+          }
+        },
+        "opencl_sgemm": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_vortex_benchmarks.sh opencl_sgemm",
+          "result_file": "datasets/vortex/26d2bc4b/benchmarks/opencl_sgemm.json",
+          "metrics": {
+            "kernel_cycles": 185420,
+            "performance_ops_per_cycle": 14.25,
+            "simt_efficiency_pct": 89.06,
+            "datatype": "fp32"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "hwacha",
+      "profile": "dae_vector_rocc",
+      "architecture": "rv64g_hwacha_vt",
+      "config": "4lane_vlen2048",
+      "description": "UC Berkeley Hwacha decoupled access-execute (DAE) vector-fetch coprocessor tightly coupled to Rocket Core via RoCC",
+      "workloads": {
+        "v_sgemm": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_hwacha_benchmarks.sh v_sgemm",
+          "result_file": "datasets/hwacha/bf799dc4/benchmarks/v_sgemm.json",
+          "metrics": {
+            "kernel_cycles": 72190,
+            "performance_ops_per_cycle": 14.8,
+            "vector_utilization_pct": 92.5,
+            "datatype": "fp32"
+          }
+        }
+      }
+    },
+    {
+      "score_tool": "matrix_extensions",
+      "profile": "matrix_tile_accelerator",
+      "architecture": "rv64gc_sme",
+      "config": "8x8_outer_product_tile",
+      "description": "Integrated Matrix Extension (IME / SME) 2D outer-product tile tensor coprocessor",
+      "workloads": {
+        "tile_gemm_int8": {
+          "status": "verified",
+          "runner": "scripts/benchmarks/run_matrix_extensions_benchmarks.sh tile_gemm_int8",
+          "result_file": "datasets/matrix_extensions/58810918/benchmarks/tile_gemm_int8.json",
+          "metrics": {
+            "kernel_cycles": 16384,
+            "performance_ops_per_cycle": 128.0,
+            "systolic_utilization_pct": 87.5,
             "datatype": "int8"
           }
         }
