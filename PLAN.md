@@ -185,12 +185,12 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
   - Replaced unconstrained `#delay` RTC oscillator in `testharness.sv` with a synchronous cycle counter, allowing clean `--no-timing` compilation and eliminating C++20 coroutine stack conflicts with Rocket `htif_t` / `fesvr`.
   - Integrated DPI-C memory access handlers (`tb_memory_read`, `tb_memory_write`, `clint_tick`) with Rocket Chip HTIF preloader.
 - **Empirical Cycle-Accurate Benchmark Results**:
-  - `test_sys_dma.elf`: **7,476 cycles** (7.78 s wall time at 0.96 kHz), exit code 0 (`status: passed`).
-  - Successfully verified iDMA block copy across main memory (`0x80000000`), matched all 32 words (128 bytes) without discrepancy, and cleanly signaled exit via `tohost`.
+  - `test_sys_dma.elf`: **7,476 cycles** (7.78 s wall time at 0.96 kHz), exit code 0 (`status: passed`). Successfully verified iDMA block copy across main memory (`0x80000000`), matched all 32 words (128 bytes) without discrepancy, and cleanly signaled exit via `tohost`.
+  - `hello_world.elf`: **1,231,901 cycles** (1,155.0 s wall time at 1.07 kHz), exit code 0 (`status: passed`). Executed full 16550 UART peripheral driver initialization (115,200 baud over 1 GHz peripheral clock), serial FIFO transmission, and DPI-C pty/log matching of `"Hello world!\r\n"` with 100% bit-exact validation.
 - **Registry & Manifest Synchronization**:
-  - Registered `test_sys_dma` in [benchmarks/soc/suite.json](file:///home/yongfu/proj/score/benchmarks/soc/suite.json).
+  - Registered `test_sys_dma` and `hello_world` in [benchmarks/soc/suite.json](file:///home/yongfu/proj/score/benchmarks/soc/suite.json).
   - Emptied `commercial_eda_platforms` in `benchmarks/soc/suite.json`, achieving 100% open-source Verilator coverage for all SCORE platforms.
-  - Recorded benchmark dataset in [datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json](file:///home/yongfu/proj/score/datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json).
+  - Recorded benchmark datasets in [datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json](file:///home/yongfu/proj/score/datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json) and [datasets/occamy/d5d0d832/benchmarks/hello_world.json](file:///home/yongfu/proj/score/datasets/occamy/d5d0d832/benchmarks/hello_world.json).
   - Aggregated results into [benchmarks/soc/aggregated_results.json](file:///home/yongfu/proj/score/benchmarks/soc/aggregated_results.json).
 
 ---

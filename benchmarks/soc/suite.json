@@ -465,6 +465,12 @@
           "total_simulation_cycles": 7476,
           "runner": "scripts/benchmarks/run_occamy_benchmarks.sh test_sys_dma"
         },
+        "hello_world": {
+          "status": "verified",
+          "execution_cycles": 1231901,
+          "total_simulation_cycles": 1231901,
+          "runner": "scripts/benchmarks/run_occamy_benchmarks.sh hello_world"
+        },
         "hbm_offload": {
           "status": "literature_reported",
           "execution_cycles": 142800,
