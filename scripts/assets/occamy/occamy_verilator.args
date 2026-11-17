@@ -1205,5 +1205,5 @@
 +incdir+/home/yongfu/proj/score/tools/occamy/hw/spm_interface/include
 +incdir+/home/yongfu/proj/score/tools/occamy/hw/vendor/pulp_platform_axi_tlb/include
 /home/yongfu/proj/score/tools/occamy/target/sim/test/uartdpi/uartdpi.sv
-/home/yongfu/proj/score/tools/occamy/target/sim/test/testharness.sv
+/home/yongfu/proj/score/scripts/assets/occamy/testharness.sv
 

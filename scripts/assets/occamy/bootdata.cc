@@ -19,3 +19,4 @@ const BootData BOOTDATA = {.boot_addr = 0x1000000,
                            .clint_base = 0x4000000};
 
 }  // namespace sim
+
