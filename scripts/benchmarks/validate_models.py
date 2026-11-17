@@ -215,6 +215,13 @@ def main() -> None:
     r_mshr_lin = pearson_r(mshr_xs, mshr_ys)
     r_mshr_log = pearson_r([math.log2(x) for x in mshr_xs], mshr_ys)
     rho_mshr_spearman = spearman_rho(mshr_xs, mshr_ys)
+    loo_mshr_log_rs = [
+        pearson_r(
+            [math.log2(x) for j, x in enumerate(mshr_xs) if j != i],
+            [y for j, y in enumerate(mshr_ys) if j != i],
+        )
+        for i in range(len(mshr_xs))
+    ]
 
     # 4. Eq. (7)-(8) Vector Ops/cyc verification, Ara fmatmul/imatmul sweeps, and 5-kernel cliff
     vec_checked = 0
@@ -299,6 +306,10 @@ def main() -> None:
     amo_coeffs, amo_r2 = poly2_fit(ns, amo_cyc)
     amo_preds = [amo_coeffs[0] + amo_coeffs[1] * n + amo_coeffs[2] * n * n for n in ns]
     amo_rmse = math.sqrt(sum((y - p) ** 2 for y, p in zip(amo_cyc, amo_preds)) / len(ns))
+    loo_amo_r2s = [
+        poly2_fit([n for j, n in enumerate(ns) if j != i], [y for j, y in enumerate(amo_cyc) if j != i])[1]
+        for i in range(len(ns))
+    ]
 
     # Exact zero-intercept discrete ceiling fit matching Eq. (9): L_tree(N) = L_node * ceil(log2(N))
     ceils = [float(math.ceil(math.log2(n))) for n in ns]
@@ -411,6 +422,8 @@ def main() -> None:
             "mshr_vs_memcpy_pearson_r_log2": round(r_mshr_log, 4),
             "mshr_vs_memcpy_r2_log2": round(r_mshr_log ** 2, 4),
             "mshr_vs_memcpy_spearman_rho": round(rho_mshr_spearman, 4),
+            "loo_log2_pearson_r_min": round(min(loo_mshr_log_rs), 4),
+            "loo_log2_pearson_r_max": round(max(loo_mshr_log_rs), 4),
             "cva6_vs_rocket_9_kernels": head_to_head,
         },
         "eq7_eq8_vector_validation": {
@@ -425,6 +438,8 @@ def main() -> None:
             "amo_quadratic_coeffs_a0_a1_a2": [round(c, 4) for c in amo_coeffs],
             "amo_r2": round(amo_r2, 5),
             "amo_rmse_cycles": round(amo_rmse, 2),
+            "loo_amo_r2_min": round(min(loo_amo_r2s), 5),
+            "loo_amo_r2_max": round(max(loo_amo_r2s), 5),
             "tree_exact_zero_intercept_l_node": round(l_node, 2),
             "tree_exact_zero_intercept_r2": round(tree_zero_r2, 5),
             "tree_exact_zero_intercept_rmse_cycles": round(tree_zero_rmse, 2),

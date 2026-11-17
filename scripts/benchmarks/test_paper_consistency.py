@@ -38,6 +38,10 @@ def main() -> int:
         failures.append("Expected log2 MSHR correlation >= 0.96")
     if val["eq5_eq6_app_validation"].get("mshr_vs_memcpy_spearman_rho", 0.0) < 0.75:
         failures.append("Expected nonparametric Spearman MSHR correlation >= 0.75")
+    if val["eq5_eq6_app_validation"].get("loo_log2_pearson_r_min", 0.0) < 0.94:
+        failures.append("Expected LOO min log2 MSHR Pearson r >= 0.94")
+    if val["eq9_barrier_scaling_fit"].get("loo_amo_r2_min", 0.0) < 0.999:
+        failures.append("Expected LOO min AMO quadratic R^2 >= 0.999")
     if "eq1_area_normalization_audit" not in val:
         failures.append("Missing eq1_area_normalization_audit in model_validation.json")
     if val["eq7_eq8_vector_validation"]["ops_per_cycle_checked"] != 13:
@@ -273,12 +277,17 @@ def main() -> int:
     pdf_path = PAPER / "main.pdf"
     if pdf_path.exists():
         pinfo = subprocess.check_output(["pdfinfo", str(pdf_path)], text=True)
+        if "Pages:          13" not in pinfo:
+            failures.append("Expected exact 13-page main.pdf pagination")
         if "Title:          SCORE:" not in pinfo or "Author:         Chao Wang, Wei Mao, Xinfei Guo, and Yongfu Li" not in pinfo:
             failures.append("main.pdf missing populated Title or Author PDF metadata")
         pfonts = subprocess.check_output(["pdffonts", str(pdf_path)], text=True).splitlines()[2:]
         unembedded = [ln for ln in pfonts if ln.strip() and ln.split()[-5] != "yes"]
         if unembedded:
             failures.append(f"Unembedded fonts in main.pdf: {unembedded}")
+        ptext = subprocess.check_output(["pdftotext", str(pdf_path), "-"], text=True)
+        if "??" in ptext or "\ufffd" in ptext:
+            failures.append("Found unresolved '??' or U+FFFD glyph anomaly in pdftotext main.pdf")
 
     if failures:
         print("FAILED CHECKS:")

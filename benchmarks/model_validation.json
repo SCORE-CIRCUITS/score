@@ -1,6 +1,6 @@
 {
   "schema": "score.model_validation.v6",
-  "generated_utc": "2026-11-17T23:48:43+00:00",
+  "generated_utc": "2026-11-17T23:52:51+00:00",
   "corpus_accounting": {
     "tier_evaluated_targets": 56,
     "per_tier_counts": {
@@ -111,6 +111,8 @@
     "mshr_vs_memcpy_pearson_r_log2": 0.9633,
     "mshr_vs_memcpy_r2_log2": 0.9279,
     "mshr_vs_memcpy_spearman_rho": 0.7974,
+    "loo_log2_pearson_r_min": 0.946,
+    "loo_log2_pearson_r_max": 0.9741,
     "cva6_vs_rocket_9_kernels": {
       "median": {
         "cva6_cycles": 8366,
@@ -318,6 +320,8 @@
     ],
     "amo_r2": 0.99992,
     "amo_rmse_cycles": 306.84,
+    "loo_amo_r2_min": 0.9996,
+    "loo_amo_r2_max": 1.0,
     "tree_exact_zero_intercept_l_node": 61.0,
     "tree_exact_zero_intercept_r2": 0.9345,
     "tree_exact_zero_intercept_rmse_cycles": 46.01,
