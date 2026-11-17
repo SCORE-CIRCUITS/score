@@ -185,20 +185,23 @@ def main() -> None:
                 "rocket_over_cva6_cycle_ratio": round(r_cyc / c_cyc, 3) if (c_cyc and r_cyc) else None,
             }
 
+    # Exact Fig. 7 MSHR column (blocking L1 / Dir / BR -> N_MSHR^eff = 1 per Eq. (5))
     cat2_mshr_bw = [
-        (1, 485.4), (2, 468.2), (1, 452.1), (2, 425.0), (2, 442.8),
-        (2, 438.4), (2, 512.0), (2, 428.5), (2, 468.2), (2, 412.6),
-        (2, 398.0), (4, 595.0), (8, 782.5), (8, 820.4), (16, 845.6),
+        (16, 845.6), (12, 820.4), (8, 782.5), (4, 595.0), (1, 512.0),
+        (1, 485.4), (2, 468.2), (2, 468.2), (1, 452.1), (1, 442.8),
+        (1, 438.4), (1, 428.5), (1, 425.0), (1, 412.6), (1, 398.0),
     ]
     mshr_xs = [float(x) for x, _ in cat2_mshr_bw]
     mshr_ys = [float(y) for _, y in cat2_mshr_bw]
     r_mshr_lin = pearson_r(mshr_xs, mshr_ys)
     r_mshr_log = pearson_r([math.log2(x) for x in mshr_xs], mshr_ys)
 
-    # 4. Eq. (7)-(8) Vector Ops/cyc verification & Ara sweep rho_host(M)
+    # 4. Eq. (7)-(8) Vector Ops/cyc verification, Ara fmatmul/imatmul sweeps, and 5-kernel cliff
     vec_checked = 0
     vec_max_err = 0.0
     ara_sweep = []
+    ara_imatmul_sweep = []
+    ara_fconv = {}
     for r in vec_doc["results"]:
         m = r.get("metrics") or {}
         ops = m.get("total_ops")
@@ -226,6 +229,48 @@ def main() -> None:
                     "utilization_pct": util,
                     "inferred_rho_host": round(rho_host, 4),
                 })
+        if r.get("core") == "ara" and r.get("workload") == "imatmul" and isinstance(m.get("sweep_results"), dict):
+            peak = 8.0
+            for dim, entry in m["sweep_results"].items():
+                perf = float(entry["ops_per_cycle"])
+                util = float(entry["utilization_pct"])
+                ara_imatmul_sweep.append({
+                    "dimension": dim,
+                    "cycles": entry["cycles"],
+                    "ops_per_cycle": round(perf, 4),
+                    "utilization_pct": round(util, 2),
+                    "inferred_rho_host": round((peak / perf) - 1.0, 4),
+                })
+        if r.get("core") == "ara" and r.get("workload") in ("fconv2d", "fconv3d"):
+            ara_fconv[r["workload"]] = {
+                "cycles": m.get("kernel_cycles"),
+                "ops_per_cycle": round(float(m["performance_ops_per_cycle"]), 4),
+                "utilization_pct": round(float(m["vector_utilization_pct"]), 2),
+                "inferred_rho_host": round((8.0 / float(m["performance_ops_per_cycle"])) - 1.0, 4),
+            }
+
+    # Ara 5-kernel utilization cliff plotted in Fig. 11 -> Eq. (8) inferred rho_host = (100/U) - 1
+    ara_5kernel_cliff = [
+        {"kernel": k, "utilization_pct": u, "eq8_inferred_rho_host": round(100.0 / u - 1.0, 3)}
+        for k, u in [
+            ("fmatmul", 98.42), ("fconv2d", 97.93), ("fdotproduct", 50.00),
+            ("fft", 33.33), ("softmax", 23.00),
+        ]
+    ]
+
+    # Cross-tier repository accounting (56 tier-evaluated targets across 53 distinct repos)
+    soc_doc = json.loads((ROOT / "benchmarks/soc/aggregated_results.json").read_text())
+    tier_sets = {
+        "core": sorted(set(r.get("core") for r in core_doc["results"])),
+        "app": sorted(set(r.get("core") for r in app_doc["results"])),
+        "vector": sorted(set(r.get("core") for r in vec_doc["results"])),
+        "soc": sorted(set(r.get("soc") or r.get("core") or r.get("target") for r in soc_doc["results"])),
+    }
+    distinct_repos = sorted(set().union(*[set(v) for v in tier_sets.values()]))
+    cross_tier_repos = sorted(
+        repo for repo in distinct_repos
+        if sum(1 for v in tier_sets.values() if repo in v) > 1
+    )
 
     # 5. Eq. (9) Barrier scaling fit across N = [4, 16, 64, 128, 256, 432]
     ns = [4.0, 16.0, 64.0, 128.0, 256.0, 432.0]
@@ -257,8 +302,14 @@ def main() -> None:
     s_check = t_setup_ns / (1.0 / b_core - 1.0 / b_dma)
 
     out = {
-        "schema": "score.model_validation.v2",
+        "schema": "score.model_validation.v3",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "corpus_accounting": {
+            "tier_evaluated_targets": sum(len(v) for v in tier_sets.values()),
+            "per_tier_counts": {k: len(v) for k, v in tier_sets.items()},
+            "distinct_repositories": len(distinct_repos),
+            "cross_tier_repositories": cross_tier_repos,
+        },
         "eq2_pareto_sets": {
             "cat1_pareto_optimal": p1,
             "cat1_count": f"{len(p1)}/{len(cat1_pts)}",
@@ -287,6 +338,9 @@ def main() -> None:
             "ops_per_cycle_checked": vec_checked,
             "max_residual_pct": round(vec_max_err, 4),
             "ara_fmatmul_sweep_rho_host": ara_sweep,
+            "ara_imatmul_sweep_rho_host": ara_imatmul_sweep,
+            "ara_fconv_measured": ara_fconv,
+            "ara_5kernel_cliff_eq8": ara_5kernel_cliff,
         },
         "eq9_barrier_scaling_fit": {
             "amo_quadratic_coeffs_a0_a1_a2": [round(c, 4) for c in amo_coeffs],

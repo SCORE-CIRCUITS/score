@@ -1,6 +1,20 @@
 {
-  "schema": "score.model_validation.v2",
-  "generated_utc": "2026-11-17T22:30:40+00:00",
+  "schema": "score.model_validation.v3",
+  "generated_utc": "2026-11-17T22:46:52+00:00",
+  "corpus_accounting": {
+    "tier_evaluated_targets": 56,
+    "per_tier_counts": {
+      "core": 15,
+      "app": 9,
+      "vector": 10,
+      "soc": 22
+    },
+    "distinct_repositories": 54,
+    "cross_tier_repositories": [
+      "araxl",
+      "cv32e40p"
+    ]
+  },
   "eq2_pareto_sets": {
     "cat1_pareto_optimal": [
       "SERV",
@@ -69,9 +83,9 @@
   },
   "eq5_eq6_app_validation": {
     "archived_app_runs": 41,
-    "mshr_vs_memcpy_pearson_r_linear": 0.8985,
-    "mshr_vs_memcpy_pearson_r_log2": 0.9083,
-    "mshr_vs_memcpy_r2_log2": 0.825,
+    "mshr_vs_memcpy_pearson_r_linear": 0.9507,
+    "mshr_vs_memcpy_pearson_r_log2": 0.9633,
+    "mshr_vs_memcpy_r2_log2": 0.9279,
     "cva6_vs_rocket_9_kernels": {
       "median": {
         "cva6_cycles": 8366,
@@ -183,6 +197,91 @@
         "ops_per_cycle": 7.8734,
         "utilization_pct": 98.42,
         "inferred_rho_host": 0.0161
+      }
+    ],
+    "ara_imatmul_sweep_rho_host": [
+      {
+        "dimension": "4x4",
+        "cycles": 496,
+        "ops_per_cycle": 0.2581,
+        "utilization_pct": 3.23,
+        "inferred_rho_host": 29.9999
+      },
+      {
+        "dimension": "8x8",
+        "cycles": 1025,
+        "ops_per_cycle": 0.999,
+        "utilization_pct": 12.49,
+        "inferred_rho_host": 7.0078
+      },
+      {
+        "dimension": "16x16",
+        "cycles": 2619,
+        "ops_per_cycle": 3.1279,
+        "utilization_pct": 39.1,
+        "inferred_rho_host": 1.5576
+      },
+      {
+        "dimension": "32x32",
+        "cycles": 11793,
+        "ops_per_cycle": 5.5572,
+        "utilization_pct": 69.46,
+        "inferred_rho_host": 0.4396
+      },
+      {
+        "dimension": "64x64",
+        "cycles": 70225,
+        "ops_per_cycle": 7.4658,
+        "utilization_pct": 93.32,
+        "inferred_rho_host": 0.0715
+      },
+      {
+        "dimension": "128x128",
+        "cycles": 535801,
+        "ops_per_cycle": 7.8281,
+        "utilization_pct": 97.85,
+        "inferred_rho_host": 0.022
+      }
+    ],
+    "ara_fconv_measured": {
+      "fconv2d": {
+        "cycles": 156914,
+        "ops_per_cycle": 7.8343,
+        "utilization_pct": 97.93,
+        "inferred_rho_host": 0.0212
+      },
+      "fconv3d": {
+        "cycles": 480317,
+        "ops_per_cycle": 7.6781,
+        "utilization_pct": 95.98,
+        "inferred_rho_host": 0.0419
+      }
+    },
+    "ara_5kernel_cliff_eq8": [
+      {
+        "kernel": "fmatmul",
+        "utilization_pct": 98.42,
+        "eq8_inferred_rho_host": 0.016
+      },
+      {
+        "kernel": "fconv2d",
+        "utilization_pct": 97.93,
+        "eq8_inferred_rho_host": 0.021
+      },
+      {
+        "kernel": "fdotproduct",
+        "utilization_pct": 50.0,
+        "eq8_inferred_rho_host": 1.0
+      },
+      {
+        "kernel": "fft",
+        "utilization_pct": 33.33,
+        "eq8_inferred_rho_host": 2.0
+      },
+      {
+        "kernel": "softmax",
+        "utilization_pct": 23.0,
+        "eq8_inferred_rho_host": 3.348
       }
     ]
   },
