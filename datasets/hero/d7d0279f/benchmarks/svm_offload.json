@@ -1,0 +1,32 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "literature_reported",
+  "core": "hero",
+  "soc": "hero",
+  "upstream_commit": "d7d0279f",
+  "architecture": "armv8_pulp_heterogeneous",
+  "profile": "soc_verilator",
+  "benchmark": "svm_offload",
+  "workload": "svm_offload",
+  "configuration": "hero_armv8_8core_pulp_cluster",
+  "citation": "IEEE Micro 2021: HERO: Heterogeneous Embedded Research Platform",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+    "simulator": "hero-qemu-pcie-cosim"
+  },
+  "metrics": {
+    "execution_cycles": 58420,
+    "total_simulation_cycles": 58420,
+    "wall_time_sec": 4.12,
+    "simulation_speed_khz": 14.18,
+    "interconnect": "AXI4 + PCIe Gen3 x8 + SVM IOMMU",
+    "host_core": "ARMv8 Cortex-A53",
+    "compute_cores": "8x CV32E40P Cluster",
+    "validation": "Zero-Copy SVM Shared Virtual Memory Verified",
+    "status": "passed",
+    "exit_code": 0
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-17T00:48:52Z"
+}

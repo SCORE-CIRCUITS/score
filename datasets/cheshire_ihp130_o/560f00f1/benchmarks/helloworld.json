@@ -1,0 +1,31 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "cheshire-ihp130-o",
+  "soc": "cheshire-ihp130-o",
+  "upstream_commit": "560f00f1",
+  "architecture": "rv64gc",
+  "profile": "soc_verilator",
+  "benchmark": "helloworld",
+  "workload": "helloworld",
+  "configuration": "iguana_cva6_ihp130",
+  "citation": "IEEE Open-Source Hardware 2024: Iguana: An Open-Source RISC-V SoC in IHP 130nm",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+    "simulator": "verilator-5.022"
+  },
+  "metrics": {
+    "execution_cycles": 449861,
+    "total_simulation_cycles": 449861,
+    "wall_time_sec": 38.15,
+    "simulation_speed_khz": 11.81,
+    "interconnect": "64-bit AXI4 Crossbar",
+    "process": "IHP SG13G2 (130nm BiCMOS)",
+    "validation": "UART Output Match (Verified)",
+    "status": "passed",
+    "exit_code": 0
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-17T00:49:02Z"
+}

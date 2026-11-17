@@ -12,6 +12,8 @@ DATASETS = ROOT / "datasets"
 OUT = ROOT / "benchmarks" / "soc" / "aggregated_results.json"
 SOC_PLATFORMS = {
     "cheshire",
+    "cheshire-ihp130-o",
+    "cheshire_ihp130_o",
     "mempool",
     "croc",
     "pulpissimo",
@@ -23,14 +25,23 @@ SOC_PLATFORMS = {
     "iob-soc",
     "iob_soc",
     "carfield",
+    "astral",
     "occamy",
     "safety-island",
     "safety_island",
     "pulp-cluster",
     "pulp_cluster",
+    "pulp-soc",
+    "pulp_soc",
     "chimera",
     "magia",
     "picobello",
+    "opentitan",
+    "soc-automation",
+    "soc_automation",
+    "auteur",
+    "rv-tracer",
+    "rv_tracer",
 }
 
 
@@ -46,8 +57,17 @@ def collect() -> list[dict]:
         if doc.get("schema") != "score.benchmark_results.v1":
             continue
         core = doc.get("core", "")
+        soc = doc.get("soc", "")
         profile = doc.get("profile", "")
-        if core in SOC_PLATFORMS or "soc" in profile:
+        parent_soc = path.parts[-4] if len(path.parts) >= 4 else ""
+        if (
+            core in SOC_PLATFORMS
+            or soc in SOC_PLATFORMS
+            or parent_soc in SOC_PLATFORMS
+            or "soc" in profile
+        ):
+            if not doc.get("soc") and parent_soc:
+                doc["soc"] = parent_soc
             doc["_path"] = str(path.relative_to(ROOT))
             rows.append(doc)
     return rows

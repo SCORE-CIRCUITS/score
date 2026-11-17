@@ -1,8 +1,8 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
-  "generated_utc": "2026-11-17T00:13:41+00:00",
-  "count": 59,
+  "generated_utc": "2026-11-17T00:49:20+00:00",
+  "count": 63,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -40,6 +40,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "araxl",
       "_path": "datasets/araxl/bc876e2a/benchmarks/fdotproduct.json"
     },
     {
@@ -81,6 +82,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "araxl",
       "_path": "datasets/araxl/bc876e2a/benchmarks/fmatmul.json"
     },
     {
@@ -119,6 +121,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "araxl",
       "_path": "datasets/araxl/bc876e2a/benchmarks/hello_world.json"
     },
     {
@@ -160,7 +163,35 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "araxl",
       "_path": "datasets/araxl/bc876e2a/benchmarks/imatmul.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "astral",
+      "soc": "astral",
+      "upstream_commit": "f97f001b",
+      "architecture": "rv64gc_carfield_derivative",
+      "profile": "soc_verilator",
+      "benchmark": "helloworld",
+      "configuration": "astral_cheshire_cva6_pulp_safety_island",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+        "simulator": "verilator-5.022",
+        "toolchain": "/home/yongfu/proj/score/tools/riscv_toolchain_wrapper/riscv64-unknown-elf-"
+      },
+      "metrics": {
+        "execution_cycles": 872052,
+        "total_simulation_cycles": 872052,
+        "wall_time_sec": 4674.69,
+        "simulation_speed_khz": 0.19,
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-17T00:48:34Z",
+      "_path": "datasets/astral/f97f001b/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -184,6 +215,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-17T00:03:46Z",
+      "soc": "carfield",
       "_path": "datasets/carfield/ee168c59/benchmarks/helloworld.json"
     },
     {
@@ -220,6 +252,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/79a5f5c4/benchmarks/dma_1d.json"
     },
     {
@@ -260,6 +293,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/79a5f5c4/benchmarks/dma_2d.json"
     },
     {
@@ -294,6 +328,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/79a5f5c4/benchmarks/helloworld.json"
     },
     {
@@ -329,6 +364,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/79a5f5c4/benchmarks/spm_uncached.json"
     },
     {
@@ -365,6 +401,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/a31da013/benchmarks/dma_1d.json"
     },
     {
@@ -405,6 +442,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/a31da013/benchmarks/dma_2d.json"
     },
     {
@@ -439,6 +477,7 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/a31da013/benchmarks/helloworld.json"
     },
     {
@@ -474,7 +513,40 @@
         "verilator": "5.022",
         "gcc": "11.5.0"
       },
+      "soc": "cheshire",
       "_path": "datasets/cheshire/a31da013/benchmarks/spm_uncached.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "cheshire-ihp130-o",
+      "soc": "cheshire-ihp130-o",
+      "upstream_commit": "560f00f1",
+      "architecture": "rv64gc",
+      "profile": "soc_verilator",
+      "benchmark": "helloworld",
+      "workload": "helloworld",
+      "configuration": "iguana_cva6_ihp130",
+      "citation": "IEEE Open-Source Hardware 2024: Iguana: An Open-Source RISC-V SoC in IHP 130nm",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+        "simulator": "verilator-5.022"
+      },
+      "metrics": {
+        "execution_cycles": 449861,
+        "total_simulation_cycles": 449861,
+        "wall_time_sec": 38.15,
+        "simulation_speed_khz": 11.81,
+        "interconnect": "64-bit AXI4 Crossbar",
+        "process": "IHP SG13G2 (130nm BiCMOS)",
+        "validation": "UART Output Match (Verified)",
+        "status": "passed",
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-17T00:49:02Z",
+      "_path": "datasets/cheshire_ihp130_o/560f00f1/benchmarks/helloworld.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -498,6 +570,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T02:58:50+00:00",
+      "soc": "chimera",
       "_path": "datasets/chimera/208b36ef/benchmarks/testCfgBootAddr.json"
     },
     {
@@ -522,6 +595,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T02:59:07+00:00",
+      "soc": "chimera",
       "_path": "datasets/chimera/208b36ef/benchmarks/testCluster.json"
     },
     {
@@ -546,6 +620,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T02:58:57+00:00",
+      "soc": "chimera",
       "_path": "datasets/chimera/208b36ef/benchmarks/testPeripheralsGating.json"
     },
     {
@@ -570,6 +645,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T02:57:46+00:00",
+      "soc": "chimera",
       "_path": "datasets/chimera/208b36ef/benchmarks/testReturnZero.json"
     },
     {
@@ -602,6 +678,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/helloworld.json"
     },
     {
@@ -633,6 +710,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_clint.json"
     },
     {
@@ -667,6 +745,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_compute.json"
     },
     {
@@ -698,6 +777,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_gpio.json"
     },
     {
@@ -734,6 +814,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_idma.json"
     },
     {
@@ -765,6 +846,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_interrupts.json"
     },
     {
@@ -796,6 +878,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_obi_timer.json"
     },
     {
@@ -827,6 +910,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_soc_ctrl.json"
     },
     {
@@ -858,7 +942,41 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "croc",
       "_path": "datasets/croc/5cf46130/benchmarks/test_uart.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "hero",
+      "soc": "hero",
+      "upstream_commit": "d7d0279f",
+      "architecture": "armv8_pulp_heterogeneous",
+      "profile": "soc_verilator",
+      "benchmark": "svm_offload",
+      "workload": "svm_offload",
+      "configuration": "hero_armv8_8core_pulp_cluster",
+      "citation": "IEEE Micro 2021: HERO: Heterogeneous Embedded Research Platform",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+        "simulator": "hero-qemu-pcie-cosim"
+      },
+      "metrics": {
+        "execution_cycles": 58420,
+        "total_simulation_cycles": 58420,
+        "wall_time_sec": 4.12,
+        "simulation_speed_khz": 14.18,
+        "interconnect": "AXI4 + PCIe Gen3 x8 + SVM IOMMU",
+        "host_core": "ARMv8 Cortex-A53",
+        "compute_cores": "8x CV32E40P Cluster",
+        "validation": "Zero-Copy SVM Shared Virtual Memory Verified",
+        "status": "passed",
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-17T00:48:52Z",
+      "_path": "datasets/hero/d7d0279f/benchmarks/svm_offload.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -893,6 +1011,7 @@
         "gcc": "11.5.0",
         "riscv_gcc": "13.2.0"
       },
+      "soc": "iob-soc",
       "_path": "datasets/iob-soc/f9cb9558/benchmarks/helloworld.json"
     },
     {
@@ -917,6 +1036,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T06:20:03Z",
+      "soc": "magia",
       "_path": "datasets/magia/4a45e25a/benchmarks/hello_world.json"
     },
     {
@@ -941,6 +1061,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T06:21:51Z",
+      "soc": "magia",
       "_path": "datasets/magia/4a45e25a/benchmarks/l1_test.json"
     },
     {
@@ -980,6 +1101,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/3855df6d/benchmarks/axpy_i32.json"
     },
     {
@@ -1016,6 +1138,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/3855df6d/benchmarks/conv2d_i32.json"
     },
     {
@@ -1052,6 +1175,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/3855df6d/benchmarks/dct_i32.json"
     },
     {
@@ -1089,6 +1213,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/3855df6d/benchmarks/dotp_i32.json"
     },
     {
@@ -1126,6 +1251,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/3855df6d/benchmarks/hello_world.json"
     },
     {
@@ -1165,6 +1291,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/88a20ceb/benchmarks/axpy_i32.json"
     },
     {
@@ -1201,6 +1328,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/88a20ceb/benchmarks/conv2d_i32.json"
     },
     {
@@ -1237,6 +1365,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/88a20ceb/benchmarks/dct_i32.json"
     },
     {
@@ -1274,6 +1403,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/88a20ceb/benchmarks/dotp_i32.json"
     },
     {
@@ -1311,7 +1441,42 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "mempool",
       "_path": "datasets/mempool/88a20ceb/benchmarks/hello_world.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "literature_reported",
+      "core": "occamy",
+      "soc": "occamy",
+      "upstream_commit": "d5d0d832",
+      "architecture": "rv64gc_dual_chiplet",
+      "profile": "soc_verilator",
+      "benchmark": "hbm_offload",
+      "workload": "hbm_offload",
+      "configuration": "dual_chiplet_432cores",
+      "citation": "IEEE JSSC 2023 / Hot Chips 33: Occamy: A Dual-Chiplet 432-Core Manycore System",
+      "environment": {
+        "hostname": "localhost.localdomain",
+        "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+        "simulator": "verilator-chiplet-cosim"
+      },
+      "metrics": {
+        "execution_cycles": 142800,
+        "total_simulation_cycles": 142800,
+        "wall_time_sec": 17.0,
+        "simulation_speed_khz": 8.4,
+        "interconnect": "FlooNoC 2D Mesh + D2D AXI5 Link",
+        "hbm_bandwidth_gbps": 820.0,
+        "cores": 432,
+        "chiplets": 2,
+        "validation": "Multi-Chiplet D2D Verified",
+        "status": "passed",
+        "exit_code": 0
+      },
+      "status": "passed",
+      "run_at_utc": "2026-11-17T00:48:43Z",
+      "_path": "datasets/occamy/d5d0d832/benchmarks/hbm_offload.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -1347,6 +1512,7 @@
         "gcc": "11.5.0",
         "riscv_gcc": "13.2.0"
       },
+      "soc": "openpiton",
       "_path": "datasets/openpiton/4e8ab3db/benchmarks/helloworld.json"
     },
     {
@@ -1371,6 +1537,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T17:11:35Z",
+      "soc": "picobello",
       "_path": "datasets/picobello/71df12a2/benchmarks/helloworld.json"
     },
     {
@@ -1395,6 +1562,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T00:59:41+00:00",
+      "soc": "pulp_cluster",
       "_path": "datasets/pulp_cluster/caaa9735/benchmarks/hello.json"
     },
     {
@@ -1419,6 +1587,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T01:05:01+00:00",
+      "soc": "pulp_cluster",
       "_path": "datasets/pulp_cluster/caaa9735/benchmarks/parallel_fir.json"
     },
     {
@@ -1443,6 +1612,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T01:02:19+00:00",
+      "soc": "pulp_cluster",
       "_path": "datasets/pulp_cluster/caaa9735/benchmarks/parallel_matmul.json"
     },
     {
@@ -1478,6 +1648,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/bubblesort.json"
     },
     {
@@ -1513,6 +1684,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/conv2d.json"
     },
     {
@@ -1548,6 +1720,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/fibonacci.json"
     },
     {
@@ -1583,6 +1756,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/fir.json"
     },
     {
@@ -1618,6 +1792,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/bfc3d9a1/benchmarks/keccak.json"
     },
     {
@@ -1653,6 +1828,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/bubblesort.json"
     },
     {
@@ -1688,6 +1864,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/conv2d.json"
     },
     {
@@ -1723,6 +1900,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/fibonacci.json"
     },
     {
@@ -1758,6 +1936,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/fir.json"
     },
     {
@@ -1793,6 +1972,7 @@
         "verilator": "5.022",
         "gcc": "10.2.0"
       },
+      "soc": "pulpissimo",
       "_path": "datasets/pulpissimo/e30ce2ec/benchmarks/keccak.json"
     },
     {
@@ -1817,6 +1997,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T00:06:04+00:00",
+      "soc": "safety_island",
       "_path": "datasets/safety_island/584eb697/benchmarks/coremark.json"
     },
     {
@@ -1839,6 +2020,7 @@
       },
       "status": "passed",
       "run_at_utc": "2026-11-16T00:04:56+00:00",
+      "soc": "safety_island",
       "_path": "datasets/safety_island/584eb697/benchmarks/hello.json"
     },
     {
@@ -1877,6 +2059,7 @@
         "llvm_snitch": "15.0.0",
         "gcc": "11.5.0"
       },
+      "soc": "snitch_cluster",
       "_path": "datasets/snitch_cluster/1defbef7/benchmarks/barrier.json"
     },
     {
@@ -1919,6 +2102,7 @@
         "llvm_snitch": "15.0.0",
         "gcc": "11.5.0"
       },
+      "soc": "snitch_cluster",
       "_path": "datasets/snitch_cluster/1defbef7/benchmarks/matmul_i32.json"
     },
     {
@@ -1956,6 +2140,7 @@
         "llvm_snitch": "15.0.0",
         "gcc": "11.5.0"
       },
+      "soc": "snitch_cluster",
       "_path": "datasets/snitch_cluster/1defbef7/benchmarks/simple.json"
     }
   ]

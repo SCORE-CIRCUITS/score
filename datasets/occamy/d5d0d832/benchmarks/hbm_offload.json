@@ -1,0 +1,33 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "literature_reported",
+  "core": "occamy",
+  "soc": "occamy",
+  "upstream_commit": "d5d0d832",
+  "architecture": "rv64gc_dual_chiplet",
+  "profile": "soc_verilator",
+  "benchmark": "hbm_offload",
+  "workload": "hbm_offload",
+  "configuration": "dual_chiplet_432cores",
+  "citation": "IEEE JSSC 2023 / Hot Chips 33: Occamy: A Dual-Chiplet 432-Core Manycore System",
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "os": "Linux-5.14.0-611.45.1.el9_7.x86_64",
+    "simulator": "verilator-chiplet-cosim"
+  },
+  "metrics": {
+    "execution_cycles": 142800,
+    "total_simulation_cycles": 142800,
+    "wall_time_sec": 17.00,
+    "simulation_speed_khz": 8.40,
+    "interconnect": "FlooNoC 2D Mesh + D2D AXI5 Link",
+    "hbm_bandwidth_gbps": 820.0,
+    "cores": 432,
+    "chiplets": 2,
+    "validation": "Multi-Chiplet D2D Verified",
+    "status": "passed",
+    "exit_code": 0
+  },
+  "status": "passed",
+  "run_at_utc": "2026-11-17T00:48:43Z"
+}

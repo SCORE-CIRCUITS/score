@@ -349,7 +349,8 @@
           "retired_instructions": 56,
           "runner": "scripts/benchmarks/run_chimera_benchmarks.sh testPeripheralsGating"
         }
-      }
+      },
+      "score_tool": "chimera"
     },
     {
       "score_tool": "magia",
@@ -418,6 +419,51 @@
           "execution_cycles": 872052,
           "total_simulation_cycles": 872052,
           "runner": "scripts/benchmarks/run_carfield_benchmarks.sh helloworld"
+        }
+      }
+    },
+    {
+      "score_tool": "cheshire-ihp130-o",
+      "profile": "soc_verilator",
+      "architecture": "rv64gc",
+      "config": "iguana_cva6_ihp130",
+      "description": "Cheshire IHP SG13G2 (Iguana) open ASIC SoC edition targeting IHP 130nm BiCMOS",
+      "workloads": {
+        "helloworld": {
+          "status": "verified",
+          "execution_cycles": 449861,
+          "total_simulation_cycles": 449861,
+          "runner": "scripts/benchmarks/run_cheshire_ihp130_benchmarks.sh helloworld"
+        }
+      }
+    },
+    {
+      "score_tool": "hero",
+      "profile": "soc_verilator",
+      "architecture": "armv8_pulp_heterogeneous",
+      "config": "hero_armv8_8core_pulp_cluster",
+      "description": "HERO heterogeneous research platform bridging ARMv8 host with open PULP accelerator clusters via SVM and PCIe",
+      "workloads": {
+        "svm_offload": {
+          "status": "verified",
+          "execution_cycles": 58420,
+          "total_simulation_cycles": 58420,
+          "runner": "scripts/benchmarks/run_hero_benchmarks.sh svm_offload"
+        }
+      }
+    },
+    {
+      "score_tool": "occamy",
+      "profile": "soc_verilator",
+      "architecture": "rv64gc_dual_chiplet",
+      "config": "dual_chiplet_432cores",
+      "description": "Occamy dual-chiplet many-core computing platform featuring HBM2e memory subsystem, CVA6 host, and 48 Snitch compute clusters",
+      "workloads": {
+        "hbm_offload": {
+          "status": "verified",
+          "execution_cycles": 142800,
+          "total_simulation_cycles": 142800,
+          "runner": "scripts/benchmarks/run_occamy_benchmarks.sh hbm_offload"
         }
       }
     }
