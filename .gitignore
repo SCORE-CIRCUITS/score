@@ -40,6 +40,7 @@ tools/*-install/
 tools/*-host-tools/
 
 # Standalone tool working clones (managed via install scripts)
+tools/boom/
 tools/c906/
 tools/c910/
 tools/cv32e40p/
@@ -54,6 +55,7 @@ tools/veer-eh1/
 tools/veer-eh2/
 tools/vicuna/
 tools/vortex/
+tools/xiangshan/
 
 # Local Python/conda installs under datasets (do not commit)
 **/miniconda3/
@@ -99,3 +101,5 @@ datasets/vortex/*/rtl_snapshot/vortex/tests/opencl/spmv/*.mtx
 
 # Standalone website repository (score-circuits.github.io)
 website/
+scripts/assets/occamy/build/
+scripts/assets/occamy/Voccamy*

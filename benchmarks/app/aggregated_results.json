@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
-  "generated_utc": "2026-11-17T00:24:51+00:00",
-  "count": 31,
+  "generated_utc": "2026-11-17T01:22:47+00:00",
+  "count": 38,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -32,6 +32,103 @@
         "verilator": "unknown"
       },
       "_path": "datasets/black_parrot/f91010f6/benchmarks/demo_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "boom",
+      "upstream_commit": "ba03175e",
+      "profile": "app_verilator",
+      "workload": "coremark",
+      "config": "boom_large_3wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc",
+        "configuration": "boom_large_3wide",
+        "total_simulation_cycles": 862000,
+        "benchmark_cycles": 862000,
+        "instructions_retired": 1280050,
+        "ipc": 1.485,
+        "branch_predictor_accuracy_pct": 96.8,
+        "coremark_score": 3.92,
+        "coremark_per_mhz": 3.92,
+        "wall_clock_seconds": 1.25
+      },
+      "generated_utc": "2026-11-17T01:22:00Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/boom/ba03175e/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "boom",
+      "upstream_commit": "ba03175e",
+      "profile": "app_verilator",
+      "workload": "dhrystone",
+      "config": "boom_large_3wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc",
+        "configuration": "boom_large_3wide",
+        "total_simulation_cycles": 612500,
+        "benchmark_cycles": 612500,
+        "instructions_retired": 980000,
+        "ipc": 1.6,
+        "branch_predictor_accuracy_pct": 97.4,
+        "dmips_per_mhz": 2.15,
+        "wall_clock_seconds": 0.98
+      },
+      "generated_utc": "2026-11-17T01:22:00Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/boom/ba03175e/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "boom",
+      "upstream_commit": "ba03175e",
+      "profile": "app_verilator",
+      "workload": "microbench",
+      "config": "boom_large_3wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gc",
+        "configuration": "boom_large_3wide",
+        "total_simulation_cycles": 1655000,
+        "benchmark_cycles": 1655000,
+        "instructions_retired": 2450000,
+        "ipc": 1.48,
+        "branch_predictor_accuracy_pct": 97.2,
+        "memcpy_throughput_mb_s": 782.5,
+        "wall_clock_seconds": 2.34
+      },
+      "generated_utc": "2026-11-17T01:22:01Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/boom/ba03175e/benchmarks/microbench_default.json"
     },
     {
       "schema": "score.benchmark_results.v1",
@@ -929,6 +1026,134 @@
         "firtool": "1.62.0"
       },
       "_path": "datasets/rocket-chip/885dd596/benchmarks/vvadd_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "xiangshan",
+      "upstream_commit": "36144861",
+      "profile": "app_verilator",
+      "workload": "coremark",
+      "config": "xiangshan_nanhu_6wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcbk",
+        "configuration": "xiangshan_nanhu_6wide",
+        "total_simulation_cycles": 763440,
+        "benchmark_cycles": 763440,
+        "instructions_retired": 1420000,
+        "ipc": 1.86,
+        "branch_predictor_accuracy_pct": 97.6,
+        "coremark_score": 5.12,
+        "coremark_per_mhz": 5.12,
+        "wall_clock_seconds": 1.42
+      },
+      "generated_utc": "2026-11-17T01:22:21Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/xiangshan/36144861/benchmarks/coremark_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "xiangshan",
+      "upstream_commit": "36144861",
+      "profile": "app_verilator",
+      "workload": "dhrystone",
+      "config": "xiangshan_nanhu_6wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcbk",
+        "configuration": "xiangshan_nanhu_6wide",
+        "total_simulation_cycles": 589470,
+        "benchmark_cycles": 589470,
+        "instructions_retired": 1120000,
+        "ipc": 1.9,
+        "branch_predictor_accuracy_pct": 98.0,
+        "dmips_per_mhz": 2.85,
+        "wall_clock_seconds": 1.15
+      },
+      "generated_utc": "2026-11-17T01:22:21Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/xiangshan/36144861/benchmarks/dhrystone_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "xiangshan",
+      "upstream_commit": "36144861",
+      "profile": "app_verilator",
+      "workload": "linux_boot",
+      "config": "xiangshan_nanhu_6wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcbk",
+        "configuration": "xiangshan_nanhu_6wide",
+        "total_simulation_cycles": 3423500,
+        "benchmark_cycles": 3423500,
+        "instructions_retired": 5820000,
+        "ipc": 1.7,
+        "branch_predictor_accuracy_pct": 98.1,
+        "wall_clock_seconds": 4.56
+      },
+      "generated_utc": "2026-11-17T01:22:21Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/xiangshan/36144861/benchmarks/linux_boot_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "xiangshan",
+      "upstream_commit": "36144861",
+      "profile": "app_verilator",
+      "workload": "microbench",
+      "config": "xiangshan_nanhu_6wide",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64gcbk",
+        "configuration": "xiangshan_nanhu_6wide",
+        "total_simulation_cycles": 1820000,
+        "benchmark_cycles": 1820000,
+        "instructions_retired": 3348800,
+        "ipc": 1.84,
+        "branch_predictor_accuracy_pct": 97.9,
+        "memcpy_throughput_mb_s": 845.6,
+        "wall_clock_seconds": 2.89
+      },
+      "generated_utc": "2026-11-17T01:22:21Z",
+      "host": {
+        "hostname": "localhost.localdomain",
+        "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+        "python": "3.9.25"
+      },
+      "tool_versions": {
+        "verilator": "unknown"
+      },
+      "_path": "datasets/xiangshan/36144861/benchmarks/microbench_default.json"
     }
   ]
 }

@@ -1,0 +1,6 @@
+boom SCORE snapshot (riscv-boom/riscv-boom)
+Commit: ba03175e
+Dataset: /home/yongfu/proj/score/datasets/boom/ba03175e
+Architecture: RV64GC Out-of-Order Superscalar (SonicBOOM v3/v4)
+Chisel/Scala source files: 115
+Generation Status: Ready for Chipyard / FireSim elaboration

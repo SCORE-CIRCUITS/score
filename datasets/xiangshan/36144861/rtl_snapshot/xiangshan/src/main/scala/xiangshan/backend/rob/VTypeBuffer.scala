@@ -1,0 +1,455 @@
+package xiangshan.backend.rob
+
+import chisel3._
+import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import utility._
+import xiangshan.backend.Bundles.{DynInst, EnqRobUop}
+import xiangshan.backend.fu.vector.Bundles.VType
+import xiangshan.backend.rename.SnapshotGenerator
+import xiangshan._
+import xiangshan.backend.decode.opcode.Opcode.VSetOpcodes
+import xiangshan.backend.rob.VTypeBuffer._
+
+
+class VTypeBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelper {
+  val in = IO(new In(size))
+  val out = IO(new Out(size))
+
+  // alias
+  private val useSnpt = in.snpt.useSnpt
+  private val snptSelect = in.snpt.snptSelect
+
+  private val s_idle :: s_spcl_walk :: s_walk :: Nil = Enum(3)
+  private val state = RegInit(s_idle)
+  private val stateNext = WireInit(state) // otherwise keep state value
+  private val stateLast = RegEnable(state, state =/= stateNext)
+  private val stateLastCycle = RegNext(state)
+
+  // +1 read port to get walk initial state
+  private val vtypeBuffer = Reg(Vec(size, new VTypeBufferEntry()))
+//  private val vtypeBuffer = Module(new SyncDataModuleTemplate(new VTypeBufferEntry(), size, numWrite = RenameWidth, numRead = CommitWidth))
+
+  private val vtypeBufferReadAddrVec = Wire(Vec(RabCommitWidth, UInt(log2Ceil(size).W)))
+  private val vtypeBufferReadDataVec = Wire(Vec(RabCommitWidth, new VTypeBufferEntry()))
+  private val vtypeBufferWriteEnVec = Wire(Vec(RenameWidth, Bool()))
+  private val vtypeBufferWriteAddrVec = Wire(Vec(RenameWidth, UInt(log2Ceil(size).W)))
+  private val vtypeBufferWriteDataVec = Wire(Vec(RenameWidth, new VTypeBufferEntry()))
+
+  private val vtypeBufferWenVec: Vec[Bool] = VecInit(vtypeBuffer.indices.map {
+    case i =>
+      Mux1H(vtypeBufferWriteEnVec zip vtypeBufferWriteAddrVec map {
+        case (wen, waddr) =>
+          wen -> (waddr === i.U)
+      })
+  })
+
+  private val commitValidVec = Wire(Vec(RabCommitWidth, Bool()))
+  private val walkValidVec = Wire(Vec(RabCommitWidth, Bool()))
+  private val infoVec = Wire(Vec(RabCommitWidth, VType()))
+  private val hasVsetvlVec = Wire(Vec(RabCommitWidth, Bool()))
+  private val pdestVlVec = Wire(Vec(RabCommitWidth, UInt(VlPhyRegIdxWidth.W)))
+
+  private val vtypeBufferWdataVec: Vec[VTypeBufferEntry] = VecInit(vtypeBuffer.indices.map {
+    case i =>
+      Mux1H(vtypeBufferWriteEnVec zip vtypeBufferWriteAddrVec zip vtypeBufferWriteDataVec map {
+        case ((wen, waddr), wdata) =>
+          (wen && (waddr === i.U)) -> wdata
+      })
+  })
+
+  for (i <- vtypeBuffer.indices) {
+    when (vtypeBufferWenVec(i)) {
+      vtypeBuffer(i) := vtypeBufferWdataVec(i)
+    }
+  }
+
+  for (i <- vtypeBufferReadDataVec.indices) {
+    vtypeBufferReadDataVec(i) := vtypeBuffer(vtypeBufferReadAddrVec(i))
+  }
+
+  // pointer
+  private val enqPtrVec = RegInit(VecInit.tabulate(RenameWidth)(idx => VTypeBufferPtr(flag = false, idx)))
+  private val enqPtr = enqPtrVec.head
+  private val enqPtrOH = RegInit(1.U(size.W))
+  private val enqPtrOHShift = CircularShift(enqPtrOH)
+  // may shift [0, RenameWidth] steps
+  private val enqPtrOHVec = VecInit.tabulate(RenameWidth + 1)(enqPtrOHShift.left)
+  private val enqPtrVecNext = WireInit(enqPtrVec)
+
+  private val deqPtrVec = RegInit(VecInit.tabulate(RabCommitWidth)(idx => VTypeBufferPtr(flag = false, idx)))
+  private val deqPtr = deqPtrVec.head
+  private val deqPtrOH = RegInit(1.U(size.W))
+  private val deqPtrOHShift = CircularShift(deqPtrOH)
+  private val deqPtrOHVec = VecInit.tabulate(RabCommitWidth + 1)(deqPtrOHShift.left)
+  private val deqPtrVecNext = WireInit(deqPtrVec)
+  XSError(deqPtr.toOH =/= deqPtrOH, p"wrong one-hot reg between $deqPtr and $deqPtrOH")
+
+  private val walkPtrVec = RegInit(VecInit.tabulate(RabCommitWidth)(idx => VTypeBufferPtr(flag = false, idx)))
+  private val walkPtr = Reg(new VTypeBufferPtr)
+  private val walkPtrOH = walkPtr.toOH
+  private val walkPtrOHVec = VecInit.tabulate(RabCommitWidth + 1)(CircularShift(walkPtrOH).left)
+  private val walkPtrNext = Wire(new VTypeBufferPtr)
+  private val walkPtrVecNext = VecInit((0 until RabCommitWidth).map(x => walkPtrNext + x.U))
+
+  private val diffPtr = RegInit(VTypeBufferPtr())
+  private val diffPtrNext = Wire(chiselTypeOf(diffPtr))
+
+  // get enque vtypes in in.req
+  private val enqVTypes = VecInit(in.req.map(req => req.bits.oldVType))
+  private val enqValids = VecInit(in.req.map(_.valid))
+  private val enqVType = PriorityMux(enqValids.zip(enqVTypes).map { case (valid, vtype) => valid -> vtype })
+
+  private val walkPtrSnapshots = SnapshotGenerator(enqPtr, in.snpt.snptEnq, in.snpt.snptDeq, in.redirect, in.snpt.flushVec)
+  private val walkVTypeSnapshots = SnapshotGenerator(enqVType, in.snpt.snptEnq, in.snpt.snptDeq, in.redirect, in.snpt.flushVec)
+
+  private val robWalkEndReg = RegInit(false.B)
+  private val robWalkEnd = in.fromRob.walkEnd || robWalkEndReg
+
+  when(in.redirect) {
+    robWalkEndReg := false.B
+  }.elsewhen(in.fromRob.walkEnd) {
+    robWalkEndReg := true.B
+  }
+
+  // There are two uops mapped to one vset inst.
+  // Only record the last here.
+  private val needAllocVec = VecInit(in.req.map(req => req.valid && req.bits.vlWen))
+  private val enqCount = PopCount(needAllocVec)
+
+  private val commitCount   = Wire(UInt(RabCommitWidth.U.getWidth.W))
+  private val walkCount     = Wire(UInt(RabCommitWidth.U.getWidth.W))
+  private val spclWalkCount = Wire(UInt(RabCommitWidth.U.getWidth.W))
+
+  private val commitSize   = RegInit(0.U(size.U.getWidth.W))
+  private val walkSize     = RegInit(0.U(size.U.getWidth.W))
+  private val spclWalkSize = RegInit(0.U(size.U.getWidth.W))
+
+  private val commitSizeNext   = Wire(UInt(size.U.getWidth.W))
+  private val walkSizeNext     = Wire(UInt(size.U.getWidth.W))
+  private val spclWalkSizeNext = Wire(UInt(size.U.getWidth.W))
+
+  private val newCommitSize   = in.fromRob.commitSize
+  private val newWalkSize     = in.fromRob.walkSize
+  private val newSpclWalkSize = Mux(in.redirect && !in.snpt.useSnpt, commitSizeNext, 0.U)
+
+  commitSizeNext   := commitSize + newCommitSize - commitCount
+  walkSizeNext     := walkSize + newWalkSize - walkCount
+  spclWalkSizeNext := spclWalkSize + newSpclWalkSize - spclWalkCount
+
+  commitSize := Mux(in.redirect && !in.snpt.useSnpt, 0.U, commitSizeNext)
+  spclWalkSize := spclWalkSizeNext
+  walkSize := Mux(in.redirect, 0.U, walkSizeNext)
+
+  walkPtrNext := MuxCase(walkPtr, Seq(
+    (state === s_idle && stateNext === s_walk) -> walkPtrSnapshots(snptSelect),
+    (state === s_spcl_walk && stateNext === s_walk) -> deqPtrVecNext.head,
+    (state === s_walk && in.snpt.useSnpt && in.redirect) -> walkPtrSnapshots(snptSelect),
+    (state === s_walk) -> (walkPtr + walkCount),
+  ))
+
+  walkPtr := walkPtrNext
+
+  diffPtr := diffPtrNext
+  diffPtrNext := diffPtr + newCommitSize
+
+  private val useSnapshotNext = WireInit(false.B)
+
+  useSnapshotNext := (state === s_idle && stateNext === s_walk) || (state === s_walk && in.snpt.useSnpt && in.redirect)
+  private val useSnapshot = RegNext(useSnapshotNext)
+  private val snapshotVType = RegEnable(walkVTypeSnapshots(snptSelect), useSnapshotNext)
+
+  // update enq ptr
+  private val enqPtrNext = Mux(
+    state === s_walk && stateNext === s_idle,
+    walkPtrNext,
+    enqPtr + enqCount
+  )
+
+  private val enqPtrOHNext = Mux(
+    state === s_walk && stateNext === s_idle,
+    walkPtrNext.toOH,
+    enqPtrOHVec(enqCount)
+  )
+
+  enqPtrOH := enqPtrOHNext
+  enqPtrVecNext.zipWithIndex.map{ case(ptr, i) => ptr := enqPtrNext + i.U }
+  enqPtrVec := enqPtrVecNext
+
+  // update deq ptr
+  private val deqPtrSteps = Mux1H(Seq(
+    (state === s_idle) -> commitCount,
+    (state === s_spcl_walk) -> spclWalkCount,
+  ))
+
+  private val deqPtrNext = deqPtr + deqPtrSteps
+  private val deqPtrOHNext = deqPtrOHVec(deqPtrSteps)
+  deqPtrOH := deqPtrOHNext
+  deqPtrVecNext.zipWithIndex.map{ case(ptr, i) => ptr := deqPtrNext + i.U }
+  deqPtrVec := deqPtrVecNext
+
+  private val allocPtrVec: Vec[VTypeBufferPtr] = VecInit((0 until RenameWidth).map(i => enqPtrVec(PopCount(needAllocVec.take(i)))))
+  private val vtypeBufferReadPtrVecNext: Vec[VTypeBufferPtr] = Mux1H(Seq(
+    (stateNext === s_idle) -> deqPtrVecNext,
+    (stateNext === s_walk) -> walkPtrVecNext,
+    (stateNext === s_spcl_walk) -> deqPtrVecNext,
+  ))
+
+  /**
+   * connection of [[vtypeBuffer]]
+   */
+  vtypeBufferWriteAddrVec := allocPtrVec.map(_.value)
+  vtypeBufferWriteEnVec := needAllocVec
+  vtypeBufferWriteDataVec.zip(in.req.map(_.bits)).foreach { case (entry: VTypeBufferEntry, inst: EnqRobUop) =>
+    entry.vtype := inst.vtype
+    entry.isVsetvl := VSetOpcodes.isVSetvl(inst.fuOpType)
+    entry.vlWen := inst.vlWen
+    entry.pdestVl := inst.pdestVl
+  }
+
+  for (i <- vtypeBufferReadAddrVec.indices) {
+    vtypeBufferReadAddrVec(i) := RegEnable(
+      vtypeBufferReadPtrVecNext(i).value,
+      commitValidVec(i) || walkValidVec(i) || in.fromRob.commitSize =/= 0.U || in.fromRob.walkSize =/= 0.U
+    )
+  }
+
+
+  for (i <- 0 until RabCommitWidth) {
+    commitValidVec(i) := state === s_idle && i.U < commitSize || state === s_spcl_walk && i.U < spclWalkSize
+    walkValidVec(i) := state === s_walk && i.U < walkSize || state === s_spcl_walk && i.U < spclWalkSize
+
+    infoVec(i) := vtypeBufferReadDataVec(i).vtype
+    hasVsetvlVec(i) := vtypeBufferReadDataVec(i).isVsetvl
+    pdestVlVec(i) := vtypeBufferReadDataVec(i).pdestVl
+  }
+
+  commitCount   := Mux(state === s_idle,      PopCount(commitValidVec), 0.U)
+  walkCount     := Mux(state === s_walk,      PopCount(walkValidVec), 0.U)
+  spclWalkCount := Mux(state === s_spcl_walk, PopCount(walkValidVec), 0.U)
+
+  private val walkEndNext = walkSizeNext === 0.U
+  private val spclWalkEndNext = spclWalkSizeNext === 0.U
+
+  state := stateNext
+
+  when (in.redirect) {
+    when (in.snpt.useSnpt) {
+      stateNext := s_walk
+    }.otherwise {
+      stateNext := s_spcl_walk
+    }
+  }.otherwise {
+    switch (state) {
+      is(s_idle) {
+        stateNext := s_idle
+      }
+      is(s_spcl_walk) {
+        when (spclWalkEndNext) {
+          stateNext := s_walk
+        }
+      }
+      is(s_walk) {
+        when (robWalkEnd && walkEndNext) {
+          stateNext := s_idle
+        }
+      }
+    }
+  }
+
+  val numValidEntries = distanceBetween(enqPtr, deqPtr)
+  val allowEnqueue = GatedValidRegNext(
+    numValidEntries + enqCount <= (size - RenameWidth).U,
+    true.B
+  )
+  val allowEnqueueForDispatch = GatedValidRegNext(
+    numValidEntries + enqCount <= (size - 2*RenameWidth).U,
+    true.B
+  )
+
+  private val decodeResumeVType = RegInit(0.U.asTypeOf(new ValidIO(VType())))
+  private val newestVType = PriorityMux(walkValidVec.zip(infoVec).map { case(walkValid, info) => walkValid -> info }.reverse)
+  private val newestArchVType = PriorityMux(commitValidVec.zip(infoVec).map { case(commitValid, info) => commitValid -> info }.reverse)
+  private val commitVTypeValid = commitValidVec.asUInt.orR
+  private val walkToArchVType = RegInit(false.B)
+
+  walkToArchVType := false.B
+
+  when (state === s_spcl_walk) {
+    // special walk use commit vtype
+    decodeResumeVType.valid := commitVTypeValid
+    decodeResumeVType.bits := newestArchVType
+  }.elsewhen (useSnapshot) {
+    // use snapshot vtype
+    decodeResumeVType.valid := true.B
+    decodeResumeVType.bits := snapshotVType
+  }.elsewhen (state === s_walk && walkCount =/= 0.U) {
+    decodeResumeVType.valid := true.B
+    decodeResumeVType.bits := newestVType
+  }.elsewhen (state === s_walk && stateLastCycle =/= s_walk) {
+    // walk start with arch vtype
+    decodeResumeVType.valid := false.B
+    walkToArchVType := true.B
+  }.otherwise {
+    decodeResumeVType.valid := false.B
+  }
+
+  in.canEnq := allowEnqueue && state === s_idle
+  in.canEnqForDispatch := allowEnqueueForDispatch && state === s_idle
+
+  out.commits.isCommit := state === s_idle || state === s_spcl_walk
+  out.commits.isWalk := state === s_walk || state === s_spcl_walk
+  for (i <- 0 until RabCommitWidth) {
+    out.commits.commitValid(i) := Mux1H(Seq(
+      (state === s_idle) -> (i.U < commitSize),
+      (state === s_spcl_walk) -> (i.U < spclWalkSize),
+    ))
+    out.commits.walkValid(i) := Mux1H(Seq(
+      (state === s_walk) -> (i.U < walkSize),
+      (state === s_spcl_walk) -> (i.U < spclWalkSize),
+    ))
+    out.commits.pdestVl(i) := pdestVlVec(i)
+  }
+
+  out.diffCommits.foreach {
+    diffCommits =>
+      for (i <- diffCommits.commitValid.indices) {
+        diffCommits.commitValid(i) := i.U < newCommitSize
+        diffCommits.pdestVl(i) := vtypeBuffer((diffPtr + i.U).value).pdestVl
+      }
+  }
+
+  in.status.walkEnd := walkEndNext
+  // update vtype in decode when VTypeBuffer resumes from walk state
+  // note that VTypeBuffer can still send resuming request in the first cycle of s_idle
+  out.toDecode.isResumeVType := state =/= s_idle || decodeResumeVType.valid
+  out.toDecode.walkVType.valid := decodeResumeVType.valid
+  out.toDecode.walkVType.bits := Mux(out.toDecode.walkVType.valid, decodeResumeVType.bits, 0.U.asTypeOf(VType()))
+
+  out.toDecode.commitVType.vtype.valid := commitVTypeValid
+  out.toDecode.commitVType.vtype.bits := newestArchVType
+
+  out.toDecode.walkToArchVType := walkToArchVType
+
+  // because vsetvl flush pipe, there is only one vset instruction when vsetvl is committed
+  private val hasVsetvl = commitValidVec.zip(hasVsetvlVec).map { case(commitValid, hasVsetvl) => commitValid && hasVsetvl }.reduce(_ || _)
+  out.toDecode.commitVType.hasVsetvl := hasVsetvl
+
+  XSError(isBefore(enqPtr, deqPtr) && !isFull(enqPtr, deqPtr), "\ndeqPtr is older than enqPtr!\n")
+
+  QueuePerf(size, numValidEntries, numValidEntries === size.U)
+
+  XSPerfAccumulate("s_idle_to_idle", state === s_idle      && stateNext === s_idle)
+  XSPerfAccumulate("s_idle_to_swlk", state === s_idle      && stateNext === s_spcl_walk)
+  XSPerfAccumulate("s_idle_to_walk", state === s_idle      && stateNext === s_walk)
+  XSPerfAccumulate("s_swlk_to_idle", state === s_spcl_walk && stateNext === s_idle)
+  XSPerfAccumulate("s_swlk_to_swlk", state === s_spcl_walk && stateNext === s_spcl_walk)
+  XSPerfAccumulate("s_swlk_to_walk", state === s_spcl_walk && stateNext === s_walk)
+  XSPerfAccumulate("s_walk_to_idle", state === s_walk      && stateNext === s_idle)
+  XSPerfAccumulate("s_walk_to_swlk", state === s_walk      && stateNext === s_spcl_walk)
+  XSPerfAccumulate("s_walk_to_walk", state === s_walk      && stateNext === s_walk)
+
+  dontTouch(enqPtrVec)
+  dontTouch(deqPtrVec)
+  dontTouch(deqPtr)
+  dontTouch(numValidEntries)
+  dontTouch(commitCount)
+  dontTouch(walkCount)
+  dontTouch(spclWalkCount)
+  dontTouch(commitSize)
+  dontTouch(walkSize)
+  dontTouch(spclWalkSize)
+  dontTouch(commitSizeNext)
+  dontTouch(walkSizeNext)
+  dontTouch(spclWalkSizeNext)
+  dontTouch(newCommitSize)
+  dontTouch(newWalkSize)
+  dontTouch(newSpclWalkSize)
+  dontTouch(commitValidVec)
+  dontTouch(walkValidVec)
+  dontTouch(infoVec)
+}
+
+object VTypeBuffer {
+  class In(size: Int)(implicit p: Parameters) extends XSBundle {
+    // Recovery redirect.
+    val redirect = Input(Bool())
+
+    // Recovery snapshots.
+    val snpt = Input(new SnapshotPort)
+
+    // Enqueue requests and admission responses.
+    val req = Vec(RenameWidth, Flipped(ValidIO(new EnqRobUop)))
+    val canEnq = Output(Bool())
+    val canEnqForDispatch = Output(Bool())
+
+    // ROB quotas and completion responses.
+    val fromRob = new VTypeBufferFromRobIO(size)
+    val status = Output(new VTypeBufferStatus)
+  }
+
+  class Out(size: Int)(implicit p: Parameters) extends XSBundle {
+    // VL mapping notifications.
+    val commits = Output(new VlCommitBundle(RabCommitWidth))
+
+    // Difftest VL mappings.
+    val diffCommits = Option.when(backendParams.basicDebugEn)(Output(new DiffVlCommitBundle(CommitWidth)))
+
+    // Decode VTYPE interface.
+    val toDecode = Output(new VTypeBufferToDecodeIO)
+  }
+
+  class VTypeBufferFromRobIO(size: Int)(implicit p: Parameters) extends XSBundle {
+    // ROB walk quota.
+    val walkSize = Input(UInt(log2Up(size).W))
+
+    // ROB walk completion.
+    val walkEnd = Input(Bool())
+
+    // ROB commit quota.
+    val commitSize = Input(UInt(log2Up(size).W))
+  }
+
+  class VTypeBufferCommitVType(implicit p: Parameters) extends XSBundle {
+    // Committed VTYPE.
+    val vtype = ValidIO(VType())
+
+    // Committed vsetvl indication.
+    val hasVsetvl = Bool()
+  }
+
+  class VTypeBufferToDecodeIO(implicit p: Parameters) extends XSBundle {
+    // VTYPE recovery.
+    val isResumeVType = Bool()
+    val walkToArchVType = Bool()
+    val walkVType = ValidIO(VType())
+
+    // Committed VTYPE.
+    val commitVType = new VTypeBufferCommitVType
+  }
+
+  class VTypeBufferStatus extends Bundle {
+    // Walk completion.
+    val walkEnd = Bool()
+  }
+
+  class VTypeBufferEntry(implicit p: Parameters) extends XSBundle {
+    val vtype = new VType()
+    val isVsetvl = Bool()
+    val vlWen = Bool()
+    val pdestVl = UInt(VlPhyRegIdxWidth.W)
+  }
+
+  class VTypeBufferPtr(size: Int) extends CircularQueuePtr[VTypeBufferPtr](size) {
+    def this()(implicit p: Parameters) = this(p(XSCoreParamsKey).VTypeBufferSize)
+  }
+
+  object VTypeBufferPtr {
+    def apply(flag: Boolean = false, v: Int = 0)(implicit p: Parameters): VTypeBufferPtr = {
+      val ptr = Wire(new VTypeBufferPtr(p(XSCoreParamsKey).VTypeBufferSize))
+      ptr.flag := flag.B
+      ptr.value := v.U
+      ptr
+    }
+  }
+}

@@ -1,0 +1,6 @@
+xiangshan SCORE snapshot (OpenXiangShan/XiangShan)
+Commit: 36144861
+Dataset: /home/yongfu/proj/score/datasets/xiangshan/36144861
+Architecture: RV64GCBK 6-Issue Out-of-Order Superscalar (NanHu / KunMingHu)
+Chisel/Scala source files: 667
+Generation Status: Ready for Mill / Chisel elaboration

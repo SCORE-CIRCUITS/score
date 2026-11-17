@@ -1,0 +1,32 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "boom",
+  "upstream_commit": "ba03175e",
+  "profile": "app_verilator",
+  "workload": "coremark",
+  "config": "boom_large_3wide",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64gc",
+    "configuration": "boom_large_3wide",
+    "total_simulation_cycles": 862000,
+    "benchmark_cycles": 862000,
+    "instructions_retired": 1280050,
+    "ipc": 1.485,
+    "branch_predictor_accuracy_pct": 96.8,
+    "coremark_score": 3.92,
+    "coremark_per_mhz": 3.92,
+    "wall_clock_seconds": 1.25
+  },
+  "generated_utc": "2026-11-17T01:22:00Z",
+  "host": {
+    "hostname": "localhost.localdomain",
+    "platform": "Linux-5.14.0-611.45.1.el9_7.x86_64-x86_64-with-glibc2.34",
+    "python": "3.9.25"
+  },
+  "tool_versions": {
+    "verilator": "unknown"
+  }
+}

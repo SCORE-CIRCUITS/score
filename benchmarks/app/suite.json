@@ -183,6 +183,52 @@
           "runner": "scripts/benchmarks/run_black_parrot_benchmarks.sh demo"
         }
       }
+    },
+    {
+      "score_tool": "boom",
+      "profile": "app_verilator",
+      "architecture": "rv64gc",
+      "config": "boom_large_3wide",
+      "description": "UC Berkeley SonicBOOM 64-bit Out-of-Order superscalar processor with TAGE-SC branch prediction and non-blocking L1 cache",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_boom_benchmarks.sh coremark"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_boom_benchmarks.sh dhrystone"
+        },
+        "microbench": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_boom_benchmarks.sh microbench"
+        }
+      }
+    },
+    {
+      "score_tool": "xiangshan",
+      "profile": "app_verilator",
+      "architecture": "rv64gcbk",
+      "config": "xiangshan_nanhu_6wide",
+      "description": "CAS/ICT XiangShan (NanHu) 64-bit 6-issue Out-of-Order superscalar processor with TAGE-SC-L branch predictor and Difftest co-simulation",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_xiangshan_benchmarks.sh coremark"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_xiangshan_benchmarks.sh dhrystone"
+        },
+        "linux_boot": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_xiangshan_benchmarks.sh linux_boot"
+        },
+        "microbench": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_xiangshan_benchmarks.sh microbench"
+        }
+      }
     }
   ]
 }
