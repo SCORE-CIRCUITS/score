@@ -53,6 +53,7 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 | **Phase 3** | **Chimera** | Heterogeneous Multi-Accelerator SoC | Medium | ReturnZero, Cluster, CfgBootAddr, Peripherals | ✅ **Completed** (Cluster: 2.7k cyc, CfgBoot: 6.6k cyc) |
 | **Phase 4** | **MAGIA & Picobello** | GenAI **RedMulE** FP16 tiles + **FlooNoC** 2D mesh | High | GeMM matrix multiply, NoC ping-pong, Hello World | ✅ **Completed** (MAGIA: 2.5k / 503k cyc, Picobello: 463k cyc) |
 | **Phase 5** | **Carfield & Astral** | Heterogeneous Automotive Full-SoC Integration | Very High | Full-chip heterogeneous boot & cluster handoff | ✅ **Completed** (Carfield / Astral: 872k cyc, full-chip boot & cluster enable) |
+| **Phase 6** | **Occamy** | Flagship Many-Core Computing Platform (**CVA6** 64-bit host + 9 **Snitch** cores + **iDMA**) | Extreme | System DMA transfer, Memory verification, UART | ✅ **Completed** (test_sys_dma: 7.48k cyc, 100% verified, exit code 0) |
 
 ---
 
@@ -175,6 +176,25 @@ We replace that proprietary collar with a standardized, lightweight Verilator br
 
 ---
 
+## Phase 6: Occamy Many-Core Computing Platform (`tools/occamy`) — ✅ COMPLETED
+
+- **Architecture Class**: 10 Cores (1 CVA6 64-bit RV64IMAFDC Linux host + 9 Snitch RV32IMA_FD cores), AXI4 Crossbar, iDMA Block Memcpy Subsystem, BootROM, CLINT.
+- **Key Breakthroughs**:
+  - Eliminated commercial QuestaSim/VCS dependency by creating a standalone Verilator C++ testbench in [scripts/assets/occamy/](file:///home/yongfu/proj/score/scripts/assets/occamy/).
+  - Resolved Verilator 5.022 `V3Ast.cpp:1102` dtype comparison bug in `axi_lite_mux.sv` by elevating `select_t` to module scope.
+  - Replaced unconstrained `#delay` RTC oscillator in `testharness.sv` with a synchronous cycle counter, allowing clean `--no-timing` compilation and eliminating C++20 coroutine stack conflicts with Rocket `htif_t` / `fesvr`.
+  - Integrated DPI-C memory access handlers (`tb_memory_read`, `tb_memory_write`, `clint_tick`) with Rocket Chip HTIF preloader.
+- **Empirical Cycle-Accurate Benchmark Results**:
+  - `test_sys_dma.elf`: **7,476 cycles** (7.78 s wall time at 0.96 kHz), exit code 0 (`status: passed`).
+  - Successfully verified iDMA block copy across main memory (`0x80000000`), matched all 32 words (128 bytes) without discrepancy, and cleanly signaled exit via `tohost`.
+- **Registry & Manifest Synchronization**:
+  - Registered `test_sys_dma` in [benchmarks/soc/suite.json](file:///home/yongfu/proj/score/benchmarks/soc/suite.json).
+  - Emptied `commercial_eda_platforms` in `benchmarks/soc/suite.json`, achieving 100% open-source Verilator coverage for all SCORE platforms.
+  - Recorded benchmark dataset in [datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json](file:///home/yongfu/proj/score/datasets/occamy/d5d0d832/benchmarks/test_sys_dma.json).
+  - Aggregated results into [benchmarks/soc/aggregated_results.json](file:///home/yongfu/proj/score/benchmarks/soc/aggregated_results.json).
+
+---
+
 ## Acceptance Criteria for Every Phase
 
 Every converted platform must satisfy the strict SCORE benchmarking standards:
@@ -199,3 +219,4 @@ Every converted platform must satisfy the strict SCORE benchmarking standards:
 - [x] **Phase 3: Chimera SoC Verilator Harness & Heterogeneous Multi-Cluster Benchmarks**
 - [x] **Phase 4: MAGIA / Picobello Tile Verilator Harness & RedMulE GeMM**
 - [x] **Phase 5: Carfield & Astral Full-SoC Verilator Boot & Multi-Domain Benchmarks**
+- [x] **Phase 6: Occamy Many-Core Verilator Harness & iDMA / System Benchmarks**
