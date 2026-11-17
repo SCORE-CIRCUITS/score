@@ -191,11 +191,16 @@ def main() -> int:
             failures.append(f"Fig. 13(B) DMA drifts >0.5 px from Eq. (10): got {ys_dma} vs {[round(y,1) for y in exp_dma]}")
 
     # 6. Companion Website Cross-Artifact Parity (if website checkout is present)
+    ws_idx = ROOT / "website/src/pages/index.astro"
+    if ws_idx.exists() and "degrades exponentially" in ws_idx.read_text():
+        failures.append("Website index.astro still claims 'degrades exponentially' instead of quadratically")
     ws_app = ROOT / "website/src/pages/app-cores/index.astro"
     if ws_app.exists():
         ws_app_txt = ws_app.read_text()
         if "MSHR SUBSYSTEM (1 TO 16 BUFFERS)" not in ws_app_txt or "135 &#8211; 680 kGE" not in ws_app_txt:
             failures.append("Website app-cores/index.astro out of sync with Fig. 5 Level 2 envelope")
+        if "4 to 8 MSHRs" in ws_app_txt:
+            failures.append("Website app-cores/index.astro still mentions stale '4 to 8 MSHRs'")
     ws_soc = ROOT / "website/src/pages/soc-multicore/index.astro"
     if ws_soc.exists():
         ws_soc_txt = ws_soc.read_text()
@@ -205,7 +210,17 @@ def main() -> int:
             if not re.search(rf"{core_n}:\s*\{{\s*amoCyc:\s*{amo_c},\s*fractCyc:\s*{fr_c}\b", ws_soc_txt):
                 failures.append(f"Website barrierSpecs mismatch at {core_n}c (expected amo={amo_c}, fract={fr_c})")
 
-    # 7. Build log health (0 Overfull boxes, 0 prose/heading Underfull >= 2500)
+    # 7. Rendered Bibliography Copy-Edit Checks (build/main.bbl)
+    bbl_path = PAPER / "build/main.bbl"
+    if bbl_path.exists():
+        bbl_txt = bbl_path.read_text()
+        bbl_titles = " ".join(re.findall(r"``([^']+)''", bbl_txt))
+        if re.search(r"\bgoogle\b|internet-of-things", bbl_titles):
+            failures.append("Found downcased proper noun ('google' or 'internet-of-things') in build/main.bbl titles")
+        if re.search(r"pp\.\s*1--1\b", bbl_txt):
+            failures.append("Found placeholder 'pp. 1--1' Early Access page range in build/main.bbl")
+
+    # 8. Build log health (0 Overfull boxes, 0 prose/heading Underfull >= 2500)
     log_path = PAPER / "build/main.log"
     if log_path.exists():
         log_txt = log_path.read_text()
