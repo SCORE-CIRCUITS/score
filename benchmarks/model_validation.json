@@ -1,0 +1,111 @@
+{
+  "schema": "score.model_validation.v1",
+  "generated_utc": "2026-11-17T21:47:10+00:00",
+  "eq2_pareto_sets": {
+    "cat1_pareto_optimal": [
+      "SERV",
+      "FemtoRV32",
+      "PicoRV32",
+      "Ibex small",
+      "Ibex OpenTitan",
+      "Ibex Dyn-BP"
+    ],
+    "cat1_count": "6/17",
+    "cat2_pareto_optimal": [
+      "Rocket Std",
+      "Rocket Max 32K",
+      "SmallBOOM",
+      "SonicBOOM",
+      "OpenC910",
+      "XiangShan"
+    ],
+    "cat2_count": "6/15"
+  },
+  "eq4_coremark_validation": {
+    "exact_matches": 21,
+    "total_checked": 22,
+    "max_residual_pct": 0.0023,
+    "metadata_anomalies": [
+      {
+        "core": "cv32e40p",
+        "config": "default",
+        "reported_cm_mhz": 3.19,
+        "iterations": 1000,
+        "total_cycles": 454545,
+        "formula_cm_mhz": 2200.0022,
+        "note": "iterations field reflects full suite parameter rather than single-run cycle window"
+      }
+    ]
+  },
+  "eq7_eq8_vector_validation": {
+    "ops_per_cycle_checked": 13,
+    "max_residual_pct": 0.0721,
+    "ara_fmatmul_sweep_rho_host": [
+      {
+        "dimension": "4x4",
+        "cycles": 452,
+        "ops_per_cycle": 0.283,
+        "utilization_pct": 3.54,
+        "inferred_rho_host": 27.2686
+      },
+      {
+        "dimension": "8x8",
+        "cycles": 890,
+        "ops_per_cycle": 1.151,
+        "utilization_pct": 14.38,
+        "inferred_rho_host": 5.9505
+      },
+      {
+        "dimension": "16x16",
+        "cycles": 2886,
+        "ops_per_cycle": 2.839,
+        "utilization_pct": 35.48,
+        "inferred_rho_host": 1.8179
+      },
+      {
+        "dimension": "32x32",
+        "cycles": 11762,
+        "ops_per_cycle": 5.572,
+        "utilization_pct": 69.65,
+        "inferred_rho_host": 0.4358
+      },
+      {
+        "dimension": "64x64",
+        "cycles": 70423,
+        "ops_per_cycle": 7.445,
+        "utilization_pct": 93.06,
+        "inferred_rho_host": 0.0745
+      },
+      {
+        "dimension": "128x128",
+        "cycles": 532717,
+        "ops_per_cycle": 7.8734,
+        "utilization_pct": 98.42,
+        "inferred_rho_host": 0.0161
+      }
+    ]
+  },
+  "eq9_barrier_scaling_fit": {
+    "amo_quadratic_coeffs_a0_a1_a2": [
+      -313.971,
+      36.4878,
+      0.4454
+    ],
+    "amo_r2": 0.99992,
+    "tree_log2_coeffs_b0_b1": [
+      -97.926,
+      75.725
+    ],
+    "tree_r2": 0.96358,
+    "speedup_at_432_cores": 161.48
+  },
+  "eq10_dma_breakeven": {
+    "b_core_gb_s": 0.8,
+    "b_dma_gb_s": 14.8,
+    "breakeven_bytes": 256.0,
+    "implied_t_setup_ns": 302.7,
+    "cycles_at_500mhz": 151.4,
+    "cycles_at_115mhz": 34.8,
+    "recomputed_s_star_bytes": 256.0
+  }
+}
