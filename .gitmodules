@@ -291,3 +291,75 @@
 	path = tools/ghdl
 	url = https://github.com/ghdl/ghdl.git
 
+[submodule "tools/cva5"]
+	path = tools/cva5
+	url = https://github.com/SCORE-CIRCUITS/cva5.git
+	branch = score-v1.0
+[submodule "tools/boom"]
+	path = tools/boom
+	url = https://github.com/SCORE-CIRCUITS/riscv-boom.git
+	branch = score-v1.0
+[submodule "tools/c906"]
+	path = tools/c906
+	url = https://github.com/SCORE-CIRCUITS/openc906.git
+	branch = score-v1.0
+[submodule "tools/c910"]
+	path = tools/c910
+	url = https://github.com/SCORE-CIRCUITS/openc910.git
+	branch = score-v1.0
+[submodule "tools/cv32e40p"]
+	path = tools/cv32e40p
+	url = https://github.com/SCORE-CIRCUITS/cv32e40p.git
+	branch = score-v1.0
+[submodule "tools/femtorv"]
+	path = tools/femtorv
+	url = https://github.com/SCORE-CIRCUITS/learn-fpga.git
+	branch = score-v1.0
+[submodule "tools/hwacha"]
+	path = tools/hwacha
+	url = https://github.com/SCORE-CIRCUITS/hwacha.git
+	branch = score-v1.0
+[submodule "tools/integrated-matrix-extension"]
+	path = tools/integrated-matrix-extension
+	url = https://github.com/SCORE-CIRCUITS/integrated-matrix-extension.git
+	branch = score-v1.0
+[submodule "tools/nutshell"]
+	path = tools/nutshell
+	url = https://github.com/SCORE-CIRCUITS/NutShell.git
+	branch = score-v1.0
+[submodule "tools/riscv-matrix-extension-spec"]
+	path = tools/riscv-matrix-extension-spec
+	url = https://github.com/SCORE-CIRCUITS/riscv-matrix-extension-spec.git
+	branch = score-v1.0
+[submodule "tools/riscv-p-spec"]
+	path = tools/riscv-p-spec
+	url = https://github.com/SCORE-CIRCUITS/riscv-p-spec.git
+	branch = score-v1.0
+[submodule "tools/shakti"]
+	path = tools/shakti
+	url = https://github.com/SCORE-CIRCUITS/c-class.git
+	branch = score-v1.0
+[submodule "tools/tvm-vta"]
+	path = tools/tvm-vta
+	url = https://github.com/SCORE-CIRCUITS/tvm-vta.git
+	branch = score-v1.0
+[submodule "tools/veer-eh1"]
+	path = tools/veer-eh1
+	url = https://github.com/SCORE-CIRCUITS/Cores-VeeR-EH1.git
+	branch = score-v1.0
+[submodule "tools/veer-eh2"]
+	path = tools/veer-eh2
+	url = https://github.com/SCORE-CIRCUITS/Cores-VeeR-EH2.git
+	branch = score-v1.0
+[submodule "tools/vicuna"]
+	path = tools/vicuna
+	url = https://github.com/SCORE-CIRCUITS/vicuna.git
+	branch = score-v1.0
+[submodule "tools/vortex"]
+	path = tools/vortex
+	url = https://github.com/SCORE-CIRCUITS/vortex.git
+	branch = score-v1.0
+[submodule "tools/xiangshan"]
+	path = tools/xiangshan
+	url = https://github.com/SCORE-CIRCUITS/XiangShan.git
+	branch = score-v1.0

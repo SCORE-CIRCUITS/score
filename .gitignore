@@ -1,5 +1,6 @@
 # Logs and temporary files
 logs/
+wip
 
 # Bender nested git mirrors under dataset snapshots (large .pack files; do not commit)
 **/.bender/git/
@@ -38,26 +39,6 @@ tools/ghdl-install/
 tools/hero-install/
 tools/*-install/
 tools/*-host-tools/
-
-# Standalone tool working clones (managed via install scripts)
-tools/boom/
-tools/c906/
-tools/c910/
-tools/cv32e40p/
-tools/cva5/
-tools/femtorv/
-tools/hwacha/
-tools/integrated-matrix-extension/
-tools/nutshell/
-tools/riscv-matrix-extension-spec/
-tools/riscv-p-spec/
-tools/shakti/
-tools/tvm-vta/
-tools/veer-eh1/
-tools/veer-eh2/
-tools/vicuna/
-tools/vortex/
-tools/xiangshan/
 
 # Local Python/conda installs under datasets (do not commit)
 **/miniconda3/
