@@ -363,3 +363,6 @@
 	path = tools/xiangshan
 	url = https://github.com/SCORE-CIRCUITS/XiangShan.git
 	branch = score-v1.0
+[submodule "tools/github"]
+	path = tools/github
+	url = https://github.com/SCORE-CIRCUITS/.github.git
