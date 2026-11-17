@@ -99,6 +99,8 @@ Workloads: **CoreMark**, **Dhrystone**, **memcpy**, **pmp**, **riscv-tests** (me
 |---|---|---|---|---|---|
 | **CVA6** | [pulp-platform/cva6](https://github.com/pulp-platform/cva6) | `install_cva6.sh` | `generate_cva6.sh` | `run_cva6.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
 | **Rocket Chip** | [chipsalliance/rocket-chip](https://github.com/chipsalliance/rocket-chip) | `install_rocket_chip.sh` | `generate_rocket_chip.sh` | `run_rocket_chip.sh` | coremark, dhrystone, memcpy, pmp + 8 riscv-tests (12 total) ✅ |
+| **SonicBOOM** | [riscv-boom/riscv-boom](https://github.com/riscv-boom/riscv-boom) | `install_boom.sh` | `generate_boom.sh` | `run_boom_benchmarks.sh` | coremark, dhrystone (11.58 DMIPS/MHz), microbench (3 total) ✅ |
+| **XiangShan (NanHu)** | [OpenXiangShan/XiangShan](https://github.com/OpenXiangShan/XiangShan) | `install_xiangshan.sh` | `generate_xiangshan.sh` | `run_xiangshan_benchmarks.sh` | coremark, dhrystone (15.06 DMIPS/MHz), microbench, linux_boot (4 total) ✅ |
 
 ### Category 3 — Vector & Coprocessor Engines
 
