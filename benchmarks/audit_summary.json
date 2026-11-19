@@ -1,13 +1,14 @@
 {
   "schema": "score.benchmark_audit.v1",
-  "generated_utc": "2026-11-17T21:47:10+00:00",
+  "generated_utc": "2026-11-19T14:48:10+00:00",
   "tiers": {
     "core": {
       "archived_runs": 42,
       "unique_profiles": 41,
       "targets": 15,
       "evidence_class": {
-        "score_measured": 42
+        "score_measured": 39,
+        "literature_calibrated": 3
       },
       "simulators": {
         "verilator": 35,
@@ -21,7 +22,8 @@
       "unique_profiles": 41,
       "targets": 9,
       "evidence_class": {
-        "score_measured": 41
+        "score_measured": 29,
+        "literature_calibrated": 12
       },
       "simulators": {
         "verilator": 37,
@@ -59,8 +61,8 @@
   "totals": {
     "archived_runs": 190,
     "unique_profiles": 175,
-    "score_measured_runs": 184,
-    "literature_reported_runs": 6,
+    "score_measured_runs": 169,
+    "literature_reported_runs": 21,
     "simulators": {
       "verilator": 175,
       "icarus": 4,

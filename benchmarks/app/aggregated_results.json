@@ -35,7 +35,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "boom",
       "upstream_commit": "ba03175e",
       "profile": "app_verilator",
@@ -68,7 +68,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "boom",
       "upstream_commit": "ba03175e",
       "profile": "app_verilator",
@@ -100,7 +100,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "boom",
       "upstream_commit": "ba03175e",
       "profile": "app_verilator",
@@ -615,7 +615,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "nutshell",
       "upstream_commit": "aa012afa",
       "profile": "app_verilator",
@@ -646,7 +646,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "nutshell",
       "upstream_commit": "aa012afa",
       "profile": "app_verilator",
@@ -1029,7 +1029,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "shakti",
       "upstream_commit": "f5277531",
       "profile": "app_verilator",
@@ -1062,7 +1062,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "shakti",
       "upstream_commit": "f5277531",
       "profile": "app_verilator",
@@ -1094,7 +1094,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "shakti",
       "upstream_commit": "f5277531",
       "profile": "app_verilator",
@@ -1126,7 +1126,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "xiangshan",
       "upstream_commit": "36144861",
       "profile": "app_verilator",
@@ -1159,7 +1159,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "xiangshan",
       "upstream_commit": "36144861",
       "profile": "app_verilator",
@@ -1191,7 +1191,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "xiangshan",
       "upstream_commit": "36144861",
       "profile": "app_verilator",
@@ -1222,7 +1222,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "xiangshan",
       "upstream_commit": "36144861",
       "profile": "app_verilator",

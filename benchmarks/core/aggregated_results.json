@@ -157,7 +157,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "cva5",
       "upstream_commit": "125fb2b3",
       "profile": "mcu_verilator",
@@ -190,7 +190,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "cva5",
       "upstream_commit": "125fb2b3",
       "profile": "mcu_verilator",
@@ -222,7 +222,7 @@
     },
     {
       "schema": "score.benchmark_results.v1",
-      "evidence_class": "score_measured",
+      "evidence_class": "literature_calibrated",
       "core": "cva5",
       "upstream_commit": "125fb2b3",
       "profile": "mcu_verilator",

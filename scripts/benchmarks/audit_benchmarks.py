@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TIERS = ["core", "app", "vector", "soc"]
-VALID_EVIDENCE = {"score_measured", "literature_reported"}
+VALID_EVIDENCE = {"score_measured", "literature_reported", "literature_calibrated"}
 
 
 def extract_cycles(metrics: dict) -> int | None:
@@ -123,7 +123,7 @@ def audit() -> tuple[dict, int]:
         total_runs += len(rows)
         total_unique += len(seen)
         total_measured += ev_counts.get("score_measured", 0)
-        total_lit += ev_counts.get("literature_reported", 0)
+        total_lit += ev_counts.get("literature_reported", 0) + ev_counts.get("literature_calibrated", 0)
 
     summary["totals"] = {
         "archived_runs": total_runs,
