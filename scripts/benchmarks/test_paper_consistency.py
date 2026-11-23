@@ -44,6 +44,10 @@ def main() -> int:
         failures.append("Expected LOO min AMO quadratic R^2 >= 0.999")
     if "eq1_area_normalization_audit" not in val:
         failures.append("Missing eq1_area_normalization_audit in model_validation.json")
+    if val["eq5_eq6_app_validation"].get("mshr_vs_memcpy_spearman_rho", 0.0) < 0.75:
+        failures.append("Expected nonparametric Spearman MSHR correlation >= 0.75")
+    if "eq1_area_normalization_audit" not in val:
+        failures.append("Missing eq1_area_normalization_audit in model_validation.json")
     if val["eq7_eq8_vector_validation"]["ops_per_cycle_checked"] != 13:
         failures.append("Expected 13 verified vector Ops/cyc runs")
     if val["level4_soc_telemetry_anchors"]["exact_matches"] != 10:
@@ -288,6 +292,27 @@ def main() -> int:
         ptext = subprocess.check_output(["pdftotext", str(pdf_path), "-"], text=True)
         if "??" in ptext or "\ufffd" in ptext:
             failures.append("Found unresolved '??' or U+FFFD glyph anomaly in pdftotext main.pdf")
+
+    # 9. ScholarOne Submission Archive & IEEE PDF eXpress Readiness
+    used_graphics = set(re.findall(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", tex))
+    orphans = [
+        p.relative_to(PAPER).as_posix()
+        for p in sorted((PAPER / "figures").iterdir())
+        if p.relative_to(PAPER).as_posix() not in used_graphics
+        and not (p.suffix == ".svg" and p.with_suffix(".pdf").relative_to(PAPER).as_posix() in used_graphics)
+    ]
+    if orphans:
+        failures.append(f"Unreferenced orphan files in figures/: {orphans}")
+
+    pdf_path = PAPER / "main.pdf"
+    if pdf_path.exists():
+        pinfo = subprocess.check_output(["pdfinfo", str(pdf_path)], text=True)
+        if "Title:          SCORE:" not in pinfo or "Author:         Chao Wang, Wei Mao, Xinfei Guo, and Yongfu Li" not in pinfo:
+            failures.append("main.pdf missing populated Title or Author PDF metadata")
+        pfonts = subprocess.check_output(["pdffonts", str(pdf_path)], text=True).splitlines()[2:]
+        unembedded = [ln for ln in pfonts if ln.strip() and ln.split()[-5] != "yes"]
+        if unembedded:
+            failures.append(f"Unembedded fonts in main.pdf: {unembedded}")
 
     if failures:
         print("FAILED CHECKS:")
