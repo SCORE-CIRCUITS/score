@@ -76,6 +76,7 @@ Structured digests live under `publications/papers/<slug>/analysis.md`. Each ana
 | RISC-V VeeR EH1 Programmer's Reference Manual | CHIPS Alliance | 2022 | Technical Reference Manual (Rev. 1.9) | processor-architecture, embedded-systems | [analysis](../publications/papers/risc-v-veer-eh1-programmers-reference-manual/analysis.md) | [pdf](../publications/papers/risc-v-veer-eh1-programmers-reference-manual/paper.pdf) |
 | ReCon: From the Bitstream to Piracy Detection | Skipper et al. | 2020 | IEEE PAINE 2020 | hardware-security, reverse-engineering | [analysis](../publications/papers/recon-from-the-bitstream-to-piracy-detection/analysis.md) | [pdf](../publications/papers/recon-from-the-bitstream-to-piracy-detection/paper.pdf) |
 | Neutron Radiation Tests of the NEORV32 RISC-V SoC on Flash-Based FPGAs | Böhmer et al. | 2023 | IEEE DFT 2023 | fault-tolerance, radiation-effects, processor-architecture | [analysis](../publications/papers/neutron-radiation-tests-of-the-neorv32-risc-v-soc-on-flash-based-fpgas/analysis.md) | [pdf](../publications/papers/neutron-radiation-tests-of-the-neorv32-risc-v-soc-on-flash-based-fpgas/paper.pdf) |
+| SCR1 RISC-V Microcontroller-Class Core Datasheet | Syntacore | 2025 | Product Datasheet (DS_SCR1 - v2) | processor-architecture, microcontroller | [analysis](../publications/papers/scr1-risc-v-microcontroller-class-core-datasheet/analysis.md) | [pdf](../publications/papers/scr1-risc-v-microcontroller-class-core-datasheet/paper.pdf) |
 
 ## Interconnect and Accelerators
 
