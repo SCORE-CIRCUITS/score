@@ -274,7 +274,7 @@ def main() -> int:
         failures.append(f"Stray debug/build artifacts in manuscript root: {stray_root}")
 
     readme_txt = (PAPER / "README.md").read_text()
-    for rtok in ["13 two-column pages", "14 vector figures", "77 references"]:
+    for rtok in ["13 two-column pages", "14 vector figures", "59 references"]:
         if rtok not in readme_txt:
             failures.append(f"TCAS1-SCORE/README.md missing accurate spec token {rtok!r}")
 
