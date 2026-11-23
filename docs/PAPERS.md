@@ -76,6 +76,7 @@ Structured digests live under `publications/papers/<slug>/analysis.md`. Each ana
 | Title | Authors | Year | Venue | Category | Analysis | PDF |
 |-------|---------|------|-------|----------|----------|-----|
 | FractalSync: Lightweight Scalable Global Synchronization of Massive Bulk Synchronous Parallel AI Accelerators (MAGIA) | Isachi et al. | 2025 | ACM CF 2025 / arXiv:2506.11668 | system-architecture, circuit-design | [analysis](../publications/papers/fractalsync-lightweight-scalable-global-synchronization-of-massive-bulk-synchronous-parallel-ai-accelerators/analysis.md) | [pdf](../publications/papers/fractalsync-lightweight-scalable-global-synchronization-of-massive-bulk-synchronous-parallel-ai-accelerators/paper.pdf) |
+| A Systematic Approach for Acceleration of Matrix-Vector Operations in CGRA Through Algorithm-Architecture Co-Design | Sahoo et al. | 2021 | IEEE TVLSI 29(12) | circuit-design, system-architecture | [analysis](../publications/papers/a-systematic-approach-for-acceleration-of-matrix-vector-operations-in-cgra-through-algorithm-architecture-co-design/analysis.md) | [pdf](../publications/papers/a-systematic-approach-for-acceleration-of-matrix-vector-operations-in-cgra-through-algorithm-architecture-co-design/paper.pdf) |
 
 ## Design Languages and SoC Construction Frameworks
 
