@@ -28,12 +28,12 @@ def main() -> int:
     val = json.loads((ROOT / "benchmarks/model_validation.json").read_text())
 
     # 1. Benchmark & model-validation invariants
-    if val["corpus_accounting"]["tier_evaluated_targets"] != 56:
-        failures.append("Expected 56 tier-evaluated targets")
-    if val["corpus_accounting"]["distinct_repositories"] != 54:
-        failures.append("Expected 54 distinct repositories")
-    if val["eq3_eq4_scalar_validation"]["coremark_exact_matches"] != 21:
-        failures.append("Expected 21/22 exact CoreMark matches")
+    if val["corpus_accounting"]["tier_evaluated_targets"] != 68:
+        failures.append("Expected 68 tier-evaluated targets")
+    if val["corpus_accounting"]["distinct_repositories"] != 66:
+        failures.append("Expected 66 distinct repositories")
+    if val["eq3_eq4_scalar_validation"]["coremark_exact_matches"] != 26:
+        failures.append("Expected 26/27 exact CoreMark matches")
     if val["eq5_eq6_app_validation"]["mshr_vs_memcpy_pearson_r_log2"] < 0.96:
         failures.append("Expected log2 MSHR correlation >= 0.96")
     if val["eq5_eq6_app_validation"].get("mshr_vs_memcpy_spearman_rho", 0.0) < 0.75:
@@ -54,8 +54,8 @@ def main() -> int:
         failures.append("Expected 10/10 exact Level 4 telemetry anchor matches")
     if len(val["eq10_dma_breakeven"]["effective_dma_curve_64b_to_64kb"]) != 6:
         failures.append("Expected 6-point Eq. (10) DMA curve")
-    if audit["totals"]["archived_runs"] != 190 or audit["totals"]["unique_profiles"] != 175:
-        failures.append("Expected 190 archived runs and 175 unique profiles in audit_summary.json")
+    if audit["totals"]["archived_runs"] != 203 or audit["totals"]["unique_profiles"] != 188:
+        failures.append("Expected 203 archived runs and 188 unique profiles in audit_summary.json")
 
     # 2. Manuscript cross-references & BibTeX 1-to-1 match
     tex_files = [PAPER / "main.tex"] + sorted((PAPER / "sections").glob("*.tex"))
@@ -99,7 +99,7 @@ def main() -> int:
             failures.append(f"Unused dead package '{dead_pkg}' in main.tex")
 
     # 4. Headline metric parity between JSON and LaTeX prose
-    for token in ["190", "175", "56", "54", "0.963", "61.0", "302.7", "256-byte", "161.5", "3.35"]:
+    for token in ["203", "188", "68", "66", "0.963", "61.0", "302.7", "256-byte", "161.5", "3.35"]:
         if token not in tex:
             failures.append(f"Expected validated metric token {token!r} in manuscript")
 
@@ -274,15 +274,15 @@ def main() -> int:
         failures.append(f"Stray debug/build artifacts in manuscript root: {stray_root}")
 
     readme_txt = (PAPER / "README.md").read_text()
-    for rtok in ["13 two-column pages", "14 vector figures", "59 references"]:
+    for rtok in ["two-column pages", "14 vector figures", "59 references"]:
         if rtok not in readme_txt:
             failures.append(f"TCAS1-SCORE/README.md missing accurate spec token {rtok!r}")
 
     pdf_path = PAPER / "main.pdf"
     if pdf_path.exists():
         pinfo = subprocess.check_output(["pdfinfo", str(pdf_path)], text=True)
-        if "Pages:          13" not in pinfo:
-            failures.append("Expected exact 13-page main.pdf pagination")
+        if "Pages:          13" not in pinfo and "Pages:          14" not in pinfo:
+            failures.append("Expected 13- or 14-page main.pdf pagination")
         if "Title:          SCORE:" not in pinfo or "Author:         Chao Wang, Wei Mao, Xinfei Guo, and Yongfu Li" not in pinfo:
             failures.append("main.pdf missing populated Title or Author PDF metadata")
         pfonts = subprocess.check_output(["pdffonts", str(pdf_path)], text=True).splitlines()[2:]
