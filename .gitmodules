@@ -4,6 +4,7 @@
 	branch = score-v1.0
 
 [submodule "tools/openpiton"]
+	ignore = dirty
 	path = tools/openpiton
 	url = https://github.com/SCORE-CIRCUITS/openpiton.git
 	branch = score-v1.0
@@ -119,6 +120,7 @@
 	branch = score-v1.0
 
 [submodule "tools/mempool"]
+	ignore = dirty
 	path = tools/mempool
 	url = https://github.com/SCORE-CIRCUITS/mempool.git
 	branch = score-v1.0
@@ -134,6 +136,7 @@
 	branch = score-v1.0
 
 [submodule "tools/pulpissimo"]
+	ignore = dirty
 	path = tools/pulpissimo
 	url = https://github.com/SCORE-CIRCUITS/pulpissimo.git
 	branch = score-v1.0
@@ -159,6 +162,7 @@
 	branch = score-v1.0
 
 [submodule "tools/croc"]
+	ignore = dirty
 	path = tools/croc
 	url = https://github.com/SCORE-CIRCUITS/croc.git
 	branch = score-v1.0
@@ -403,6 +407,7 @@
 	url = https://github.com/SCORE-CIRCUITS/taiga.git
 	branch = score-v1.0
 [submodule "tools/ventus-gpgpu"]
+	ignore = dirty
 	path = tools/ventus-gpgpu
 	url = https://github.com/SCORE-CIRCUITS/ventus-gpgpu.git
 	branch = score-v1.0
