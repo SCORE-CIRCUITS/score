@@ -1,0 +1,26 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "litex",
+  "soc": "litex",
+  "upstream_commit": "afed662",
+  "profile": "soc_verilator",
+  "workload": "dma_1d",
+  "config": "vexriscv_wishbone_default",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32ima",
+    "configuration": "vexriscv_wishbone_default",
+    "clock_frequency_hz": 150000000,
+    "wall_time_s": 8.45,
+    "exit_code": 0,
+    "execution_cycles": 8450,
+    "total_simulation_cycles": 8450,
+    "simulation_speed_khz": 1.0,
+    "description": "LiteX Wishbone memory DMA transfer test",
+    "stdout_verified": true
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/litex/afed662/benchmarks/dma_1d.json"
+}

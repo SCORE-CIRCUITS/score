@@ -1,0 +1,5 @@
+rs5 SCORE snapshot (gaph-pucrs/RS5)
+Commit: 66d7e14d
+Dataset: /home/yongfu/proj/score/datasets/rs5/66d7e14d
+Lint: FAIL
+HDL files: 30

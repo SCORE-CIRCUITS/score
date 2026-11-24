@@ -1,0 +1,5 @@
+vespa SCORE snapshot (hardware-fab/vespa)
+Commit: d092d9b
+Dataset: datasets/vespa/d092d9b
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 2751

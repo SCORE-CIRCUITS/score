@@ -516,6 +516,42 @@
           }
         }
       }
+    },
+    {
+      "score_tool": "ventus_gpgpu",
+      "profile": "vector_gpgpu_verilator",
+      "workloads": {
+        "sgemm_tensor": {
+          "status": "implemented"
+        },
+        "saxpy": {
+          "status": "implemented"
+        }
+      }
+    },
+    {
+      "score_tool": "ant_v",
+      "profile": "vector_verilator",
+      "workloads": {
+        "tiled_matmul_int8": {
+          "status": "implemented"
+        },
+        "depthwise_conv2d": {
+          "status": "implemented"
+        }
+      }
+    },
+    {
+      "score_tool": "rs5",
+      "profile": "vector_verilator",
+      "workloads": {
+        "fdotproduct": {
+          "status": "implemented"
+        },
+        "saxpy": {
+          "status": "implemented"
+        }
+      }
     }
   ]
 }

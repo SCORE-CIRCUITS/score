@@ -1,0 +1,5 @@
+proteus SCORE snapshot (proteus-core/proteus)
+Commit: ae1400d
+Dataset: datasets/proteus/ae1400d
+Lint: GENERATOR_RECORDED
+HDL/Generator files: 87

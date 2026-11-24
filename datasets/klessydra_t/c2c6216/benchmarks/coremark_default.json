@@ -1,0 +1,21 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "klessydra_t",
+  "upstream_commit": "c2c6216",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "default",
+  "metrics": {
+    "coremark_per_mhz": 2.65,
+    "iterations": 1,
+    "total_cycles": 377358,
+    "operating_frequency_mhz": 250.0,
+    "ipc": 0.75,
+    "area_kge": 36.5,
+    "simulator": "verilator",
+    "validation_method": "crc_match"
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/klessydra_t/c2c6216/benchmarks/coremark_default.json"
+}

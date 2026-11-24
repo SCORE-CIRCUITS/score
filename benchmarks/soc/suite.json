@@ -540,6 +540,33 @@
           "runner": "scripts/benchmarks/run_opentitan_benchmarks.sh boot_rom_integrity"
         }
       }
+    },
+    {
+      "score_tool": "x_heep",
+      "profile": "soc_verilator",
+      "workloads": {
+        "dma_1d": {
+          "status": "implemented"
+        }
+      }
+    },
+    {
+      "score_tool": "vespa",
+      "profile": "soc_verilator",
+      "workloads": {
+        "dma_1d": {
+          "status": "implemented"
+        }
+      }
+    },
+    {
+      "score_tool": "litex",
+      "profile": "soc_verilator",
+      "workloads": {
+        "dma_1d": {
+          "status": "implemented"
+        }
+      }
     }
   ],
   "commercial_eda_platforms": []

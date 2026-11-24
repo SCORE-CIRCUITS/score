@@ -212,7 +212,76 @@
           "runner": "scripts/benchmarks/run_rv12_benchmarks.sh"
         }
       }
+    },
+    {
+      "score_tool": "taiga",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_taiga_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_taiga_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "orca",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_orca_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_orca_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "proteus",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_proteus_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_proteus_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "kronos",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_kronos_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_kronos_dhrystone.sh"
+        }
+      }
+    },
+    {
+      "score_tool": "klessydra_t",
+      "profile": "mcu_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_klessydra_t_coremark.sh"
+        },
+        "dhrystone": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_klessydra_t_dhrystone.sh"
+        }
+      }
     }
   ]
 }
-

@@ -1,0 +1,21 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "orca",
+  "upstream_commit": "f39b2d8",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "default",
+  "metrics": {
+    "coremark_per_mhz": 2.45,
+    "iterations": 1,
+    "total_cycles": 408163,
+    "operating_frequency_mhz": 250.0,
+    "ipc": 0.74,
+    "area_kge": 28.0,
+    "simulator": "verilator",
+    "validation_method": "crc_match"
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/orca/f39b2d8/benchmarks/coremark_default.json"
+}

@@ -1,0 +1,9 @@
+{
+  "project": "enjoy-digital/litex",
+  "commit_short": "afed6623",
+  "dataset_name": "litex",
+  "generated_at_utc": "2026-11-23T20:35:19Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

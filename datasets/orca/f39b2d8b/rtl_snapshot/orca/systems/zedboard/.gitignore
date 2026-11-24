@@ -1,0 +1,11 @@
+*.mmi
+jtag_init.tcl
+
+*.bit
+
+software/hex_to_coe
+project/
+/tmp.*
+software/rv32*-p-*
+
+/link.ld

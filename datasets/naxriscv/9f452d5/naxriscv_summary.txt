@@ -1,0 +1,5 @@
+naxriscv SCORE snapshot (SpinalHDL/NaxRiscv)
+Commit: 9f452d5
+Dataset: datasets/naxriscv/9f452d5
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 131

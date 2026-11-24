@@ -1,0 +1,22 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "naxriscv",
+  "upstream_commit": "9f452d5",
+  "profile": "app_verilator",
+  "workload": "demo",
+  "config": "nax_2wide_default",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv64imafdc",
+    "configuration": "nax_2wide_default",
+    "total_simulation_cycles": 4120,
+    "benchmark_cycles": 4120,
+    "instructions_retired": 2450,
+    "ipc": 0.5947,
+    "wall_clock_seconds": 1.85
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/naxriscv/9f452d5/benchmarks/demo_default.json"
+}

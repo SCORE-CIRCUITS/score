@@ -1,0 +1,9 @@
+{
+  "project": "esl-epfl/x-heep",
+  "commit_short": "2e12b161",
+  "dataset_name": "x_heep",
+  "generated_at_utc": "2026-11-23T20:34:59Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

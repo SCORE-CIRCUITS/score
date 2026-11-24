@@ -1,0 +1,5 @@
+vespa SCORE snapshot (hardware-fab/vespa)
+Commit: d092d9b5
+Dataset: /home/yongfu/proj/score/datasets/vespa/d092d9b5
+Lint: FAIL
+HDL files: 30

@@ -1,0 +1,28 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "rs5",
+  "upstream_commit": "66d7e14",
+  "profile": "vector_verilator",
+  "workload": "fdotproduct",
+  "config": "embedded_vlen128_dse",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32im_zve32x",
+    "configuration": "embedded_vlen128_dse",
+    "nr_lanes": 2,
+    "vlen": 128,
+    "wall_time_s": 8.65,
+    "exit_code": 0,
+    "benchmark_cycles": 14210,
+    "kernel_cycles": 14210,
+    "simulation_cycles": 38100,
+    "performance_ops_per_cycle": 3.4,
+    "vector_utilization_pct": 85.0,
+    "sim_speed_hz": 4404.6,
+    "datatype": "int32"
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/rs5/66d7e14/benchmarks/fdotproduct.json"
+}

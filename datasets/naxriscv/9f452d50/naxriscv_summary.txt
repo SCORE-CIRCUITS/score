@@ -1,0 +1,5 @@
+naxriscv SCORE snapshot (SpinalHDL/NaxRiscv)
+Commit: 9f452d50
+Dataset: /home/yongfu/proj/score/datasets/naxriscv/9f452d50
+Lint: FAIL
+HDL files: 1

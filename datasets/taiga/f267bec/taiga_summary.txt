@@ -1,0 +1,5 @@
+taiga SCORE snapshot (sfu-rcl/Taiga)
+Commit: f267bec
+Dataset: datasets/taiga/f267bec
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 97

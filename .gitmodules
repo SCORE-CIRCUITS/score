@@ -366,3 +366,51 @@
 [submodule "tools/github"]
 	path = tools/github
 	url = https://github.com/SCORE-CIRCUITS/.github.git
+[submodule "tools/ant-v"]
+	path = tools/ant-v
+	url = https://github.com/SCORE-CIRCUITS/ANT-V.git
+	branch = score-v1.0
+[submodule "tools/klessydra-t"]
+	path = tools/klessydra-t
+	url = https://github.com/SCORE-CIRCUITS/T13x.git
+	branch = score-v1.0
+[submodule "tools/kronos"]
+	path = tools/kronos
+	url = https://github.com/SCORE-CIRCUITS/kronos.git
+	branch = score-v1.0
+[submodule "tools/litex"]
+	path = tools/litex
+	url = https://github.com/SCORE-CIRCUITS/litex.git
+	branch = score-v1.0
+[submodule "tools/naxriscv"]
+	path = tools/naxriscv
+	url = https://github.com/SCORE-CIRCUITS/NaxRiscv.git
+	branch = score-v1.0
+[submodule "tools/orca"]
+	path = tools/orca
+	url = https://github.com/SCORE-CIRCUITS/orca.git
+	branch = score-v1.0
+[submodule "tools/proteus"]
+	path = tools/proteus
+	url = https://github.com/SCORE-CIRCUITS/proteus.git
+	branch = score-v1.0
+[submodule "tools/rs5"]
+	path = tools/rs5
+	url = https://github.com/SCORE-CIRCUITS/RS5.git
+	branch = score-v1.0
+[submodule "tools/taiga"]
+	path = tools/taiga
+	url = https://github.com/SCORE-CIRCUITS/taiga.git
+	branch = score-v1.0
+[submodule "tools/ventus-gpgpu"]
+	path = tools/ventus-gpgpu
+	url = https://github.com/SCORE-CIRCUITS/ventus-gpgpu.git
+	branch = score-v1.0
+[submodule "tools/vespa"]
+	path = tools/vespa
+	url = https://github.com/SCORE-CIRCUITS/vespa.git
+	branch = score-v1.0
+[submodule "tools/x-heep"]
+	path = tools/x-heep
+	url = https://github.com/SCORE-CIRCUITS/x-heep.git
+	branch = score-v1.0

@@ -1,0 +1,22 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "naxriscv",
+  "upstream_commit": "9f452d5",
+  "profile": "app_verilator",
+  "workload": "coremark",
+  "config": "nax_2wide_default",
+  "metrics": {
+    "coremark_per_mhz": 5.02,
+    "operating_frequency_mhz": 1200.0,
+    "ipc": 1.27212,
+    "area_kge": 210.0,
+    "simulator": "verilator",
+    "architecture": "rv32im",
+    "total_simulation_cycles": 2051477,
+    "instructions_retired": 2609720,
+    "validated": true
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/naxriscv/9f452d5/benchmarks/coremark_default.json"
+}

@@ -1,0 +1,5 @@
+rs5 SCORE snapshot (gaph-pucrs/RS5)
+Commit: 66d7e14
+Dataset: datasets/rs5/66d7e14
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 50

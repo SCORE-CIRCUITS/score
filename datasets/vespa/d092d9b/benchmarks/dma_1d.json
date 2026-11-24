@@ -1,0 +1,26 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "vespa",
+  "soc": "vespa",
+  "upstream_commit": "d092d9b",
+  "profile": "soc_verilator",
+  "workload": "dma_1d",
+  "config": "dfs_hetero_default",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32im",
+    "configuration": "dfs_hetero_default",
+    "clock_frequency_hz": 250000000,
+    "wall_time_s": 0.05,
+    "exit_code": 0,
+    "execution_cycles": 408,
+    "total_simulation_cycles": 408,
+    "simulation_speed_khz": 8.16,
+    "description": "VESPA BaseJump STL SIPO/PISO dataflow pipeline benchmark",
+    "stdout_verified": true
+  },
+  "generated_utc": "2026-11-24T19:14:00Z",
+  "_path": "datasets/vespa/d092d9b/benchmarks/dma_1d.json"
+}

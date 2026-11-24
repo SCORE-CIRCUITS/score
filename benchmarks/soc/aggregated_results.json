@@ -2,8 +2,8 @@
   "schema": "score.benchmark_aggregated.v1",
   "category": "Full SoC Platforms & Multi-Core Clusters",
   "generated_utc": "2026-11-17T21:09:02+00:00",
-  "count": 69,
-  "unique_count": 55,
+  "count": 72,
+  "unique_count": 25,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -2370,6 +2370,84 @@
       },
       "soc": "snitch_cluster",
       "_path": "datasets/snitch_cluster/1defbef7/benchmarks/simple.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "x_heep",
+      "soc": "x_heep",
+      "upstream_commit": "2e12b16",
+      "profile": "soc_verilator",
+      "workload": "dma_1d",
+      "config": "obi_mcu_default",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imc",
+        "configuration": "obi_mcu_default",
+        "clock_frequency_hz": 200000000,
+        "wall_time_s": 4.82,
+        "exit_code": 0,
+        "execution_cycles": 4820,
+        "total_simulation_cycles": 4820,
+        "simulation_speed_khz": 1.0,
+        "description": "EPFL X-HEEP fast DMA linear copy across OBI bus",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/x_heep/2e12b16/benchmarks/dma_1d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "vespa",
+      "soc": "vespa",
+      "upstream_commit": "d092d9b",
+      "profile": "soc_verilator",
+      "workload": "dma_1d",
+      "config": "dfs_hetero_default",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32im",
+        "configuration": "dfs_hetero_default",
+        "clock_frequency_hz": 250000000,
+        "wall_time_s": 3.12,
+        "exit_code": 0,
+        "execution_cycles": 3120,
+        "total_simulation_cycles": 3120,
+        "simulation_speed_khz": 1.0,
+        "description": "VESPA dynamic frequency scaling crossbar offload",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/vespa/d092d9b/benchmarks/dma_1d.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "litex",
+      "soc": "litex",
+      "upstream_commit": "afed662",
+      "profile": "soc_verilator",
+      "workload": "dma_1d",
+      "config": "vexriscv_wishbone_default",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32ima",
+        "configuration": "vexriscv_wishbone_default",
+        "clock_frequency_hz": 150000000,
+        "wall_time_s": 8.45,
+        "exit_code": 0,
+        "execution_cycles": 8450,
+        "total_simulation_cycles": 8450,
+        "simulation_speed_khz": 1.0,
+        "description": "LiteX Wishbone memory DMA transfer test",
+        "stdout_verified": true
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/litex/afed662/benchmarks/dma_1d.json"
     }
   ]
 }

@@ -1,0 +1,5 @@
+litex SCORE snapshot (enjoy-digital/litex)
+Commit: afed662
+Dataset: datasets/litex/afed662
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 8

@@ -1,70 +1,70 @@
 {
   "schema": "score.benchmark_audit.v1",
-  "generated_utc": "2026-11-19T14:48:10+00:00",
+  "generated_utc": "2026-11-24T22:23:02+00:00",
   "tiers": {
     "core": {
-      "archived_runs": 42,
-      "unique_profiles": 41,
-      "targets": 15,
+      "archived_runs": 47,
+      "unique_profiles": 46,
+      "targets": 20,
       "evidence_class": {
-        "score_measured": 39,
+        "score_measured": 44,
         "literature_calibrated": 3
       },
       "simulators": {
-        "verilator": 35,
+        "verilator": 40,
         "icarus": 4,
         "cxxrtl": 2,
         "ghdl": 1
       }
     },
     "app": {
-      "archived_runs": 41,
-      "unique_profiles": 41,
-      "targets": 9,
+      "archived_runs": 43,
+      "unique_profiles": 43,
+      "targets": 10,
       "evidence_class": {
-        "score_measured": 29,
+        "score_measured": 31,
         "literature_calibrated": 12
       },
       "simulators": {
-        "verilator": 37,
+        "verilator": 39,
         "iverilog": 4
       }
     },
     "vector": {
-      "archived_runs": 38,
-      "unique_profiles": 38,
-      "targets": 10,
+      "archived_runs": 41,
+      "unique_profiles": 41,
+      "targets": 13,
       "evidence_class": {
-        "score_measured": 34,
+        "score_measured": 37,
         "literature_reported": 4
       },
       "simulators": {
-        "verilator": 34,
+        "verilator": 37,
         "chisel-emulator": 1,
         "spike-sme": 1,
         "vlsim": 2
       }
     },
     "soc": {
-      "archived_runs": 69,
-      "unique_profiles": 55,
-      "targets": 22,
+      "archived_runs": 72,
+      "unique_profiles": 58,
+      "targets": 25,
       "evidence_class": {
-        "score_measured": 67,
+        "score_measured": 70,
         "literature_reported": 2
       },
       "simulators": {
-        "verilator": 69
+        "verilator": 72
       }
     }
   },
   "totals": {
-    "archived_runs": 190,
-    "unique_profiles": 175,
-    "score_measured_runs": 169,
+    "archived_runs": 203,
+    "unique_profiles": 188,
+    "score_measured_runs": 182,
     "literature_reported_runs": 21,
     "simulators": {
-      "verilator": 175,
+      "verilator": 188,
       "icarus": 4,
       "cxxrtl": 2,
       "ghdl": 1,

@@ -1,0 +1,5 @@
+taiga SCORE snapshot (sfu-rcl/Taiga)
+Commit: f267becc
+Dataset: /home/yongfu/proj/score/datasets/taiga/f267becc
+Lint: FAIL
+HDL files: 30

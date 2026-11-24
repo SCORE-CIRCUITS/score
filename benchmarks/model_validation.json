@@ -1,15 +1,15 @@
 {
   "schema": "score.model_validation.v6",
-  "generated_utc": "2026-11-17T23:52:51+00:00",
+  "generated_utc": "2026-11-24T07:20:43+00:00",
   "corpus_accounting": {
-    "tier_evaluated_targets": 56,
+    "tier_evaluated_targets": 68,
     "per_tier_counts": {
-      "core": 15,
-      "app": 9,
-      "vector": 10,
-      "soc": 22
+      "core": 20,
+      "app": 10,
+      "vector": 13,
+      "soc": 25
     },
-    "distinct_repositories": 54,
+    "distinct_repositories": 66,
     "cross_tier_repositories": [
       "araxl",
       "cv32e40p"
@@ -53,8 +53,8 @@
     "cat3_64b_norm_count": "5/10"
   },
   "eq3_eq4_scalar_validation": {
-    "coremark_exact_matches": 21,
-    "coremark_total_checked": 22,
+    "coremark_exact_matches": 26,
+    "coremark_total_checked": 27,
     "coremark_max_residual_pct": 0.0023,
     "metadata_anomalies": [
       {
@@ -106,7 +106,7 @@
     }
   },
   "eq5_eq6_app_validation": {
-    "archived_app_runs": 41,
+    "archived_app_runs": 43,
     "mshr_vs_memcpy_pearson_r_linear": 0.9507,
     "mshr_vs_memcpy_pearson_r_log2": 0.9633,
     "mshr_vs_memcpy_r2_log2": 0.9279,

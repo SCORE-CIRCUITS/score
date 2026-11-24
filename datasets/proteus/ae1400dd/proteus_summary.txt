@@ -1,0 +1,5 @@
+proteus SCORE snapshot (proteus-core/proteus)
+Commit: ae1400dd
+Dataset: /home/yongfu/proj/score/datasets/proteus/ae1400dd
+Lint: PASS
+HDL files: 0

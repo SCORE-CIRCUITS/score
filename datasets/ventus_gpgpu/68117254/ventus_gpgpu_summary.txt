@@ -1,0 +1,5 @@
+ventus_gpgpu SCORE snapshot (THU-DSP-LAB/ventus-gpgpu)
+Commit: 68117254
+Dataset: /home/yongfu/proj/score/datasets/ventus_gpgpu/68117254
+Lint: FAIL
+HDL files: 2

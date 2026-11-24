@@ -1,0 +1,5 @@
+x_heep SCORE snapshot (esl-epfl/x-heep)
+Commit: 2e12b16
+Dataset: datasets/x_heep/2e12b16
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 1018

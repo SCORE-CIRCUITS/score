@@ -1,0 +1,5 @@
+ventus_gpgpu SCORE snapshot (THU-DSP-LAB/ventus-gpgpu)
+Commit: 6811725
+Dataset: datasets/ventus_gpgpu/6811725
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 96

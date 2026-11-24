@@ -1,0 +1,29 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ventus_gpgpu",
+  "upstream_commit": "68117254",
+  "profile": "vector_gpgpu_verilator",
+  "workload": "sgemm_tensor",
+  "config": "1sm_8warps_32threads",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imfv_gpgpu",
+    "configuration": "1sm_8warps_32threads",
+    "nr_lanes": 32,
+    "vlen": 1024,
+    "wall_time_s": 28.45,
+    "exit_code": 0,
+    "benchmark_cycles": 24150,
+    "kernel_cycles": 24150,
+    "simulation_cycles": 235485,
+    "performance_ops_per_cycle": 64.2,
+    "vector_utilization_pct": 78.4,
+    "sim_speed_hz": 3001.7,
+    "datatype": "fp16_fp32"
+  },
+  "generated_utc": "2026-11-24T19:22:00Z",
+  "_path": "datasets/ventus_gpgpu/68117254/benchmarks/sgemm_tensor.json"
+}
+

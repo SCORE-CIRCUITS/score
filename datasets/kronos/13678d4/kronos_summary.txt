@@ -1,0 +1,5 @@
+kronos SCORE snapshot (SonalPinto/kronos)
+Commit: 13678d4
+Dataset: datasets/kronos/13678d4
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 61

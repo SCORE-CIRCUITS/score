@@ -1,0 +1,5 @@
+kronos SCORE snapshot (SonalPinto/kronos)
+Commit: 13678d47
+Dataset: /home/yongfu/proj/score/datasets/kronos/13678d47
+Lint: FAIL
+HDL files: 30

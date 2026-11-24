@@ -1,0 +1,21 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "proteus",
+  "upstream_commit": "ae1400d",
+  "profile": "mcu_verilator",
+  "workload": "coremark",
+  "config": "default",
+  "metrics": {
+    "coremark_per_mhz": 2.78,
+    "iterations": 1,
+    "total_cycles": 359712,
+    "operating_frequency_mhz": 280.0,
+    "ipc": 0.78,
+    "area_kge": 34.0,
+    "simulator": "verilator",
+    "validation_method": "crc_match"
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/proteus/ae1400d/benchmarks/coremark_default.json"
+}

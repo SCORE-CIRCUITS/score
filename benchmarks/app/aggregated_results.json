@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "generated_utc": "2026-11-17T04:08:02+00:00",
-  "count": 41,
+  "count": 43,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -1251,6 +1251,47 @@
         "verilator": "unknown"
       },
       "_path": "datasets/xiangshan/36144861/benchmarks/microbench_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "naxriscv",
+      "upstream_commit": "9f452d5",
+      "profile": "app_verilator",
+      "workload": "demo",
+      "config": "nax_2wide_default",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv64imafdc",
+        "configuration": "nax_2wide_default",
+        "total_simulation_cycles": 4120,
+        "benchmark_cycles": 4120,
+        "instructions_retired": 2450,
+        "ipc": 0.5947,
+        "wall_clock_seconds": 1.85
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/naxriscv/9f452d5/benchmarks/demo_default.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "naxriscv",
+      "upstream_commit": "9f452d5",
+      "profile": "app_verilator",
+      "workload": "coremark",
+      "config": "nax_2wide_default",
+      "metrics": {
+        "coremark_per_mhz": 4.85,
+        "operating_frequency_mhz": 1200.0,
+        "ipc": 1.42,
+        "area_kge": 210.0,
+        "simulator": "verilator",
+        "architecture": "rv64imafdc"
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/naxriscv/9f452d5/benchmarks/coremark_default.json"
     }
   ]
 }

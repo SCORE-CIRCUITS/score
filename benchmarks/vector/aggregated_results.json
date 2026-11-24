@@ -1,7 +1,7 @@
 {
   "schema": "score.benchmark_aggregated.v1",
   "generated_utc": "2026-11-17T04:08:07+00:00",
-  "count": 38,
+  "count": 41,
   "results": [
     {
       "schema": "score.benchmark_results.v1",
@@ -1372,6 +1372,90 @@
         "verilator": "5.022"
       },
       "_path": "datasets/xls/cf337d11/benchmarks/pipeline_datapath.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ventus_gpgpu",
+      "upstream_commit": "6811725",
+      "profile": "vector_gpgpu_verilator",
+      "workload": "sgemm_tensor",
+      "config": "1sm_8warps_32threads",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imfv_gpgpu",
+        "configuration": "1sm_8warps_32threads",
+        "nr_lanes": 32,
+        "vlen": 1024,
+        "wall_time_s": 28.45,
+        "exit_code": 0,
+        "benchmark_cycles": 24150,
+        "kernel_cycles": 24150,
+        "simulation_cycles": 85400,
+        "performance_ops_per_cycle": 64.2,
+        "vector_utilization_pct": 78.4,
+        "sim_speed_hz": 3001.7,
+        "datatype": "fp16_fp32"
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/ventus_gpgpu/6811725/benchmarks/sgemm_tensor.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "ant_v",
+      "upstream_commit": "6981616",
+      "profile": "vector_verilator",
+      "workload": "tiled_matmul_int8",
+      "config": "monolithic_4lanes_vlen256",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32imf_zve32x",
+        "configuration": "monolithic_4lanes_vlen256",
+        "nr_lanes": 4,
+        "vlen": 256,
+        "wall_time_s": 14.2,
+        "exit_code": 0,
+        "benchmark_cycles": 18240,
+        "kernel_cycles": 18240,
+        "simulation_cycles": 54200,
+        "performance_ops_per_cycle": 14.8,
+        "vector_utilization_pct": 92.5,
+        "sim_speed_hz": 3816.9,
+        "datatype": "int8"
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/ant_v/6981616/benchmarks/tiled_matmul_int8.json"
+    },
+    {
+      "schema": "score.benchmark_results.v1",
+      "evidence_class": "score_measured",
+      "core": "rs5",
+      "upstream_commit": "66d7e14",
+      "profile": "vector_verilator",
+      "workload": "fdotproduct",
+      "config": "embedded_vlen128_dse",
+      "metrics": {
+        "validated": true,
+        "simulator": "verilator",
+        "architecture": "rv32im_zve32x",
+        "configuration": "embedded_vlen128_dse",
+        "nr_lanes": 2,
+        "vlen": 128,
+        "wall_time_s": 8.65,
+        "exit_code": 0,
+        "benchmark_cycles": 14210,
+        "kernel_cycles": 14210,
+        "simulation_cycles": 38100,
+        "performance_ops_per_cycle": 3.4,
+        "vector_utilization_pct": 85.0,
+        "sim_speed_hz": 4404.6,
+        "datatype": "int32"
+      },
+      "generated_utc": "2026-11-24T03:30:00Z",
+      "_path": "datasets/rs5/66d7e14/benchmarks/fdotproduct.json"
     }
   ]
 }

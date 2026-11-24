@@ -1,0 +1,5 @@
+litex SCORE snapshot (enjoy-digital/litex)
+Commit: afed6623
+Dataset: /home/yongfu/proj/score/datasets/litex/afed6623
+Lint: FAIL
+HDL files: 10

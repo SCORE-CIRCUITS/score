@@ -1,0 +1,26 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "x_heep",
+  "soc": "x_heep",
+  "upstream_commit": "2e12b16",
+  "profile": "soc_verilator",
+  "workload": "dma_1d",
+  "config": "obi_mcu_default",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imc",
+    "configuration": "obi_mcu_default",
+    "clock_frequency_hz": 200000000,
+    "wall_time_s": 4.82,
+    "exit_code": 0,
+    "execution_cycles": 4820,
+    "total_simulation_cycles": 4820,
+    "simulation_speed_khz": 1.0,
+    "description": "EPFL X-HEEP fast DMA linear copy across OBI bus",
+    "stdout_verified": true
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/x_heep/2e12b16/benchmarks/dma_1d.json"
+}

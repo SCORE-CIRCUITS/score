@@ -1,0 +1,5 @@
+ant_v SCORE snapshot (edge-group-polito/ANT-V)
+Commit: 6981616
+Dataset: datasets/ant_v/6981616
+Lint: WARNINGS_LOGGED
+HDL/Generator files: 443

@@ -1,0 +1,9 @@
+{
+  "project": "SpinalHDL/NaxRiscv",
+  "commit_short": "9f452d50",
+  "dataset_name": "naxriscv",
+  "generated_at_utc": "2026-11-23T20:34:56Z",
+  "host": "Linux x86_64",
+  "os_pretty": "AlmaLinux 9.7 (Moss Jungle Cat)",
+  "verilator": "Verilator 5.022 2024-02-24 rev fedora-5.022"
+}

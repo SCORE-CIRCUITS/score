@@ -250,6 +250,20 @@
           "runner": "scripts/benchmarks/run_shakti_benchmarks.sh microbench"
         }
       }
+    },
+    {
+      "score_tool": "naxriscv",
+      "profile": "app_verilator",
+      "workloads": {
+        "coremark": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_naxriscv_coremark.sh"
+        },
+        "demo": {
+          "status": "implemented",
+          "runner": "scripts/benchmarks/run_naxriscv_demo.sh"
+        }
+      }
     }
   ]
 }

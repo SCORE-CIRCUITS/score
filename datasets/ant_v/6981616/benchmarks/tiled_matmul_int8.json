@@ -1,0 +1,28 @@
+{
+  "schema": "score.benchmark_results.v1",
+  "evidence_class": "score_measured",
+  "core": "ant_v",
+  "upstream_commit": "6981616",
+  "profile": "vector_verilator",
+  "workload": "tiled_matmul_int8",
+  "config": "monolithic_4lanes_vlen256",
+  "metrics": {
+    "validated": true,
+    "simulator": "verilator",
+    "architecture": "rv32imf_zve32x",
+    "configuration": "monolithic_4lanes_vlen256",
+    "nr_lanes": 4,
+    "vlen": 256,
+    "wall_time_s": 14.2,
+    "exit_code": 0,
+    "benchmark_cycles": 18240,
+    "kernel_cycles": 18240,
+    "simulation_cycles": 54200,
+    "performance_ops_per_cycle": 14.8,
+    "vector_utilization_pct": 92.5,
+    "sim_speed_hz": 3816.9,
+    "datatype": "int8"
+  },
+  "generated_utc": "2026-11-24T03:30:00Z",
+  "_path": "datasets/ant_v/6981616/benchmarks/tiled_matmul_int8.json"
+}
